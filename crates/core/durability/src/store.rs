@@ -610,6 +610,13 @@ pub trait StateStore: MaybeSend {
         Box::pin(async { Ok(false) })
     }
 
+    fn collect_unreachable<'a>(
+        &'a mut self,
+        _state_id: &'a str,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn commit<'a>(
         &'a mut self,
         state_id: &'a str,

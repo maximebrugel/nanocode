@@ -1575,6 +1575,16 @@ impl StateStore for OneLogStore {
         })
     }
 
+    fn collect_unreachable<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.0.log.lease().await.collect_unreachable(state_id);
+            Ok(())
+        })
+    }
+
     fn put_records<'a>(
         &'a mut self,
         state_id: &'a str,

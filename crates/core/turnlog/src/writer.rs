@@ -1,4 +1,8 @@
-use std::{borrow::Cow, collections::VecDeque, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 use nanocode_durability_core::StoreError;
 use nanocode_sync::{Held, Owned};
@@ -343,6 +347,7 @@ struct TailRow {
 struct Writer {
     buffer: Vec<Record>,
     check: usize,
+    collectable: BTreeSet<String>,
     floor: Option<u64>,
     fold: Fold,
     history: History,
@@ -477,6 +482,7 @@ impl TurnLog {
             writer: Owned::new(Writer {
                 buffer: Vec::new(),
                 check: snapshot,
+                collectable: BTreeSet::new(),
                 floor,
                 fold,
                 history,
@@ -630,6 +636,12 @@ impl Lease<'_> {
         self.writer.fold.next_event()
     }
 
+    pub fn collect_unreachable(&mut self, state: &str) {
+        if !self.writer.collectable.contains(state) {
+            self.writer.collectable.insert(state.to_owned());
+        }
+    }
+
     pub fn push(&mut self, record: Record) -> Result<(), StoreError> {
         let writer = &mut *self.writer;
         writer.fold.apply(&record, None)?;
@@ -705,6 +717,9 @@ impl Lease<'_> {
         let mut snapshot = None;
         let due = self.rows.is_some_and(|rows| writer.tail_rows >= rows);
         if due || writer.tail + body.len() >= writer.check {
+            if !writer.collectable.is_empty() {
+                writer.stats.collected += writer.fold.collect_in(&writer.collectable) as u64;
+            }
             for turn in &recovered {
                 writer.fold.recovered_at(turn, seq);
             }

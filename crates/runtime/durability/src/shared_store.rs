@@ -83,6 +83,10 @@ enum Command {
         state_id: String,
         result: oneshot::Sender<Result<Option<OwnerToken>, StoreError>>,
     },
+    CollectUnreachable {
+        state_id: String,
+        result: oneshot::Sender<Result<(), StoreError>>,
+    },
     ListStates {
         limit: usize,
         result: oneshot::Sender<Result<Vec<String>, StoreError>>,
@@ -1250,6 +1254,9 @@ async fn run<S: StateStore + ?Sized>(store: &mut S, request: StoreRequest) {
             Command::Owner { state_id, result } => {
                 drop(result.send(store.owner(&state_id).await));
             }
+            Command::CollectUnreachable { state_id, result } => {
+                drop(result.send(store.collect_unreachable(&state_id).await));
+            }
             Command::ListStates { limit, result } => {
                 drop(result.send(store.list_states(limit).await));
             }
@@ -1616,6 +1623,32 @@ impl StateStore for SharedStore {
             };
             self.pools.observe(state_id, stored.payload.as_deref());
             Ok(stored)
+        })
+    }
+
+    fn collect_unreachable<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        let span = nanocode_trace::info_span!(
+            "durability.store",
+            operation = "collect_unreachable",
+            state.id = state_id,
+            queue.duration_ms = nanocode_trace::field::Empty
+        );
+        Box::pin(async move {
+            let (result, receiver) = oneshot::channel();
+            self.commands
+                .send(StoreRequest {
+                    command: Command::CollectUnreachable {
+                        state_id: state_id.to_owned(),
+                        result,
+                    },
+                    span,
+                    queued: nanocode_platform::now(),
+                })
+                .map_err(|_| stopped())?;
+            receiver.await.map_err(|_| stopped())?
         })
     }
 

@@ -240,19 +240,21 @@ impl Fold {
         })
     }
 
-    fn garbage(&self) -> Vec<String> {
+    fn garbage(&self, collectable: impl Fn(&str) -> bool) -> Vec<String> {
         let mut holders: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
         for key in self.stored.keys() {
             if let Some((state, content)) = key.split_once('\n')
                 && content.starts_with("b3:")
+                && collectable(state)
             {
                 holders.entry(content).or_default().push((state, key));
             }
         }
         let mut queue = self
             .checkpoints
-            .values()
-            .flat_map(|checkpoint| EncodedPayload::references(&checkpoint.payload))
+            .iter()
+            .filter(|(state, _)| collectable(state))
+            .flat_map(|(_, checkpoint)| EncodedPayload::references(&checkpoint.payload))
             .collect::<Vec<_>>();
         let mut visited = BTreeSet::new();
         while let Some(content) = queue.pop() {
@@ -290,7 +292,15 @@ impl Fold {
     }
 
     pub(crate) fn collect(&mut self) -> usize {
-        let garbage = self.garbage();
+        self.drop_garbage(|_| true)
+    }
+
+    pub(crate) fn collect_in(&mut self, states: &BTreeSet<String>) -> usize {
+        self.drop_garbage(|state| states.contains(state))
+    }
+
+    fn drop_garbage(&mut self, collectable: impl Fn(&str) -> bool) -> usize {
+        let garbage = self.garbage(collectable);
         for key in &garbage {
             self.stored.remove(key);
         }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     future::Future,
     sync::{
         Arc, Weak,
@@ -74,8 +74,6 @@ impl JournalClaim {
 struct Fenced {
     owner: Option<(OwnerToken, u64)>,
 
-    committed: HashSet<String>,
-
     seed: Option<(oneshot::Receiver<OwnedState>, Arc<AtomicBool>)>,
 
     next: u64,
@@ -98,7 +96,6 @@ struct InFlight {
     write: Option<Arc<LatestWrite>>,
     deferred: Option<DeferredKeys>,
     done: oneshot::Receiver<Result<u64, StoreError>>,
-    staged: Vec<String>,
     pending: Vec<String>,
 }
 
@@ -123,6 +120,10 @@ impl Fenced {
                 .await
                 .map_err(std::io::Error::other)?,
         };
+        store
+            .collect_unreachable(state_id)
+            .await
+            .map_err(std::io::Error::other)?;
         self.next = owned.state.revision;
         self.owner = Some((owned.owner, owned.state.revision));
         Ok(owned.state.payload)
@@ -146,7 +147,6 @@ impl Fenced {
         }
         let retry = std::mem::take(&mut self.retry)
             .into_iter()
-            .filter(|key| !self.committed.contains(key))
             .filter_map(|key| {
                 let json = self.pending.read(|pending| pending.get(&key).cloned())?;
                 Some((Arc::<str>::from(key), json))
@@ -155,10 +155,8 @@ impl Fenced {
         let mut staged = Vec::new();
         let mut pending = Vec::with_capacity(records.len() + retry.len());
         for (key, json) in records.into_iter().chain(retry) {
-            let committed = &self.committed;
             pending.push((key.to_string(), Arc::clone(&json)));
-            EncodedPayload::keyed(key, json)
-                .stage_unless(&mut staged, &|key| committed.contains(key));
+            EncodedPayload::keyed(key, json).stage(&mut staged);
         }
         staged.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         staged.dedup_by(|a, b| a.key == b.key);
@@ -177,18 +175,15 @@ impl Fenced {
             });
         }
         let pending = pending.into_iter().map(|(key, _)| key);
-        let keys = staged.iter().map(|record| record.key.clone());
         if let Some(last) = self.inflight.back_mut()
             && last
                 .write
                 .as_ref()
                 .is_some_and(|write| write.update(&payload, &staged))
         {
-            last.staged.extend(keys);
             last.pending.extend(pending);
             return Ok(());
         }
-        let staged_keys = keys.collect();
         let write = Arc::new(latest_write(payload, staged));
         let expected = self.next;
         let next = self.next_revision()?;
@@ -201,7 +196,6 @@ impl Fenced {
             write: Some(write),
             deferred: None,
             done,
-            staged: staged_keys,
             pending: pending.collect(),
         });
         Ok(())
@@ -230,7 +224,6 @@ impl Fenced {
             .ok_or_else(|| std::io::Error::other("journal owner was not acquired"))?;
         let retry = std::mem::take(&mut self.retry)
             .into_iter()
-            .filter(|key| !self.committed.contains(key))
             .filter_map(|key| {
                 let json = self.pending.read(|pending| pending.get(&key).cloned())?;
                 Some((Arc::<str>::from(key), json))
@@ -289,7 +282,6 @@ impl Fenced {
             write: None,
             deferred: Some(keys),
             done,
-            staged: Vec::new(),
             pending: Vec::new(),
         });
         Ok(fill)
@@ -340,7 +332,6 @@ impl Fenced {
                 if let Some((owner, _)) = self.owner.take() {
                     self.owner = Some((owner, revision));
                 }
-                self.committed.extend(entry.staged);
                 if !entry.pending.is_empty() {
                     self.pending.update(|known| {
                         for key in &entry.pending {
@@ -658,7 +649,6 @@ fn journal(
         store.clone(),
         Fenced {
             owner: None,
-            committed: HashSet::new(),
             seed,
             next: 0,
             inflight: std::collections::VecDeque::new(),

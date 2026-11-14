@@ -1216,6 +1216,9 @@ enum JournalRequest {
         scope: bool,
         done: oneshot::Sender<std::io::Result<()>>,
     },
+    Settled {
+        done: oneshot::Sender<std::io::Result<()>>,
+    },
     Final {
         write: JournalWrite,
         done: oneshot::Sender<std::io::Result<()>>,
@@ -3352,6 +3355,18 @@ impl Registry {
             .map_err(|_| std::io::Error::other("subagent journal write was interrupted"))?
     }
 
+    async fn settled(&self, session_id: &str) -> std::io::Result<()> {
+        let root_session_id = self.root_of(session_id);
+        if self.store_for(&root_session_id).is_none() {
+            return Ok(());
+        }
+        let (done, saved) = oneshot::channel();
+        self.send_journal(&root_session_id, Some(JournalRequest::Settled { done }));
+        saved
+            .await
+            .map_err(|_| std::io::Error::other("subagent journal write was interrupted"))?
+    }
+
     async fn final_journal(
         &self,
         root_session_id: &str,
@@ -3471,6 +3486,7 @@ impl Registry {
             )
         };
         let mut waiters = Vec::new();
+        let mut settled = Vec::new();
         let mut finals = Vec::new();
         for request in requests {
             match request {
@@ -3482,6 +3498,7 @@ impl Registry {
                     )));
                 }
                 JournalRequest::Persist { scope, done } => waiters.push((scope, done)),
+                JournalRequest::Settled { done } => settled.push(done),
                 JournalRequest::Final { write, done } => finals.push((write, done)),
             }
         }
@@ -3492,6 +3509,9 @@ impl Registry {
                 .chain(finals.into_iter().map(|(_, done)| done))
             {
                 let _ = done.send(Err(std::io::Error::other("no subagent store is installed")));
+            }
+            for done in settled {
+                let _ = done.send(Ok(()));
             }
             return (true, JournalSave::Idle);
         };
@@ -3506,7 +3526,7 @@ impl Registry {
         let root = root_session_id.to_owned();
         let mut owned_cache = std::mem::take(cache);
         let defer = *deferrable;
-        let (snapshot, finished, returned_waiters, returned_cache, wanted) = self
+        let (snapshot, finished, returned_waiters, returned_settled, returned_cache, wanted) = self
             .state
             .call(move |state| {
                 let root_session_id = root.as_str();
@@ -3522,6 +3542,9 @@ impl Registry {
                         for (scope, done) in waiters.drain(..) {
                             let _ = done.send(if scope { Ok(()) } else { frozen() });
                         }
+                        for done in settled.drain(..) {
+                            let _ = done.send(Ok(()));
+                        }
                         (None, true)
                     }
                     Some(scope) => {
@@ -3532,13 +3555,18 @@ impl Registry {
                             for (_, done) in unscoped {
                                 let _ = done.send(frozen());
                             }
+                            for done in settled.drain(..) {
+                                let _ = done.send(Ok(()));
+                            }
                         }
                         if scope.life.released() {
                             for (_, done) in waiters.drain(..) {
                                 let _ = done.send(frozen());
                             }
                         }
-                        let write = !waiters.is_empty() || (background && !scope.life.frozen());
+                        let write = !waiters.is_empty()
+                            || !settled.is_empty()
+                            || (background && !scope.life.frozen());
                         wanted = write;
                         scope.cool(root_session_id, &registry, cache);
                         (
@@ -3558,10 +3586,11 @@ impl Registry {
                         )
                     }
                 };
-                (snapshot, finished, waiters, owned_cache, wanted)
+                (snapshot, finished, waiters, settled, owned_cache, wanted)
             })
             .await;
         let waiters = returned_waiters;
+        let settled = returned_settled;
         *cache = returned_cache;
         if defer && wanted {
             let deferred = match slot {
@@ -3578,6 +3607,7 @@ impl Registry {
             match deferred {
                 Ok(true) => {
                     awaiting.extend(waiters.into_iter().map(|(_, done)| done));
+                    awaiting.extend(settled);
                     let closed = !finals.is_empty();
                     if closed && let Some(open) = slot.take() {
                         let filled = self
@@ -3604,6 +3634,11 @@ impl Registry {
                     let mut requeued = waiters
                         .into_iter()
                         .map(|(scope, done)| JournalRequest::Persist { scope, done })
+                        .chain(
+                            settled
+                                .into_iter()
+                                .map(|done| JournalRequest::Settled { done }),
+                        )
                         .collect::<Vec<_>>();
                     requeued.extend(
                         finals
@@ -3631,6 +3666,9 @@ impl Registry {
                         JournalSave::Failed
                     };
                     for (_, done) in waiters {
+                        let _ = done.send(Err(copy_error(&error)));
+                    }
+                    for done in settled {
                         let _ = done.send(Err(copy_error(&error)));
                     }
                     let closed = !finals.is_empty();
@@ -3705,6 +3743,9 @@ impl Registry {
             nanocode_trace::warn!(%error, %root_session_id, "could not save subagent journal");
         }
         for (_, done) in waiters {
+            let _ = done.send(result.as_ref().copied().map_err(copy_error));
+        }
+        for done in settled {
             let _ = done.send(result.as_ref().copied().map_err(copy_error));
         }
         let save = match &result {
@@ -7825,10 +7866,15 @@ impl Registry {
     ) -> std::io::Result<Vec<AgentDirectoryEntry>> {
         self.await_restored(session_id).await?;
         if include_completed {
-            return self.listed_cold(session_id, include_self, None).await;
+            let agents = self.listed_cold(session_id, include_self, None).await?;
+            self.settled(session_id).await?;
+            return Ok(agents);
         }
-        self.listed(session_id, include_completed, include_self, None)
-            .await
+        let agents = self
+            .listed(session_id, include_completed, include_self, None)
+            .await?;
+        self.settled(session_id).await?;
+        Ok(agents)
     }
 
     pub(super) async fn directory_page(
@@ -7855,6 +7901,7 @@ impl Registry {
             self.listed(session_id, include_completed, include_self, None)
                 .await?
         };
+        self.settled(session_id).await?;
         if let Some(after) = after {
             agents.retain(|agent| agent.agent_id > after);
         }

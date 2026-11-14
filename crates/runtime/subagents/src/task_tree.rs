@@ -1,10 +1,11 @@
 use super::model::AgentId;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 
 #[derive(Default)]
 pub(super) struct TaskTree {
     next_id: u64,
-    nodes: HashMap<AgentId, TaskNode>,
+    nodes: BTreeMap<AgentId, TaskNode>,
     sessions: HashMap<String, AgentId>,
     children: HashMap<Option<AgentId>, BTreeSet<AgentId>>,
 }
@@ -100,6 +101,15 @@ impl TaskTree {
 
     pub(super) fn ids(&self) -> Vec<AgentId> {
         self.nodes.keys().copied().collect()
+    }
+
+    pub(super) fn ids_after(&self, after: Option<AgentId>) -> impl Iterator<Item = AgentId> + '_ {
+        self.nodes
+            .range((
+                after.map_or(Bound::Unbounded, Bound::Excluded),
+                Bound::Unbounded,
+            ))
+            .map(|(id, _)| *id)
     }
 
     pub(super) fn children(&self, id: AgentId) -> impl Iterator<Item = AgentId> + '_ {

@@ -7206,11 +7206,17 @@ impl Registry {
                     let Some(registry) = registry.upgrade() else {
                         return;
                     };
-                    for (id, revision, _, _, _) in group {
-                        registry
-                            .settle_notice(&root_session_id, id, revision, outcome, &parent)
-                            .await;
-                    }
+                    registry
+                        .settle_notices(
+                            &root_session_id,
+                            group
+                                .into_iter()
+                                .map(|(id, revision, _, _, _)| (id, revision))
+                                .collect(),
+                            outcome,
+                            &parent,
+                        )
+                        .await;
                 }));
                 routed
             }
@@ -7389,14 +7395,37 @@ impl Registry {
             .await
     }
 
-    async fn settle_notice(
+    async fn settle_notices(
         self: &Arc<Self>,
         root_session_id: &str,
-        id: AgentId,
-        revision: u64,
+        notices: Vec<(AgentId, u64)>,
         outcome: NoticeOutcome,
         parent: &WeakAgent,
     ) {
+        if !matches!(outcome, NoticeOutcome::Read) {
+            for (id, revision) in notices {
+                self.settle_notice(root_session_id, id, revision, outcome, parent)
+                    .await;
+            }
+            return;
+        }
+        for &(id, revision) in &notices {
+            self.release_notice_route(root_session_id, id, revision);
+            self.acknowledge_completion(root_session_id, id, revision)
+                .await;
+        }
+        if self.store_for(root_session_id).is_some()
+            && let Err(error) = self.persist_durably(root_session_id).await
+        {
+            for (id, revision) in notices {
+                nanocode_trace::warn!(%error, %id, revision, "subagent completion acknowledgement was not journaled");
+                self.restore_completion(root_session_id, id, revision).await;
+                self.retry_completion(root_session_id, id, revision);
+            }
+        }
+    }
+
+    fn release_notice_route(&self, root_session_id: &str, id: AgentId, revision: u64) {
         let key = (root_session_id.to_owned(), id);
         if self
             .completion_routes
@@ -7408,6 +7437,17 @@ impl Registry {
                 }
             });
         }
+    }
+
+    async fn settle_notice(
+        self: &Arc<Self>,
+        root_session_id: &str,
+        id: AgentId,
+        revision: u64,
+        outcome: NoticeOutcome,
+        parent: &WeakAgent,
+    ) {
+        self.release_notice_route(root_session_id, id, revision);
         match outcome {
             NoticeOutcome::Read => {
                 self.acknowledge_completion(root_session_id, id, revision)

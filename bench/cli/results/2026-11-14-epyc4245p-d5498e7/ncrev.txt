@@ -1,0 +1,1 @@
+nc: nanocode d5498e7845329c2b4604b318ed2919abf6cc3340 built with scripts/build-cli.sh (dist, non-PIE, BOLT 21) from a clean checkout on this machine; nc-lite at the same commit with PROFILE=lite

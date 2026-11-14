@@ -48,7 +48,7 @@ export async function startServer(extra = {}) {
 }
 
 export function baseEnv(home) {
-  const keep = ["PATH", "LANG", "TMPDIR", "USER", "LOGNAME", "SHELL"];
+  const keep = ["PATH", "LANG", "TMPDIR", "USER", "LOGNAME", "SHELL", "RUNSTAT_PERF"];
   const env = {};
   for (const k of keep) if (process.env[k] !== undefined) env[k] = process.env[k];
   env.TERM = process.env.BENCH_TERM ?? "xterm-256color";

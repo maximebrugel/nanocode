@@ -1,6 +1,6 @@
 # Seven agent CLIs, measured, 2026-11-14
 
-*Draft for nanocode.xyz/experiments. Not published. Generated from the results' JSONL by `python3 harness/post.py --out results/2026-11-14-epyc4245p-d5498e7/POST.md results/2026-11-14-epyc4245p-d5498e7 results/2026-11-14-fra2-epyc9254 results/2026-11-13-epyc4245p results/2026-11-13-epyc4245p-b results/2026-11-13-epyc4245p-c results/2026-11-14-dev-georgios-store14600` (run from bench/cli); edit harness/post.py, not this file.*
+*Draft for nanocode.xyz/experiments. Not published. Generated from the results' JSONL by `python3 harness/post.py --out results/2026-11-14-epyc4245p-d5498e7/POST.md --since results/2026-11-14-nc-since/since.json results/2026-11-14-epyc4245p-d5498e7 results/2026-11-14-fra2-epyc9254 results/2026-11-13-epyc4245p results/2026-11-13-epyc4245p-b results/2026-11-13-epyc4245p-c results/2026-11-14-dev-georgios-store14600` (run from bench/cli); edit harness/post.py, not this file.*
 
 Seven terminal coding agents ran the same scripted work: nc (nanocode), nc-lite (the same SDK cut down to what fx ships), Vercel fx, Pi, OpenCode, Claude Code and Codex CLI. No lane talks to a real model: each points at a local fixture that streams a fixed reply, runs with its own empty HOME, inside a network namespace where only loopback works. The lanes take turns in every round. Every number is a median with the sample count in parentheses; CPU and memory cover the CLI's whole process tree. Lower is better in every row except the KB-printed context row.
 
@@ -182,6 +182,23 @@ The same nc rows from every source that has them, to show what changed between n
 | Continuing the latest of 14,600, instructions (user+kernel), M |  | 6,521 (10) |  |  |  | 4,984 (10) |
 | Install, MB | 45.4 (1) | 61.9 (1) |  | 69.8 (1) |  | 44.1 (1) |
 | Main binary, MB | 45.4 (1) | 45.2 (1) |  | 69.8 (1) |  | 44.1 (1) |
+
+## nc since these runs
+
+Numbers the source table's runs do not cover. Source A did not rebuild the 14,600-session store, so those rows above still come from B at 41dcbc7c4, before the session index (38e547873, which A's d5498e784 includes); H is that store remeasured after it, nc against fx on a shared machine, so compare within a row. Every fx number in this post is fx 0.0.16: fx 0.0.17 came out on 2026-11-14 with a smaller binary (8.4 MiB against 0.0.16's 12.2) and has not been run here. Changes that landed on nanocode master after d5498e784 are in no number in this post: TUI bytes per token (4f8526511), the streaming read buffer (e4230c13d) and nc-lite's store and binary (d83b08fa2, 89de9e518).
+
+| Source | Machine | When (UTC) | nanocode commit |
+|---|---|---|---|
+| H | dev-georgios (shared), 14,600-session store, pinned to two CPUs, perf stat, 20 rounds | 2026-11-14 20:40 | 38e547873 |
+
+| | nc | fx | nc before | Src |
+|---|---:|---:|---:|---|
+| Listing 14,600 sessions, CPU ms | 85 | 86 | n/a | H |
+| Listing 14,600 sessions, kernel instructions, M | 37 | 98 | 166 | H |
+| Listing 14,600 sessions, peak RSS MB | 32.4 | 33.2 | n/a | H |
+| Continuing the latest of 14,600, CPU ms | 100 | 89 | n/a | H |
+| Continuing the latest of 14,600, kernel instructions, M | 58 | 104 | 177 | H |
+| Continuing the latest of 14,600, peak RSS MB | 34.3 | 34.6 | 41.0 | H |
 
 ## Method
 

@@ -158,38 +158,69 @@ fn startup_files(shell: &Path, environment: &HashMap<OsString, OsString>) -> Vec
     files
 }
 
+const BASH_LOGIN: &str = "shopt -s login_shell; if [ -e /etc/profile ]; then . /etc/profile; fi; if [ -e ~/.bash_profile ]; then . ~/.bash_profile; elif [ -e ~/.bash_login ]; then . ~/.bash_login; elif [ -e ~/.profile ]; then . ~/.profile; fi; [ -z \"${BASH_ENV-}${POSIXLY_CORRECT-}\" ] || exit 1; ";
+
+async fn in_process(
+    shell: &Path,
+    workdir: &Path,
+    launched: &[(OsString, OsString)],
+    report: &str,
+) -> Option<Vec<u8>> {
+    let psh = |name: &OsStr| name.as_encoded_bytes().starts_with(b"PSH_");
+    if shell.file_name() != Some(OsStr::new("bash"))
+        || launched.iter().any(|(name, _)| psh(name))
+    {
+        return None;
+    }
+    let mut environment = launched.to_vec();
+    environment.push((OsString::from("PSH_NAME"), shell.as_os_str().to_owned()));
+    let script = format!("{BASH_LOGIN}{report}");
+    let output = super::embedded::output(&script, workdir, &environment).await?;
+    (matches!(output.status, Ok(0)) && !output.stderr).then_some(output.stdout)
+}
+
 async fn probe(
     shell: &Path,
     workdir: &Path,
     launched: Vec<(OsString, OsString)>,
 ) -> Result<Snapshot, String> {
-    let script = format!("printf '\\0%s\\0' {MARK}; /usr/bin/env -0");
     let failed = |why: String| format!("the login shell {} {why}", shell.display());
-    let output = nanocode_executor::process::Command::new(shell)
-        .args(["-lc", &script])
-        .current_dir(workdir)
-        .env_clear()
-        .envs(launched.iter().cloned())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0)
-        .output()
-        .await
-        .map_err(|error| failed(format!("did not start: {error}")))?;
-    if !output.status.success() {
-        return Err(failed(format!(
-            "ended with {} instead of reporting its environment",
-            output.status
-        )));
-    }
     let mark = [b"\0", MARK.as_bytes(), b"\0"].concat();
-    let reported = output
-        .stdout
-        .windows(mark.len())
-        .rposition(|window| window == mark)
-        .map(|at| &output.stdout[at + mark.len()..])
+    let found = |stdout: &[u8]| {
+        stdout
+            .windows(mark.len())
+            .rposition(|window| window == mark)
+            .map(|at| at + mark.len())
+    };
+    let reported = format!("printf '\\0%s\\0' {MARK}; command env -0");
+    let stdout = match in_process(shell, workdir, &launched, &reported).await {
+        Some(stdout) if found(&stdout).is_some() => stdout,
+        _ => {
+            let script = format!("printf '\\0%s\\0' {MARK}; /usr/bin/env -0");
+            let output = nanocode_executor::process::Command::new(shell)
+                .args(["-lc", &script])
+                .current_dir(workdir)
+                .env_clear()
+                .envs(launched.iter().cloned())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .process_group(0)
+                .output()
+                .await
+                .map_err(|error| failed(format!("did not start: {error}")))?;
+            if !output.status.success() {
+                return Err(failed(format!(
+                    "ended with {} instead of reporting its environment",
+                    output.status
+                )));
+            }
+            output.stdout
+        }
+    };
+    let reported = found(&stdout)
+        .map(|at| &stdout[at..])
         .ok_or_else(|| failed("did not report its environment".to_owned()))?;
     let child: Vec<(OsString, OsString)> = reported
         .split(|byte| *byte == 0)

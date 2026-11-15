@@ -3,7 +3,10 @@ use std::{
     io,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -151,5 +154,53 @@ pub(crate) fn spawn(
         child,
         stdin: None,
         output,
+    })
+}
+
+pub(crate) struct Output {
+    pub status: io::Result<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: bool,
+}
+
+pub(crate) async fn output(
+    script: &str,
+    workdir: &Path,
+    environment: &[(OsString, OsString)],
+) -> Option<Output> {
+    let embedded = EMBEDDED.get()?;
+    let (written, mut chunks) = mpsc::unbounded_channel::<Vec<u8>>();
+    let complained = Arc::new(AtomicBool::new(false));
+    let noted = Arc::clone(&complained);
+    let (exit, exited) = oneshot::channel();
+    let _running = embedded
+        .start(Contained {
+            script: script.to_owned(),
+            workdir: workdir.to_owned(),
+            environment: environment.to_vec(),
+            stdout: Box::new(move |bytes: &[u8]| {
+                written
+                    .send(bytes.to_vec())
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+            }),
+            stderr: Box::new(move |bytes: &[u8]| {
+                if !bytes.is_empty() {
+                    noted.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            }),
+            ended: Box::new(move |status| drop(exit.send(status))),
+        })
+        .inspect_err(|error| nanocode_trace::warn!(%error, "the shell did not start in this process"))
+        .ok()?;
+    let status = exited.await.ok()?;
+    let mut stdout = Vec::new();
+    while let Ok(chunk) = chunks.try_recv() {
+        stdout.extend_from_slice(&chunk);
+    }
+    Some(Output {
+        status,
+        stdout,
+        stderr: complained.load(Ordering::Relaxed),
     })
 }

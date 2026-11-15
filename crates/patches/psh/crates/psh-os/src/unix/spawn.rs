@@ -132,9 +132,6 @@ pub(crate) fn umask_probe() -> Option<u32> {
     ok.then(|| u32::from_ne_bytes(b))
 }
 
-/// Waiter and escalation threads only wait and signal.
-const SMALL_STACK: usize = 64 << 10;
-
 /// What group-wide operations of one external reach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scope {
@@ -238,7 +235,7 @@ impl Shared {
         let grace = self.grace;
         let fallback = groups.clone();
         *lock(&ESCALATING) += 1;
-        let started = crate::spawn_helper("psh-kill", Some(SMALL_STACK), move || {
+        let started = crate::spawn_helper("psh-kill", None, move || {
             let deadline = Instant::now() + grace;
             while Instant::now() < deadline && groups.iter().any(|&g| Scope::Group(g).alive()) {
                 std::thread::sleep(Duration::from_millis(10));
@@ -998,7 +995,7 @@ fn watch(pid: i32, tracker: Arc<Tracker>) -> io::Result<()> {
         job: Mutex::new(Some((pid, tracker))),
         ready: Condvar::new(),
     });
-    crate::spawn_helper("psh-wait", Some(SMALL_STACK), move || waiter(&mb))
+    crate::spawn_helper("psh-wait", None, move || waiter(&mb))
 }
 
 fn waiter(mb: &Arc<Mailbox>) {
@@ -1195,7 +1192,7 @@ impl Drop for UnixProc {
                 let deadline = Instant::now() + self.shared.grace;
                 let (tracker, scope, pid) = (self.tracker.clone(), self.scope, self.pid);
                 *lock(&ESCALATING) += 1;
-                let started = crate::spawn_helper("psh-kill", Some(SMALL_STACK), move || {
+                let started = crate::spawn_helper("psh-kill", None, move || {
                     escalate(&tracker, scope, pid, deadline);
                     *lock(&ESCALATING) -= 1;
                     SETTLED.notify_all();

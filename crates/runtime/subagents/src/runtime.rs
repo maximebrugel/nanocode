@@ -613,6 +613,10 @@ pub struct Registry {
 
     manual_resume: std::sync::atomic::AtomicBool,
 
+    deferred_restore: AtomicBool,
+
+    pending_restores: Atom<HashMap<String, Arc<watch::Sender<RestorationState>>>>,
+
     journal_version: std::sync::atomic::AtomicU32,
 
     deferred_resume: Atom<nanocode_sync::Map<String, nanocode_sync::OrdSet<AgentId>>>,
@@ -2924,6 +2928,8 @@ impl Registry {
             checkpoint_changes: Atom::default(),
             pending_resume: Atom::default(),
             manual_resume: std::sync::atomic::AtomicBool::new(false),
+            deferred_restore: AtomicBool::new(false),
+            pending_restores: Atom::default(),
             journal_version: std::sync::atomic::AtomicU32::new(durable::JOURNAL_VERSION),
             deferred_resume: Atom::default(),
             deferred_work: Atom::default(),
@@ -3034,6 +3040,37 @@ impl Registry {
             journals.insert(root.clone(), Arc::clone(&store));
         });
         self.ensure_journal_writer();
+        let ready = Arc::new(ready);
+        if self.deferred_restore.load(Ordering::SeqCst) {
+            self.pending_restores.update(|pending| {
+                pending.insert(root.clone(), Arc::clone(&ready));
+            });
+            return;
+        }
+        self.spawn_restore(root, ready);
+    }
+
+    pub(crate) fn start_restore(&self, session_id: &str) {
+        let root = self.root_of(session_id);
+        if !self
+            .pending_restores
+            .read(|pending| pending.contains_key(&root))
+        {
+            return;
+        }
+        let Some(registry) = self.shared() else {
+            return;
+        };
+        let mut ready = None;
+        self.pending_restores.update(|pending| {
+            ready = pending.remove(&root);
+        });
+        if let Some(ready) = ready {
+            registry.spawn_restore(root, ready);
+        }
+    }
+
+    fn spawn_restore(self: &Arc<Self>, root: String, ready: Arc<watch::Sender<RestorationState>>) {
         let registry = Arc::clone(self);
         drop(platform::spawn(async move {
             let mut completed = Vec::new();
@@ -3144,6 +3181,7 @@ impl Registry {
     }
 
     pub(crate) async fn await_restored(&self, session_id: &str) -> std::io::Result<()> {
+        self.start_restore(session_id);
         let root = self.root_of(session_id);
         let gate = self
             .claims
@@ -9544,6 +9582,16 @@ impl SubagentControl {
 
     pub async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {
         self.registry.close_all(root_session_id).await.map(drop)
+    }
+
+    pub fn set_deferred_restore(&self, deferred: bool) {
+        self.registry
+            .deferred_restore
+            .store(deferred, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn start_restore(&self, root_session_id: &str) {
+        self.registry.start_restore(root_session_id);
     }
 
     pub fn set_manual_resume(&self, manual: bool) {

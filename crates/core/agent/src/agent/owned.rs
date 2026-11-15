@@ -428,6 +428,9 @@ impl LifecycleBackend for Owned {
     fn unfinished_request(&self, id: String) -> BackendFuture<Result<bool>> {
         self.0.backend().unfinished_request(id)
     }
+    fn prefetch_request(&self, id: String) -> BackendFuture<Result<bool>> {
+        self.0.backend().prefetch_request(id)
+    }
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>> {
         self.0.backend().cancel(key)
     }

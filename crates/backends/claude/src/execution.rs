@@ -161,6 +161,9 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         })
     }
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>>;
+    fn prefetch_continuation(&self, _id: String) -> PolicyFuture<'_, bool> {
+        Box::pin(async { Ok(false) })
+    }
     fn advance(&self, id: String, state: Value) -> PolicyFuture<'_, ()>;
 
     #[allow(clippy::boxed_local)]

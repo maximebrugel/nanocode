@@ -384,6 +384,10 @@ pub trait LifecycleBackend: Send + Sync + 'static {
         Box::pin(async { Ok(false) })
     }
 
+    fn prefetch_request(&self, _id: String) -> BackendFuture<Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
+
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>>;
 
     fn cancel_active(&self) -> BackendFuture<Result<()>> {

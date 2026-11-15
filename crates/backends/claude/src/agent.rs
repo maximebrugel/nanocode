@@ -8796,7 +8796,10 @@ impl LifecycleBackend for Driver {
                         .unwrap_or_else(|| durable::candidate_id("turn"));
                     let input =
                         json!({"provider":"claude","kind":"prompt","prompt":request.prompt});
-                    let (id, admission) = policy.admit(candidate, input, automatic).await?;
+                    let (id, admission) = policy
+                        .admit(candidate, input, automatic)
+                        .instrument(nanocode_trace::info_span!(target: "nanocode", "agent.admit"))
+                        .await?;
 
                     let order = state.admission_order.fetch_add(1, Ordering::SeqCst);
                     request.request_id = Some(id.clone());
@@ -8814,7 +8817,14 @@ impl LifecycleBackend for Driver {
                     };
                     let mut attempt = None;
                     if terminal.is_none() {
-                        match policy.begin_attempt(id.clone()).await {
+                        match policy
+                            .begin_attempt(id.clone())
+                            .instrument(nanocode_trace::info_span!(
+                                target: "nanocode",
+                                "agent.begin_attempt"
+                            ))
+                            .await
+                        {
                             Ok(()) => attempt = Some(AttemptGuard::begin(state.clone())),
                             Err(error) => {
                                 let blocked = error.execution_policy_disposition()
@@ -8963,6 +8973,23 @@ impl LifecycleBackend for Driver {
         Box::pin(async move {
             match &state.policy {
                 Some(policy) => policy.unfinished_operation(id).await,
+                None => Ok(false),
+            }
+        })
+    }
+    fn prefetch_request(&self, id: String) -> BackendFuture<Result<bool>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            match &state.policy {
+                Some(policy) => {
+                    policy
+                        .prefetch_continuation(id)
+                        .instrument(nanocode_trace::info_span!(
+                            target: "nanocode",
+                            "agent.prefetch_continuation"
+                        ))
+                        .await
+                }
                 None => Ok(false),
             }
         })

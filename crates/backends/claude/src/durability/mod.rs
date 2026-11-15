@@ -16,6 +16,7 @@ use nanocode_durability::{
     JournalClaim, JournalSeed, OwnerWrite, PayloadReader, SessionRecord, SharedStore, StepState,
     StepStatus, agent_error,
 };
+use nanocode_trace::Instrument as _;
 use serde_json::{Value, value::RawValue};
 
 use crate::{
@@ -147,6 +148,7 @@ impl DurableAgentExt for ClaudeBuilder {
                 session: state,
                 branches,
                 hydrated: nanocode_sync::Slot::default(),
+                hydrating: nanocode_sync::Sequencer::new(),
             }),
             checkpoint,
         )
@@ -192,7 +194,8 @@ struct ClaudeExecution {
     owner: DurableOwner,
     session: DurableSession,
     branches: Branches,
-    hydrated: nanocode_sync::Slot<(String, Value)>,
+    hydrated: nanocode_sync::Slot<(String, Value, bool)>,
+    hydrating: nanocode_sync::Sequencer,
 }
 
 struct Deferred {
@@ -338,6 +341,7 @@ impl LazyClaudeExecution {
                             record: Some(record),
                         },
                         hydrated: nanocode_sync::Slot::default(),
+                        hydrating: nanocode_sync::Sequencer::new(),
                     },
                     reopened,
                 })
@@ -451,6 +455,15 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
 
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>> {
         Box::pin(async move { self.get().await?.continuation(id).await })
+    }
+
+    fn prefetch_continuation(&self, id: String) -> PolicyFuture<'_, bool> {
+        Box::pin(async move {
+            match self.acquired() {
+                Some(execution) => execution.prefetch_continuation(id).await,
+                None => Ok(false),
+            }
+        })
     }
 
     fn advance(&self, id: String, state: Value) -> PolicyFuture<'_, ()> {
@@ -834,14 +847,61 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
     }
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>> {
         Box::pin(async move {
-            let Some(value) = self.owner.continuation(id).await.map_err(agent_error)? else {
+            let span = nanocode_trace::info_span!(
+                target: "nanocode",
+                "agent.continuation",
+                hydrated = nanocode_trace::field::Empty,
+            );
+            let _hydrating = self.hydrating.enter().instrument(span.clone()).await;
+            let Some(value) = self
+                .owner
+                .continuation(id)
+                .instrument(span.clone())
+                .await
+                .map_err(agent_error)?
+            else {
                 self.hydrated.take();
                 return Ok(None);
             };
-            if let Some((key, hydrated)) = self.hydrated.take()
+            if let Some((key, hydrated, ahead)) = self.hydrated.take()
                 && key == value.key()
             {
+                span.record("hydrated", if ahead { "ahead" } else { "kept" });
+                if ahead {
+                    self.hydrated.put((key, hydrated.clone(), false));
+                }
                 return Ok(Some(hydrated));
+            }
+            span.record("hydrated", "read");
+            let hydrated = format::hydrate_cursor(
+                PayloadReader::from(&self.owner),
+                value.decode().map_err(agent_error)?,
+            )
+            .instrument(span)
+            .await
+            .map_err(agent_error)?;
+            self.hydrated
+                .put((value.key().to_owned(), hydrated.clone(), false));
+            Ok(Some(hydrated))
+        })
+    }
+
+    fn prefetch_continuation(&self, id: String) -> PolicyFuture<'_, bool> {
+        Box::pin(async move {
+            let _hydrating = self.hydrating.enter().await;
+            let Some(value) = self
+                .owner
+                .peek_continuation(id)
+                .await
+                .map_err(agent_error)?
+            else {
+                return Ok(false);
+            };
+            if let Some((key, hydrated, ahead)) = self.hydrated.take()
+                && key == value.key()
+            {
+                self.hydrated.put((key, hydrated, ahead));
+                return Ok(true);
             }
             let hydrated = format::hydrate_cursor(
                 PayloadReader::from(&self.owner),
@@ -849,9 +909,8 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             )
             .await
             .map_err(agent_error)?;
-            self.hydrated
-                .put((value.key().to_owned(), hydrated.clone()));
-            Ok(Some(hydrated))
+            self.hydrated.put((value.key().to_owned(), hydrated, true));
+            Ok(true)
         })
     }
 

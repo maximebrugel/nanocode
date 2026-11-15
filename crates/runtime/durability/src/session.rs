@@ -289,6 +289,7 @@ enum Command {
     Continuation {
         caller: Caller,
         operation_id: String,
+        peek: bool,
         result: oneshot::Sender<Result<Option<EncodedPayload>>>,
     },
     Advance {
@@ -557,11 +558,27 @@ pub(crate) async fn pending_turn(store: &SharedStore, state_id: &str) -> Result<
     }
 }
 
-struct CommandRequest(Box<(Command, nanocode_trace::Span)>);
+struct CommandRequest(Box<(Command, nanocode_trace::Span, nanocode_platform::Instant)>);
 
 impl From<Command> for CommandRequest {
     fn from(command: Command) -> Self {
-        Self(Box::new((command, nanocode_trace::Span::current())))
+        Self(Box::new((
+            command,
+            nanocode_trace::Span::current(),
+            nanocode_platform::now(),
+        )))
+    }
+}
+
+impl Command {
+    const fn admission(&self) -> Option<&'static str> {
+        match self {
+            Self::Admit { .. } | Self::AdmitAutomatic { .. } => Some("admit"),
+            Self::BeginAttempt { .. } => Some("begin_attempt"),
+            Self::Continuation { peek: false, .. } => Some("continuation"),
+            Self::Continuation { peek: true, .. } => Some("peek_continuation"),
+            _ => None,
+        }
     }
 }
 
@@ -676,7 +693,7 @@ impl Driver {
             let Some(CommandRequest(request)) = command else {
                 break;
             };
-            let (command, span) = *request;
+            let (command, span, queued) = *request;
 
             for _ in 0..RELEASE_BURST_LIMIT {
                 let Ok(release) = self.releases.try_recv() else {
@@ -684,6 +701,27 @@ impl Driver {
                 };
                 self.handle_release(release);
             }
+            let span = match command.admission() {
+                Some(kind) => {
+                    let waited = nanocode_platform::now().saturating_duration_since(queued);
+                    nanocode_trace::event!(
+                        target: "nc_metrics",
+                        nanocode_trace::Level::INFO,
+                        {
+                            histogram.nc.durability.admission_queue_micros =
+                                u64::try_from(waited.as_micros()).unwrap_or(u64::MAX)
+                        }
+                    );
+                    nanocode_trace::info_span!(
+                        target: "nanocode",
+                        parent: span.id(),
+                        "durability.command",
+                        command = kind,
+                        queue.ms = waited.as_secs_f64() * 1_000.0,
+                    )
+                }
+                None => span,
+            };
             Box::pin(self.handle_command(command).instrument(span)).await;
             if self.poisoned {
                 break;
@@ -755,12 +793,15 @@ impl Driver {
             Command::Continuation {
                 caller,
                 operation_id,
+                peek,
                 result,
             } => {
                 let outcome = async {
                     self.authorize(&caller)?;
-                    self.require_claimed(&caller, &operation_id)?;
-                    self.require_running(&operation_id)?;
+                    if !peek {
+                        self.require_claimed(&caller, &operation_id)?;
+                        self.require_running(&operation_id)?;
+                    }
                     match self
                         .state
                         .operation(&operation_id)
@@ -2248,7 +2289,10 @@ impl Driver {
             let _ = next.retain_terminal_receipts(limit);
         }
         self.persist(next).await?;
-        assert!(!self.deferred_writes, "a commit leaves no deferred writes behind");
+        assert!(
+            !self.deferred_writes,
+            "a commit leaves no deferred writes behind"
+        );
         Ok(())
     }
 
@@ -3545,10 +3589,23 @@ impl DurableOwner {
     }
 
     pub async fn continuation(&self, operation_id: String) -> Result<Option<EncodedPayload>> {
+        self.read_continuation(operation_id, false).await
+    }
+
+    pub async fn peek_continuation(&self, operation_id: String) -> Result<Option<EncodedPayload>> {
+        self.read_continuation(operation_id, true).await
+    }
+
+    async fn read_continuation(
+        &self,
+        operation_id: String,
+        peek: bool,
+    ) -> Result<Option<EncodedPayload>> {
         let (result, receiver) = oneshot::channel();
         self.send(Command::Continuation {
             caller: self.caller()?,
             operation_id,
+            peek,
             result,
         })
         .await?;

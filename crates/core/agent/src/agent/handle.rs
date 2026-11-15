@@ -980,6 +980,10 @@ impl Agent {
         self.backend.unfinished_request(id.to_owned()).await
     }
 
+    pub fn prefetch_request(&self, id: &str) -> super::backend::BackendFuture<Result<bool>> {
+        self.backend.prefetch_request(id.to_owned())
+    }
+
     pub async fn set_thinking(&self, thinking: Thinking) -> Result<()> {
         self.backend.set_thinking(thinking).await
     }

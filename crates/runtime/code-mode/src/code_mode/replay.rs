@@ -281,6 +281,7 @@ struct Journals {
     cells: Atom<Vec<Weak<CellRecord>>>,
     held: Atom<HashSet<String>>,
     restored: Atom<HashMap<String, Arc<Restored>>>,
+    pending: Atom<HashMap<String, watch::Receiver<bool>>>,
     finished: Atom<Vec<Arc<CellRecord>>>,
     dormant: Atom<Vec<(Arc<CellJournal>, Arc<Restored>)>>,
     loaded: Atom<HashSet<String>>,
@@ -315,6 +316,40 @@ const fn call_mark(state: &JournaledCallState) -> u8 {
         JournaledCallState::Queued => 0,
         JournaledCallState::Running => 1,
         JournaledCallState::Completed { .. } => 2,
+    }
+}
+
+#[must_use]
+pub struct PendingRestore {
+    journals: CellJournals,
+    session_id: String,
+    ready: watch::Sender<bool>,
+}
+
+impl PendingRestore {
+    pub fn restore(
+        self,
+        cells: Vec<CellJournal>,
+        fallback: Option<String>,
+        outcomes: HashMap<String, (Value, bool)>,
+    ) {
+        self.journals
+            .restore(&self.session_id, cells, fallback, outcomes);
+    }
+}
+
+impl Drop for PendingRestore {
+    fn drop(&mut self) {
+        let mine = self.ready.subscribe();
+        self.journals.0.pending.update(|pending| {
+            if pending
+                .get(&self.session_id)
+                .is_some_and(|waiting| waiting.same_channel(&mine))
+            {
+                pending.remove(&self.session_id);
+            }
+        });
+        self.ready.send_replace(true);
     }
 }
 
@@ -600,6 +635,36 @@ impl CellJournals {
                     .map(|(session_id, restored)| (session_id.clone(), Arc::clone(restored))),
             );
         });
+    }
+
+    pub fn expect_restore(&self, session_id: &str) -> PendingRestore {
+        let (ready, waiting) = watch::channel(false);
+        self.0.pending.update(|pending| {
+            pending.insert(session_id.to_owned(), waiting.clone());
+        });
+        PendingRestore {
+            journals: self.clone(),
+            session_id: session_id.to_owned(),
+            ready,
+        }
+    }
+
+    #[must_use]
+    pub fn restore_pending(&self, session_id: &str) -> bool {
+        self.0
+            .pending
+            .read(|pending| pending.contains_key(session_id))
+    }
+
+    pub async fn await_restore(&self, session_id: &str) {
+        let Some(mut waiting) = self
+            .0
+            .pending
+            .read(|pending| pending.get(session_id).cloned())
+        else {
+            return;
+        };
+        drop(waiting.wait_for(|ready| *ready).await);
     }
 
     #[must_use]

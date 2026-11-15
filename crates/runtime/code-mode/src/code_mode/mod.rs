@@ -79,7 +79,7 @@ use nanocode_tool_contracts::{ToolProcessTraceWire, ToolReceipt};
 pub use replay::{
     CELL_JOURNAL_VERSION, CellHold, CellJournal, CellJournalHeader, CellJournalSink,
     CellJournalState, CellJournalUpdate, CellJournals, JournaledCall, JournaledCallState,
-    MovedCells,
+    MovedCells, PendingRestore,
 };
 use replay::{CellLife, CellRecord, CellStatus, Hold, Replay, ReplayPlan, Restored};
 pub use spec::{
@@ -650,6 +650,7 @@ impl CodeModeRuntime {
             return;
         };
         journals.load(&context.session_id).await;
+        journals.await_restore(&context.session_id).await;
         self.restore_stored(journals, &context.session_id);
         if !journals.has_restored(&context.session_id) {
             return;
@@ -979,6 +980,7 @@ impl CodeModeRuntime {
         }
         if let Some(journals) = &self.journals {
             journals.load(&context.session_id).await;
+            journals.await_restore(&context.session_id).await;
             self.restore_stored(journals, &context.session_id);
             journals.discard_restored(&context.session_id).await;
             journals.release_finished(&context.session_id).await;

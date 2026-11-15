@@ -879,6 +879,7 @@ impl ModelRun {
         let mut first_batch = true;
         let mut reprompted = false;
         let mut nudged = false;
+        let mut finish_checked = false;
         loop {
             let call_index = self.stats.model_calls + 1;
             if !first_batch {
@@ -1023,6 +1024,21 @@ impl ModelRun {
                         session.conversation.clear_delta();
                         continue;
                     }
+                    if self.config.headless
+                        && self.finish_check
+                        && !finish_checked
+                        && self
+                            .deadline
+                            .as_ref()
+                            .is_some_and(|reminders| !reminders.last_passed())
+                    {
+                        finish_checked = true;
+                        session.conversation.append([context_notice(
+                            nanocode_tool_host::deadline::finish_notice(self.deadline.as_ref()),
+                        )]);
+                        session.conversation.clear_delta();
+                        continue;
+                    }
                     return Ok(message);
                 }
                 if !reprompted {
@@ -1073,6 +1089,13 @@ impl ModelRun {
                 }
             }
             self.prompt_cache.publish_live(None);
+            if let Some(notice) = self
+                .deadline
+                .as_ref()
+                .and_then(nanocode_tool_host::deadline::Reminders::notice)
+            {
+                session.conversation.append([context_notice(notice)]);
+            }
             self.maybe_compact(
                 call_index,
                 &mut session.conversation,

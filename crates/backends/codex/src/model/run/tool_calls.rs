@@ -3,6 +3,7 @@ use crate::client::responses::FunctionOutputContent;
 use nanocode_code_mode::code_mode::NestedToolCall;
 use nanocode_code_mode::contract::ToolOutputContent;
 use nanocode_sync::{Slot, Swap, SwapOption};
+use nanocode_tool_host::deadline::{Cap, Deadline};
 use nanocode_types::preview;
 
 #[derive(Clone)]
@@ -621,6 +622,78 @@ impl NestedToolEventObserver<'_> {
     }
 }
 
+fn deadline_cap(deadline: Deadline, call: &CodeCall) -> Cap<String> {
+    if call.namespace.is_some() {
+        return Cap::Unchanged;
+    }
+    let field = match (call.kind, call.name.as_str()) {
+        (CodeCallKind::Custom, "exec") => return deadline.cap_source(&call.input),
+        (CodeCallKind::Function, "exec" | "exec_command" | "job_wait" | "wait" | "write_stdin") => {
+            "yield_time_ms"
+        }
+        _ => return Cap::Unchanged,
+    };
+    let Ok(input) = serde_json::from_str::<Value>(&call.input) else {
+        return Cap::Unchanged;
+    };
+    let cap = match nanocode_code_mode::code_mode_spec::json_wrapper_key(&call.input) {
+        Some(key) if call.name == "exec" && input.get(field).is_none() => {
+            let Some(code) = input.get(key).and_then(Value::as_str) else {
+                return Cap::Unchanged;
+            };
+            match deadline.cap_source(code) {
+                Cap::Capped {
+                    input: code,
+                    notice,
+                } => {
+                    let mut input = input.clone();
+                    input[key] = code.into();
+                    Cap::Capped { input, notice }
+                }
+                Cap::Expired(text) => Cap::Expired(text),
+                Cap::Unchanged => Cap::Unchanged,
+            }
+        }
+        _ => deadline.cap(field, &input),
+    };
+    match cap {
+        Cap::Capped { input, notice } => Cap::Capped {
+            input: input.to_string(),
+            notice,
+        },
+        Cap::Expired(text) => Cap::Expired(text),
+        Cap::Unchanged => Cap::Unchanged,
+    }
+}
+
+fn tool_output(kind: CodeCallKind, call_id: String, output: &ToolOutputBody) -> ResponseItem {
+    match kind {
+        CodeCallKind::Custom => custom_tool_output(call_id, output.clone()),
+        CodeCallKind::Function => function_tool_output(call_id, output.clone()),
+        CodeCallKind::ToolSearch => tool_search_output(call_id, Vec::new()),
+    }
+}
+
+fn with_notice(
+    mut completed: CompletedToolCall,
+    kind: CodeCallKind,
+    notice: &str,
+) -> CompletedToolCall {
+    match &mut completed.output {
+        ToolOutputBody::Text(text) => {
+            text.push_str("\n\n");
+            text.push_str(notice);
+        }
+        ToolOutputBody::Content(content) => content.push(ToolOutputContent::InputText {
+            text: notice.to_owned(),
+        }),
+    }
+    if let Some(item) = completed.response_items.first_mut() {
+        *item = tool_output(kind, completed.call_id.clone(), &completed.output);
+    }
+    completed
+}
+
 async fn execute_code_call(
     tools: &ToolRuntime,
     call: &CodeCall,
@@ -696,6 +769,10 @@ impl ModelRun {
         let host_context = self.host_context.clone();
         let before_tool_call = self.before_tool_call.clone();
 
+        let deadline = self
+            .deadline
+            .as_ref()
+            .map(nanocode_tool_host::deadline::Reminders::deadline);
         let instruction_revision = self.instruction_revision;
         let execution_steps = self.execution_steps.clone();
         let images = self.images.clone();
@@ -755,35 +832,62 @@ impl ModelRun {
                             (Ok(completed), persist)
                         }
                         ToolStep::Run { recover } => {
-                            let dispatch = async {
-                                active
-                                    .execution_started_at
-                                    .store(Some(Arc::new(Instant::now())));
-                                Self::execute_model_tool_call(
-                                    tools,
-                                    &images,
-                                    &events,
-                                    &tool_call_indices,
-                                    call_index,
-                                    call,
-                                    history,
-                                    &session_id,
-                                    &turn_id,
-                                    model,
-                                    host_context.as_deref(),
-                                    before_tool_call.as_deref(),
-                                    instruction_revision,
-                                    started_at,
-                                    &active.progress,
-                                    &active.span,
-                                    recover,
-                                    output_tokens,
-                                )
-                                .await
+                            let mut call = call;
+                            let cap = match deadline {
+                                Some(deadline) if !recover => deadline_cap(deadline, &call),
+                                _ => Cap::Unchanged,
                             };
-                            let result = match AssertUnwindSafe(dispatch).catch_unwind().await {
-                                Ok(result) => result,
-                                Err(payload) => Ok(Self::panicked_tool_call(&active, payload)),
+                            let notice = match cap {
+                                Cap::Capped { input, notice } => {
+                                    call.input = input;
+                                    Ok(Some(notice))
+                                }
+                                Cap::Expired(text) => Err(text),
+                                Cap::Unchanged => Ok(None),
+                            };
+                            let result = match notice {
+                                Err(text) => Ok(Self::expired_tool_call(&active, text)),
+                                Ok(notice) => {
+                                    let dispatch = async {
+                                        active
+                                            .execution_started_at
+                                            .store(Some(Arc::new(Instant::now())));
+                                        Self::execute_model_tool_call(
+                                            tools,
+                                            &images,
+                                            &events,
+                                            &tool_call_indices,
+                                            call_index,
+                                            call,
+                                            history,
+                                            &session_id,
+                                            &turn_id,
+                                            model,
+                                            host_context.as_deref(),
+                                            before_tool_call.as_deref(),
+                                            instruction_revision,
+                                            started_at,
+                                            &active.progress,
+                                            &active.span,
+                                            recover,
+                                            output_tokens,
+                                        )
+                                        .await
+                                    };
+                                    let result =
+                                        match AssertUnwindSafe(dispatch).catch_unwind().await {
+                                            Ok(result) => result,
+                                            Err(payload) => {
+                                                Ok(Self::panicked_tool_call(&active, payload))
+                                            }
+                                        };
+                                    match notice {
+                                        Some(notice) => result.map(|completed| {
+                                            with_notice(completed, active.kind, &notice)
+                                        }),
+                                        None => result,
+                                    }
+                                }
                             };
                             (result, true)
                         }
@@ -1048,6 +1152,24 @@ impl ModelRun {
             structured_result,
             metadata: None,
             response_items: vec![response_item],
+        }
+    }
+
+    fn expired_tool_call(active: &ActiveToolCall, text: String) -> CompletedToolCall {
+        let output = ToolOutputBody::Text(text);
+        let structured_result = output.structured_result();
+        record_tool_span_terminal(&active.span, "failed", "ERROR", 0, &output);
+        CompletedToolCall {
+            cell: None,
+            call_id: active.call_id.clone(),
+            tool: active.name.clone(),
+            success: false,
+            duration_ns: 0,
+            work_duration_ns: 0,
+            response_items: vec![tool_output(active.kind, active.call_id.clone(), &output)],
+            output,
+            structured_result,
+            metadata: None,
         }
     }
 

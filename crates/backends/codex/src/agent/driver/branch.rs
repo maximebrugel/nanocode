@@ -12,6 +12,7 @@ pub(in crate::agent) struct BranchSpawner {
     pub(in crate::agent) shared_prompt_cache: Option<SharedPromptCache>,
     pub(in crate::agent) before_compaction: Option<Arc<dyn execution::BeforeCompaction>>,
     pub(in crate::agent) before_tool_call: Option<Arc<dyn execution::BeforeToolCall>>,
+    pub(in crate::agent) deadline: Option<crate::Deadline>,
     pub(in crate::agent) images: ImageHistory,
     pub(in crate::agent) context_config: ContextSourceConfig,
     pub(in crate::agent) context_source: ContextSource,
@@ -79,6 +80,7 @@ impl BranchSpawner {
 
             before_compaction: None,
             before_tool_call: None,
+            deadline: self.deadline,
             images: self.images.clone(),
             context_config: self.context_config.clone(),
             context_source: self.context_source.clone(),
@@ -222,6 +224,7 @@ impl BranchSpawner {
 
             before_compaction: None,
             before_tool_call: None,
+            deadline: self.deadline,
             images: self.images.clone(),
             context_config: self.context_config.clone(),
             context_source: self.context_config.build(),

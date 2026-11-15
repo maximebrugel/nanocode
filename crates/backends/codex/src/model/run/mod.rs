@@ -56,9 +56,9 @@ use super::{
     context::{ContextBaseline, ContextSnapshot, ContextState},
     display_endpoint, elapsed_ns,
     input::{
-        admits_incomplete, custom_tool_notification, custom_tool_output, developer_context,
-        empty_response, function_tool_output, host_context, persistence_nudge, prompt_messages,
-        task_input, tool_search_output, turn_aborted,
+        admits_incomplete, context_notice, custom_tool_notification, custom_tool_output,
+        developer_context, empty_response, function_tool_output, host_context, persistence_nudge,
+        prompt_messages, task_input, tool_search_output, turn_aborted,
     },
     terminal_payload,
 };
@@ -111,6 +111,8 @@ pub(crate) struct ModelRun {
     execution_steps: Option<ExecutionSteps>,
     before_compaction: Option<Arc<dyn crate::execution::BeforeCompaction>>,
     before_tool_call: Option<Arc<dyn crate::execution::BeforeToolCall>>,
+    deadline: Option<nanocode_tool_host::deadline::Reminders>,
+    finish_check: bool,
     images: ImageHistory,
     compaction_thinking: Option<Thinking>,
 }
@@ -321,6 +323,8 @@ impl ModelRun {
             execution_steps: None,
             before_compaction: None,
             before_tool_call: None,
+            deadline: None,
+            finish_check: false,
             images: ImageHistory::default(),
             compaction_thinking: None,
         }
@@ -411,6 +415,8 @@ impl ModelRun {
             execution_steps: None,
             before_compaction: None,
             before_tool_call: None,
+            deadline: None,
+            finish_check: false,
             images: ImageHistory::default(),
             compaction_thinking: None,
         }
@@ -421,6 +427,11 @@ impl ModelRun {
         hook: Option<Arc<dyn crate::execution::BeforeToolCall>>,
     ) {
         self.before_tool_call = hook;
+    }
+
+    pub(crate) fn set_deadline(&mut self, deadline: Option<crate::Deadline>, root: bool) {
+        self.finish_check = root && deadline.is_some();
+        self.deadline = deadline.map(nanocode_tool_host::deadline::Reminders::new);
     }
 
     pub(crate) fn set_before_compaction(

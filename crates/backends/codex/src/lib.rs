@@ -49,6 +49,7 @@ pub use agent::{CodexBuilder, ExecutionEnvironment};
 
 pub use error::CompactionRecovery;
 pub use error::{ExecutionPolicyDisposition, NanocodeError, Result};
+pub use nanocode_tool_host::deadline::Deadline;
 pub use nanocode_tool_host::tool;
 
 pub use nanocode_tool_host::{Tool, Tools};

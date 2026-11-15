@@ -631,7 +631,7 @@ fn hooked_handler(
 
 fn deadline_handler(name: String, handler: Handler, deadline: crate::Deadline) -> Handler {
     Arc::new(move |input, invocation| {
-        let cap = deadline.cap(&name, &input);
+        let cap = crate::deadline::cap(deadline, &name, &input);
         let handler = handler.clone();
         Box::pin(async move {
             match cap {

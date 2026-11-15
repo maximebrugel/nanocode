@@ -130,6 +130,10 @@ pub(in crate::model) fn admits_incomplete(message: &str) -> bool {
         .any(|admission| message.contains(admission))
 }
 
+pub(in crate::model) fn context_notice(text: String) -> ResponseItem {
+    ResponseItem::message(MessageRole::User, [ContentItem::input_text(text)])
+}
+
 pub(in crate::model) fn persistence_nudge() -> ResponseItem {
     ResponseItem::message(
         MessageRole::User,

@@ -74,6 +74,7 @@ pub(super) struct CodexCompatibility {
     pub(super) execution: ExecutionConfig,
     pub(super) before_compaction: Option<Arc<dyn execution::BeforeCompaction>>,
     pub(super) before_tool_call: Option<Arc<dyn execution::BeforeToolCall>>,
+    pub(super) deadline: Option<crate::Deadline>,
     pub(super) images: ImageHistory,
     pub(super) spawn_factory: Option<Arc<dyn backend::AgentFactory>>,
     pub(super) host_context: Option<Arc<str>>,
@@ -89,6 +90,7 @@ impl Default for CodexCompatibility {
             execution: ExecutionConfig::default(),
             before_compaction: None,
             before_tool_call: None,
+            deadline: None,
             images: ImageHistory::default(),
             spawn_factory: None,
             host_context: None,
@@ -123,6 +125,12 @@ impl<F> CodexBuilder<F> {
     #[must_use]
     pub fn before_tool_call(mut self, hook: Arc<dyn execution::BeforeToolCall>) -> Self {
         self.codex.before_tool_call = Some(hook);
+        self
+    }
+
+    #[must_use]
+    pub const fn deadline(mut self, deadline: crate::Deadline) -> Self {
+        self.codex.deadline = Some(deadline);
         self
     }
 

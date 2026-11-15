@@ -107,6 +107,7 @@ pub(super) fn build_agent(
             shared_prompt_cache: shared,
             before_compaction: codex.before_compaction,
             before_tool_call: codex.before_tool_call,
+            deadline: codex.deadline,
             images: codex.images,
             instant_tool_steering: codex.instant_tool_steering,
             context_config: codex.context,

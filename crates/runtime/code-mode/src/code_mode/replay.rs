@@ -546,6 +546,17 @@ impl CellJournals {
         Some(journals)
     }
 
+    #[must_use]
+    pub fn live_journals(&self, session_id: &str) -> Vec<CellJournal> {
+        let mut journals = self
+            .live(session_id)
+            .iter()
+            .filter_map(|record| record.snapshot_live())
+            .collect::<Vec<_>>();
+        journals.sort_by_key(|journal| journal.cell_id);
+        journals
+    }
+
     pub fn restore(
         &self,
         session_id: &str,
@@ -1132,9 +1143,17 @@ impl CellRecord {
     }
 
     fn snapshot(&self) -> Option<CellJournal> {
+        self.snapshot_when(CellLife::settled)
+    }
+
+    fn snapshot_live(&self) -> Option<CellJournal> {
+        self.snapshot_when(|life| !life.replaying())
+    }
+
+    fn snapshot_when(&self, ready: impl FnOnce(CellLife) -> bool) -> Option<CellJournal> {
         let entries = self.journal.entries()?;
         let status = self.status.get();
-        if status.unsupported || !status.life.settled() {
+        if status.unsupported || !ready(status.life) {
             return None;
         }
         Some(CellJournal {

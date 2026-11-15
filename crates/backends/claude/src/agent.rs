@@ -3467,6 +3467,14 @@ impl AgentFactory for ClaudeNativeFactory {
         let available = self.owner().map(|_| ());
         Box::pin(async move { available })
     }
+    fn model_call(
+        &self,
+        _parent: AgentHandle,
+        prompt: String,
+    ) -> BackendFuture<Result<nanocode_agent_core::SideAnswer>> {
+        let state = self.owner();
+        Box::pin(async move { state?.model_call(prompt).await })
+    }
     fn settings(&self, _parent: AgentHandle) -> BackendFuture<Result<(ModelSelection, Thinking)>> {
         let state = self.owner();
         Box::pin(async move {

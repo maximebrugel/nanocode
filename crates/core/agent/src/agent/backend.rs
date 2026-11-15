@@ -302,6 +302,14 @@ pub trait AgentFactory: Send + Sync + 'static {
         unsupported("fork")
     }
 
+    fn model_call(
+        &self,
+        _parent: AgentHandle,
+        _prompt: String,
+    ) -> BackendFuture<Result<SideAnswer>> {
+        unsupported("model_call")
+    }
+
     fn restore(
         &self,
         _parent: AgentHandle,

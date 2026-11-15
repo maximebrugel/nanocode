@@ -466,7 +466,7 @@ impl LifecycleBackend for LocalLifecycle {
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
             request_command(&commands, &shutdown, |result| Command::SideQuestion {
-                question,
+                question: crate::model::run::SideAsk::Question(question),
                 result,
             })
             .await

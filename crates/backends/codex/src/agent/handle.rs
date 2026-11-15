@@ -22,6 +22,22 @@ impl super::backend::AgentFactory for OpenAiAgentFactory {
             }
         })
     }
+    fn model_call(
+        &self,
+        _parent: AgentHandle,
+        prompt: String,
+    ) -> super::backend::BackendFuture<Result<nanocode_agent_core::SideAnswer>> {
+        let commands = self.commands.upgrade();
+        let shutdown = self.shutdown.clone();
+        Box::pin(async move {
+            let commands = commands.ok_or(NanocodeError::AgentStopped)?;
+            request_command(&commands, &shutdown, |result| Command::SideQuestion {
+                question: crate::model::run::SideAsk::Call(prompt),
+                result,
+            })
+            .await
+        })
+    }
     fn spawn(
         &self,
         _parent: AgentHandle,

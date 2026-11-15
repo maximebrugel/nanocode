@@ -205,21 +205,61 @@ impl State {
                 .set_cache_control(&control)
                 .map_err(provider_error)?;
         }
+        self.side_answer(
+            &messages,
+            &template,
+            wire_profile.as_ref(),
+            false,
+            "side question",
+        )
+        .await
+    }
+
+    pub(super) async fn model_call(&self, prompt: String) -> Result<SideAnswer> {
+        if self.life.stopped() {
+            return Err(NanocodeError::AgentStopped);
+        }
+        let (mut template, wire_profile) = self.side_template();
+        let messages: Vec<HistoryMessage> = vec![Message::text(Role::User, prompt).into()];
+        if template.cache_control.is_some() {
+            template
+                .cache_system_prefix_with(&messages)
+                .map_err(provider_error)?;
+            template.cache_control = None;
+        }
+        self.side_answer(
+            &messages,
+            &template,
+            wire_profile.as_ref(),
+            true,
+            "model call",
+        )
+        .await
+    }
+
+    async fn side_answer(
+        &self,
+        messages: &[HistoryMessage],
+        template: &MessagesRequest,
+        wire_profile: Option<&FrozenWireProfile>,
+        tools_off: bool,
+        purpose: &str,
+    ) -> Result<SideAnswer> {
         let response = self
             .response(
-                &messages,
+                messages,
                 None,
                 &Cancellation::default(),
                 None,
                 0,
                 ResponseContext {
                     origin: self.host_context.clone(),
-                    disable_tools: false,
-                    force_text: false,
+                    disable_tools: tools_off,
+                    force_text: tools_off,
                     container: None,
                     previous_message_id: None,
-                    template: Some(&template),
-                    wire_profile: wire_profile.as_ref(),
+                    template: Some(template),
+                    wire_profile,
                     effect: None,
                     journal: None,
                     threaded: false,
@@ -244,9 +284,9 @@ impl State {
                     .iter()
                     .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
                 {
-                    "the side question response called a tool instead of answering directly"
+                    format!("the {purpose} response called a tool instead of answering directly")
                 } else {
-                    "the side question response contained no text"
+                    format!("the {purpose} response contained no text")
                 },
             ));
         }

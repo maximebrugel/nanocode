@@ -107,7 +107,7 @@ pub(super) enum Command {
         result: oneshot::Sender<Result<AgentSessionContext>>,
     },
     SideQuestion {
-        question: String,
+        question: crate::model::run::SideAsk,
         result: oneshot::Sender<Result<nanocode_agent_core::SideAnswer>>,
     },
     Shutdown,

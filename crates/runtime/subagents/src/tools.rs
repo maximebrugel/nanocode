@@ -77,6 +77,9 @@ const SUBMIT_RESULT_TOOL: &str = "submit_result";
 const SEND_AGENT_MESSAGE_TOOL: &str = "send_agent_message";
 const LIST_AGENTS_TOOL: &str = "list_agents";
 const LIST_MODELS_TOOL: &str = "list_models";
+const MODEL_CALL_TOOL: &str = "model_call";
+const MODEL_CALL_JSON: &str =
+    "Answer with only a JSON value matching this JSON schema, with no code fence or other text:";
 const WAIT_AGENT_TOOL: &str = "wait_agent";
 
 #[derive(Deserialize)]
@@ -2078,12 +2081,137 @@ impl Tool for ChangeAgentLifecycle {
     }
 }
 
+struct ModelCall {
+    parent: AgentHandle,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelCallInput {
+    prompt: String,
+    #[serde(default)]
+    output_schema: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ModelCallReply {
+    Text(String),
+    Output(Value),
+}
+
+#[derive(Serialize)]
+struct ModelCallAnswer<'a> {
+    #[serde(flatten)]
+    reply: ModelCallReply,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<&'a nanocode_agent_core::TurnUsage>,
+}
+
+impl ModelCall {
+    async fn call(&self, input: ToolInput) -> ToolResult {
+        let ModelCallInput {
+            prompt,
+            output_schema,
+        } = input.decode_json()?;
+        let Some(schema) = output_schema else {
+            let answer = self.parent.model_call(prompt).await?;
+            return json_output(&ModelCallAnswer {
+                reply: ModelCallReply::Text(answer.text().to_owned()),
+                usage: answer.usage(),
+            });
+        };
+        let validator = nanocode_schema::validator_for(&schema)
+            .map_err(|error| std::io::Error::other(format!("invalid output_schema: {error}")))?;
+        let answer = self
+            .parent
+            .model_call(format!(
+                "{prompt}\n\n{MODEL_CALL_JSON}\n{}",
+                serde_json::to_string(&schema)?
+            ))
+            .await?;
+        let output = serde_json::from_str::<Value>(answer.text().trim()).map_err(|error| {
+            std::io::Error::other(format!(
+                "the model call answer is not JSON: {error}\n\nAnswer:\n{}",
+                answer.text()
+            ))
+        })?;
+        let issues = validator
+            .iter_errors(&output)
+            .map(|issue| format!("{} ({})", issue.instance_path(), issue.schema_path()))
+            .collect::<Vec<_>>();
+        if !issues.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "the model call answer does not match output_schema: {}\n\nAnswer:\n{}",
+                issues.join("; "),
+                answer.text()
+            ))
+            .into());
+        }
+        json_output(&ModelCallAnswer {
+            reply: ModelCallReply::Output(output),
+            usage: answer.usage(),
+        })
+    }
+}
+
+impl Tool for ModelCall {
+    fn definition(&self) -> ToolDefinition {
+        memoized(MODEL_CALL_TOOL, || {
+            ToolDefinition::function(
+                MODEL_CALL_TOOL,
+                "Asks this agent's model one question with none of this conversation and no tools, and returns its answer: for reading, classifying, extracting from or summarizing text a tool returned, such as one call per slice of a large result run together with Promise.all, so only what the calls return reaches this conversation. It reuses this agent's model, settings and cached prompt prefix. With output_schema, the answer is a JSON value that matches it, or the call fails with the answer it got.",
+                nanocode_tool_contracts::json_schema!({
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "The whole question, with the text it is about: the model sees nothing else."
+                        },
+                        "output_schema": {
+                            "type": "object",
+                            "description": "A JSON Schema the answer must match; it then comes back as output instead of text."
+                        }
+                    },
+                    "required": ["prompt"],
+                    "additionalProperties": false
+                }),
+            )
+            .with_output_schema(nanocode_tool_contracts::json_schema!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "output": {},
+                    "usage": { "type": "object" }
+                },
+                "additionalProperties": false
+            }))
+        })
+    }
+
+    fn execute<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        input: ToolInput,
+        _context: ToolContext<'life1>,
+    ) -> nanocode_tool_contracts::ToolCallFuture<'async_trait, ToolResult>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(self.call(input))
+    }
+}
+
 fn shared_tools(
     parent: AgentHandle,
     registry: &Arc<Registry>,
     code_mode: bool,
 ) -> Vec<Arc<dyn Tool>> {
     registry.register_handle(parent.clone());
+    let model_call = ModelCall {
+        parent: parent.clone(),
+    };
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(SubmitResult {
             registry: Arc::downgrade(registry),
@@ -2116,6 +2244,7 @@ fn shared_tools(
             registry: Arc::downgrade(registry),
         }));
     }
+    tools.push(Arc::new(model_call));
     tools
 }
 

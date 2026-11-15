@@ -321,7 +321,7 @@ fn spawn_side_question(
     spawner: &BranchSpawner,
     defaults: TurnDefaults,
     session_id: &str,
-    question: String,
+    question: crate::model::run::SideAsk,
     result: oneshot::Sender<Result<nanocode_agent_core::SideAnswer>>,
 ) {
     let Some(latest) = latest.map(Arc::clone) else {

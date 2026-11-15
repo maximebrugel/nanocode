@@ -512,6 +512,16 @@ impl AgentHandle {
         self.native.ensure_available(self.clone()).await?;
         created(self.native.fork(self.clone(), request).await).await
     }
+
+    pub async fn model_call(&self, prompt: impl Into<String>) -> Result<SideAnswer> {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return Err(NanocodeError::InvalidRequest(
+                "model call prompt must not be empty".to_owned(),
+            ));
+        }
+        self.native.model_call(self.clone(), prompt).await
+    }
 }
 
 pub async fn created(child: Result<(Agent, AgentEvents)>) -> Result<(Agent, AgentEvents)> {

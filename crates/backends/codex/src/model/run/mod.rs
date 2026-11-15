@@ -15,6 +15,8 @@ use responses::*;
 use state::*;
 use tool_calls::*;
 
+pub(crate) use side::SideAsk;
+
 use std::{
     any::Any,
     collections::{HashMap, VecDeque},

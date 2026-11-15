@@ -41,6 +41,20 @@ fn running_outputs(history: &[ResponseItem]) -> Vec<ResponseItem> {
         .collect()
 }
 
+pub(crate) enum SideAsk {
+    Question(String),
+    Call(String),
+}
+
+impl SideAsk {
+    const fn purpose(&self) -> &'static str {
+        match self {
+            Self::Question(_) => "side question",
+            Self::Call(_) => "model call",
+        }
+    }
+}
+
 impl ModelCheckpoint {
     #[allow(
         clippy::too_many_arguments,
@@ -55,7 +69,7 @@ impl ModelCheckpoint {
         thinking: Thinking,
         service_tier: ServiceTier,
         thread_id: &str,
-        question: &str,
+        ask: &SideAsk,
     ) -> Result<SideAnswer> {
         let (events, _events) = EventSink::channel(thread_id.to_owned());
         let factory = ResponsesAttemptFactory::new(
@@ -70,15 +84,28 @@ impl ModelCheckpoint {
         );
         let mut conversation = self.conversation.clone();
         conversation.reset_for_full_request();
-        let running = running_outputs(&conversation.flattened_history());
-        conversation.append_client(running);
-        conversation.append_client([ResponseItem::message(
-            MessageRole::User,
-            [ContentItem::InputText {
-                text: side_question_prompt(question).into_boxed_str(),
-            }],
-        )]);
-        let history = evict_images(&conversation.managed.generation_request(), model);
+        let message = |text: String| {
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::InputText {
+                    text: text.into_boxed_str(),
+                }],
+            )
+        };
+        let history = match ask {
+            SideAsk::Question(question) => {
+                let running = running_outputs(&conversation.flattened_history());
+                conversation.append_client(running);
+                conversation.append_client([message(side_question_prompt(question))]);
+                conversation.managed.generation_request()
+            }
+            SideAsk::Call(prompt) => {
+                let mut history = conversation.managed.generation_request();
+                history.replace_from(0, vec![message(prompt.clone())], false);
+                history
+            }
+        };
+        let history = evict_images(&history, model);
         let request = factory.generation(
             1,
             &inline_images(images, history).await?,
@@ -93,18 +120,21 @@ impl ModelCheckpoint {
         let success = client.execute(request).await?;
         let ResponsesOutput::Generation(response) = success.into_output() else {
             return Err(NanocodeError::InvalidAttemptState {
-                detail: "side question returned a non-generation response",
+                detail: match ask {
+                    SideAsk::Question(_) => "side question returned a non-generation response",
+                    SideAsk::Call(_) => "model call returned a non-generation response",
+                },
             });
         };
         let text = response
             .final_message
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| {
+                let purpose = ask.purpose();
                 NanocodeError::InvalidRequest(if response.code_calls.is_empty() {
-                    "the side question response contained no text".to_owned()
+                    format!("the {purpose} response contained no text")
                 } else {
-                    "the side question response called a tool instead of answering directly"
-                        .to_owned()
+                    format!("the {purpose} response called a tool instead of answering directly")
                 })
             })?;
         let mut stats = RunStats::default();

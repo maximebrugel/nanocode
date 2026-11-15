@@ -29,6 +29,7 @@ pub use catalog::{
 pub use child_journal::{JournalClaim, JournalSeed};
 pub use format::{AdmittedTurn, CheckpointFormat, FormatFuture};
 pub use memory::MemoryStore;
+pub use nanocode_agent_core::backend::{ContinuationAhead, Prefetched};
 pub use nanocode_durability_core::{
     BlobKey, BlobStore, BlobUrl, Colocation, Committed, EncodedPayload, Error, EventCursor,
     EventHit, EventHits, EventOrder, EventPage, EventQuery, EventRange, Examined, IndexedState,

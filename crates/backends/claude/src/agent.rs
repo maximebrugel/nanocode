@@ -8994,6 +8994,28 @@ impl LifecycleBackend for Driver {
             }
         })
     }
+    fn prefetch_request_ahead(
+        &self,
+        id: String,
+        ahead: BackendFuture<Option<nanocode_agent_core::backend::ContinuationAhead>>,
+    ) -> BackendFuture<Result<nanocode_agent_core::backend::Prefetched>> {
+        let state = self.state.clone();
+        Box::pin(async move {
+            match &state.policy {
+                Some(policy) => {
+                    policy
+                        .prefetch_continuation_ahead(id, ahead)
+                        .instrument(nanocode_trace::info_span!(
+                            target: "nanocode",
+                            "agent.prefetch_continuation",
+                            ahead = true
+                        ))
+                        .await
+                }
+                None => Ok(nanocode_agent_core::backend::Prefetched::Nothing),
+            }
+        })
+    }
     fn steer_receipt(
         &self,
         id: String,

@@ -984,6 +984,17 @@ impl Agent {
         self.backend.prefetch_request(id.to_owned())
     }
 
+    /// [`Self::prefetch_request`] with `ahead`, the continuation read
+    /// ahead from the durable store: kept, without reading it again, while
+    /// the operation's stored continuation has its key.
+    pub fn prefetch_request_ahead(
+        &self,
+        id: &str,
+        ahead: super::backend::BackendFuture<Option<super::backend::ContinuationAhead>>,
+    ) -> super::backend::BackendFuture<Result<super::backend::Prefetched>> {
+        self.backend.prefetch_request_ahead(id.to_owned(), ahead)
+    }
+
     pub async fn set_thinking(&self, thinking: Thinking) -> Result<()> {
         self.backend.set_thinking(thinking).await
     }

@@ -8,7 +8,7 @@ use std::{
 
 use nanocode_agent_core::{
     Agent, AgentEvents, BackendRequest, Result as AgentResult, SteerReceiptStatus,
-    backend::BackendFuture,
+    backend::{BackendFuture, ContinuationAhead, Prefetched},
 };
 use nanocode_durability::{
     Admission, BeginStep, Branches, CheckpointFormat, DurableAgentExt, DurableBackendRegistration,
@@ -220,6 +220,10 @@ struct LazyClaudeExecution {
     model: nanocode_sync::Atom<Option<nanocode_agent_core::ModelSelection>>,
 
     deferred: Option<Deferred>,
+
+    /// A continuation read ahead before the owner was acquired: the
+    /// acquired execution starts with it, under its key.
+    ahead: nanocode_sync::Slot<(String, Value)>,
 }
 
 impl LazyClaudeExecution {
@@ -231,6 +235,7 @@ impl LazyClaudeExecution {
             initialized: std::sync::atomic::AtomicBool::new(false),
             model: nanocode_sync::Atom::default(),
             deferred: None,
+            ahead: nanocode_sync::Slot::default(),
         }
     }
 
@@ -331,6 +336,10 @@ impl LazyClaudeExecution {
                         .map_err(agent_error)?
                         .pending_operations()
                         .is_empty();
+                let hydrated = nanocode_sync::Slot::default();
+                if let Some((key, cursor)) = self.ahead.take() {
+                    hydrated.put((key, cursor, true));
+                }
                 Ok::<_, nanocode_agent_core::NanocodeError>(Acquired {
                     execution: ClaudeExecution {
                         state_id: record.session_id.clone(),
@@ -340,7 +349,7 @@ impl LazyClaudeExecution {
                             store: self.store.clone(),
                             record: Some(record),
                         },
-                        hydrated: nanocode_sync::Slot::default(),
+                        hydrated,
                         hydrating: nanocode_sync::Sequencer::new(),
                     },
                     reopened,
@@ -463,6 +472,32 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
                 Some(execution) => execution.prefetch_continuation(id).await,
                 None => Ok(false),
             }
+        })
+    }
+
+    fn prefetch_continuation_ahead(
+        &self,
+        id: String,
+        ahead: BackendFuture<Option<ContinuationAhead>>,
+    ) -> PolicyFuture<'_, Prefetched> {
+        Box::pin(async move {
+            if let Some(execution) = self.acquired() {
+                return execution.prefetch_continuation_ahead(id, ahead).await;
+            }
+            let ahead = ahead.await;
+            if let Some(execution) = self.acquired() {
+                return execution
+                    .prefetch_continuation_ahead(id, Box::pin(async move { ahead }))
+                    .await;
+            }
+            // No owner yet: the execution it acquires starts with the
+            // continuation read ahead, which its run's read keeps only while
+            // the stored continuation has that key.
+            let Some(ahead) = ahead else {
+                return Ok(Prefetched::Nothing);
+            };
+            self.ahead.put(ahead.into_parts());
+            Ok(Prefetched::Seeded)
         })
     }
 
@@ -911,6 +946,49 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             .map_err(agent_error)?;
             self.hydrated.put((value.key().to_owned(), hydrated, true));
             Ok(true)
+        })
+    }
+
+    fn prefetch_continuation_ahead(
+        &self,
+        id: String,
+        ahead: BackendFuture<Option<ContinuationAhead>>,
+    ) -> PolicyFuture<'_, Prefetched> {
+        Box::pin(async move {
+            let _hydrating = self.hydrating.enter().await;
+            let ahead = ahead.await;
+            let Some(value) = self
+                .owner
+                .peek_continuation(id.clone())
+                .await
+                .map_err(agent_error)?
+            else {
+                return Ok(Prefetched::Nothing);
+            };
+            if let Some((key, hydrated, kept)) = self.hydrated.take()
+                && key == value.key()
+            {
+                self.hydrated.put((key, hydrated, kept));
+                return Ok(Prefetched::Kept);
+            }
+            // Read ahead from the store: kept only under the key of the
+            // continuation the owner holds now, so a stale one is read again.
+            if let Some(ahead) = ahead
+                && ahead.operation_id() == id
+                && ahead.key() == value.key()
+            {
+                let (key, cursor) = ahead.into_parts();
+                self.hydrated.put((key, cursor, true));
+                return Ok(Prefetched::Kept);
+            }
+            let hydrated = format::hydrate_cursor(
+                PayloadReader::from(&self.owner),
+                value.decode().map_err(agent_error)?,
+            )
+            .await
+            .map_err(agent_error)?;
+            self.hydrated.put((value.key().to_owned(), hydrated, true));
+            Ok(Prefetched::Read)
         })
     }
 

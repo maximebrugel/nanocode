@@ -164,6 +164,22 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
     fn prefetch_continuation(&self, _id: String) -> PolicyFuture<'_, bool> {
         Box::pin(async { Ok(false) })
     }
+    fn prefetch_continuation_ahead(
+        &self,
+        id: String,
+        ahead: nanocode_agent_core::backend::BackendFuture<
+            Option<nanocode_agent_core::backend::ContinuationAhead>,
+        >,
+    ) -> PolicyFuture<'_, nanocode_agent_core::backend::Prefetched> {
+        Box::pin(async move {
+            drop(ahead);
+            Ok(if self.prefetch_continuation(id).await? {
+                nanocode_agent_core::backend::Prefetched::Read
+            } else {
+                nanocode_agent_core::backend::Prefetched::Nothing
+            })
+        })
+    }
     fn advance(&self, id: String, state: Value) -> PolicyFuture<'_, ()>;
 
     #[allow(clippy::boxed_local)]

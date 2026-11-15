@@ -9,7 +9,7 @@ const LAST_REMINDER: &str = "Finish now. Make sure every output the task asks fo
 const FINISH_OPEN: &str =
     "<system-reminder>\nThis session is non-interactive and nobody will reply.";
 const FINISH_CHECK: &str = " Before you finish, check the work:\n";
-const FINISH_HEAD: &str = "- Every output the task names exists at that exact path, with a relative path resolved against the working directory.\n- The task's own check, or a direct test of the result, passes when you run it again now.\n";
+const FINISH_HEAD: &str = "- Every output the task names exists at that exact path, with a relative path resolved against the working directory.\n- The task's own check, or a direct test of the result, passes when you run it again now.\n- Each case the task statement names holds when you run it now on an input made for that case: empty input, leading or trailing whitespace, letter case, and each boundary or invalid form the statement lists. Compare exact output bytes, including newlines.\n";
 const SCORE_CHECK: &str = "- If the task states a speed, size or score goal, the result was compared with at least one structurally different approach under repeated measurements, and the best one is kept. Beating the given baseline is not by itself the goal.\n";
 const TARGET_CHECK: &str = "- If the task states a target you can check yourself (a score, win rate, accuracy, speed or size to reach on given inputs or against given opponents), the result meets it with a margin across repeated runs of that check, and meeting it is done: do not keep improving it. If the goal is measured against something you cannot see, such as a hidden reference time, the result was compared with at least one structurally different approach under repeated measurements, and the best one is kept.\n";
 const FINISH_TAIL: &str = "- The task's checks use inputs you have not seen (other files, data, sizes or seeds) and run the program as a script does: stdout piped, not a terminal, and signals such as SIGINT. The result holds on at least one input you made that differs from the given example, including the case the task names, and with stdout piped when output matters.\n- The scratch files and test output you made where the task's program or its checks write, read or wait for files, such as a file in /tmp, are deleted, and nothing else is.\n- What the task's program built or set up is kept: caches and compiled artifacts (such as a compiled model or a build directory), installed packages, and the state the task asked for (repositories and their branches, served files, databases, services). None of that state is reset or emptied to make it clean.\n- Background processes you started are stopped, unless the task asked to keep them running.\n- Any choice left open is made, and its result is written.\n";
@@ -278,7 +278,7 @@ pub fn finish_notice_with(
     let reply = if brief {
         "reply with one line that says the task is done"
     } else {
-        "reply with your final message"
+        "reply with your final message. In it, name the checks you ran and the stated cases you did not test. A test you wrote alone does not show that the result works"
     };
     let checklist = checks.checklist();
     format!(
@@ -303,7 +303,7 @@ pub fn persisting_folded_finish_notice() -> String {
 pub fn folded_finish_notice_with(checks: FinishChecks) -> String {
     let checklist = checks.checklist();
     format!(
-        "{FINISH_OPEN} Before your final message, check the work:\n{checklist}Fix what falls short before you reply with your final message.\n</system-reminder>"
+        "{FINISH_OPEN} Before your final message, check the work:\n{checklist}Fix what falls short before you reply with your final message. In it, name the checks you ran and the stated cases you did not test. A test you wrote alone does not show that the result works.\n</system-reminder>"
     )
 }
 

@@ -714,8 +714,8 @@ pub const DEFAULT_REFUSAL_CONTINUATIONS: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RefusalFallbackScope {
-    ReturnOnce,
     #[default]
+    ReturnOnce,
     Session,
 }
 
@@ -845,7 +845,7 @@ impl ClaudeBuilder {
             message_threads: false,
             omit_custom_model_thinking: false,
             refusal_continuations: DEFAULT_REFUSAL_CONTINUATIONS,
-            refusal_fallback_scope: RefusalFallbackScope::Session,
+            refusal_fallback_scope: RefusalFallbackScope::ReturnOnce,
             steer_preempts_model: false,
             context_window_tokens,
             auto_compact_window_tokens: None,

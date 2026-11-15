@@ -90,6 +90,14 @@ def tui(rate, cols=120, rows=40):
     return ("tui", lambda r: r.get("rate") == rate and r.get("cols", 120) == cols and r.get("rows", 40) == rows)
 
 
+def tool_mode(r):
+    return r.get("tool_mode", "code-mode") if r.get("harness") == "nc" else None
+
+
+def tools(steps, mode):
+    return ("suite", lambda r: r.get("part") == "tools" and r.get("steps") == steps and tool_mode(r) in (None, mode))
+
+
 def single(part):
     return ("suite", lambda r: r.get("part") == part)
 
@@ -108,8 +116,12 @@ ROWS = [
     ("Using it", "Idle CPU, ms per s", suite("idle"), "idle_cpu_ms_per_second", True),
     ("Headless", "One-word reply, ms", suite("oneshot"), "wall_ms", True),
     ("Headless", "CPU for that reply, ms", suite("oneshot"), "tree_cpu_ms", True),
-    ("Headless", "50 shell steps in one turn, ms", suite("tools", steps=(50, None)), "wall_ms", True),
-    ("Headless", "Tool result to next request p50, ms", suite("tools", steps=(50, None)), "step_gap_p50_ms", True),
+    ("Headless", "Tool turn, 50 shell steps, ms", tools(50, "direct"), "wall_ms", True),
+    ("Headless", "Tool turn, tool result to next request p50, ms", tools(50, "direct"), "step_gap_p50_ms", True),
+    ("Headless", "Tool turn, 10 shell steps, CLI process peak RSS MB", tools(10, "direct"), "max_rss_mb", True),
+    ("Headless", "Tool turn (Code Mode), 50 shell steps, ms", tools(50, "code-mode"), "wall_ms", True),
+    ("Headless", "Tool turn (Code Mode), tool result to next request p50, ms", tools(50, "code-mode"), "step_gap_p50_ms", True),
+    ("Headless", "Tool turn (Code Mode), 10 shell steps, CLI process peak RSS MB", tools(10, "code-mode"), "max_rss_mb", True),
     ("Headless", "32 runs at once, peak RSS MB each", suite("fleet", k=(32, None)), "rss_mb_per_agent", True),
     ("Headless", "32 runs at once, CPU ms each", suite("fleet", k=(32, None)), "cpu_ms_per_agent", True),
     ("Streaming", "Token on screen at 100 tok/s, p50 ms", tui(100), "lag_p50_ms", True),
@@ -241,7 +253,7 @@ def main(argv):
         ("Terminal interactions p95", "< 15 ms", "Keystroke echo, slowest of 26, ms", "ours is the slowest of 26 echoes"),
         ("Listing 14,600 sessions", "95 s to 0.17 s", "Listing 14,600 sessions, ms", ""),
         ("--resume last", "0.5 s", "Continuing the latest of 14,600, ms", "ours includes sending the next request"),
-        ("Shell calls", "27.9 ms", "Tool result to next request p50, ms", "ours is per step inside one turn"),
+        ("Shell calls", "27.9 ms", "Tool turn, tool result to next request p50, ms", "ours is per step inside one turn"),
         ("MCP exit", "7.4 ms", None, "not measured: no lane runs an MCP server here"),
     ]
     say("| fx claim | fx says | fx, ours | nc, ours | Note |")
@@ -300,6 +312,7 @@ def main(argv):
         say("Not measured in these sources: " + "; ".join(missing) + ".\n")
     say("## Method\n")
     say("- First frame is the time from spawn until the terminal interface has drawn its prompt in a pseudo-terminal (harness/tui.py); memory is sampled from /proc/<pid>/smaps_rollup one second later, summed over the process tree. RSS counts the executable's file pages, which kernel fault-around maps in 64 KB blocks, so it depends on code layout as much as on what runs.")
+    say("- Tool turn rows run one headless turn of shell steps. In the plain rows nc calls exec_command directly, its default; in the Code Mode rows it sends every step as an exec cell under --codex-orchestration code-mode, and nc rows recorded before tool_mode existed count as Code Mode. The other lanes have one way to call tools and appear in both. Their peak RSS is the largest single process's (wait4 rusage), normally the CLI itself, where other memory rows sum the process tree.")
     say("- One-word reply is a headless run from spawn to exit against a fixture that answers at once. Streaming rows replay a fixed reply at the given token rate and time each token from the fixture sending it to the pseudo-terminal showing it.")
     say("- Session rows save one-turn sessions through each CLI's own headless mode, then list them with its documented command (nc sessions, fx sessions --json) and continue the latest one (nc --continue, fx --resume last), interleaving the lanes round by round. On a loaded machine the 14,600-session rows run under perf stat, whose task-clock and instruction counts are the comparable numbers; wall times there are noise.")
     say("- Idle CPU is a 23 s session's CPU minus a 3 s session's, per second; values a few thousandths from zero are zero within measurement noise.")

@@ -45,8 +45,9 @@ Versions, from each source's VERSIONS.md: nc 0.7.0; fx 0.0.16; nc-lite 0.7.0; Cl
 |---|---:|---:|---:|---:|---:|---:|---:|---|
 | One-word reply, ms | 4.79 (20) | 22.8 (20) | 2.81 (20) | n/a | n/a | n/a | n/a | A |
 | CPU for that reply, ms | 2.36 (20) | 1.59 (20) | 1.70 (20) | n/a | n/a | n/a | n/a | A |
-| 50 shell steps in one turn, ms | 38.0 (10) | 1,059 (10) | 27.0 (10) | n/a | n/a | n/a | n/a | A |
-| Tool result to next request p50, ms | 0.339 (10) | 20.5 (10) | 0.302 (10) | n/a | n/a | n/a | n/a | A |
+| Tool turn (Code Mode), 50 shell steps, ms | 38.0 (10) | 1,059 (10) | 27.0 (10) | n/a | n/a | n/a | n/a | A |
+| Tool turn (Code Mode), tool result to next request p50, ms | 0.339 (10) | 20.5 (10) | 0.302 (10) | n/a | n/a | n/a | n/a | A |
+| Tool turn (Code Mode), 10 shell steps, CLI process peak RSS MB | 25.4 (10) | 9.25 (10) | 11.9 (10) | n/a | n/a | n/a | n/a | A |
 | 32 runs at once, peak RSS MB each | 16.3 (10) | 7.74 (10) | 8.15 (9) | 227 (10) | 152 (10) | 125 (10) | 599 (10) | B |
 | 32 runs at once, CPU ms each | 19.2 (10) | 19.1 (10) | 29.7 (9) | 793 (10) | 332 (10) | 700 (10) | 4,799 (10) | B |
 
@@ -103,7 +104,7 @@ Vercel publishes these for fx. We have not reproduced them; the right-hand colum
 | Terminal interactions p95 | < 15 ms | 113 (A) | 0.082 (A) | ours is the slowest of 26 echoes |
 | Listing 14,600 sessions | 95 s to 0.17 s | 89.7 (B) | 588 (B) |  |
 | --resume last | 0.5 s | 113 (B) | 596 (B) | ours includes sending the next request |
-| Shell calls | 27.9 ms | 20.5 (A) | 0.339 (A) | ours is per step inside one turn |
+| Shell calls | 27.9 ms | n/a | n/a | ours is per step inside one turn |
 | MCP exit | 7.4 ms | n/a | n/a | not measured: no lane runs an MCP server here |
 
 ## Where nanocode does not lead yet
@@ -126,6 +127,7 @@ Every row above where nc's median is not below each of fx, nc-lite, Claude Code 
 - Main binary, MB (A): nc 45.4 against fx 12.2, 33.2 or 3.71x; also behind nc-lite
 - Install, MB (A): nc 45.4 against fx 12.2, 33.2 or 3.71x; also behind nc-lite
 - Memory 1 s after the first frame, RSS MB (A): nc 10.3 against nc-lite 3.09, 7.26 or 3.35x; also behind fx
+- Tool turn (Code Mode), 10 shell steps, CLI process peak RSS MB (A): nc 25.4 against fx 9.25, 16.2 or 2.75x; also behind nc-lite
 - Keystroke echo p50, ms (A): nc 0.037 against nc-lite 0.014, 0.023 or 2.63x
 - --version, CPU ms (A): nc 0.224 against fx 0.099, 0.125 or 2.27x
 - 240x70 at 10,000 tok/s, peak RSS MB (D): nc 25.6 against nc-lite 11.6, 14.1 or 2.22x
@@ -137,9 +139,9 @@ Every row above where nc's median is not below each of fx, nc-lite, Claude Code 
 - One-word reply, ms (A): nc 4.79 against nc-lite 2.81, 1.98 or 1.71x
 - Keystroke echo, slowest of 26, ms (A): nc 0.082 against nc-lite 0.052, 0.029 or 1.56x
 - CPU for that reply, ms (A): nc 2.36 against fx 1.59, 0.772 or 1.49x; also behind nc-lite
-- 50 shell steps in one turn, ms (A): nc 38.0 against nc-lite 27.0, 11.0 or 1.41x
+- Tool turn (Code Mode), 50 shell steps, ms (A): nc 38.0 against nc-lite 27.0, 11.0 or 1.41x
 - First frame, ms (A): nc 1.19 against nc-lite 0.896, 0.291 or 1.32x
-- Tool result to next request p50, ms (A): nc 0.339 against nc-lite 0.302, 0.038 or 1.13x
+- Tool turn (Code Mode), tool result to next request p50, ms (A): nc 0.339 against nc-lite 0.302, 0.038 or 1.13x
 - --version, cold page cache, ms (A): nc 5.35 against fx 5.07, 0.275 or 1.05x; also behind nc-lite
 - 32 runs at once, CPU ms each (B): nc 19.2 against fx 19.1, 0.144 or 1.01x
 - --version, ms (A): nc 2.63 against fx 2.62, 0.012 or 1.00x; also behind nc-lite
@@ -162,8 +164,9 @@ The same nc rows from every source that has them, to show what changed between n
 | Idle CPU, ms per s | -0.009 (10) |  | -0.008 (10) | -0.009 (10) |  |  |
 | One-word reply, ms | 4.79 (20) | 7.40 (20) | 5.12 (20) | 5.16 (20) |  |  |
 | CPU for that reply, ms | 2.36 (20) | 5.63 (20) | 5.37 (20) | 4.05 (20) |  |  |
-| 50 shell steps in one turn, ms | 38.0 (10) | 65.5 (10) | 33.1 (10) | 33.0 (10) |  |  |
-| Tool result to next request p50, ms | 0.339 (10) | 0.509 (10) | 0.276 (10) | 0.264 (10) |  |  |
+| Tool turn (Code Mode), 50 shell steps, ms | 38.0 (10) | 65.5 (10) | 33.1 (10) | 33.0 (10) |  |  |
+| Tool turn (Code Mode), tool result to next request p50, ms | 0.339 (10) | 0.509 (10) | 0.276 (10) | 0.264 (10) |  |  |
+| Tool turn (Code Mode), 10 shell steps, CLI process peak RSS MB | 25.4 (10) | 19.3 (10) | 18.8 (10) | 18.6 (10) |  |  |
 | 32 runs at once, peak RSS MB each |  | 16.3 (10) | 15.5 (10) | 15.2 (9) |  |  |
 | 32 runs at once, CPU ms each |  | 19.2 (10) | 13.5 (10) | 10.9 (9) |  |  |
 | Token on screen at 100 tok/s, p50 ms | 0.038 (10) | 0.192 (10) | 0.064 (5) |  |  |  |
@@ -200,9 +203,12 @@ Numbers the source table's runs do not cover. Source A did not rebuild the 14,60
 | Continuing the latest of 14,600, kernel instructions, M | 58 | 104 | 177 | H |
 | Continuing the latest of 14,600, peak RSS MB | 34.3 | 34.6 | 41.0 | H |
 
+Not measured in these sources: Tool turn, 50 shell steps, ms; Tool turn, tool result to next request p50, ms; Tool turn, 10 shell steps, CLI process peak RSS MB.
+
 ## Method
 
 - First frame is the time from spawn until the terminal interface has drawn its prompt in a pseudo-terminal (harness/tui.py); memory is sampled from /proc/<pid>/smaps_rollup one second later, summed over the process tree. RSS counts the executable's file pages, which kernel fault-around maps in 64 KB blocks, so it depends on code layout as much as on what runs.
+- Tool turn rows run one headless turn of shell steps. In the plain rows nc calls exec_command directly, its default; in the Code Mode rows it sends every step as an exec cell under --codex-orchestration code-mode, and nc rows recorded before tool_mode existed count as Code Mode. The other lanes have one way to call tools and appear in both. Their peak RSS is the largest single process's (wait4 rusage), normally the CLI itself, where other memory rows sum the process tree.
 - One-word reply is a headless run from spawn to exit against a fixture that answers at once. Streaming rows replay a fixed reply at the given token rate and time each token from the fixture sending it to the pseudo-terminal showing it.
 - Session rows save one-turn sessions through each CLI's own headless mode, then list them with its documented command (nc sessions, fx sessions --json) and continue the latest one (nc --continue, fx --resume last), interleaving the lanes round by round. On a loaded machine the 14,600-session rows run under perf stat, whose task-clock and instruction counts are the comparable numbers; wall times there are noise.
 - Idle CPU is a 23 s session's CPU minus a 3 s session's, per second; values a few thousandths from zero are zero within measurement noise.

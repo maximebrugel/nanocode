@@ -174,16 +174,19 @@ if (parts.includes("tools")) {
       for (const name of rot(names, r)) {
         const x = extra[name];
         if (!x?.toolHeadless) { emit({ part: "tools", harness: name, steps, round: r, error: "no tool lane" }); continue; }
-        const { home, env } = prepared(name, "tools");
-        const run = "tl-" + name + "-" + seq++;
-        const res = await measured(...x.toolHeadless(home, server.base, "Run ls, step by step BENCH[run=" + run + ",mode=steps,steps=" + steps + ",kind=shell,h=" + (name === "nclite" ? "ncdirect" : lanes[name].version()[0] === lanes.nc?.version()[0] || name.startsWith("nc") ? "nc" : name) + "]"), env, { timeoutMs: 300000 });
-        const records = (await server.log(run)).filter((record) => record.mode !== "side");
-        const busy = records.reduce((sum, record) => sum + (msBetween(record.arrive_ns, record.done_ns) ?? 0), 0);
-        const gaps = records.slice(1).map((record, i) => msBetween(records[i].done_ns, record.arrive_ns)).filter((g) => g != null).sort((a, b) => a - b);
-        const ok = res.code === 0 && records.length === steps + 1 && res.o.includes("LONG_TURN_COMPLETE");
-        emit({ part: "tools", harness: name, steps, round: r, code: res.code, requests: records.length, wall_ms: msBetween(res.spawnNs, res.exitNs), server_ms: busy,
-          step_gap_p50_ms: gaps[gaps.length >> 1] ?? null, step_gap_max_ms: gaps.at(-1) ?? null, last_request_bytes: records.at(-1)?.request_bytes, first_request_bytes: records[0]?.request_bytes,
-          cpu_per_step_ms: res.usage.tree_cpu_ms / steps, ...res.usage, error: ok ? undefined : "exit " + res.code + ", " + records.length + " requests, done " + res.o.includes("LONG_TURN_COMPLETE") + ": " + res.e.slice(-300) });
+        const modes = x.codeModeToolHeadless ? [["direct", x.toolHeadless, "ncdirect"], ["code-mode", x.codeModeToolHeadless, "nc"]] : [[undefined, x.toolHeadless, name === "nclite" ? "ncdirect" : name]];
+        for (const [toolMode, toolHeadless, h] of modes) {
+          const { home, env } = prepared(name, "tools");
+          const run = "tl-" + name + "-" + seq++;
+          const res = await measured(...toolHeadless(home, server.base, "Run ls, step by step BENCH[run=" + run + ",mode=steps,steps=" + steps + ",kind=shell,h=" + h + "]"), env, { timeoutMs: 300000 });
+          const records = (await server.log(run)).filter((record) => record.mode !== "side");
+          const busy = records.reduce((sum, record) => sum + (msBetween(record.arrive_ns, record.done_ns) ?? 0), 0);
+          const gaps = records.slice(1).map((record, i) => msBetween(records[i].done_ns, record.arrive_ns)).filter((g) => g != null).sort((a, b) => a - b);
+          const ok = res.code === 0 && records.length === steps + 1 && res.o.includes("LONG_TURN_COMPLETE");
+          emit({ part: "tools", harness: name, tool_mode: toolMode, steps, round: r, code: res.code, requests: records.length, wall_ms: msBetween(res.spawnNs, res.exitNs), server_ms: busy,
+            step_gap_p50_ms: gaps[gaps.length >> 1] ?? null, step_gap_max_ms: gaps.at(-1) ?? null, last_request_bytes: records.at(-1)?.request_bytes, first_request_bytes: records[0]?.request_bytes,
+            cpu_per_step_ms: res.usage.tree_cpu_ms / steps, ...res.usage, error: ok ? undefined : "exit " + res.code + ", " + records.length + " requests, done " + res.o.includes("LONG_TURN_COMPLETE") + ": " + res.e.slice(-300) });
+        }
       }
     }
   }

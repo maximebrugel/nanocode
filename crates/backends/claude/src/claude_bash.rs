@@ -857,7 +857,14 @@ impl BashExecutor for LocalBash {
                 .and_then(|first| first.split_whitespace().next())
                 == Some("sleep");
         let mut request = request;
-        let directory = if direct {
+        let given = request.directory.take();
+        let tracked = direct && given.is_none();
+        let directory = if let Some(given) = given {
+            if direct {
+                request.command = format!("eval {} < /dev/null 2>&1", quoted(&request.command));
+            }
+            given
+        } else if direct {
             request.command = format!(
                 "eval {} < /dev/null 2>&1 && pwd -P >| {}",
                 quoted(&request.command),
@@ -979,7 +986,7 @@ impl BashExecutor for LocalBash {
             match nanocode_platform::timeout(timeout, completion(&job)).await {
                 Ok(mut result) => {
                     self.jobs.forget(&id);
-                    if direct && let Ok(result) = &mut result {
+                    if tracked && let Ok(result) = &mut result {
                         self.moved(&marker, result).await;
                     }
                     if let (Ok(result), Some(kills)) = (&mut result, job.memory_kills().await) {
@@ -1193,7 +1200,13 @@ impl Tool for BashTool {
                 Ok(
                     match self
                         .bash
-                        .execute_call("Bash", input, self.session.clone(), Some(context.call_id()))
+                        .execute_call_in(
+                            "Bash",
+                            input,
+                            self.session.clone(),
+                            Some(context.call_id()),
+                            context.directory(),
+                        )
                         .await
                     {
                         Ok(output) => {

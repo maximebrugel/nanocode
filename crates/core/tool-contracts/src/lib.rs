@@ -69,6 +69,7 @@ pub struct ToolContext<'a> {
     output_token_budget: usize,
     host_context: Option<&'a str>,
     instruction_revision: Option<u64>,
+    directory: Option<&'a std::path::Path>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -89,6 +90,7 @@ impl<'a> ToolContext<'a> {
             output_token_budget,
             host_context: None,
             instruction_revision: None,
+            directory: None,
         }
     }
 
@@ -115,6 +117,17 @@ impl<'a> ToolContext<'a> {
     #[must_use]
     pub const fn instruction_revision(self) -> Option<u64> {
         self.instruction_revision
+    }
+
+    #[must_use]
+    pub const fn with_directory(mut self, directory: Option<&'a std::path::Path>) -> Self {
+        self.directory = directory;
+        self
+    }
+
+    #[must_use]
+    pub const fn directory(self) -> Option<&'a std::path::Path> {
+        self.directory
     }
 
     #[doc(hidden)]

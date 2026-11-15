@@ -35,6 +35,8 @@ pub struct BashRequest {
     pub max_stderr_bytes: usize,
 
     pub session: Option<SessionEnvironment>,
+
+    pub directory: Option<std::path::PathBuf>,
 }
 
 impl BashRequest {
@@ -142,6 +144,18 @@ impl<E: BashExecutor> ClaudeBash<E> {
         session: Option<SessionEnvironment>,
         call_id: Option<&str>,
     ) -> Result<String, String> {
+        self.execute_call_in(name, input, session, call_id, None)
+            .await
+    }
+
+    pub async fn execute_call_in(
+        &self,
+        name: &str,
+        input: Value,
+        session: Option<SessionEnvironment>,
+        call_id: Option<&str>,
+        directory: Option<&std::path::Path>,
+    ) -> Result<String, String> {
         if name != "Bash" {
             return Err(format!("unknown Claude Bash tool: {name}"));
         }
@@ -231,6 +245,7 @@ impl<E: BashExecutor> ClaudeBash<E> {
             max_stdout_bytes: stream_bytes,
             max_stderr_bytes: stream_bytes,
             session,
+            directory: directory.map(std::path::Path::to_path_buf),
         };
         let result = self
             .executor

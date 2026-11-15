@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use nanocode_sync::watch;
@@ -281,7 +284,7 @@ struct Journals {
     cells: Atom<Vec<Weak<CellRecord>>>,
     held: Atom<HashSet<String>>,
     restored: Atom<HashMap<String, Arc<Restored>>>,
-    pending: Atom<HashMap<String, watch::Receiver<bool>>>,
+    pending: Atom<HashMap<String, (watch::Receiver<bool>, Arc<AtomicUsize>)>>,
     finished: Atom<Vec<Arc<CellRecord>>>,
     dormant: Atom<Vec<(Arc<CellJournal>, Arc<Restored>)>>,
     loaded: Atom<HashSet<String>>,
@@ -324,9 +327,15 @@ pub struct PendingRestore {
     journals: CellJournals,
     session_id: String,
     ready: watch::Sender<bool>,
+    waiting: Arc<AtomicUsize>,
 }
 
 impl PendingRestore {
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
     pub fn restore(
         self,
         cells: Vec<CellJournal>,
@@ -344,7 +353,7 @@ impl Drop for PendingRestore {
         self.journals.0.pending.update(|pending| {
             if pending
                 .get(&self.session_id)
-                .is_some_and(|waiting| waiting.same_channel(&mine))
+                .is_some_and(|(waiting, _)| waiting.same_channel(&mine))
             {
                 pending.remove(&self.session_id);
             }
@@ -638,14 +647,19 @@ impl CellJournals {
     }
 
     pub fn expect_restore(&self, session_id: &str) -> PendingRestore {
-        let (ready, waiting) = watch::channel(false);
+        let (ready, receiver) = watch::channel(false);
+        let waiting = Arc::new(AtomicUsize::new(0));
         self.0.pending.update(|pending| {
-            pending.insert(session_id.to_owned(), waiting.clone());
+            pending.insert(
+                session_id.to_owned(),
+                (receiver.clone(), Arc::clone(&waiting)),
+            );
         });
         PendingRestore {
             journals: self.clone(),
             session_id: session_id.to_owned(),
             ready,
+            waiting,
         }
     }
 
@@ -657,14 +671,15 @@ impl CellJournals {
     }
 
     pub async fn await_restore(&self, session_id: &str) {
-        let Some(mut waiting) = self
+        let Some((mut receiver, waiting)) = self
             .0
             .pending
             .read(|pending| pending.get(session_id).cloned())
         else {
             return;
         };
-        drop(waiting.wait_for(|ready| *ready).await);
+        waiting.fetch_add(1, Ordering::AcqRel);
+        drop(receiver.wait_for(|ready| *ready).await);
     }
 
     #[must_use]

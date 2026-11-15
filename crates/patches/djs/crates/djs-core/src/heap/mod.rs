@@ -175,6 +175,25 @@ fn capacity_target(t: u32) -> u32 {
 /// The default memory cap: the whole `u32` offset space.
 pub const DEFAULT_LIMIT: usize = arena::MAX_ARENA as usize;
 
+/// The call site that `each_fused` (interp/run/each.rs) last ran, with what it derived
+/// from the code and the callee: `code` is the arena offset of its `fclosure`, 0 for none.
+/// Its offsets are arena offsets, so every collection empties it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EachSite {
+    pub(crate) callee: u32,
+    pub(crate) cap: Option<u32>,
+    pub(crate) child: u32,
+    pub(crate) code: u32,
+    pub(crate) end: u32,
+    pub(crate) fixed: i64,
+    pub(crate) fuel: i64,
+    pub(crate) init: Option<i32>,
+    pub(crate) mode: i32,
+    pub(crate) op: u8,
+    pub(crate) template: u32,
+    pub(crate) y: Option<i32>,
+}
+
 /// The VM heap. All state is in the arena; this struct only adds methods.
 pub struct Heap {
     arena: Arena,
@@ -205,6 +224,7 @@ pub struct Heap {
     pub(crate) mega_ic: alloc::vec::Vec<u32>,
     pub(crate) iterator_ic: [u32; cells::IC_WORDS as usize],
     pub(crate) return_ic: [u32; 2],
+    pub(crate) each_site: EachSite,
     pub(crate) regexp_shape: u32,
     pub(crate) rest_shape: u32,
     pub(crate) iter_result_shape: u32,
@@ -361,6 +381,7 @@ impl Heap {
             mega_ic: Default::default(),
             iterator_ic: Default::default(),
             return_ic: Default::default(),
+            each_site: Default::default(),
             regexp_shape: 0,
             rest_shape: 0,
             iter_result_shape: 0,

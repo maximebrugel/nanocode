@@ -39,9 +39,19 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(target_family = "wasm"))]
+pub(crate) type RegistryFuture<'a, T> = nanocode_sync::future::BoxFuture<'a, T>;
+
+#[cfg(target_family = "wasm")]
+pub(crate) type RegistryFuture<'a, T> = nanocode_sync::future::LocalBoxFuture<'a, T>;
+
 mod activity;
 mod completion;
+mod delivery;
 mod focus;
+mod journal;
+mod lifecycle;
+mod restore;
 
 pub use activity::{Restoration, SubagentActivity};
 pub use completion::{RunningSubagents, SubagentCompletion};
@@ -1379,150 +1389,153 @@ async fn refill(
     Some((commit, Vec::new()))
 }
 
-async fn journal_writer(
+#[inline(never)]
+fn journal_writer<'a>(
     registry: Weak<Registry>,
     root_session_id: String,
     mut requests: mpsc::UnboundedReceiver<JournalRequest>,
     mut revision: watch::Receiver<u64>,
-) {
-    let mut saved = None;
-    let mut recorded = HashMap::new();
-    let mut cache = durable::JournalCache::default().written_as(
-        registry
-            .upgrade()
-            .map_or(durable::JOURNAL_VERSION, |registry| {
-                registry.journal_version.load(Ordering::Relaxed)
-            }),
-    );
-    let mut pending = Vec::new();
-    let mut failures = 0_u32;
-    let mut fenced = false;
-    let mut slot: Option<nanocode_agent_core::backend::DeferredJournal> = None;
-    let mut deferrable = true;
-    let mut deferred = Vec::new();
-    loop {
-        for _ in 0..requests.len() {
-            if let Ok(request) = requests.try_recv() {
-                pending.push(request);
+) -> RegistryFuture<'a, ()> {
+    Box::pin(async move {
+        let mut saved = None;
+        let mut recorded = HashMap::new();
+        let mut cache = durable::JournalCache::default().written_as(
+            registry
+                .upgrade()
+                .map_or(durable::JOURNAL_VERSION, |registry| {
+                    registry.journal_version.load(Ordering::Relaxed)
+                }),
+        );
+        let mut pending = Vec::new();
+        let mut failures = 0_u32;
+        let mut fenced = false;
+        let mut slot: Option<nanocode_agent_core::backend::DeferredJournal> = None;
+        let mut deferrable = true;
+        let mut deferred = Vec::new();
+        loop {
+            for _ in 0..requests.len() {
+                if let Ok(request) = requests.try_recv() {
+                    pending.push(request);
+                }
             }
-        }
-        let Some(live) = registry.upgrade() else {
-            return;
-        };
-        let (finished, save) = live
-            .write_journal(
-                &root_session_id,
-                std::mem::take(&mut pending),
-                &mut saved,
-                &mut recorded,
-                &mut cache,
-                fenced,
-                &mut slot,
-                &mut deferrable,
-                &mut deferred,
-            )
-            .await;
-        match save {
-            JournalSave::Fenced if !fenced => {
-                fenced = true;
-                nanocode_trace::info!(
-                    %root_session_id,
-                    "another process owns the subagent journal now; this process stops saving it"
-                );
-            }
-            JournalSave::Saved => fenced = false,
-            JournalSave::Idle | JournalSave::Failed | JournalSave::Fenced => {}
-        }
-        failures = if save == JournalSave::Failed {
-            failures.saturating_add(1)
-        } else {
-            0
-        };
-        if finished {
-            while let Ok(request) = requests.try_recv() {
-                pending.push(request);
-            }
-            if pending.is_empty() {
-                if let Some(open) = slot.take() {
-                    let filled = match saved.clone() {
-                        Some(payload) => refill(open, payload).await,
-                        None => None,
-                    };
-                    acknowledge_deferred(
-                        registry.clone(),
-                        &root_session_id,
-                        std::mem::take(&mut deferred),
-                        filled,
+            let Some(live) = registry.upgrade() else {
+                return;
+            };
+            let (finished, save) = live
+                .write_journal(
+                    &root_session_id,
+                    std::mem::take(&mut pending),
+                    &mut saved,
+                    &mut recorded,
+                    &mut cache,
+                    fenced,
+                    &mut slot,
+                    &mut deferrable,
+                    &mut deferred,
+                )
+                .await;
+            match save {
+                JournalSave::Fenced if !fenced => {
+                    fenced = true;
+                    nanocode_trace::info!(
+                        %root_session_id,
+                        "another process owns the subagent journal now; this process stops saving it"
                     );
                 }
-                requests.close();
-                live.journal_writers.update(|writers| {
-                    if writers
-                        .get(&root_session_id)
-                        .is_some_and(mpsc::UnboundedSender::is_closed)
-                    {
-                        writers.remove(&root_session_id);
-                    }
-                });
-                while let Some(request) = requests.recv().await {
-                    live.send_journal(&root_session_id, Some(request));
+                JournalSave::Saved => fenced = false,
+                JournalSave::Idle | JournalSave::Failed | JournalSave::Fenced => {}
+            }
+            failures = if save == JournalSave::Failed {
+                failures.saturating_add(1)
+            } else {
+                0
+            };
+            if finished {
+                while let Ok(request) = requests.try_recv() {
+                    pending.push(request);
                 }
-                return;
+                if pending.is_empty() {
+                    if let Some(open) = slot.take() {
+                        let filled = match saved.clone() {
+                            Some(payload) => refill(open, payload).await,
+                            None => None,
+                        };
+                        acknowledge_deferred(
+                            registry.clone(),
+                            &root_session_id,
+                            std::mem::take(&mut deferred),
+                            filled,
+                        );
+                    }
+                    requests.close();
+                    live.journal_writers.update(|writers| {
+                        if writers
+                            .get(&root_session_id)
+                            .is_some_and(mpsc::UnboundedSender::is_closed)
+                        {
+                            writers.remove(&root_session_id);
+                        }
+                    });
+                    while let Some(request) = requests.recv().await {
+                        live.send_journal(&root_session_id, Some(request));
+                    }
+                    return;
+                }
+                continue;
             }
-            continue;
-        }
-        drop(live);
-        if cache.settles() {
-            continue;
-        }
-        let retry = async {
-            match failures {
-                0 => std::future::pending().await,
-                attempt => platform::sleep(completion_retry_delay(attempt)).await,
+            drop(live);
+            if cache.settles() {
+                continue;
             }
-        };
-        let mut retry = std::pin::pin!(retry);
-        loop {
-            let taken = async {
-                match slot.as_mut() {
-                    Some(open) => open.await.ok(),
-                    None => std::future::pending().await,
+            let retry = async {
+                match failures {
+                    0 => std::future::pending().await,
+                    attempt => platform::sleep(completion_retry_delay(attempt)).await,
                 }
             };
-            nanocode_sync::select! {
-                fill = taken => {
-                    slot = None;
-                    let filled = match (fill, registry.upgrade()) {
-                        (Some((fill, commit)), Some(live)) => live
-                            .fill_with(&root_session_id, fill, &mut saved, &mut recorded, &mut cache)
-                            .await
-                            .map(|saving| (commit, saving)),
-                        _ => None,
-                    };
-                    acknowledge_deferred(
-                        registry.clone(),
-                        &root_session_id,
-                        std::mem::take(&mut deferred),
-                        filled,
-                    );
-                }
-                changed = revision.changed() => {
-                    if changed.is_err() {
-                        return;
+            let mut retry = std::pin::pin!(retry);
+            loop {
+                let taken = async {
+                    match slot.as_mut() {
+                        Some(open) => open.await.ok(),
+                        None => std::future::pending().await,
                     }
-                    break;
-                }
-                request = requests.recv() => match request {
-                    Some(request) => {
-                        pending.push(request);
+                };
+                nanocode_sync::select! {
+                    fill = taken => {
+                        slot = None;
+                        let filled = match (fill, registry.upgrade()) {
+                            (Some((fill, commit)), Some(live)) => live
+                                .fill_with(&root_session_id, fill, &mut saved, &mut recorded, &mut cache)
+                                .await
+                                .map(|saving| (commit, saving)),
+                            _ => None,
+                        };
+                        acknowledge_deferred(
+                            registry.clone(),
+                            &root_session_id,
+                            std::mem::take(&mut deferred),
+                            filled,
+                        );
+                    }
+                    changed = revision.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
                         break;
                     }
-                    None => return,
-                },
-                () = &mut retry => break,
+                    request = requests.recv() => match request {
+                        Some(request) => {
+                            pending.push(request);
+                            break;
+                        }
+                        None => return,
+                    },
+                    () = &mut retry => break,
+                }
             }
         }
-    }
+    })
 }
 
 impl AgentScope {
@@ -3337,28 +3350,7 @@ impl Registry {
     }
 
     pub(crate) async fn await_restored(&self, session_id: &str) -> std::io::Result<()> {
-        let root = self.root_of(session_id);
-        let gate = self
-            .claims
-            .read(|claims| claims.restored.get(&root).cloned());
-        if let Some(mut gate) = gate {
-            let outcome = gate
-                .wait_for(|outcome| {
-                    matches!(
-                        outcome,
-                        RestorationState::Ready | RestorationState::Failed(_)
-                    )
-                })
-                .await
-                .map_err(|_| {
-                    std::io::Error::other("subagent journal restoration ended without an outcome")
-                })?
-                .clone();
-            if let RestorationState::Failed(error) = outcome {
-                return Err(std::io::Error::other(error));
-            }
-        }
-        Ok(())
+        restore::await_restored(self, session_id).await
     }
 
     pub fn set_store(self: &Arc<Self>, store: Arc<dyn SubagentStore>) {
@@ -3560,284 +3552,19 @@ impl Registry {
         deferrable: &mut bool,
         awaiting: &mut Vec<oneshot::Sender<std::io::Result<()>>>,
     ) -> (bool, JournalSave) {
-        let (restoring, background) = {
-            let gate = self.claims.read(|claims| {
-                claims
-                    .restored
-                    .get(root_session_id)
-                    .map(|gate| gate.borrow().clone())
-            });
-            (
-                matches!(
-                    gate,
-                    Some(RestorationState::Loading | RestorationState::Failed(_))
-                ),
-                matches!(gate, None | Some(RestorationState::Ready)) && !fenced,
-            )
-        };
-        let mut waiters = Vec::new();
-        let mut finals = Vec::new();
-        for request in requests {
-            match request {
-                JournalRequest::Stored(stored) => cache.adopt(*stored),
-                JournalRequest::Warmed(agents) => cache.warm(agents),
-                JournalRequest::Persist { scope: false, done } if restoring => {
-                    let _ = done.send(Err(std::io::Error::other(
-                        "subagent task tree is still restoring",
-                    )));
-                }
-                JournalRequest::Persist { scope, done } => waiters.push((scope, done)),
-                JournalRequest::Final { write, done } => finals.push((write, done)),
-            }
-        }
-        let Some(store) = self.store_for(root_session_id) else {
-            for done in waiters
-                .into_iter()
-                .map(|(_, done)| done)
-                .chain(finals.into_iter().map(|(_, done)| done))
-            {
-                let _ = done.send(Err(std::io::Error::other("no subagent store is installed")));
-            }
-            return (true, JournalSave::Idle);
-        };
-        let frozen = || {
-            Err(std::io::Error::other(
-                "subagent journal is frozen for shutdown",
-            ))
-        };
-        let Some(registry) = self.shared() else {
-            return (true, JournalSave::Idle);
-        };
-        let root = root_session_id.to_owned();
-        let mut owned_cache = std::mem::take(cache);
-        let defer = *deferrable;
-        let (snapshot, finished, returned_waiters, returned_cache, wanted) = self
-            .state
-            .call(move |state| {
-                let root_session_id = root.as_str();
-                let cache = &mut owned_cache;
-                let _collect = nanocode_trace::info_span!(
-                    "subagent.journal.collect",
-                    session.root_id = root_session_id
-                )
-                .entered();
-                let mut wanted = false;
-                let (snapshot, finished) = match state.scopes.get_mut(root_session_id) {
-                    None => {
-                        for (scope, done) in waiters.drain(..) {
-                            let _ = done.send(if scope { Ok(()) } else { frozen() });
-                        }
-                        (None, true)
-                    }
-                    Some(scope) => {
-                        if scope.life.frozen() {
-                            let (scoped, unscoped): (Vec<_>, Vec<_>) =
-                                waiters.drain(..).partition(|(scope, _)| *scope);
-                            waiters = scoped;
-                            for (_, done) in unscoped {
-                                let _ = done.send(frozen());
-                            }
-                        }
-                        if scope.life.released() {
-                            for (_, done) in waiters.drain(..) {
-                                let _ = done.send(frozen());
-                            }
-                        }
-                        let write = !waiters.is_empty() || (background && !scope.life.frozen());
-                        wanted = write;
-                        scope.cool(root_session_id, &registry, cache);
-                        (
-                            (write && !defer).then(|| {
-                                cache.track(
-                                    registry
-                                        .checkpoint_changes
-                                        .update(|changes| changes.remove(root_session_id))
-                                        .into_iter()
-                                        .flatten(),
-                                );
-                                cache.track(scope.sessions.take_changed());
-                                let checkpoints = registry.checkpoints.get();
-                                scope.journal_snapshot(root_session_id, &checkpoints, cache)
-                            }),
-                            scope.life.frozen(),
-                        )
-                    }
-                };
-                (snapshot, finished, waiters, owned_cache, wanted)
-            })
-            .await;
-        let waiters = returned_waiters;
-        *cache = returned_cache;
-        if defer && wanted {
-            let deferred = match slot {
-                Some(_) => Ok(true),
-                None => match store.save_deferred(root_session_id).await {
-                    Ok(Some(open)) => {
-                        *slot = Some(open);
-                        Ok(true)
-                    }
-                    Ok(None) => Ok(false),
-                    Err(error) => Err(error),
-                },
-            };
-            match deferred {
-                Ok(true) => {
-                    awaiting.extend(waiters.into_iter().map(|(_, done)| done));
-                    let closed = !finals.is_empty();
-                    if closed && let Some(open) = slot.take() {
-                        let filled = self
-                            .fill_journal(root_session_id, open, saved, recorded, cache)
-                            .await;
-                        acknowledge_deferred(
-                            self.this.get().cloned().unwrap_or_default(),
-                            root_session_id,
-                            std::mem::take(awaiting),
-                            filled,
-                        );
-                    }
-                    for (write, done) in finals {
-                        *saved = None;
-                        let _ = done.send(
-                            self.save_write(root_session_id, store.as_ref(), write)
-                                .await,
-                        );
-                    }
-                    return (finished || closed, JournalSave::Saved);
-                }
-                Ok(false) => {
-                    *deferrable = false;
-                    let mut requeued = waiters
-                        .into_iter()
-                        .map(|(scope, done)| JournalRequest::Persist { scope, done })
-                        .collect::<Vec<_>>();
-                    requeued.extend(
-                        finals
-                            .into_iter()
-                            .map(|(write, done)| JournalRequest::Final { write, done }),
-                    );
-                    return Box::pin(self.write_journal(
-                        root_session_id,
-                        requeued,
-                        saved,
-                        recorded,
-                        cache,
-                        fenced,
-                        slot,
-                        deferrable,
-                        awaiting,
-                    ))
-                    .await;
-                }
-                Err(error) => {
-                    let save = if is_fenced(&error) {
-                        JournalSave::Fenced
-                    } else {
-                        nanocode_trace::warn!(%error, %root_session_id, "could not save subagent journal");
-                        JournalSave::Failed
-                    };
-                    for (_, done) in waiters {
-                        let _ = done.send(Err(copy_error(&error)));
-                    }
-                    let closed = !finals.is_empty();
-                    for (write, done) in finals {
-                        *saved = None;
-                        let _ = done.send(
-                            self.save_write(root_session_id, store.as_ref(), write)
-                                .await,
-                        );
-                    }
-                    return (finished || closed, save);
-                }
-            }
-        }
-        let encoded = snapshot.map(|snapshot| {
-            snapshot.and_then(|snapshot| {
-                let _encode = nanocode_trace::info_span!(
-                    "subagent.journal.encode",
-                    session.root_id = root_session_id
-                )
-                .entered();
-                snapshot.encode(cache)
-            })
-        });
-        let attempted = encoded.is_some();
-        let result = match encoded {
-            None => Ok(()),
-            Some(Err(error)) => Err(error),
-            Some(Ok(encoded)) => {
-                let records = &encoded.records;
-                if waiters.is_empty() && saved.as_deref() == Some(encoded.payload.as_str()) {
-                    self.acknowledge(root_session_id, &encoded.acknowledged);
-                    cache.committed(encoded);
-                    Ok(())
-                } else {
-                    let payload = encoded.payload.clone();
-                    let result = store
-                        .save(root_session_id, payload.clone(), records.clone())
-                        .instrument(nanocode_trace::info_span!(
-                            "subagent.journal.save",
-                            session.root_id = root_session_id,
-                            payload.bytes = payload.len(),
-                            record.count = records.len(),
-                            record.bytes =
-                                records.iter().map(|(_, json)| json.len()).sum::<usize>(),
-                            request.count = waiters.len()
-                        ))
-                        .await;
-                    match result {
-                        Ok(()) => {
-                            self.acknowledge(root_session_id, &encoded.acknowledged);
-                            cache.committed(encoded);
-                            if store.records_sessions() {
-                                self.record_children(root_session_id, store.as_ref(), recorded)
-                                    .await;
-                            }
-                            *saved = Some(payload);
-                            Ok(())
-                        }
-                        Err(error) => {
-                            *saved = None;
-                            Err(error)
-                        }
-                    }
-                }
-            }
-        };
-        if waiters.is_empty()
-            && let Err(error) = &result
-            && !is_fenced(error)
-        {
-            nanocode_trace::warn!(%error, %root_session_id, "could not save subagent journal");
-        }
-        for (_, done) in waiters {
-            let _ = done.send(result.as_ref().copied().map_err(copy_error));
-        }
-        let save = match &result {
-            Ok(()) if attempted => JournalSave::Saved,
-            Ok(()) => JournalSave::Idle,
-            Err(error) if is_fenced(error) => JournalSave::Fenced,
-            Err(_) => JournalSave::Failed,
-        };
-        let closed = !finals.is_empty();
-        if closed && let Some(open) = slot.take() {
-            let filled = self
-                .fill_journal(root_session_id, open, saved, recorded, cache)
-                .await;
-            acknowledge_deferred(
-                self.this.get().cloned().unwrap_or_default(),
-                root_session_id,
-                Vec::new(),
-                filled,
-            );
-        }
-        for (write, done) in finals {
-            *saved = None;
-            let _ = done.send(
-                self.save_write(root_session_id, store.as_ref(), write)
-                    .await,
-            );
-        }
-        (finished || closed, save)
+        journal::write_journal(
+            self,
+            root_session_id,
+            requests,
+            saved,
+            recorded,
+            cache,
+            fenced,
+            slot,
+            deferrable,
+            awaiting,
+        )
+        .await
     }
 
     async fn fill_journal(
@@ -3862,68 +3589,7 @@ impl Registry {
         recorded: &mut HashMap<String, Arc<str>>,
         cache: &mut durable::JournalCache,
     ) -> Option<Vec<(AgentId, Arc<str>)>> {
-        let (Some(store), Some(registry)) = (self.store_for(root_session_id), self.shared()) else {
-            return None;
-        };
-        let root = root_session_id.to_owned();
-        let mut owned_cache = std::mem::take(cache);
-        let (snapshot, returned_cache) = self
-            .state
-            .call(move |state| {
-                let root_session_id = root.as_str();
-                let cache = &mut owned_cache;
-                let snapshot = state.scopes.get_mut(root_session_id).map(|scope| {
-                    scope.cool(root_session_id, &registry, cache);
-                    cache.track(
-                        registry
-                            .checkpoint_changes
-                            .update(|changes| changes.remove(root_session_id))
-                            .into_iter()
-                            .flatten(),
-                    );
-                    cache.track(scope.sessions.take_changed());
-                    let checkpoints = registry.checkpoints.get();
-                    scope.journal_snapshot(root_session_id, &checkpoints, cache)
-                });
-                (snapshot, owned_cache)
-            })
-            .await;
-        *cache = returned_cache;
-        let encoded = snapshot.map(|snapshot| {
-            snapshot.and_then(|snapshot| {
-                let _encode = nanocode_trace::info_span!(
-                    "subagent.journal.encode",
-                    session.root_id = root_session_id
-                )
-                .entered();
-                snapshot.encode(cache)
-            })
-        });
-        let Some(Ok(encoded)) = encoded else {
-            if let Some(Err(error)) = encoded {
-                nanocode_trace::warn!(%error, %root_session_id, "could not encode subagent journal");
-            }
-            return None;
-        };
-        let payload = encoded.payload.clone();
-        if fill
-            .send((payload.clone(), encoded.records.clone()))
-            .is_err()
-        {
-            return None;
-        }
-        let saving = encoded.acknowledged.clone();
-        self.settle(root_session_id, &saving, |payload| match payload {
-            durable::Payload::Unsaved(json) => durable::Payload::Saving(Arc::clone(json)),
-            other => other.clone(),
-        });
-        cache.committed(encoded);
-        if store.records_sessions() {
-            self.record_children(root_session_id, store.as_ref(), recorded)
-                .await;
-        }
-        *saved = Some(payload);
-        Some(saving)
+        journal::fill_with(self, root_session_id, fill, saved, recorded, cache).await
     }
 
     async fn record_children(
@@ -3932,22 +3598,7 @@ impl Registry {
         store: &dyn SubagentStore,
         recorded: &mut HashMap<String, Arc<str>>,
     ) {
-        for (key, checkpoint) in self.child_checkpoints(root_session_id).await {
-            let session_id = checkpoint.session_id().to_owned();
-            if recorded.get(&session_id) == Some(&key) {
-                continue;
-            }
-            match store.record_session(root_session_id, checkpoint).await {
-                Ok(()) => {
-                    self.release_recorded(root_session_id, &key);
-                    recorded.insert(session_id, key);
-                }
-                Err(error) => nanocode_trace::warn!(
-                    %error, %root_session_id, %session_id,
-                    "could not record subagent session"
-                ),
-            }
-        }
+        journal::record_children(self, root_session_id, store, recorded).await
     }
 
     async fn child_checkpoints(&self, root_session_id: &str) -> Vec<(Arc<str>, SessionCheckpoint)> {
@@ -4061,34 +3712,7 @@ impl Registry {
         root_session_id: &str,
         id: AgentId,
     ) -> std::io::Result<SessionCheckpoint> {
-        let (key, pending) = self
-            .checkpoints
-            .read(|checkpoints| {
-                checkpoints
-                    .get(&(root_session_id.to_owned(), id))
-                    .map(|checkpoint| (Arc::clone(&checkpoint.key), checkpoint.held().cloned()))
-            })
-            .ok_or_else(|| {
-                std::io::Error::other(format!("subagent {id} has no journaled checkpoint"))
-            })?;
-        match pending {
-            Some(json) => durable::decode_checkpoint(&json, &key),
-            None => {
-                let store = self
-                    .store_for(root_session_id)
-                    .ok_or_else(|| std::io::Error::other("no subagent store is installed"))?;
-                store
-                    .load_record(root_session_id, &key)
-                    .await
-                    .and_then(|json| durable::decode_checkpoint(&json, &key))
-                    .map_err(|error| {
-                        std::io::Error::new(
-                            error.kind(),
-                            format!("subagent {id}'s checkpoint {key} is unreadable: {error}"),
-                        )
-                    })
-            }
-        }
+        journal::journal_snapshot(self, root_session_id, id).await
     }
 
     fn insert_checkpoint(
@@ -4552,43 +4176,7 @@ impl Registry {
         root_session_id: &str,
         ids: Vec<AgentId>,
     ) -> std::io::Result<Option<Warm>> {
-        let Some(store) = self.store_for(root_session_id) else {
-            return Ok(None);
-        };
-        let root = root_session_id.to_owned();
-        let (leaves, cold) = self
-            .state
-            .call(move |state| {
-                let Some(scope) = state.scopes.get_mut(&root) else {
-                    return (Vec::new(), false);
-                };
-                let leaves = scope.warming(&ids);
-                for leaf in &leaves {
-                    *scope.pins.entry(*leaf).or_default() += 1;
-                }
-                let cold = leaves.iter().any(|leaf| scope.cold.contains_key(leaf));
-                (leaves.into_iter().collect::<Vec<_>>(), cold)
-            })
-            .await;
-        if leaves.is_empty() {
-            return Ok(None);
-        }
-        let warm = Warm {
-            state: self.state.clone(),
-            registry: self.this.get().cloned().unwrap_or_default(),
-            root: root_session_id.to_owned(),
-            leaves,
-        };
-        if cold {
-            self.thaw(root_session_id, store.as_ref(), &warm.leaves)
-                .instrument(nanocode_trace::info_span!(
-                    "subagent.warm",
-                    session.root_id = root_session_id,
-                    leaf.count = warm.leaves.len()
-                ))
-                .await?;
-        }
-        Ok(Some(warm))
+        restore::warm(self, root_session_id, ids).await
     }
 
     async fn thaw(
@@ -4597,80 +4185,7 @@ impl Registry {
         store: &dyn SubagentStore,
         leaves: &[u64],
     ) -> std::io::Result<()> {
-        let locks = self.scope_locks(root_session_id);
-        let _warming = locks.warming.enter().await;
-        let root = root_session_id.to_owned();
-        let wanted = leaves.to_vec();
-        let cold = self
-            .state
-            .call(move |state| {
-                let Some(scope) = state.scopes.get(&root) else {
-                    return Vec::new();
-                };
-                wanted
-                    .iter()
-                    .filter_map(|leaf| Some((*leaf, Arc::clone(&scope.cold.get(leaf)?.key))))
-                    .collect::<Vec<_>>()
-            })
-            .await;
-        if cold.is_empty() {
-            return Ok(());
-        }
-        let thawed = cold.iter().map(|(leaf, _)| *leaf).collect::<Vec<_>>();
-        let agents = durable::load_cold(store, root_session_id, cold).await?;
-        let mut sessions = Vec::with_capacity(agents.len());
-        let mut checkpoints = Vec::new();
-        let mut waited = Vec::new();
-        for (agent, cached) in agents {
-            let id = agent.descriptor.id;
-            if let Some(key) = &agent.checkpoint_ref {
-                checkpoints.push((id, durable::JournalCheckpoint::stored(key.clone(), None)));
-            }
-            let (session, _, _) = durable::restored_session(agent, None)?;
-            if session.conversation && !store.records_sessions() {
-                session.marks.captured.store(true, Ordering::Release);
-            }
-            waited.extend(
-                session
-                    .waited
-                    .iter()
-                    .map(|waited| ((waited.session.clone(), id), waited.mark)),
-            );
-            sessions.push((id, session, cached));
-        }
-        let root = root_session_id.to_owned();
-        let warmed = self
-            .state
-            .call(move |state| {
-                let last_used = state.next_access();
-                let Some(scope) = state.scopes.get_mut(&root) else {
-                    return Vec::new();
-                };
-                for leaf in &thawed {
-                    scope.remove_cold_leaf(*leaf);
-                }
-                sessions
-                    .into_iter()
-                    .map(|(id, mut session, cached)| {
-                        session.last_used = last_used;
-                        (id, cached.at(scope.sessions.insert_stored(id, session)))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .await;
-        if !checkpoints.is_empty() {
-            self.checkpoints.update(|stored| {
-                for (id, checkpoint) in &checkpoints {
-                    stored.insert((root_session_id.to_owned(), *id), checkpoint.clone());
-                }
-            });
-        }
-        if !waited.is_empty() {
-            self.wait_reported
-                .update(|reported| reported.extend(waited.iter().cloned()));
-        }
-        self.send_journal(root_session_id, Some(JournalRequest::Warmed(warmed)));
-        Ok(())
+        restore::thaw(self, root_session_id, store, leaves).await
     }
 
     async fn warm_subtree(&self, session_id: &str, id: AgentId) -> std::io::Result<Option<Warm>> {
@@ -4749,265 +4264,11 @@ impl Registry {
         self: &Arc<Self>,
         root_session_id: &str,
     ) -> std::io::Result<RestoreReport> {
-        let store = self
-            .store_for(root_session_id)
-            .ok_or_else(|| std::io::Error::other("no subagent store is installed"))?;
-        let Some(payload) = store.load(root_session_id).await? else {
-            return Ok(RestoreReport::default());
-        };
-        let journal: durable::PersistedScope = serde_json::from_str(&payload)
-            .map_err(|error| std::io::Error::other(format!("invalid subagent journal: {error}")))?;
-
-        drop(payload);
-        if !(durable::MIN_JOURNAL_VERSION..=durable::JOURNAL_VERSION).contains(&journal.version) {
-            return Err(std::io::Error::other(format!(
-                "unsupported subagent journal version {}",
-                journal.version
-            )));
-        }
-        let folds_all = !journal.agents.is_empty()
-            || !journal.agent_records.is_empty()
-            || journal.agent_pages.is_some()
-            || (journal.version <= durable::FIELDS_JOURNAL_VERSION
-                && self.journal_version.load(Ordering::Relaxed) > durable::FIELDS_JOURNAL_VERSION);
-        let mut written = durable::JournalCache::default().written_as(journal.version);
-        let deltas = durable::load_deltas(
-            store.as_ref(),
-            root_session_id,
-            journal.deltas,
-            &mut written,
-        )
-        .await?;
-        let messages = journal
-            .messages
-            .hydrate(
-                store.as_ref(),
-                root_session_id,
-                deltas.messages,
-                &mut written,
-            )
-            .await?;
-        let mut records = journal.agent_records;
-        if let Some(pages) = journal.agent_pages {
-            records.extend(pages.agent_records(store.as_ref(), root_session_id).await?);
-        }
-        let mut agents = journal.agents;
-        agents.extend(durable::load_agents(store.as_ref(), root_session_id, records).await?);
-        let leaves = durable::load_leaves(
-            store.as_ref(),
-            root_session_id,
-            journal.agent_leaves,
-            deltas.agents,
-            &mut written,
-        )
-        .await?;
-        agents.extend(leaves.agents);
-        let cold = leaves.cold;
-        let mut written = written.stored(folds_all);
-        agents.sort_by_key(|agent| agent.descriptor.id);
-        let spawning_turns = agents
-            .iter()
-            .filter_map(durable::PersistedAgent::unmarked_spawning_turn)
-            .map(str::to_owned)
-            .collect::<HashSet<_>>();
-        if !spawning_turns.is_empty() {
-            let cancelled = store
-                .cancelled_turns(root_session_id, spawning_turns.into_iter().collect())
-                .await
-                .map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("could not read the root's cancelled turns: {error}"),
-                    )
-                })?;
-            for agent in &mut agents {
-                if agent
-                    .unmarked_spawning_turn()
-                    .is_some_and(|turn| cancelled.iter().any(|cancelled| cancelled == turn))
-                {
-                    agent.cancelled_revision = Some(agent.next_instruction_revision);
-                }
-            }
-        }
-
-        let lazy = journal.version >= durable::LAZY_CHECKPOINT_VERSION;
-        let mut stored = HashMap::new();
-        for agent in &mut agents {
-            if lazy {
-                if let Some(key) = &agent.checkpoint_ref {
-                    stored.insert(
-                        agent.descriptor.id,
-                        durable::JournalCheckpoint::stored(key.clone(), None),
-                    );
-                }
-            } else if let Some(checkpoint) = agent.hydrate(store.as_ref(), root_session_id).await? {
-                stored.insert(agent.descriptor.id, checkpoint);
-            }
-        }
-        let registry = self.shared();
-        let root = root_session_id.to_owned();
-        let records_sessions = store.records_sessions();
-        let (report, restored_sessions, waited, written) = self
-            .state
-            .call(move |state| -> std::io::Result<_> {
-                let root_session_id = root.as_str();
-                let mut report = RestoreReport::default();
-                let mut waited = Vec::new();
-                let mut checkpoints = Vec::new();
-                if state
-                    .scopes
-                    .get(root_session_id)
-                    .is_some_and(|scope| !scope.sessions.is_empty() || !scope.cold.is_empty())
-                {
-                    return Err(std::io::Error::other(
-                        "subagent scope already has live children and cannot be restored",
-                    ));
-                }
-                let lineages = durable::journaled_lineages(root_session_id, &agents);
-                let mut restored_sessions = Vec::with_capacity(agents.len());
-                let mut stubs = cold.iter().flat_map(|(_, _, stubs)| stubs).peekable();
-                for (agent, lineage) in agents.into_iter().zip(lineages) {
-                    let id = agent.descriptor.id;
-                    while let Some(stub) = stubs.next_if(|stub| stub.id < id) {
-                        state.insert_cold(root_session_id, stub)?;
-                        restored_sessions.push(stub.session.clone());
-                        report.restored += 1;
-                    }
-                    let checkpoint = agent.snapshot(&lineage)?;
-                    let (session, resume, lost) = durable::restored_session(agent, checkpoint)?;
-                    if session.conversation
-                        && registry
-                            .as_ref()
-                            .is_some_and(|registry| !registry.records_sessions(root_session_id))
-                    {
-                        session.marks.captured.store(true, Ordering::Release);
-                    }
-                    if session.completion.revision().is_some()
-                        && session.status.wakes_parent()
-                        && !resume
-                    {
-                        report.completed.push(id);
-                    }
-                    match (stored.remove(&id), session.stored_runtime.checkpoint()) {
-                        (Some(checkpoint), _) => checkpoints.push((id, checkpoint)),
-
-                        (None, Some(snapshot)) => {
-                            let checkpoint = durable::JournalCheckpoint::encode(
-                                snapshot.clone(),
-                                records_sessions,
-                            )?;
-                            if let Some(registry) = &registry {
-                                registry.insert_checkpoint(root_session_id, id, checkpoint);
-                            }
-                        }
-                        (None, None) => {}
-                    }
-                    restored_sessions.push(session.descriptor.session_id.clone());
-                    waited.extend(
-                        session
-                            .waited
-                            .iter()
-                            .map(|waited| ((waited.session.clone(), id), waited.mark)),
-                    );
-                    if matches!(session.stored_runtime, StoredRuntime::Unstarted(_)) {
-                        report.unstarted.push(id);
-                    }
-                    let generation = state.insert_restored(root_session_id, session, !resume)?;
-                    if let Some(written) = &mut written
-                        && !resume
-                    {
-                        written.restored(id, generation);
-                    }
-                    report.restored += 1;
-                    if resume {
-                        report.interrupted.push(id);
-                    }
-                    if lost {
-                        report.unrecoverable.push(id);
-                    }
-                }
-                for stub in stubs {
-                    state.insert_cold(root_session_id, stub)?;
-                    restored_sessions.push(stub.session.clone());
-                    report.restored += 1;
-                }
-                let scope = state.scope_mut(root_session_id);
-                scope.messages = messages;
-                for (leaf, stored, stubs) in &cold {
-                    if let Some(pending) = &stored.pending {
-                        report.unstarted.extend(pending.unstarted.iter().copied());
-                    }
-                    scope.insert_cold_leaf(*leaf, stored.clone(), stubs);
-                }
-                report.unstarted.sort_unstable();
-                if let Some(registry) = &registry {
-                    registry.checkpoints.update(|stored| {
-                        for (id, checkpoint) in &checkpoints {
-                            stored.insert((root_session_id.to_owned(), *id), checkpoint.clone());
-                        }
-                    });
-                    if written.is_none() {
-                        registry.checkpoint_changes.update(|changes| {
-                            changes
-                                .entry(root_session_id.to_owned())
-                                .or_default()
-                                .extend(checkpoints.iter().map(|(id, _)| *id));
-                        });
-                    }
-                }
-                Ok((report, restored_sessions, waited, written))
-            })
-            .await?;
-        if let Some(written) = written {
-            self.send_journal(
-                root_session_id,
-                Some(JournalRequest::Stored(Box::new(written))),
-            );
-        }
-        self.roots.update(|roots| {
-            for session_id in &restored_sessions {
-                roots.insert(session_id.clone(), root_session_id.to_owned());
-            }
-        });
-        if !waited.is_empty() {
-            self.wait_reported
-                .update(|reported| reported.extend(waited.iter().cloned()));
-        }
-
-        if !report.interrupted.is_empty() || !report.completed.is_empty() {
-            self.save_scope(root_session_id).await.map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("could not record subagent resume attempts: {error}"),
-                )
-            })?;
-        }
-        if self.manual_resume.load(std::sync::atomic::Ordering::SeqCst) {
-            self.deferred_resume.update(|deferred| {
-                deferred.insert(
-                    root_session_id.to_owned(),
-                    report.interrupted.iter().copied().collect(),
-                );
-            });
-        } else {
-            self.pending_resume.update(|pending| {
-                pending.insert(
-                    root_session_id.to_owned(),
-                    report.interrupted.iter().copied().collect(),
-                );
-            });
-        }
-        self.changed();
-        Ok(report)
+        restore::restore_inner(self, root_session_id).await
     }
 
     async fn save_scope(&self, root_session_id: &str) -> std::io::Result<()> {
-        self.request_journal(root_session_id, true)
-            .instrument(nanocode_trace::info_span!(
-                "subagent.journal.snapshot",
-                session.root_id = root_session_id
-            ))
-            .await
+        journal::save_scope(self, root_session_id).await
     }
 
     async fn save_write(
@@ -5271,102 +4532,11 @@ impl Registry {
         hibernated: Hibernated,
         lock: Turn,
     ) {
-        let finished = hibernated.call.finished();
-        let root = root_session_id.to_owned();
-        let asleep = self
-            .state
-            .call(move |state| {
-                let session = state
-                    .scopes
-                    .get_mut(&root)
-                    .and_then(|scope| scope.sessions.get_mut(&id))?;
-                session.residency = Residency::Evicted;
-                session.stored_runtime = stored;
-                session.hibernated = Some(hibernated);
-                session.hibernations += 1;
-                drop(session.harness_task.take());
-                drop(session.event_task.take());
-                Some((
-                    session.descriptor.session_id.clone(),
-                    session.turn.as_ref().is_some_and(|turn| turn.interrupted),
-                ))
-            })
-            .await;
-        let interrupted = asleep.as_ref().is_some_and(|(_, interrupted)| *interrupted);
-        if let Some((session_id, _)) = asleep {
-            self.session_handles.update(|handles| {
-                handles.remove(&session_id);
-            });
-            if let Some(released) = Option::clone(&self.session_released.get()) {
-                released(&session_id);
-            }
-        }
-        drop(lock);
-        self.changed();
-        let registry = Arc::downgrade(self);
-        let root = root_session_id.to_owned();
-        let capacity = self.capacity.clone();
-        drop(platform::spawn(async move {
-            if !interrupted {
-                finished.await;
-                let granted = capacity.acquire(Waiter::Resident).await;
-                let Some(registry) = registry.upgrade() else {
-                    return;
-                };
-                let scoped = root.clone();
-                registry
-                    .state
-                    .call(move |state| {
-                        if let Some(hibernated) = state
-                            .scopes
-                            .get_mut(&scoped)
-                            .and_then(|scope| scope.sessions.get_mut(&id))
-                            .and_then(|session| session.hibernated.as_mut())
-                        {
-                            hibernated.capacity = Some(granted);
-                        }
-                    })
-                    .await;
-            }
-            if let Some(registry) = registry.upgrade() {
-                Box::pin(registry.wake(&root, id)).await;
-            }
-        }));
+        lifecycle::hibernated(self, root_session_id, id, stored, hibernated, lock).await
     }
 
     async fn wake(self: &Arc<Self>, root_session_id: &str, id: AgentId) {
-        let root = root_session_id.to_owned();
-        let asleep = self
-            .state
-            .call(move |state| {
-                state
-                    .scopes
-                    .get(&root)
-                    .and_then(|scope| scope.sessions.get(&id))
-                    .is_some_and(|session| session.hibernated.is_some())
-            })
-            .await;
-        if !asleep {
-            return;
-        }
-        if let Err(error) = self
-            .rehydrate(root_session_id, id, MessagePurpose::Coordinate)
-            .instrument(nanocode_trace::info_span!(
-                "subagent.wake",
-                session.root_id = root_session_id
-            ))
-            .await
-        {
-            nanocode_trace::warn!(%id, %error, "could not wake a hibernated subagent");
-            let failure = format!("agent {id} could not wake: {error}");
-            self.settle_hibernated(
-                root_session_id,
-                &[id],
-                || NanocodeError::InvalidRequest(failure.clone()),
-                &failure,
-            )
-            .await;
-        }
+        lifecycle::wake(self, root_session_id, id).await
     }
 
     async fn settle_hibernated(
@@ -5642,12 +4812,7 @@ impl Registry {
     }
 
     async fn persist_durably(&self, root_session_id: &str) -> std::io::Result<()> {
-        self.request_journal(root_session_id, false)
-            .instrument(nanocode_trace::info_span!(
-                "subagent.journal.persist",
-                session.root_id = root_session_id
-            ))
-            .await
+        journal::persist_durably(self, root_session_id).await
     }
 
     fn enqueue_status(
@@ -6297,80 +5462,18 @@ impl Registry {
         reasoning_mode: nanocode_agent_core::ReasoningMode,
         schema: String,
     ) -> std::io::Result<()> {
-        let checkpoint = if self.store_for(root_session_id).is_some() {
-            match agent.checkpoint().await {
-                Ok(snapshot) => Some(snapshot),
-                Err(error) => {
-                    let _ = agent.shutdown().await;
-                    return Err(std::io::Error::other(error));
-                }
-            }
-        } else {
-            None
-        };
-        let registry = Arc::clone(self);
-        let root = root_session_id.to_owned();
-        let updates = self.updates.clone();
-        let (start, ready) = oneshot::channel();
-        let attached = self
-            .state
-            .call(move |state| {
-                let Some(session) = state
-                    .scopes
-                    .get_mut(&root)
-                    .and_then(|scope| scope.sessions.get_mut(&id))
-                    .filter(|session| {
-                        matches!(session.status, AgentStatus::Pending)
-                            && matches!(session.stored_runtime, StoredRuntime::Unstarted(_))
-                    })
-                else {
-                    return Err(agent);
-                };
-                session.descriptor.model = model;
-                session.descriptor.thinking = thinking;
-                session.descriptor.reasoning_mode = reasoning_mode;
-                let event_task = forward_events(
-                    root.clone(),
-                    id,
-                    session.descriptor.parent,
-                    events,
-                    ready,
-                    Arc::downgrade(&registry),
-                    updates,
-                );
-                let (harness, harness_task) = harness::spawn(
-                    root.clone(),
-                    id,
-                    session.descriptor.context(),
-                    agent,
-                    registry.capacity.clone(),
-                    Arc::downgrade(&registry),
-                    schema,
-                    None,
-                );
-                if let Some(snapshot) = checkpoint {
-                    registry.record_checkpoint(&root, id, &session.marks, snapshot);
-                }
-                session.residency = Residency::Resident(harness);
-                session.harness_task = Some(harness_task);
-                session.event_task = Some(event_task);
-                session.stored_runtime = StoredRuntime::None;
-                Ok(Arc::clone(&session.marks))
-            })
-            .await;
-        match attached {
-            Ok(marks) => {
-                let _ = start.send((0, marks));
-                self.changed();
-                Ok(())
-            }
-            Err(agent) => {
-                let _ = agent.shutdown().await;
-                Err(std::io::Error::other(format!(
-                    "subagent {id} was stopped before it started"
-                )))
-            }
-        }
+        lifecycle::attach_started(
+            self,
+            root_session_id,
+            id,
+            agent,
+            events,
+            model,
+            thinking,
+            reasoning_mode,
+            schema,
+        )
+        .await
     }
 
     pub(super) async fn fail_unstarted(&self, root_session_id: &str, id: AgentId, error: String) {
@@ -6426,12 +5529,7 @@ impl Registry {
         prompt: String,
         capacity: TurnCapacity,
     ) -> std::io::Result<()> {
-        let root = root_session_id.to_owned();
-        let harness = self
-            .state
-            .call(move |state| state.harness_in_scope(&root, id))
-            .await?;
-        harness.start(prompt, capacity).await
+        lifecycle::launch_initial_turn(self, root_session_id, id, prompt, capacity).await
     }
 
     pub(super) async fn pending_turn(
@@ -6624,123 +5722,7 @@ impl Registry {
         id: AgentId,
         result: AgentResult<TurnResult>,
     ) {
-        let registry = Arc::clone(self);
-        let root = root_session_id.to_owned();
-        let finished = self
-            .state
-            .call(move |state| {
-                let root_session_id = root.as_str();
-                let session = state
-                    .scopes
-                    .get_mut(root_session_id)
-                    .and_then(|scope| scope.sessions.get_mut(&id))?;
-                let turn = session.turn.take()?;
-                let settled = turn.revision;
-                let submitted_output = match turn.stage {
-                    TurnStage::Submitted(output) => Some(output),
-                    TurnStage::Working | TurnStage::Steering => None,
-                };
-                if matches!(result, Err(NanocodeError::TurnStopped))
-                    && submitted_output.is_none()
-                    && !matches!(session.status, AgentStatus::Closing | AgentStatus::Closed)
-                {
-                    return Some((
-                        session.status.clone(),
-                        None,
-                        None,
-                        false,
-                        Arc::clone(&session.marks),
-                    ));
-                }
-
-                session.resume_attempts = 0;
-                session.in_flight_calls = Vec::new();
-                session.in_flight_omitted = 0;
-                session.in_flight_progress = durable::OmittedProgress::default();
-                if let Ok(TurnResult {
-                    usage: Some(usage), ..
-                }) = &result
-                {
-                    session.usage.record(usage);
-                }
-                let follow_up_output = session.follow_up_output.take();
-
-                if let Some(output) = &submitted_output {
-                    session.last_output = Some(output.clone());
-                }
-                if matches!(session.status, AgentStatus::Closing | AgentStatus::Closed) {
-                    session.status.clone()
-                } else {
-                    match result {
-                        Ok(_) => complete_session(session, submitted_output.or(follow_up_output)),
-                        Err(NanocodeError::TurnCancelled | NanocodeError::TurnStopped) => {
-                            AgentStatus::Interrupted
-                        }
-                        Err(error) => match submitted_output {
-                            Some(output) => complete_session(session, Some(output)),
-                            None => AgentStatus::Failed {
-                                error: error.to_string(),
-                            },
-                        },
-                    }
-                }
-                .clone_into(&mut session.status);
-
-                let harness = session
-                    .harness()
-                    .cloned()
-                    .filter(|_| registry.begin_pending_checkpoint(root_session_id));
-                let delivered = session.settled_revision == Some(settled)
-                    && session.completion == Completion::None;
-                session.settled_revision = Some(settled);
-
-                let completion = (session.status.wakes_parent()
-                    && session.descriptor.parent.is_none()
-                    && !delivered)
-                    .then_some(settled);
-                if let Some(revision) = completion {
-                    session.settle_completion(revision);
-                }
-                Some((
-                    session.status.clone(),
-                    completion,
-                    harness,
-                    true,
-                    Arc::clone(&session.marks),
-                ))
-            })
-            .await;
-        let Some((status, completion, harness, settled, lane)) = finished else {
-            return;
-        };
-        self.enqueue_status(
-            root_session_id,
-            id,
-            lane,
-            OrderedJob::Settle {
-                status,
-                completion,
-                harness,
-            },
-        );
-        self.changed();
-        if !settled {
-            return;
-        }
-        let registry = Arc::clone(self);
-        let root_session_id = root_session_id.to_owned();
-        let locks = registry.scope_locks(&root_session_id);
-        if !locks.evicting.start() {
-            return;
-        }
-        drop(platform::spawn(async move {
-            loop {
-                registry.enforce_resident_limit(&root_session_id).await;
-                if locks.evicting.finish() {
-                    break;
-                }
-            }
-        }));
+        lifecycle::harness_turn_finished(self, root_session_id, id, result).await
     }
 
     async fn enforce_resident_limit(self: &Arc<Self>, root_session_id: &str) {
@@ -6777,93 +5759,7 @@ impl Registry {
     }
 
     async fn evict(&self, root_session_id: &str, eviction: ResidentEviction) -> bool {
-        let ResidentEviction {
-            id,
-            harness,
-            marks,
-            _lock,
-        } = eviction;
-        let snapshot = if self.store_for(root_session_id).is_some()
-            && self.journal_holds_conversation(root_session_id, &marks)
-        {
-            Ok(None)
-        } else {
-            harness.snapshot().await.map(Some)
-        };
-        match snapshot {
-            Ok(snapshot) => {
-                let stored = match snapshot {
-                    None => None,
-                    Some(snapshot)
-                        if self.store_for(root_session_id).is_some()
-                            && self.record_checkpoint(
-                                root_session_id,
-                                id,
-                                &marks,
-                                snapshot.clone(),
-                            ) =>
-                    {
-                        None
-                    }
-                    Some(snapshot) => Some(snapshot),
-                };
-                let root = root_session_id.to_owned();
-                self.state
-                    .call(move |state| {
-                        if let Some(session) = state
-                            .scopes
-                            .get_mut(&root)
-                            .and_then(|scope| scope.sessions.get_mut(&id))
-                        {
-                            session.stored_runtime = stored
-                                .map_or(StoredRuntime::Journaled, |stored| {
-                                    StoredRuntime::Checkpoint(Box::new(stored))
-                                });
-                        }
-                    })
-                    .await;
-            }
-            Err(_) => {
-                let root = root_session_id.to_owned();
-                self.state
-                    .call(move |state| {
-                        if let Some(session) = state
-                            .scopes
-                            .get_mut(&root)
-                            .and_then(|scope| scope.sessions.get_mut(&id))
-                        {
-                            session.residency = Residency::Resident(harness);
-                        }
-                    })
-                    .await;
-                return false;
-            }
-        }
-        self.changed();
-        if harness.close().await.is_err() {
-            self.harness_closed(root_session_id, id).await;
-        }
-
-        let root = root_session_id.to_owned();
-        let tasks = self
-            .state
-            .call(move |state| {
-                let session = state
-                    .scopes
-                    .get_mut(&root)
-                    .and_then(|scope| scope.sessions.get_mut(&id));
-                session.map(|session| (session.harness_task.take(), session.event_task.take()))
-            })
-            .await;
-        if let Some((harness_task, event_task)) = tasks {
-            if let Some(task) = harness_task {
-                let _ = task.await;
-            }
-            if let Some(task) = event_task {
-                let _ = task.await;
-            }
-        }
-        true
+        lifecycle::evict(self, root_session_id, eviction).await
     }
 
     pub(super) async fn harness_closed(&self, root_session_id: &str, id: AgentId) {
@@ -7095,105 +5991,9 @@ impl Registry {
         self: &Arc<Self>,
         parent: &Agent,
         root_session_id: &str,
-        mut completions: Vec<(AgentId, u64)>,
+        completions: Vec<(AgentId, u64)>,
     ) -> std::io::Result<Vec<Arc<Signal>>> {
-        completions.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
-        completions.dedup_by_key(|(id, _)| *id);
-        if let [(id, revision)] = completions[..] {
-            let result = self
-                .dispatch_parent(parent, root_session_id, id, revision)
-                .await;
-            self.release_dispatch(root_session_id, &[id]);
-            return result.map(|routed| match routed {
-                Routed::Steered(injected) => vec![injected],
-                Routed::Skipped | Routed::Started => Vec::new(),
-            });
-        }
-        let _warm = self
-            .warm(
-                root_session_id,
-                completions.iter().map(|(id, _)| *id).collect(),
-            )
-            .await?;
-        let mut dispatches = Vec::with_capacity(completions.len());
-        for &(id, _) in &completions {
-            let dispatch = self.completion_dispatch.update(|dispatch| {
-                dispatch
-                    .entry((root_session_id.to_owned(), id))
-                    .or_default()
-                    .clone()
-            });
-            dispatches.push(dispatch.enter().await);
-        }
-        let mut ready = Vec::new();
-        let mut parked_any = false;
-        for (id, revision) in completions {
-            let key = (root_session_id.to_owned(), id);
-            if self
-                .completion_routes
-                .read(|routes| routes.get(&key) == Some(&revision))
-            {
-                continue;
-            }
-            let Some((_, _, _, parked)) = self.peek_completion(root_session_id, id, revision).await
-            else {
-                continue;
-            };
-            if parked
-                || self
-                    .park_completion(root_session_id, id, revision, false)
-                    .await
-            {
-                self.watch_root(root_session_id, parent);
-                parked_any |= !parked;
-                continue;
-            }
-            ready.push((id, revision));
-        }
-        if self.store_for(root_session_id).is_some()
-            && (parked_any || !ready.is_empty())
-            && let Err(error) = self.persist_durably(root_session_id).await
-        {
-            for &(id, revision) in &ready {
-                self.retry_completion(root_session_id, id, revision);
-            }
-            return Err(error);
-        }
-        let mut groups = Vec::<(
-            Option<Arc<str>>,
-            Vec<(AgentId, u64, AgentStatus, String, u32)>,
-        )>::new();
-        for (id, revision) in ready {
-            let Some((status, session_id, attempt, _)) =
-                self.peek_completion(root_session_id, id, revision).await
-            else {
-                continue;
-            };
-            let started = parent
-                .unfinished_request(&completion_request_id(&session_id, revision, attempt))
-                .await;
-            if !matches!(started, Ok(false)) {
-                groups.push((None, vec![(id, revision, status, session_id, attempt)]));
-                continue;
-            }
-            let host_context = self.host_context(root_session_id, id).await;
-            match groups
-                .iter_mut()
-                .find(|(context, _)| *context == host_context)
-            {
-                Some((_, group)) => group.push((id, revision, status, session_id, attempt)),
-                None => groups.push((
-                    host_context,
-                    vec![(id, revision, status, session_id, attempt)],
-                )),
-            }
-        }
-        let mut steered = Vec::new();
-        for (_, group) in groups {
-            steered.extend(self.route_completions(parent, root_session_id, group).await);
-        }
-        drop(dispatches);
-        Ok(steered)
+        delivery::dispatch_parent_batch(self, parent, root_session_id, completions).await
     }
 
     fn watch_steer(
@@ -7253,97 +6053,7 @@ impl Registry {
         root_session_id: &str,
         group: Vec<(AgentId, u64, AgentStatus, String, u32)>,
     ) -> Option<Arc<Signal>> {
-        let group = group
-            .into_iter()
-            .filter(|(id, revision, _, _, _)| self.claim_route(root_session_id, *id, *revision))
-            .collect::<Vec<_>>();
-        let (_, first_revision, _, first_session, _) = group.first()?;
-        let request_id = if let [(_, revision, _, session_id, attempt)] = &group[..] {
-            completion_request_id(session_id, *revision, *attempt)
-        } else {
-            let members = group
-                .iter()
-                .map(|(_, revision, _, session_id, attempt)| {
-                    format!("{session_id}:{revision}:{attempt}")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "{}{first_session}:{first_revision}:batch-{}",
-                crate::COMPLETION_REQUEST_PREFIX,
-                durable::checkpoint_key(&members)
-            )
-        };
-        let prompt = if let [(id, _, status, _, _)] = &group[..] {
-            completion_continuation_prompt(*id, status)
-        } else {
-            completion_batch_prompt(
-                &group
-                    .iter()
-                    .map(|(id, _, status, _, _)| (*id, status))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let (steered, injected) = self.watch_steer(root_session_id, parent, &request_id, &prompt);
-        match parent
-            .route_prompt_request(
-                nanocode_agent_core::PromptRequest::new(prompt.clone())
-                    .request_id(request_id.clone()),
-            )
-            .await
-        {
-            Ok(route) => {
-                for (id, revision, status, _, _) in &group {
-                    let key = (root_session_id.to_owned(), *id);
-                    self.wait_reported.update(|reported| {
-                        reported.insert(key.clone(), wait_mark(status, *revision));
-                    });
-                    self.completion_routes.update(|routes| {
-                        routes.insert(key.clone(), *revision);
-                    });
-                }
-                let routed = match route {
-                    PromptRoute::Started(_) => None,
-                    PromptRoute::Steered => Some(Arc::clone(&injected)),
-                };
-                let registry = Arc::downgrade(self);
-                let parent = parent.downgrade();
-                let root_session_id = root_session_id.to_owned();
-                drop(platform::spawn(async move {
-                    let outcome =
-                        NoticeOutcome::of_route(route, steered, &parent, request_id, prompt).await;
-                    injected.fire();
-                    let Some(registry) = registry.upgrade() else {
-                        return;
-                    };
-                    for (id, revision, _, _, _) in group {
-                        registry
-                            .settle_notice(&root_session_id, id, revision, outcome, &parent)
-                            .await;
-                    }
-                }));
-                routed
-            }
-            Err(error) => {
-                for (id, revision, _, _, _) in &group {
-                    self.release_route(root_session_id, *id, *revision);
-                }
-                if !matches!(
-                    error,
-                    NanocodeError::AgentStopped | NanocodeError::TurnStopped
-                ) {
-                    for (id, revision, _, _, _) in group {
-                        if matches!(error, NanocodeError::InvalidRequest(_)) {
-                            self.next_completion_attempt(root_session_id, id, revision)
-                                .await;
-                        }
-                        self.retry_completion(root_session_id, id, revision);
-                    }
-                }
-                nanocode_trace::warn!(%error, "subagent completions did not continue their parent");
-                None
-            }
-        }
+        delivery::route_completions(self, parent, root_session_id, group).await
     }
 
     pub async fn continue_parent(
@@ -7367,109 +6077,7 @@ impl Registry {
         id: AgentId,
         revision: u64,
     ) -> std::io::Result<Routed> {
-        if parent.session_id() != root_session_id {
-            return Err(std::io::Error::other(
-                "subagent completion parent is not the root session",
-            ));
-        }
-        let _warm = self.warm(root_session_id, vec![id]).await?;
-        let dispatch = self.completion_dispatch.update(|dispatch| {
-            dispatch
-                .entry((root_session_id.to_owned(), id))
-                .or_default()
-                .clone()
-        });
-        let _dispatch = dispatch.enter().await;
-        let key = (root_session_id.to_owned(), id);
-        if self
-            .completion_routes
-            .read(|routes| routes.get(&key) == Some(&revision))
-        {
-            return Ok(Routed::Skipped);
-        }
-        let Some((_, _, _, parked)) = self.peek_completion(root_session_id, id, revision).await
-        else {
-            return Ok(Routed::Skipped);
-        };
-        if parked
-            || self
-                .park_completion(root_session_id, id, revision, false)
-                .await
-        {
-            self.watch_root(root_session_id, parent);
-            if !parked && self.store_for(root_session_id).is_some() {
-                self.persist_durably(root_session_id).await?;
-            }
-            return Ok(Routed::Skipped);
-        }
-        if self.store_for(root_session_id).is_some()
-            && let Err(error) = self.persist_durably(root_session_id).await
-        {
-            self.retry_completion(root_session_id, id, revision);
-            return Err(error);
-        }
-        let Some((status, session_id, attempt, _)) =
-            self.peek_completion(root_session_id, id, revision).await
-        else {
-            return Ok(Routed::Skipped);
-        };
-        let request_id = completion_request_id(&session_id, revision, attempt);
-        if !self.claim_route(root_session_id, id, revision) {
-            return Ok(Routed::Skipped);
-        }
-        let prompt = completion_continuation_prompt(id, &status);
-        let (steered, injected) = self.watch_steer(root_session_id, parent, &request_id, &prompt);
-        match parent
-            .route_prompt_request(
-                nanocode_agent_core::PromptRequest::new(prompt.clone())
-                    .request_id(request_id.clone()),
-            )
-            .await
-        {
-            Ok(route) => {
-                self.wait_reported.update(|reported| {
-                    reported.insert(
-                        (root_session_id.to_owned(), id),
-                        wait_mark(&status, revision),
-                    );
-                });
-                self.completion_routes.update(|routes| {
-                    routes.insert(key.clone(), revision);
-                });
-                let routed = match route {
-                    PromptRoute::Started(_) => Routed::Started,
-                    PromptRoute::Steered => Routed::Steered(Arc::clone(&injected)),
-                };
-                let registry = Arc::downgrade(self);
-                let parent = parent.downgrade();
-                drop(platform::spawn(async move {
-                    let outcome =
-                        NoticeOutcome::of_route(route, steered, &parent, request_id, prompt).await;
-                    injected.fire();
-                    let Some(registry) = registry.upgrade() else {
-                        return;
-                    };
-                    registry
-                        .settle_notice(&key.0, id, revision, outcome, &parent)
-                        .await;
-                }));
-                Ok(routed)
-            }
-            Err(error) => {
-                self.release_route(root_session_id, id, revision);
-                if matches!(error, NanocodeError::InvalidRequest(_)) {
-                    self.next_completion_attempt(root_session_id, id, revision)
-                        .await;
-                }
-                if !matches!(
-                    error,
-                    NanocodeError::AgentStopped | NanocodeError::TurnStopped
-                ) {
-                    self.retry_completion(root_session_id, id, revision);
-                }
-                Err(std::io::Error::other(error))
-            }
-        }
+        delivery::dispatch_parent(self, parent, root_session_id, id, revision).await
     }
 
     async fn peek_completion(
@@ -7905,96 +6513,7 @@ impl Registry {
         ids: &[AgentId],
         call_id: &str,
     ) -> Option<Arc<dyn ToolReceipt>> {
-        let resolver = Option::clone(&self.parent_resolver.get());
-        let Some(parent) = resolver.and_then(|resolver| resolver(root_session_id)) else {
-            self.acknowledge_observed(root_session_id, ids).await;
-            return None;
-        };
-        let root = root_session_id.to_owned();
-        let wanted = ids.to_vec();
-        let pending = self
-            .state
-            .call(move |state| {
-                let scope = state.scopes.get(&root)?;
-                Some(
-                    wanted
-                        .iter()
-                        .filter_map(|id| {
-                            let session = scope.sessions.get(id)?;
-                            let revision = session.completion.revision()?;
-                            session.status.wakes_parent().then_some((*id, revision))
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .await?;
-        let (claimed, routed) = self.completion_routes.update(|routes| {
-            let mut claimed = Vec::new();
-            let mut routed = Vec::new();
-            for &(id, revision) in &pending {
-                let key = (root_session_id.to_owned(), id);
-                match routes.get(&key) {
-                    None => {
-                        routes.insert(key, revision);
-                        claimed.push((id, revision));
-                    }
-                    Some(&held) if held == revision => routed.push(key),
-                    Some(_) => {}
-                }
-            }
-            (claimed, routed)
-        });
-        let receipt = Arc::new(ResultReceipt {
-            carrier: Atom::new(Some(Arc::from(call_id))),
-        });
-        let joined = self.result_readers.read(|readers| {
-            routed
-                .iter()
-                .filter_map(|key| readers.get(key))
-                .map(|readers| readers.update(|readers| readers.push(Arc::clone(&receipt))))
-                .count()
-        });
-        if claimed.is_empty() {
-            return (joined > 0).then_some(receipt as Arc<dyn ToolReceipt>);
-        }
-        let watched = claimed
-            .into_iter()
-            .map(|claim| (claim, parent.subscribe()))
-            .collect::<Vec<_>>();
-        let running = self
-            .running_roots
-            .read(|running| running.contains(root_session_id));
-        for ((id, revision), events) in watched {
-            let key = (root_session_id.to_owned(), id);
-            let readers: Readers = Arc::new(Atom::new(vec![Arc::clone(&receipt)]));
-            self.result_readers.update(|all| {
-                all.insert(key.clone(), Arc::clone(&readers));
-            });
-            let registry = Arc::downgrade(self);
-            let parent = parent.downgrade();
-            drop(platform::spawn(async move {
-                let outcome = if running {
-                    NoticeOutcome::of_tool_output(events, &readers).await
-                } else {
-                    NoticeOutcome::Undelivered
-                };
-                let Some(registry) = registry.upgrade() else {
-                    return;
-                };
-                registry.result_readers.update(|all| {
-                    if all
-                        .get(&key)
-                        .is_some_and(|current| Arc::ptr_eq(current, &readers))
-                    {
-                        all.remove(&key);
-                    }
-                });
-                registry
-                    .settle_notice(&key.0, id, revision, outcome, &parent)
-                    .await;
-            }));
-        }
-        Some(receipt)
+        delivery::observe_completions(self, root_session_id, ids, call_id).await
     }
 
     pub(crate) async fn observe_listed(
@@ -8250,94 +6769,7 @@ impl Registry {
         to: AgentId,
         purpose: MessagePurpose,
     ) -> std::io::Result<Turn> {
-        let _warm = self.warm(&self.root_of(session_id), vec![to]).await?;
-        let session = session_id.to_owned();
-        if let Some((root, lane)) = self
-            .state
-            .call(move |state| state.release_unstarted(&session, to))
-            .await
-        {
-            self.enqueue_status(&root, to, lane, OrderedJob::Status(AgentStatus::Pending));
-            let turn = self.capacity.acquire(Waiter::Spawn).await;
-            Box::pin(super::tools::start_unstarted(self, &root, to, turn)).await;
-        }
-        let session = session_id.to_owned();
-        let (root, target) = self
-            .state
-            .call(move |state| -> std::io::Result<_> {
-                let session_id = session.as_str();
-                let root = state.root_session_id(session_id).to_owned();
-                let scope = state
-                    .scopes
-                    .get(&root)
-                    .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {to}")))?;
-                if scope.topology.agent_for_session(session_id) == Some(to) {
-                    return Err(std::io::Error::other("agents cannot message themselves"));
-                }
-                if purpose == MessagePurpose::Delegate {
-                    scope.topology.authorize(session_id, to)?;
-                }
-                let target = scope
-                    .sessions
-                    .get(&to)
-                    .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {to}")))?
-                    .residency_lock
-                    .clone();
-                Ok((root, target))
-            })
-            .await?;
-        let guard = target.enter().await;
-        let hibernates = self.hibernates();
-        let mut ancestors = HashMap::new();
-        let mut missing = loop {
-            let held = ancestors.keys().copied().collect::<HashSet<_>>();
-            let scoped = root.clone();
-            let (missing, locks) =
-                self.state
-                    .call(move |state| -> std::io::Result<_> {
-                        let root = scoped;
-                        let scope = state.scopes.get(&root).ok_or_else(|| {
-                            std::io::Error::other(format!("unknown agent_id {to}"))
-                        })?;
-                        let missing = Self::missing_runtimes(scope, &root, to)?;
-                        let parents = std::iter::successors(
-                            scope
-                                .sessions
-                                .get(&to)
-                                .and_then(|session| session.descriptor.parent),
-                            |id| {
-                                scope
-                                    .sessions
-                                    .get(id)
-                                    .and_then(|session| session.descriptor.parent)
-                            },
-                        )
-                        .filter(|_| hibernates);
-                        let locks = missing
-                            .iter()
-                            .map(|(id, ..)| *id)
-                            .filter(|id| *id != to)
-                            .chain(parents)
-                            .filter(|id| !held.contains(id))
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .filter_map(|id| {
-                                Some((id, scope.sessions.get(&id)?.residency_lock.clone()))
-                            })
-                            .collect::<Vec<_>>();
-                        Ok((missing, locks))
-                    })
-                    .await?;
-            if locks.is_empty() {
-                break missing;
-            }
-            for (id, lock) in locks {
-                ancestors.insert(id, lock.enter().await);
-            }
-        };
-        self.restore_missing(&root, &mut missing).await?;
-        drop(ancestors);
-        Ok(guard)
+        restore::rehydrate(self, session_id, to, purpose).await
     }
 
     fn missing_runtimes(
@@ -8396,115 +6828,7 @@ impl Registry {
         root: &str,
         missing: &mut Vec<MissingRuntime>,
     ) -> std::io::Result<()> {
-        let root = root.to_owned();
-        while let Some((
-            id,
-            parent_id,
-            parent_session,
-            snapshot,
-            host_context,
-            schema,
-            task,
-            budget,
-            conversation,
-        )) = missing.pop()
-        {
-            let snapshot = match snapshot {
-                Some(snapshot) => snapshot,
-                None => self.journal_snapshot(&root, id).await?,
-            };
-            let parent = self
-                .session_handles
-                .read(|handles| handles.get(&parent_session).cloned())
-                .ok_or_else(|| {
-                    std::io::Error::other("subagent parent runtime is unavailable for rehydration")
-                })?;
-            let contract = OutputContract::compile(&schema)?;
-            let needs_assignment = !snapshot.has_conversation() && !conversation;
-            let context = super::model::AgentContext {
-                model: snapshot.model(),
-                thinking: snapshot.thinking(),
-                reasoning_mode: snapshot.reasoning_mode(),
-            };
-            let (agent, events) = parent
-                .restore_runtime(snapshot, host_context)
-                .await
-                .map_err(std::io::Error::other)?;
-            let (start, ready) = oneshot::channel();
-            let event_task = forward_events(
-                root.clone(),
-                id,
-                parent_id,
-                events,
-                ready,
-                Arc::downgrade(self),
-                self.updates.clone(),
-            );
-            let (harness, task) = harness::spawn(
-                root.clone(),
-                id,
-                Some(context.clone()),
-                agent,
-                self.capacity.clone(),
-                Arc::downgrade(self),
-                contract.schema,
-                needs_assignment.then(|| super::model::agent_prompt(id, &task, budget)),
-            );
-            let resident = harness.clone();
-            let scoped = root.clone();
-            let installed = self
-                .state
-                .call(move |state| {
-                    let session = state
-                        .scopes
-                        .get_mut(&scoped)
-                        .expect("locked scope")
-                        .sessions
-                        .get_mut(&id)
-                        .expect("retained child");
-                    if matches!(session.status, AgentStatus::Closing | AgentStatus::Closed) {
-                        return None;
-                    }
-                    session.descriptor.model = Some(context.model);
-                    session.descriptor.thinking = Some(context.thinking);
-                    session.descriptor.reasoning_mode = context.reasoning_mode;
-                    session.residency = Residency::Resident(resident);
-                    session.harness_task = Some(task);
-                    session.event_task = Some(event_task);
-
-                    Some((
-                        std::mem::take(&mut session.announce).then(|| {
-                            let mut descriptor = session.descriptor.clone();
-                            descriptor.task = session.binding_task.clone();
-                            descriptor
-                        }),
-                        session.hibernated.take(),
-                        session.hibernations,
-                        session.turn.as_ref().is_some_and(|turn| turn.interrupted),
-                        Arc::clone(&session.marks),
-                    ))
-                })
-                .await;
-            let Some((announce, hibernated, hibernations, interrupted, marks)) = installed else {
-                drop(start);
-                if let Err(error) = harness.close().await {
-                    nanocode_trace::debug!(%id, %error, "a restored subagent that began closing did not shut down");
-                }
-                return Ok(());
-            };
-            if let Some(descriptor) = announce {
-                self.send(&root, AgentUpdate::Added(descriptor));
-            }
-            let _ = start.send((hibernations, marks));
-            if let Some(mut hibernated) = hibernated {
-                let capacity = hibernated
-                    .capacity
-                    .take()
-                    .unwrap_or_else(|| self.capacity.overdraw());
-                harness.resume(hibernated, capacity, interrupted).await?;
-            }
-        }
-        Ok(())
+        restore::restore_missing(self, root, missing).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8618,44 +6942,18 @@ impl Registry {
         body: String,
         user: bool,
     ) -> std::io::Result<MessageReceipt> {
-        let target = self.rehydrate(session_id, to, purpose).await?;
-        let session = session_id.to_owned();
-        let call = call_id.map(str::to_owned);
-        let (prepared, delivery) = self
-            .when_messages_flow(session_id, move |state| -> std::io::Result<_> {
-                let prepared = state.prepare_message(
-                    &session,
-                    to,
-                    priority,
-                    purpose,
-                    in_reply_to,
-                    body,
-                    user,
-                )?;
-                let delivery = prepared
-                    .harness
-                    .enqueue_delivery(prepared.message.clone())?;
-                state.commit_message(&prepared.root_session_id, prepared.message.clone())?;
-                if let Some(call) = &call {
-                    state.record_sent(
-                        &prepared.root_session_id,
-                        &session,
-                        call,
-                        prepared.message.id,
-                    );
-                }
-                Ok((prepared, delivery))
-            })
-            .await??;
-        drop(target);
-        let registry = Arc::clone(self);
-        let settled = platform::spawn(
-            async move { registry.settle_delivery(prepared, delivery).await }.in_current_span(),
-        );
-        match settled.await {
-            Ok(receipt) => receipt,
-            Err(error) => Err(std::io::Error::other(error.to_string())),
-        }
+        delivery::deliver_message(
+            self,
+            session_id,
+            call_id,
+            to,
+            priority,
+            purpose,
+            in_reply_to,
+            body,
+            user,
+        )
+        .await
     }
 
     async fn settle_delivery(
@@ -8871,27 +7169,7 @@ impl Registry {
         message_id: MessageId,
         delivery: MessageDeliveryState,
     ) {
-        let Some(registry) = self.shared() else {
-            return;
-        };
-        let root = root_session_id.to_owned();
-        self.state
-            .call(move |state| {
-                let Some(thread) = state.thread_for_message(&root, message_id) else {
-                    return;
-                };
-                registry.send(
-                    &root,
-                    AgentUpdate::Message(AgentMessageUpdate {
-                        message_id,
-                        thread,
-                        delivery,
-                    }),
-                );
-                registry.changed();
-                state.mark_message_terminal(&root, message_id);
-            })
-            .await;
+        delivery::publish_message_state(self, root_session_id, message_id, delivery).await
     }
 
     pub async fn wait(
@@ -9200,82 +7478,11 @@ impl Registry {
     }
 
     pub async fn close(&self, session_id: &str, id: AgentId) -> std::io::Result<Vec<AgentSummary>> {
-        self.await_restored(session_id).await?;
-        let _warm = self.warm_subtree(session_id, id).await?;
-        let locks = self.session_locks(session_id).await;
-        let _closing = locks.closing.enter().await;
-        let _paused = self.pause_messages(session_id).await;
-        let CloseRequest {
-            root_session_id,
-            ids,
-            harnesses,
-            status_updates,
-        } = {
-            let session = session_id.to_owned();
-            self.state
-                .call(move |state| state.request_close(&session, id))
-                .await?
-        };
-        for (id, status, lane) in status_updates {
-            self.enqueue_status(&root_session_id, id, lane, OrderedJob::Status(status));
-        }
-        self.changed();
-        let summaries = self
-            .stop_and_close(root_session_id.clone(), ids, harnesses, false)
-            .await?;
-        let root = root_session_id.clone();
-        let frozen = self
-            .state
-            .call(move |state| {
-                state
-                    .scopes
-                    .get(&root)
-                    .is_some_and(|scope| scope.life.frozen())
-            })
-            .await;
-        if self.store_for(&root_session_id).is_some() && !frozen {
-            self.persist_durably(&root_session_id)
-                .await
-                .map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("agent {id} closed, but its closure is not durable yet: {error}"),
-                    )
-                })?;
-        }
-        Ok(summaries)
+        lifecycle::close(self, session_id, id).await
     }
 
     async fn close_batch(&self, root_session_id: &str, ids: Vec<AgentId>) -> std::io::Result<()> {
-        let root = root_session_id.to_owned();
-        if self
-            .state
-            .call(move |state| {
-                state
-                    .scopes
-                    .get(&root)
-                    .is_some_and(|scope| scope.life.closing())
-            })
-            .await
-        {
-            return Ok(());
-        }
-        let mut errors = Vec::new();
-        for id in ids.into_iter().rev() {
-            if let Err(error) = self.close(root_session_id, id).await {
-                errors.push(format!("subagent {id}: {error}"));
-            }
-        }
-        if self.store_for(root_session_id).is_some()
-            && let Err(error) = self.persist_durably(root_session_id).await
-        {
-            errors.push(format!("persisting startup cleanup: {error}"));
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(errors.join("; ")))
-        }
+        lifecycle::close_batch(self, root_session_id, ids).await
     }
 
     async fn close_all(&self, session_id: &str) -> std::io::Result<Vec<AgentSummary>> {
@@ -9451,91 +7658,7 @@ impl Registry {
         harnesses: Vec<HarnessHandle>,
         detach: bool,
     ) -> std::io::Result<Vec<AgentSummary>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let deadline = nanocode_platform::now() + AGENT_STOP_TIMEOUT;
-        let closing_result = self.close_harnesses(harnesses, deadline).await;
-        if let Some(registry) = self.shared() {
-            registry
-                .settle_hibernated(
-                    &root_session_id,
-                    &ids,
-                    || NanocodeError::TurnStopped,
-                    "message cancelled because the agent closed",
-                )
-                .await;
-        }
-        self.wait_until_inactive(&root_session_id, &ids, deadline)
-            .await?;
-
-        drop(closing_result);
-        let (
-            ClosedSessions {
-                summaries,
-                harness_tasks,
-                event_tasks,
-            },
-            released,
-        ) = {
-            let root = root_session_id.clone();
-            let closing = ids.clone();
-            self.state
-                .call(move |state| {
-                    let closed = state.finish_close(&root, &closing)?;
-                    let released = state
-                        .scopes
-                        .get(&root)
-                        .is_some_and(|scope| scope.life.released());
-                    Ok::<_, std::io::Error>((closed, released))
-                })
-                .await?
-        };
-        for summary in summaries.iter().filter(|_| !released) {
-            let _ = send_update(
-                &self.updates,
-                &root_session_id,
-                AgentUpdate::Status {
-                    id: summary.agent_id,
-                    status: AgentStatus::Closed,
-                },
-                detach,
-            );
-        }
-        let closed_sessions = {
-            let root = root_session_id.clone();
-            let closing = ids.clone();
-            self.state
-                .call(move |state| {
-                    state
-                        .scopes
-                        .get(&root)
-                        .map(|scope| {
-                            closing
-                                .iter()
-                                .filter_map(|id| {
-                                    scope
-                                        .sessions
-                                        .get(id)
-                                        .map(|session| session.descriptor.session_id.clone())
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .await
-        };
-        self.session_handles.update(|handles| {
-            for session in &closed_sessions {
-                handles.remove(session);
-            }
-        });
-        self.changed();
-        self.wait_for_tasks(harness_tasks, deadline, "subagent harnesses")
-            .await?;
-        self.wait_for_tasks(event_tasks, deadline, "subagent event streams")
-            .await?;
-        Ok(summaries)
+        lifecycle::stop_and_close(self, root_session_id, ids, harnesses, detach).await
     }
 
     async fn cancel_all(&self, session_id: &str) {
@@ -9974,11 +8097,11 @@ impl SubagentControl {
     }
 
     pub async fn cancel_all(&self, root_session_id: &str) {
-        self.registry.cancel_all(root_session_id).await;
+        lifecycle::cancel_all(self, root_session_id).await
     }
 
     pub async fn close_all(&self, root_session_id: &str) -> std::io::Result<()> {
-        self.registry.close_all(root_session_id).await.map(drop)
+        lifecycle::close_all(self, root_session_id).await
     }
 
     pub fn set_manual_resume(&self, manual: bool) {
@@ -10002,88 +8125,18 @@ impl SubagentControl {
     }
 
     pub async fn deferred_resume(&self, root_session_id: &str) -> std::io::Result<Vec<AgentId>> {
-        self.registry.await_restored(root_session_id).await?;
-        Ok(self
-            .registry
-            .deferred_resume
-            .read(|deferred| {
-                deferred
-                    .get(root_session_id)
-                    .map(|ids| ids.iter().copied().collect())
-            })
-            .unwrap_or_default())
+        lifecycle::deferred_resume(self, root_session_id).await
     }
 
     pub async fn resume_restored(
         &self,
         root_session_id: &str,
     ) -> std::io::Result<Vec<(AgentId, std::io::Result<MessageReceipt>)>> {
-        self.registry.await_restored(root_session_id).await?;
-        let mut ids = Vec::new();
-        self.registry.deferred_resume.update(|deferred| {
-            ids = deferred
-                .remove(root_session_id)
-                .map(|ids| ids.into_iter().collect())
-                .unwrap_or_default();
-        });
-        let work = self.registry.take_deferred_work(root_session_id);
-        let results = if ids.is_empty() {
-            Vec::new()
-        } else {
-            self.registry.pending_resume.update(|pending| {
-                pending
-                    .entry(root_session_id.to_owned())
-                    .or_default()
-                    .extend(ids.iter().copied());
-            });
-            self.registry.changed();
-            self.registry.resume_interrupted(root_session_id).await
-        };
-        if let Some(work) = work {
-            self.registry
-                .start_restored_work(root_session_id, work)
-                .await;
-        }
-        Ok(results)
+        lifecycle::resume_restored(self, root_session_id).await
     }
 
     pub async fn discard_restored(&self, root_session_id: &str) -> std::io::Result<()> {
-        self.registry.await_restored(root_session_id).await?;
-        let mut ids = std::collections::BTreeSet::new();
-        self.registry.deferred_resume.update(|deferred| {
-            ids = deferred
-                .remove(root_session_id)
-                .map(|ids| ids.into_iter().collect())
-                .unwrap_or_default();
-        });
-        let messages = match self.registry.take_deferred_work(root_session_id) {
-            Some(work) => {
-                ids.extend(work.unstarted);
-                ids.extend(work.messages.iter().map(|message| message.to));
-                work.messages
-            }
-            None => Vec::new(),
-        };
-        let closed = if ids.is_empty() {
-            Ok(())
-        } else {
-            self.registry
-                .close_batch(root_session_id, ids.into_iter().collect())
-                .await
-        };
-        for message in messages {
-            self.registry
-                .message_failed(
-                    root_session_id,
-                    message.id,
-                    format!(
-                        "message {} was discarded with restored agent {}",
-                        message.id, message.to
-                    ),
-                )
-                .await;
-        }
-        closed
+        lifecycle::discard_restored(self, root_session_id).await
     }
 
     pub fn runtime_id(&self) -> SubagentRuntimeId {
@@ -10091,61 +8144,64 @@ impl SubagentControl {
     }
 }
 
-async fn continue_root(
+#[inline(never)]
+fn continue_root<'a>(
     registry: Arc<Registry>,
     resolver: ParentResolver,
     root_session_id: String,
     mut completions: mpsc::UnboundedReceiver<(AgentId, u64)>,
-) {
-    while let Some(first) = completions.recv().await {
-        let mut batch = vec![first];
-        loop {
-            while let Ok(completion) = completions.try_recv() {
-                batch.push(completion);
+) -> RegistryFuture<'a, ()> {
+    Box::pin(async move {
+        while let Some(first) = completions.recv().await {
+            let mut batch = vec![first];
+            loop {
+                while let Ok(completion) = completions.try_recv() {
+                    batch.push(completion);
+                }
+                let Some(deadline) = registry.completion_deadline(&root_session_id).await else {
+                    break;
+                };
+                nanocode_sync::select! {
+                    completion = completions.recv() => match completion {
+                        Some(completion) => batch.push(completion),
+                        None => break,
+                    },
+                    () = platform::sleep(deadline.saturating_duration_since(nanocode_platform::now())) => {}
+                }
             }
-            let Some(deadline) = registry.completion_deadline(&root_session_id).await else {
-                break;
-            };
-            nanocode_sync::select! {
-                completion = completions.recv() => match completion {
-                    Some(completion) => batch.push(completion),
-                    None => break,
-                },
-                () = platform::sleep(deadline.saturating_duration_since(nanocode_platform::now())) => {}
-            }
-        }
-        match resolver(&root_session_id) {
-            Some(parent) => {
-                match registry
-                    .continue_parent_batch(&parent, &root_session_id, batch)
-                    .await
-                {
-                    Ok(steered) => {
-                        drop(parent);
-                        registry.record_completion_wake(&root_session_id).await;
-                        for injected in steered {
-                            injected.wait().await;
+            match resolver(&root_session_id) {
+                Some(parent) => {
+                    match registry
+                        .continue_parent_batch(&parent, &root_session_id, batch)
+                        .await
+                    {
+                        Ok(steered) => {
+                            drop(parent);
+                            registry.record_completion_wake(&root_session_id).await;
+                            for injected in steered {
+                                injected.wait().await;
+                            }
+                        }
+                        Err(error) => {
+                            nanocode_trace::warn!(%error, "subagent completions did not continue their parent");
                         }
                     }
-                    Err(error) => {
-                        nanocode_trace::warn!(%error, "subagent completions did not continue their parent");
+                }
+                None => {
+                    for (id, revision) in batch {
+                        registry.retry_completion(&root_session_id, id, revision);
                     }
                 }
             }
-            None => {
-                for (id, revision) in batch {
-                    registry.retry_completion(&root_session_id, id, revision);
+            if completions.is_empty() {
+                completions.close();
+                while let Some((id, revision)) = completions.recv().await {
+                    registry.schedule_parent_continuation(&root_session_id, id, revision);
                 }
+                return;
             }
         }
-        if completions.is_empty() {
-            completions.close();
-            while let Some((id, revision)) = completions.recv().await {
-                registry.schedule_parent_continuation(&root_session_id, id, revision);
-            }
-            return;
-        }
-    }
+    })
 }
 
 pub(super) fn forward_events(

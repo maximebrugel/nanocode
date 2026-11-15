@@ -25,6 +25,8 @@ use std::{
     },
 };
 
+mod turns;
+
 const COMMAND_CAPACITY: usize = 8;
 
 #[derive(Clone)]
@@ -598,103 +600,8 @@ impl Harness {
         }
     }
 
-    async fn accept_delivery(&mut self, mut command: DeliveryCommand, priority: MessagePriority) {
-        if !command.wait_for_commit().await {
-            return;
-        }
-        let steer = if priority == MessagePriority::Urgent && self.active.is_some() {
-            match self.registry.upgrade() {
-                Some(registry) => {
-                    registry
-                        .begin_turn_steer(&self.root_session_id, self.id)
-                        .await
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        if let Some(steer) = steer {
-            let delegation = self.begin_delegation(command.message.id).await;
-            let prompt = format!("{}\n\n{}", command.message.prompt(), completion_reminder());
-            let result = self
-                .active
-                .as_ref()
-                .expect("steering requires an active turn")
-                .control
-                .steer(Prompt::new(prompt).with_instruction_revision(steer.revision()))
-                .await;
-            if let Some(registry) = self.registry.upgrade() {
-                registry
-                    .finish_turn_steer(&self.root_session_id, steer, result.is_ok())
-                    .await;
-            }
-            match result {
-                Ok(()) => {
-                    self.admit(
-                        command.message.id,
-                        command.response,
-                        MessageDisposition::Steered,
-                    )
-                    .await;
-                    return;
-                }
-                Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => {
-                    self.rollback_delegation(delegation).await;
-                }
-                Err(error) => {
-                    self.rollback_delegation(delegation).await;
-                    self.reject(
-                        command,
-                        format!("could not urgently message agent {}: {error}", self.id),
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-
-        if self.active.is_none()
-            && self.pending_deferred.is_empty()
-            && self.pending_urgent.is_empty()
-            && let Ok(capacity) = self.capacity.reserve()
-        {
-            let delegation = self.begin_delegation(command.message.id).await;
-            let from_peers = from_peers(std::slice::from_ref(&command.message));
-            match self
-                .start_turn(command.message.prompt(), capacity, from_peers)
-                .await
-            {
-                Ok(Started::Prompt) => {
-                    self.admit(
-                        command.message.id,
-                        command.response,
-                        MessageDisposition::Started,
-                    )
-                    .await;
-                }
-                Ok(Started::RecoveryOnly) if resumes(&command.message) => {
-                    self.rollback_delegation(delegation).await;
-                    self.admit(
-                        command.message.id,
-                        command.response,
-                        MessageDisposition::Started,
-                    )
-                    .await;
-                }
-                Ok(Started::RecoveryOnly) => {
-                    self.rollback_delegation(delegation).await;
-                    self.queue_delivery(command, priority).await;
-                }
-                Err(error) => {
-                    self.rollback_delegation(delegation).await;
-                    self.reject(command, error.to_string()).await;
-                }
-            }
-            return;
-        }
-
-        self.queue_delivery(command, priority).await;
+    async fn accept_delivery(&mut self, command: DeliveryCommand, priority: MessagePriority) {
+        turns::accept_delivery(self, command, priority).await
     }
 
     async fn queue_delivery(&mut self, command: DeliveryCommand, priority: MessagePriority) {
@@ -882,134 +789,7 @@ impl Harness {
         capacity: TurnCapacity,
         from_peers: bool,
     ) -> std::io::Result<Started> {
-        if self.active.is_some() {
-            return Err(std::io::Error::other(format!(
-                "agent {} is not idle",
-                self.id
-            )));
-        }
-        let registry = self
-            .registry
-            .upgrade()
-            .ok_or_else(|| std::io::Error::other("subagent runtime is closed"))?;
-        let agent = self
-            .agent
-            .as_ref()
-            .ok_or_else(|| std::io::Error::other(format!("agent {} is closed", self.id)))?;
-        let pending = registry
-            .pending_turn(&self.root_session_id, self.id, agent.session_id())
-            .await?;
-        let pending = match pending {
-            Some((id, input)) => Some((
-                id,
-                agent
-                    .decode_durable_prompt(input)
-                    .map_err(std::io::Error::other)?,
-            )),
-            None => None,
-        };
-        let recovering = pending.is_some();
-        let recovery_request_id = pending.as_ref().map(|(id, _)| id.clone());
-        if !recovering {
-            let (model, thinking, reasoning_mode) =
-                agent.settings().await.map_err(std::io::Error::other)?;
-            self.context = Some(AgentContext {
-                model,
-                thinking,
-                reasoning_mode,
-            });
-        }
-        let Some(started) = registry
-            .harness_turn_started(
-                &self.root_session_id,
-                self.id,
-                pending
-                    .as_ref()
-                    .map(|(_, recovered)| recovered.instruction_revision().unwrap_or(0)),
-                if recovering {
-                    None
-                } else {
-                    self.context.as_ref()
-                },
-            )
-            .await
-        else {
-            return Err(std::io::Error::other(format!(
-                "agent {} cannot start another turn",
-                self.id
-            )));
-        };
-        let instruction_revision = started.revision;
-
-        let (prompt, contract) = match &self.contract {
-            Contract::Pending {
-                assignment: Some(assignment),
-            } => (
-                format!("{assignment}\n\n{prompt}"),
-                completion_instructions(&self.output_schema),
-            ),
-            Contract::Pending { assignment: None } => {
-                (prompt, completion_instructions(&self.output_schema))
-            }
-            Contract::Delivered if from_peers && started.keeps_result => {
-                (prompt, follow_up_reminder())
-            }
-            Contract::Delivered => (prompt, completion_reminder()),
-        };
-        let prompt = format!("{prompt}\n\n{contract}");
-        let request = match pending {
-            Some((id, recovered)) => {
-                nanocode_agent_core::PromptRequest::new(recovered).request_id(id)
-            }
-            None => {
-                let prompt =
-                    Prompt::new(prompt.clone()).with_instruction_revision(instruction_revision);
-                let prompt = match &self.context {
-                    Some(context) => context.prompt(prompt),
-                    None => prompt,
-                };
-                nanocode_agent_core::PromptRequest::new(prompt)
-            }
-        };
-        agent.set_parking(registry.hibernates() && !recovering);
-        let turn = match agent.prompt(request).await {
-            Ok(turn) => turn,
-            Err(error) => {
-                let error = format!("could not start agent {}: {error}", self.id);
-                registry
-                    .harness_turn_start_failed(&self.root_session_id, self.id, error.clone())
-                    .await;
-                return Err(std::io::Error::other(error));
-            }
-        };
-        self.contract = Contract::Delivered;
-        let control = turn.control();
-        let result = platform::spawn(turn.result());
-        self.active = Some(ActiveTurn {
-            control: control.clone(),
-            result,
-            _capacity: capacity,
-        });
-        if let Some(request_id) = recovery_request_id {
-            let prompt = Prompt::new(prompt).with_instruction_revision(instruction_revision);
-            let prompt = match &self.context {
-                Some(context) => context.prompt(prompt),
-                None => prompt,
-            };
-            let encoded = serde_json::to_string(&prompt).map_err(std::io::Error::other)?;
-            let message_id = format!(
-                "subagent-recovery:{request_id}:{}",
-                super::durable::checkpoint_key(&encoded)
-            );
-            return match control.steer_with_id(message_id, prompt).await {
-                Ok(()) => Ok(Started::Prompt),
-                Err(NanocodeError::TurnNotSteerable | NanocodeError::TurnStopped) => {
-                    Ok(Started::RecoveryOnly)
-                }
-                Err(error) => Err(std::io::Error::other(error)),
-            };
-        }
-        Ok(Started::Prompt)
+        turns::start_turn(self, prompt, capacity, from_peers).await
     }
 
     async fn stop_active(&mut self) -> std::io::Result<()> {

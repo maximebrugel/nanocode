@@ -1360,39 +1360,42 @@ pub(super) async fn load_agents(
 
 type LeafRecords = (u64, usize, Vec<(AgentId, AgentRecord, Arc<str>, Arc<str>)>);
 
-async fn read_leaves(
-    store: &dyn SubagentStore,
-    root_session_id: &str,
+#[inline(never)]
+fn read_leaves<'a>(
+    store: &'a dyn SubagentStore,
+    root_session_id: &'a str,
     leaves: Vec<(u64, Arc<str>)>,
-) -> std::io::Result<Vec<LeafRecords>> {
-    let keys = leaves
-        .iter()
-        .map(|(_, key)| key.to_string())
-        .collect::<Vec<_>>();
-    let stored = verified(store, root_session_id, keys).await?;
-    super::platform::spread(
-        leaves.into_iter().zip(stored).collect(),
-        |((index, key), json): ((u64, Arc<str>), String)| {
-            let invalid = |error| {
-                std::io::Error::other(format!("invalid subagent journal leaf {key}: {error}"))
-            };
-            let leaf: AgentLeaf = serde_json::from_str(&json).map_err(invalid)?;
-            let mut agents = Vec::with_capacity(leaf.agents.len());
-            for (id, json) in leaf.agents {
-                if id >> LEAF_AGENT_BITS != index {
-                    return Err(std::io::Error::other(format!(
-                        "subagent journal leaf {key} holds agent {id} of another leaf"
-                    )));
+) -> SubagentStoreFuture<'a, std::io::Result<Vec<LeafRecords>>> {
+    Box::pin(async move {
+        let keys = leaves
+            .iter()
+            .map(|(_, key)| key.to_string())
+            .collect::<Vec<_>>();
+        let stored = verified(store, root_session_id, keys).await?;
+        super::platform::spread(
+            leaves.into_iter().zip(stored).collect(),
+            |((index, key), json): ((u64, Arc<str>), String)| {
+                let invalid = |error| {
+                    std::io::Error::other(format!("invalid subagent journal leaf {key}: {error}"))
+                };
+                let leaf: AgentLeaf = serde_json::from_str(&json).map_err(invalid)?;
+                let mut agents = Vec::with_capacity(leaf.agents.len());
+                for (id, json) in leaf.agents {
+                    if id >> LEAF_AGENT_BITS != index {
+                        return Err(std::io::Error::other(format!(
+                            "subagent journal leaf {key} holds agent {id} of another leaf"
+                        )));
+                    }
+                    let record: AgentRecord = serde_json::from_str(json.get()).map_err(invalid)?;
+                    let json: Arc<str> = json.get().into();
+                    let key = record_key(Arc::clone(&json));
+                    agents.push((AgentId::new(id), record, key, json));
                 }
-                let record: AgentRecord = serde_json::from_str(json.get()).map_err(invalid)?;
-                let json: Arc<str> = json.get().into();
-                let key = record_key(Arc::clone(&json));
-                agents.push((AgentId::new(id), record, key, json));
-            }
-            Ok((index, json.len(), agents))
-        },
-    )
-    .await
+                Ok((index, json.len(), agents))
+            },
+        )
+        .await
+    })
 }
 
 type StubbedLeaf = (u64, Arc<str>, Arc<str>, Option<Arc<LeafPending>>);
@@ -1436,160 +1439,166 @@ pub(super) struct Leaves {
     pub(super) cold: Vec<(u64, ColdLeaf, Vec<AgentStub>)>,
 }
 
-pub(super) async fn load_leaves(
-    store: &dyn SubagentStore,
-    root_session_id: &str,
+#[inline(never)]
+pub(super) fn load_leaves<'a>(
+    store: &'a dyn SubagentStore,
+    root_session_id: &'a str,
     leaves: Option<AgentPages>,
     changed: Vec<(AgentId, Arc<str>, Changed)>,
-    stored: &mut JournalCache,
-) -> std::io::Result<Leaves> {
-    let leaves = match leaves {
-        Some(leaves) => {
-            let (leaves, tree) = leaves.tree(store, root_session_id).await?;
-            stored.tree = tree;
-            leaves
-        }
-        None => Vec::new(),
-    };
-    let touched = changed
-        .iter()
-        .map(|(id, _, _)| leaf_of(*id))
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut settled = Vec::new();
-    let mut live = Vec::new();
-    for (leaf, key) in leaves {
-        match stored.tree.stub(leaf) {
-            Some(stub) if !touched.contains(&leaf) => {
-                settled.push((
-                    leaf,
-                    key,
-                    Arc::clone(stub),
-                    stored.tree.pending(leaf).cloned(),
-                ));
+    stored: &'a mut JournalCache,
+) -> SubagentStoreFuture<'a, std::io::Result<Leaves>> {
+    Box::pin(async move {
+        let leaves = match leaves {
+            Some(leaves) => {
+                let (leaves, tree) = leaves.tree(store, root_session_id).await?;
+                stored.tree = tree;
+                leaves
             }
-            _ => live.push((leaf, key)),
-        }
-    }
-    let mut cold = read_stubs(store, root_session_id, settled)
-        .await?
-        .into_iter()
-        .map(|(leaf, stored, agents)| (leaf, (stored, agents)))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let contexts = cold
-        .values()
-        .flat_map(|(_, agents)| agents)
-        .filter_map(|agent| agent.context.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    if !contexts.is_empty() {
-        let cancelled = store
-            .cancelled_turns(root_session_id, contexts.into_iter().collect())
-            .await?;
-        let spawned = cold
+            None => Vec::new(),
+        };
+        let touched = changed
             .iter()
-            .filter(|(_, (_, agents))| {
-                agents.iter().any(|agent| {
-                    agent
-                        .context
-                        .as_ref()
-                        .is_some_and(|context| cancelled.contains(context))
-                })
-            })
-            .map(|(leaf, _)| *leaf)
-            .collect::<Vec<_>>();
-        for leaf in spawned {
-            if let Some((stored, _)) = cold.remove(&leaf) {
-                live.push((leaf, stored.key));
+            .map(|(id, _, _)| leaf_of(*id))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut settled = Vec::new();
+        let mut live = Vec::new();
+        for (leaf, key) in leaves {
+            match stored.tree.stub(leaf) {
+                Some(stub) if !touched.contains(&leaf) => {
+                    settled.push((
+                        leaf,
+                        key,
+                        Arc::clone(stub),
+                        stored.tree.pending(leaf).cloned(),
+                    ));
+                }
+                _ => live.push((leaf, key)),
             }
         }
-    }
-    let mut records = Vec::new();
-    for (index, bytes, agents) in read_leaves(store, root_session_id, live).await? {
-        stored.leaf_bytes.insert(index, bytes);
-        stored.folded_bytes += bytes;
-        for (id, record, key, json) in agents {
-            stored.stores(id, &record, Arc::clone(&key), json);
-            records.push((id, key, record));
-        }
-    }
-    if !changed.is_empty() {
-        let mut latest = records
+        let mut cold = read_stubs(store, root_session_id, settled)
+            .await?
             .into_iter()
-            .map(|(id, key, record)| (id, (key, record)))
+            .map(|(leaf, stored, agents)| (leaf, (stored, agents)))
             .collect::<std::collections::BTreeMap<_, _>>();
-        let mut unfolded = std::collections::BTreeSet::new();
-        for (id, key, changed) in changed {
-            let record = changed.onto(latest.get(&id).map(|(_, record)| record))?;
-            latest.insert(id, (key, record));
-            unfolded.insert(id);
-        }
-        for id in unfolded {
-            if let Some((_, record)) = latest.get(&id) {
-                let (key, json) = encoded(record)?;
-                stored.stores(id, record, key, json);
+        let contexts = cold
+            .values()
+            .flat_map(|(_, agents)| agents)
+            .filter_map(|agent| agent.context.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !contexts.is_empty() {
+            let cancelled = store
+                .cancelled_turns(root_session_id, contexts.into_iter().collect())
+                .await?;
+            let spawned = cold
+                .iter()
+                .filter(|(_, (_, agents))| {
+                    agents.iter().any(|agent| {
+                        agent
+                            .context
+                            .as_ref()
+                            .is_some_and(|context| cancelled.contains(context))
+                    })
+                })
+                .map(|(leaf, _)| *leaf)
+                .collect::<Vec<_>>();
+            for leaf in spawned {
+                if let Some((stored, _)) = cold.remove(&leaf) {
+                    live.push((leaf, stored.key));
+                }
             }
-        }
-        records = latest
-            .into_iter()
-            .map(|(id, (key, record))| (id, key, record))
-            .collect();
-    }
-    let mut agents = with_profiles(store, root_session_id, records).await?;
-    let mut parents = agents
-        .iter()
-        .filter_map(|agent| agent.descriptor.parent)
-        .collect::<Vec<_>>();
-    loop {
-        let above = parents
-            .drain(..)
-            .map(leaf_of)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .filter_map(|leaf| cold.remove(&leaf).map(|(stored, _)| (leaf, stored.key)))
-            .collect::<Vec<_>>();
-        if above.is_empty() {
-            break;
         }
         let mut records = Vec::new();
-        for (index, bytes, loaded) in read_leaves(store, root_session_id, above).await? {
+        for (index, bytes, agents) in read_leaves(store, root_session_id, live).await? {
             stored.leaf_bytes.insert(index, bytes);
             stored.folded_bytes += bytes;
-            for (id, record, key, json) in loaded {
+            for (id, record, key, json) in agents {
                 stored.stores(id, &record, Arc::clone(&key), json);
                 records.push((id, key, record));
             }
         }
-        let loaded = with_profiles(store, root_session_id, records).await?;
-        parents.extend(loaded.iter().filter_map(|agent| agent.descriptor.parent));
-        agents.extend(loaded);
-    }
-    for (leaf, (stored_leaf, _)) in &cold {
-        stored.leaf_bytes.insert(*leaf, stored_leaf.bytes);
-        stored.folded_bytes += stored_leaf.bytes;
-    }
-    Ok(Leaves {
-        agents,
-        cold: cold
-            .into_iter()
-            .map(|(leaf, (stored, agents))| (leaf, stored, agents))
-            .collect(),
+        if !changed.is_empty() {
+            let mut latest = records
+                .into_iter()
+                .map(|(id, key, record)| (id, (key, record)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut unfolded = std::collections::BTreeSet::new();
+            for (id, key, changed) in changed {
+                let record = changed.onto(latest.get(&id).map(|(_, record)| record))?;
+                latest.insert(id, (key, record));
+                unfolded.insert(id);
+            }
+            for id in unfolded {
+                if let Some((_, record)) = latest.get(&id) {
+                    let (key, json) = encoded(record)?;
+                    stored.stores(id, record, key, json);
+                }
+            }
+            records = latest
+                .into_iter()
+                .map(|(id, (key, record))| (id, key, record))
+                .collect();
+        }
+        let mut agents = with_profiles(store, root_session_id, records).await?;
+        let mut parents = agents
+            .iter()
+            .filter_map(|agent| agent.descriptor.parent)
+            .collect::<Vec<_>>();
+        loop {
+            let above = parents
+                .drain(..)
+                .map(leaf_of)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|leaf| cold.remove(&leaf).map(|(stored, _)| (leaf, stored.key)))
+                .collect::<Vec<_>>();
+            if above.is_empty() {
+                break;
+            }
+            let mut records = Vec::new();
+            for (index, bytes, loaded) in read_leaves(store, root_session_id, above).await? {
+                stored.leaf_bytes.insert(index, bytes);
+                stored.folded_bytes += bytes;
+                for (id, record, key, json) in loaded {
+                    stored.stores(id, &record, Arc::clone(&key), json);
+                    records.push((id, key, record));
+                }
+            }
+            let loaded = with_profiles(store, root_session_id, records).await?;
+            parents.extend(loaded.iter().filter_map(|agent| agent.descriptor.parent));
+            agents.extend(loaded);
+        }
+        for (leaf, (stored_leaf, _)) in &cold {
+            stored.leaf_bytes.insert(*leaf, stored_leaf.bytes);
+            stored.folded_bytes += stored_leaf.bytes;
+        }
+        Ok(Leaves {
+            agents,
+            cold: cold
+                .into_iter()
+                .map(|(leaf, (stored, agents))| (leaf, stored, agents))
+                .collect(),
+        })
     })
 }
 
-pub(super) async fn load_cold(
-    store: &dyn SubagentStore,
-    root_session_id: &str,
+#[inline(never)]
+pub(super) fn load_cold<'a>(
+    store: &'a dyn SubagentStore,
+    root_session_id: &'a str,
     leaves: Vec<(u64, Arc<str>)>,
-) -> std::io::Result<Vec<(PersistedAgent, CachedAgent)>> {
-    let mut records = Vec::new();
-    let mut cached = Vec::new();
-    for (_, _, agents) in read_leaves(store, root_session_id, leaves).await? {
-        for (id, record, key, json) in agents {
-            cached.push(CachedAgent::stored(&record, Arc::clone(&key), json));
-            records.push((id, key, record));
+) -> SubagentStoreFuture<'a, std::io::Result<Vec<(PersistedAgent, CachedAgent)>>> {
+    Box::pin(async move {
+        let mut records = Vec::new();
+        let mut cached = Vec::new();
+        for (_, _, agents) in read_leaves(store, root_session_id, leaves).await? {
+            for (id, record, key, json) in agents {
+                cached.push(CachedAgent::stored(&record, Arc::clone(&key), json));
+                records.push((id, key, record));
+            }
         }
-    }
-    let agents = with_profiles(store, root_session_id, records).await?;
-    Ok(agents.into_iter().zip(cached).collect())
+        let agents = with_profiles(store, root_session_id, records).await?;
+        Ok(agents.into_iter().zip(cached).collect())
+    })
 }
 
 pub(super) async fn list_cold(
@@ -1689,33 +1698,36 @@ async fn with_profiles(
     .await
 }
 
-async fn verified(
-    store: &dyn SubagentStore,
-    root_session_id: &str,
+#[inline(never)]
+fn verified<'a>(
+    store: &'a dyn SubagentStore,
+    root_session_id: &'a str,
     keys: Vec<String>,
-) -> std::io::Result<Vec<String>> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let records = store.load_records(root_session_id, keys.clone()).await?;
-    if records.len() != keys.len() {
-        return Err(std::io::Error::other(format!(
-            "subagent journal store answered {} of {} records",
-            records.len(),
-            keys.len()
-        )));
-    }
-    if store.verifies_records() {
-        return Ok(records);
-    }
-    for (key, json) in keys.iter().zip(&records) {
-        if !key_matches(json, key) {
+) -> SubagentStoreFuture<'a, std::io::Result<Vec<String>>> {
+    Box::pin(async move {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let records = store.load_records(root_session_id, keys.clone()).await?;
+        if records.len() != keys.len() {
             return Err(std::io::Error::other(format!(
-                "subagent journal record {key} does not match its content"
+                "subagent journal store answered {} of {} records",
+                records.len(),
+                keys.len()
             )));
         }
-    }
-    Ok(records)
+        if store.verifies_records() {
+            return Ok(records);
+        }
+        for (key, json) in keys.iter().zip(&records) {
+            if !key_matches(json, key) {
+                return Err(std::io::Error::other(format!(
+                    "subagent journal record {key} does not match its content"
+                )));
+            }
+        }
+        Ok(records)
+    })
 }
 
 fn agent_from(

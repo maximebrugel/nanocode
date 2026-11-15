@@ -307,8 +307,25 @@ impl<'de> Visitor<'de> for FrameVisitor {
         let Some(Value::String(tag)) = fields.remove("type") else {
             return Err(de::Error::missing_field("type"));
         };
-        body(&tag, Value::Object(fields)).map_err(de::Error::custom)
+        reordered(&tag, fields).map_err(de::Error::custom)
     }
+}
+
+fn reordered(tag: &str, fields: serde_json::Map<String, Value>) -> Result<RemoteFrame, String> {
+    let rest = serde_json::to_string(&Value::Object(fields)).map_err(|error| error.to_string())?;
+    let tag = serde_json::to_string(tag).map_err(|error| error.to_string())?;
+    let text = match rest.strip_prefix('{').filter(|rest| *rest != "}") {
+        Some(rest) => format!(r#"{{"type":{tag},{rest}"#),
+        None => format!(r#"{{"type":{tag}}}"#),
+    };
+    serde_json::from_str(&text).map_err(|error| {
+        let message = error.to_string();
+        let position = format!(" at line {} column {}", error.line(), error.column());
+        match message.strip_suffix(&position) {
+            Some(message) if error.line() != 0 => message.to_owned(),
+            _ => message,
+        }
+    })
 }
 
 impl<'de> Deserialize<'de> for RemoteFrame {

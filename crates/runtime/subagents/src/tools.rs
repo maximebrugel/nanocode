@@ -11,6 +11,7 @@ use super::{
         forward_events,
     },
 };
+use crate::runtime::RegistryFuture;
 use nanocode_agent_core::usage::{UsdAmount, usd_number};
 use nanocode_agent_core::{
     AgentHandle, ClaudeModel, ForkRequest, HarnessFamily, Model, ModelSelection, ReasoningMode,
@@ -285,18 +286,21 @@ fn inferred_harness(parent: Option<HarnessFamily>, model: &str) -> std::io::Resu
     Ok(parent)
 }
 
-async fn spawn_parent(
-    parent: &AgentHandle,
-    registry: &Registry,
-    session_id: &str,
-) -> AgentToolResult<SpawnParent> {
-    let registered = registry.descriptor_for_session(session_id).await.is_some();
-    let (model, thinking) = parent.settings().await?;
-    Ok(SpawnParent {
-        model,
-        registered,
-        thinking: Some(thinking),
-        reasoning_mode: parent.reasoning_mode().await?,
+#[inline(never)]
+fn spawn_parent<'a>(
+    parent: &'a AgentHandle,
+    registry: &'a Registry,
+    session_id: &'a str,
+) -> RegistryFuture<'a, AgentToolResult<SpawnParent>> {
+    Box::pin(async move {
+        let registered = registry.descriptor_for_session(session_id).await.is_some();
+        let (model, thinking) = parent.settings().await?;
+        Ok(SpawnParent {
+            model,
+            registered,
+            thinking: Some(thinking),
+            reasoning_mode: parent.reasoning_mode().await?,
+        })
     })
 }
 
@@ -719,171 +723,174 @@ async fn start_agent_with_host_context(
     .await
 }
 
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
-async fn start_child(
-    parent: &AgentHandle,
-    registry: &Arc<Registry>,
-    session_id: &str,
+fn start_child<'a>(
+    parent: &'a AgentHandle,
+    registry: &'a Arc<Registry>,
+    session_id: &'a str,
     task: AgentTask,
     options: SpawnOptions,
     budget: Option<UsdAmount>,
     host_context: Option<Arc<str>>,
     fork: bool,
     capacity: Option<TurnCapacity>,
-    call_id: Option<&str>,
-) -> AgentToolResult<AgentStartReport> {
-    if fork && parent.session_id() != session_id {
-        return Err("child caller identity must match its native parent handle".into());
-    }
-    if let Some(budget) = budget {
-        admit_budget(registry, session_id, budget).await?;
-    }
-    registry.register_handle(parent.clone());
-    let policy_parent = spawn_parent(parent, registry, session_id).await?;
-    if !fork {
-        registry.spawn_policy().admit_reasoning_mode(
-            &policy_parent,
-            options.selected_reasoning_mode().unwrap_or_default(),
-        )?;
-    }
-
-    let AgentTask {
-        role,
-        task,
-        output_schema,
-    } = task;
-    let contract = OutputContract::compile(&output_schema)?;
-    let capacity = match capacity {
-        Some(capacity) => capacity,
-        None => registry.reserve_turn().await?,
-    };
-    let admission = registry.admit_spawn(session_id).await?;
-    let mut startup = registry.batch_startup();
-    let reservation = registry.reserve(session_id).await?;
-    drop(admission);
-    let id = reservation.id;
-    let host_context = match host_context {
-        Some(host_context) => Some(host_context),
-        None => registry.host_context_for_session(session_id).await,
-    };
-    let router = if fork { None } else { registry.spawn_router() };
-    let route = if let Some(router) = &router {
-        let route = router
-            .resolve_spawn(
-                session_id,
-                &role,
-                &task,
-                options.clone(),
-                host_context.as_deref(),
-            )
-            .await?;
-        route.validate(options.clone())?;
-        Some(route)
-    } else {
-        None
-    };
-    let options = if fork {
-        options
-    } else {
-        admit_options(
-            &registry.spawn_policy(),
-            &policy_parent,
-            route
-                .as_ref()
-                .map_or_else(|| options.clone(), |route| route.options(options.clone())),
-        )?
-    };
-    let (child, events) = if fork {
-        parent.fork(ForkRequest::latest()).await?
-    } else {
-        parent
-            .spawn_with_host_context(options, host_context.as_ref().map(Arc::clone))
-            .await?
-    };
-    let (model, thinking, reasoning_mode) = match child_settings(
-        &child,
-        (!fork).then_some((registry.as_ref(), &policy_parent)),
-    )
-    .await
-    {
-        Ok(settings) => settings,
-        Err(error) => {
-            child.abandon_created().await;
-            return Err(error.into());
+    call_id: Option<&'a str>,
+) -> RegistryFuture<'a, AgentToolResult<AgentStartReport>> {
+    Box::pin(async move {
+        if fork && parent.session_id() != session_id {
+            return Err("child caller identity must match its native parent handle".into());
         }
-    };
-    if let (Some(router), Some(route)) = (&router, &route)
-        && let Err(error) = router.bind(
-            session_id,
-            child.session_id(),
-            route.reference(),
-            host_context.as_deref(),
-        )
-    {
-        let _ = child.shutdown().await;
-        return Err(error.into());
-    }
-    let caller = session_id;
-    let session_id = child.session_id().to_string();
-    let descriptor = AgentDescriptor {
-        id,
-        session_id,
-        role: role.clone(),
-        task: task.clone(),
-        parent: reservation.parent,
-        model: model.clone(),
-        thinking,
-        reasoning_mode,
-        budget_usd: budget,
-    };
-    let (start_events, events_ready) = oneshot::channel();
-    let event_task = forward_events(
-        reservation.root_session_id.clone(),
-        id,
-        reservation.parent,
-        events,
-        events_ready,
-        Arc::downgrade(registry),
-        registry.updates.clone(),
-    );
-    let marks = registry
-        .insert(
-            reservation.root_session_id.clone(),
-            descriptor.clone(),
-            host_context,
-            child,
-            event_task,
-            contract,
-            call_id.map(|call| super::durable::Spawned {
-                session: caller.to_owned(),
-                call: call.to_owned(),
-            }),
-        )
-        .await?;
-    startup.track(&reservation.root_session_id, id);
-    registry.send(&reservation.root_session_id, AgentUpdate::Added(descriptor));
-    let _ = start_events.send((0, marks));
+        if let Some(budget) = budget {
+            admit_budget(registry, session_id, budget).await?;
+        }
+        registry.register_handle(parent.clone());
+        let policy_parent = spawn_parent(parent, registry, session_id).await?;
+        if !fork {
+            registry.spawn_policy().admit_reasoning_mode(
+                &policy_parent,
+                options.selected_reasoning_mode().unwrap_or_default(),
+            )?;
+        }
 
-    if let Err(error) = registry
-        .launch_initial_turn(
-            &reservation.root_session_id,
-            id,
-            agent_prompt(id, &task, budget),
-            capacity,
+        let AgentTask {
+            role,
+            task,
+            output_schema,
+        } = task;
+        let contract = OutputContract::compile(&output_schema)?;
+        let capacity = match capacity {
+            Some(capacity) => capacity,
+            None => registry.reserve_turn().await?,
+        };
+        let admission = registry.admit_spawn(session_id).await?;
+        let mut startup = registry.batch_startup();
+        let reservation = registry.reserve(session_id).await?;
+        drop(admission);
+        let id = reservation.id;
+        let host_context = match host_context {
+            Some(host_context) => Some(host_context),
+            None => registry.host_context_for_session(session_id).await,
+        };
+        let router = if fork { None } else { registry.spawn_router() };
+        let route = if let Some(router) = &router {
+            let route = router
+                .resolve_spawn(
+                    session_id,
+                    &role,
+                    &task,
+                    options.clone(),
+                    host_context.as_deref(),
+                )
+                .await?;
+            route.validate(options.clone())?;
+            Some(route)
+        } else {
+            None
+        };
+        let options = if fork {
+            options
+        } else {
+            admit_options(
+                &registry.spawn_policy(),
+                &policy_parent,
+                route
+                    .as_ref()
+                    .map_or_else(|| options.clone(), |route| route.options(options.clone())),
+            )?
+        };
+        let (child, events) = if fork {
+            parent.fork(ForkRequest::latest()).await?
+        } else {
+            parent
+                .spawn_with_host_context(options, host_context.as_ref().map(Arc::clone))
+                .await?
+        };
+        let (model, thinking, reasoning_mode) = match child_settings(
+            &child,
+            (!fork).then_some((registry.as_ref(), &policy_parent)),
         )
         .await
-    {
-        return Err(startup.fail(error).await.into());
-    }
-    startup.commit().await?;
-    Ok(AgentStartReport {
-        agent_id: id,
-        role,
-        status: AgentStatus::Running,
-        model,
-        thinking,
-        reasoning_mode,
-        budget_usd: budget,
+        {
+            Ok(settings) => settings,
+            Err(error) => {
+                child.abandon_created().await;
+                return Err(error.into());
+            }
+        };
+        if let (Some(router), Some(route)) = (&router, &route)
+            && let Err(error) = router.bind(
+                session_id,
+                child.session_id(),
+                route.reference(),
+                host_context.as_deref(),
+            )
+        {
+            let _ = child.shutdown().await;
+            return Err(error.into());
+        }
+        let caller = session_id;
+        let session_id = child.session_id().to_string();
+        let descriptor = AgentDescriptor {
+            id,
+            session_id,
+            role: role.clone(),
+            task: task.clone(),
+            parent: reservation.parent,
+            model: model.clone(),
+            thinking,
+            reasoning_mode,
+            budget_usd: budget,
+        };
+        let (start_events, events_ready) = oneshot::channel();
+        let event_task = forward_events(
+            reservation.root_session_id.clone(),
+            id,
+            reservation.parent,
+            events,
+            events_ready,
+            Arc::downgrade(registry),
+            registry.updates.clone(),
+        );
+        let marks = registry
+            .insert(
+                reservation.root_session_id.clone(),
+                descriptor.clone(),
+                host_context,
+                child,
+                event_task,
+                contract,
+                call_id.map(|call| super::durable::Spawned {
+                    session: caller.to_owned(),
+                    call: call.to_owned(),
+                }),
+            )
+            .await?;
+        startup.track(&reservation.root_session_id, id);
+        registry.send(&reservation.root_session_id, AgentUpdate::Added(descriptor));
+        let _ = start_events.send((0, marks));
+
+        if let Err(error) = registry
+            .launch_initial_turn(
+                &reservation.root_session_id,
+                id,
+                agent_prompt(id, &task, budget),
+                capacity,
+            )
+            .await
+        {
+            return Err(startup.fail(error).await.into());
+        }
+        startup.commit().await?;
+        Ok(AgentStartReport {
+            agent_id: id,
+            role,
+            status: AgentStatus::Running,
+            model,
+            thinking,
+            reasoning_mode,
+            budget_usd: budget,
+        })
     })
 }
 
@@ -964,110 +971,116 @@ async fn enqueue_child(
     })
 }
 
-pub(super) async fn start_unstarted(
-    registry: &Arc<Registry>,
-    root_session_id: &str,
+#[inline(never)]
+pub(super) fn start_unstarted<'a>(
+    registry: &'a Arc<Registry>,
+    root_session_id: &'a str,
     id: AgentId,
     capacity: TurnCapacity,
-) {
-    if let Err(error) = build_unstarted(registry, root_session_id, id, capacity).await {
-        registry
-            .fail_unstarted(
-                root_session_id,
-                id,
-                format!("subagent {id} could not start: {error}"),
-            )
-            .await;
-    }
+) -> RegistryFuture<'a, ()> {
+    Box::pin(async move {
+        if let Err(error) = build_unstarted(registry, root_session_id, id, capacity).await {
+            registry
+                .fail_unstarted(
+                    root_session_id,
+                    id,
+                    format!("subagent {id} could not start: {error}"),
+                )
+                .await;
+        }
+    })
 }
 
-async fn build_unstarted(
-    registry: &Arc<Registry>,
-    root_session_id: &str,
+#[inline(never)]
+fn build_unstarted<'a>(
+    registry: &'a Arc<Registry>,
+    root_session_id: &'a str,
     id: AgentId,
     capacity: TurnCapacity,
-) -> AgentToolResult<()> {
-    let _warm = registry.warm(root_session_id, vec![id]).await?;
-    let Some(child) = registry.unstarted(root_session_id, id).await else {
-        return Ok(());
-    };
-    let _resident = child.lock.enter().await;
-    if let Some(parent) = child.descriptor.parent {
-        registry.ensure_resident(root_session_id, parent).await?;
-    }
-    let parent = registry
-        .session_handle(&child.parent_session)
-        .ok_or("the runtime of the agent that spawned it is unavailable")?;
-    let policy_parent = spawn_parent(&parent, registry, &child.parent_session).await?;
-    let options = child.unstarted.options(&child.descriptor.session_id);
-    let router = registry.spawn_router();
-    let route = if let Some(router) = &router {
-        let route = router
-            .resolve_spawn(
+) -> RegistryFuture<'a, AgentToolResult<()>> {
+    Box::pin(async move {
+        let _warm = registry.warm(root_session_id, vec![id]).await?;
+        let Some(child) = registry.unstarted(root_session_id, id).await else {
+            return Ok(());
+        };
+        let _resident = child.lock.enter().await;
+        if let Some(parent) = child.descriptor.parent {
+            registry.ensure_resident(root_session_id, parent).await?;
+        }
+        let parent = registry
+            .session_handle(&child.parent_session)
+            .ok_or("the runtime of the agent that spawned it is unavailable")?;
+        let policy_parent = spawn_parent(&parent, registry, &child.parent_session).await?;
+        let options = child.unstarted.options(&child.descriptor.session_id);
+        let router = registry.spawn_router();
+        let route = if let Some(router) = &router {
+            let route = router
+                .resolve_spawn(
+                    &child.parent_session,
+                    &child.descriptor.role,
+                    &child.descriptor.task,
+                    options.clone(),
+                    child.host_context.as_deref(),
+                )
+                .await?;
+            route.validate(options.clone())?;
+            Some(route)
+        } else {
+            None
+        };
+        let options = admit_options(
+            &registry.spawn_policy(),
+            &policy_parent,
+            route
+                .as_ref()
+                .map_or_else(|| options.clone(), |route| route.options(options.clone())),
+        )?
+        .session_id(&child.descriptor.session_id);
+        let schema = OutputContract::compile(&child.output_schema)?.into_schema();
+        let (agent, events) = parent
+            .spawn_with_host_context(options, child.host_context.clone())
+            .await?;
+        let (model, thinking, reasoning_mode) =
+            match child_settings(&agent, Some((registry.as_ref(), &policy_parent))).await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    agent.abandon_created().await;
+                    return Err(error.into());
+                }
+            };
+        if let (Some(router), Some(route)) = (&router, &route)
+            && let Err(error) = router.bind(
                 &child.parent_session,
-                &child.descriptor.role,
-                &child.descriptor.task,
-                options.clone(),
+                agent.session_id(),
+                route.reference(),
                 child.host_context.as_deref(),
             )
+        {
+            let _ = agent.shutdown().await;
+            return Err(error.into());
+        }
+        registry
+            .attach_started(
+                root_session_id,
+                id,
+                agent,
+                events,
+                model,
+                thinking,
+                reasoning_mode,
+                schema,
+            )
             .await?;
-        route.validate(options.clone())?;
-        Some(route)
-    } else {
-        None
-    };
-    let options = admit_options(
-        &registry.spawn_policy(),
-        &policy_parent,
-        route
-            .as_ref()
-            .map_or_else(|| options.clone(), |route| route.options(options.clone())),
-    )?
-    .session_id(&child.descriptor.session_id);
-    let schema = OutputContract::compile(&child.output_schema)?.into_schema();
-    let (agent, events) = parent
-        .spawn_with_host_context(options, child.host_context.clone())
-        .await?;
-    let (model, thinking, reasoning_mode) =
-        match child_settings(&agent, Some((registry.as_ref(), &policy_parent))).await {
-            Ok(settings) => settings,
-            Err(error) => {
-                agent.abandon_created().await;
-                return Err(error.into());
-            }
-        };
-    if let (Some(router), Some(route)) = (&router, &route)
-        && let Err(error) = router.bind(
-            &child.parent_session,
-            agent.session_id(),
-            route.reference(),
-            child.host_context.as_deref(),
-        )
-    {
-        let _ = agent.shutdown().await;
-        return Err(error.into());
-    }
-    registry
-        .attach_started(
-            root_session_id,
-            id,
-            agent,
-            events,
-            model,
-            thinking,
-            reasoning_mode,
-            schema,
-        )
-        .await?;
-    registry
-        .launch_initial_turn(
-            root_session_id,
-            id,
-            agent_prompt(id, &child.descriptor.task, child.descriptor.budget_usd),
-            capacity,
-        )
-        .await?;
-    Ok(())
+        registry
+            .launch_initial_turn(
+                root_session_id,
+                id,
+                agent_prompt(id, &child.descriptor.task, child.descriptor.budget_usd),
+                capacity,
+            )
+            .await?;
+        Ok(())
+    })
 }
 
 async fn admit_budget(
@@ -1174,8 +1187,10 @@ fn spawn_agent_definition(mut policy: SpawnPolicy, code_mode: bool) -> ToolDefin
     let description = format!(
         "Starts a reusable clean-room subagent without inherited conversation history and immediately returns its ID. When the root agent is durable, the task tree survives runtime restarts with the same IDs and interrupted children resume from their latest committed checkpoint; otherwise children are dropped when the parent runtime restarts. Delegate meaningful, separable work and handle trivial or tightly coupled work directly. {}Do not repeat delegated work; double-check results against the relevant evidence before relying on them. Use output contracts that expose the fields downstream stages need, keep concurrent write scopes disjoint, and own final synthesis and verification.",
         match code_mode {
-            true => "When Code Mode is available, build multi-agent pipelines in it: start independent subtasks in parallel, await and reduce their results, then dispatch dependent stages. ",
-            false => "Start independent subtasks in parallel, wait for and reduce their results, then dispatch dependent stages. ",
+            true =>
+                "When Code Mode is available, build multi-agent pipelines in it: start independent subtasks in parallel, await and reduce their results, then dispatch dependent stages. ",
+            false =>
+                "Start independent subtasks in parallel, wait for and reduce their results, then dispatch dependent stages. ",
         }
     );
     let description = match policy.providers {

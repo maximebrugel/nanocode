@@ -239,6 +239,9 @@ pub(crate) fn preview_text(text: &str) -> Option<String> {
 pub use store::*;
 
 mod store {
+    mod listing;
+    mod loading;
+    mod opening;
     mod pending;
     mod transfer;
 
@@ -660,7 +663,7 @@ mod store {
         }
 
         pub async fn list(&self) -> Result<Vec<SessionSummary>> {
-            self.list_page(None, usize::MAX, |_| true).await
+            listing::list(self).await
         }
 
         pub async fn list_page(
@@ -674,17 +677,11 @@ mod store {
                     && keep(record)
             };
             let Some(listed) = self.store.clone().list_summaries(usize::MAX).await? else {
-                let ids = self.store.clone().list_states(usize::MAX).await?;
-                let mut sessions: Vec<_> = nanocode_sync::try_join_in_order(
-                    ids.iter()
-                        .filter(|id| !is_auxiliary_state(id))
-                        .map(|id| self.summary(id)),
-                )
-                .await?
-                .into_iter()
-                .flatten()
-                .filter(|session| wanted(&session.record))
-                .collect();
+                let mut sessions: Vec<_> = listing::summaries(self)
+                    .await?
+                    .into_iter()
+                    .filter(|session| wanted(&session.record))
+                    .collect();
                 sessions.sort_by_key(|session| std::cmp::Reverse(session.record.updated_at_ms));
                 sessions.truncate(limit);
                 return Ok(sessions);
@@ -779,38 +776,7 @@ mod store {
             limit: usize,
             wanted: impl Fn(&SessionRecord) -> bool,
         ) -> Result<Vec<SessionSummary>> {
-            let elsewhere =
-                |scope: &str| workspace.is_some_and(|workspace| Path::new(scope) != workspace);
-            let mut candidates = Vec::with_capacity(listed.len());
-            let mut unknown = Vec::new();
-            for state in listed {
-                if is_auxiliary_state(&state.state_id) {
-                    continue;
-                }
-                match state.summary {
-                    ListedSummary::Listed(summary)
-                        if summary.scope.as_deref().is_some_and(elsewhere) => {}
-                    ListedSummary::Listed(summary) => candidates.push(Candidate::Listed(summary)),
-                    ListedSummary::Unlisted => {}
-                    ListedSummary::Unknown => unknown.push(state.state_id),
-                }
-            }
-            let mut known = Vec::new();
-            for state_id in unknown {
-                let Some((revision, summary)) = self.revised_summary(&state_id).await? else {
-                    continue;
-                };
-                known.push(KnownSummary {
-                    state_id,
-                    revision,
-                    summary: summary.as_ref().map(listed_summary).transpose()?,
-                });
-                candidates.extend(summary.map(Candidate::Read));
-            }
-            if !known.is_empty() {
-                self.store.clone().remember_summaries(known).await?;
-            }
-            candidates.sort_by_cached_key(|candidate| std::cmp::Reverse(candidate.updated_at_ms()));
+            let candidates = listing::candidates(self, listed, workspace).await?;
             let mut sessions = Vec::new();
             for candidate in candidates {
                 if sessions.len() == limit {
@@ -831,43 +797,11 @@ mod store {
         }
 
         pub async fn summarize(&self, session_ids: &[String]) -> Result<()> {
-            let mut known = Vec::new();
-            for state_id in session_ids.iter().filter(|id| !is_auxiliary_state(id)) {
-                let Some((revision, summary)) = self.revised_summary(state_id).await? else {
-                    continue;
-                };
-                known.push(KnownSummary {
-                    state_id: state_id.clone(),
-                    revision,
-                    summary: summary.as_ref().map(listed_summary).transpose()?,
-                });
-            }
-            if !known.is_empty() {
-                self.store.clone().remember_summaries(known).await?;
-            }
-            Ok(())
+            listing::summarize(self, session_ids).await
         }
 
         async fn revised_summary(&self, id: &str) -> Result<Option<(u64, Option<SessionSummary>)>> {
-            let Some(state) = self.peek(id).await? else {
-                return Ok(None);
-            };
-            let revision = state.revision();
-            if !is_listed(&state) {
-                return Ok(Some((revision, None)));
-            }
-            let preview = self.first_prompt(id, &state).await?;
-            let record = match state.session() {
-                Some(record) => record.clone(),
-                None => {
-                    let Some(checkpoint) = self.native_checkpoint(id, &state).await? else {
-                        return Ok(Some((revision, None)));
-                    };
-                    self.infer_record(id, &checkpoint)?
-                }
-            };
-            let preview = preview.or_else(|| record.event_preview.clone());
-            Ok(Some((revision, Some(SessionSummary { record, preview }))))
+            listing::revised_summary(self, id).await
         }
 
         pub async fn query(&self, query: &SessionQuery) -> Result<SessionPage> {
@@ -899,10 +833,7 @@ mod store {
         }
 
         pub async fn summary(&self, id: &str) -> Result<Option<SessionSummary>> {
-            Ok(self
-                .revised_summary(id)
-                .await?
-                .and_then(|(_, summary)| summary))
+            listing::summary(self, id).await
         }
 
         pub async fn record(&self, id: &str) -> Result<Option<SessionRecord>> {
@@ -913,165 +844,35 @@ mod store {
             &self,
             id: &str,
         ) -> Result<Option<(SessionRecord, Option<String>)>> {
-            let Some(state) = self.peek(id).await? else {
-                return Ok(None);
-            };
-            if !is_listed(&state) {
-                return Ok(None);
-            }
-            let base = state
-                .latest_checkpoint()
-                .map(|latest| latest.key().to_owned());
-            let record = match state.session() {
-                Some(record) => record.clone(),
-                None => match self.native_checkpoint(id, &state).await? {
-                    Some(checkpoint) => self.infer_record(id, &checkpoint)?,
-                    None => return Ok(None),
-                },
-            };
-            Ok(Some((record, base)))
+            listing::record_and_base(self, id).await
         }
 
         pub async fn latest_checkpoint_key(&self, id: &str) -> Result<Option<String>> {
-            let Some(state) = self.peek_head(id).await? else {
-                return Ok(None);
-            };
-            Ok(is_listed(&state)
-                .then(|| {
-                    state
-                        .latest_checkpoint()
-                        .map(|latest| latest.key().to_owned())
-                })
-                .flatten())
+            listing::latest_checkpoint_key(self, id).await
         }
 
         pub async fn load(&self, id: &str) -> Result<StoredSession> {
-            let state = self.require(id).await?;
-            let (checkpoint, checkpoint_payload, hydrated) =
-                match self.loaded_checkpoint(id, &state).await? {
-                    Some((checkpoint, payload, records, hydrated)) => (
-                        Some(checkpoint),
-                        Some((payload, Arc::new(records))),
-                        hydrated,
-                    ),
-                    None => (None, None, None),
-                };
-            let record = match (state.session(), &checkpoint) {
-                (Some(record), _) => record.clone(),
-                (None, Some(checkpoint)) => self.infer_record(id, checkpoint)?,
-                (None, None) => {
-                    return Err(Error::SessionNotFound {
-                        session_id: id.to_owned(),
-                    });
-                }
-            };
-            let turns = self.state_turns(id, &state).await?;
-            let admitted = admitted_turns(&turns, &state);
-            let progress = self.progress(id, &state, record.family()).await?;
-            let transcript = match (&progress, &checkpoint) {
-                (Some((_, view, steers)), _) => {
-                    let mut transcript = self.transcript(view, record.family(), &admitted)?;
-                    transcript.extend(steers.iter().cloned().map(TranscriptItem::User));
-                    transcript
-                }
-                (None, Some(checkpoint)) => {
-                    self.transcript(checkpoint, record.family(), &admitted)?
-                }
-                (None, None) => Vec::new(),
-            };
-            let preview = turns
-                .iter()
-                .find_map(|turn| turn.preview.clone())
-                .or_else(|| {
-                    transcript.iter().find_map(|item| match item {
-                        TranscriptItem::User(text) => Some(text.clone()),
-                        _ => None,
-                    })
-                });
-            Ok(StoredSession {
-                summary: SessionSummary { record, preview },
-                transcript,
-                turns,
-                in_progress: progress.map(|(operation, _, _)| operation),
-                checkpoint,
-                formats: self.formats.clone(),
-                loaded: Loaded {
-                    store: self.store.downgrade(),
-                    state_id: id.to_owned(),
-                    checkpoint_key: state
-                        .latest_checkpoint()
-                        .map(|payload| payload.key().to_owned()),
-                    checkpoint_payload,
-                    hydrated,
-                    record_inferred: state.session().is_none(),
-                },
-            })
+            loading::load(self, id).await
         }
 
         pub async fn turns(&self, id: &str) -> Result<Vec<StoredTurn>> {
-            let state = self.require(id).await?;
-            self.state_turns(id, &state).await
+            loading::turns(self, id).await
         }
 
         pub async fn pending_turns(&self, id: &str) -> Result<Vec<StoredTurn>> {
-            let state = self.require_head(id).await?;
-            self.stored_turns(id, state.pending_operations(), false)
-                .await
+            loading::pending_turns(self, id).await
         }
 
         pub async fn resumable(&self, id: &str) -> Result<Option<Resumable>> {
-            let Some(state) = self.peek_head(id).await? else {
-                return Ok(None);
-            };
-            let Some(record) = state.session().cloned() else {
-                return match self.load(id).await {
-                    Ok(stored) => Ok(Some(Resumable {
-                        record: stored.summary.record,
-                        pending: stored
-                            .turns
-                            .into_iter()
-                            .filter(|turn| turn.status == TurnStatus::Pending)
-                            .collect(),
-                        checkpointed: stored.checkpoint.is_some(),
-                    })),
-                    Err(Error::SessionNotFound { .. }) => Ok(None),
-                    Err(error) => Err(error),
-                };
-            };
-            Ok(Some(Resumable {
-                pending: self
-                    .stored_turns(id, state.pending_operations(), false)
-                    .await?,
-                checkpointed: state.latest_checkpoint().is_some(),
-                record,
-            }))
+            loading::resumable(self, id).await
         }
 
         pub async fn turn(&self, id: &str, request_id: &str) -> Result<Option<StoredTurn>> {
-            let mut state = self.require_head(id).await?;
-            if state.operation(request_id).is_none() {
-                state
-                    .hydrate(&mut self.store.clone(), id, &mut HashSet::new())
-                    .await?;
-            }
-            let Some(operation) = state.operation(request_id) else {
-                return Ok(None);
-            };
-            Ok(self
-                .stored_turns(id, vec![(request_id, operation)], false)
-                .await?
-                .pop())
+            loading::turn(self, id, request_id).await
         }
 
         pub async fn session(&self, record: SessionRecord) -> Result<DurableSession> {
-            let session = DurableSession::open_shared_described(
-                self.store.clone(),
-                record.session_id.clone(),
-                None,
-                Some(record),
-            )
-            .await?;
-            self.publish_opened(session).await
+            opening::session(self, record).await
         }
 
         async fn publish_opened(&self, session: DurableSession) -> Result<DurableSession> {
@@ -1099,46 +900,15 @@ mod store {
             &self,
             journal: nanocode_agent_core::SessionCheckpoint,
         ) -> Result<(nanocode_agent_core::SessionCheckpoint, Option<String>)> {
-            journal
-                .validate()
-                .map_err(|error| Error::InvalidState(error.to_string()))?;
-            let id = journal.session_id();
-            let Some(state) = self.peek_head(id).await? else {
-                return Ok((journal, None));
-            };
-            let checkpoint = self.loaded_checkpoint(id, &state).await?;
-            let record = match (state.session(), &checkpoint) {
-                (Some(record), _) => record.clone(),
-                (None, Some((checkpoint, ..))) => self.infer_record(id, checkpoint)?,
-                (None, None) => return Ok((journal, None)),
-            };
-            if record.family() != journal.family() || record.lineage != *journal.lineage() {
-                return Err(Error::InvalidState(
-                    "child journal identity differs from its durable session".into(),
-                ));
-            }
-            let provider = is_listed(&state).then(|| record.provider.clone()).flatten();
-            let checkpoint = match checkpoint {
-                Some((checkpoint, ..)) => session_checkpoint(&self.formats, &record, &checkpoint)?,
-                None => journal,
-            };
-            Ok((checkpoint, provider))
+            opening::recovery(self, journal).await
         }
 
         pub async fn resume(&self, id: &str) -> Result<DurableSession> {
-            let record = self.resume_record(id, None).await?;
-            let session = DurableSession::open_shared_described(
-                self.store.clone(),
-                id.to_owned(),
-                None,
-                record,
-            )
-            .await?;
-            self.publish_opened(session).await
+            opening::resume(self, id).await
         }
 
         pub async fn prepare_resume(&self, id: &str) -> Result<DurableSession> {
-            self.prepare_resume_with(id, None).await
+            opening::prepare_resume(self, id).await
         }
 
         async fn prepare_resume_with(
@@ -1160,38 +930,7 @@ mod store {
             &self,
             stored: &StoredSession,
         ) -> Result<DurableSession> {
-            if !stored.loaded.store.is(&self.store) {
-                return Err(Error::InvalidState(
-                    "the stored session was loaded from a different session store".to_owned(),
-                ));
-            }
-            let id = &stored.summary.record.session_id;
-            if *id != stored.loaded.state_id {
-                return Err(Error::InvalidState(
-                    "the stored session identity changed after loading".to_owned(),
-                ));
-            }
-            let state = if stored.loaded.record_inferred {
-                let inferred = match (&stored.loaded.checkpoint_key, &stored.checkpoint) {
-                    (Some(key), Some(checkpoint)) => Some((key.as_str(), checkpoint)),
-                    _ => None,
-                };
-                self.prepare_resume_with(id, inferred).await?
-            } else {
-                DurableSession::prepare_shared_described(self.store.clone(), id.clone(), None, None)
-                    .await?
-            };
-            if let (Some(key), Some(checkpoint)) =
-                (&stored.loaded.checkpoint_key, &stored.checkpoint)
-            {
-                state.preload_checkpoint(
-                    key.clone(),
-                    checkpoint.clone(),
-                    stored.loaded.checkpoint_payload.clone(),
-                    stored.loaded.hydrated.clone(),
-                );
-            }
-            Ok(state)
+            opening::prepare_resume_loaded(self, stored).await
         }
 
         async fn resume_record(
@@ -1220,8 +959,7 @@ mod store {
             at: BranchPoint,
             workspace: Option<PathBuf>,
         ) -> Result<SessionSummary> {
-            self.branch_with(id, at, workspace, |selected, _| Ok(selected))
-                .await
+            opening::branch(self, id, at, workspace).await
         }
 
         pub async fn branch_with(

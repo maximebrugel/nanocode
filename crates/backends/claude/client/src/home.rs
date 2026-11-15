@@ -21,6 +21,8 @@ use crate::{
     },
 };
 
+mod login;
+
 const FILE: &str = "claude.json";
 const KEY: &str = "claude";
 const CALLBACK_PATH: &str = "/callback";
@@ -194,27 +196,7 @@ pub struct ClaudeHomeLogin {
 
 impl ClaudeHomeLogin {
     pub async fn start() -> Result<Self, ClaudeSubscriptionError> {
-        let subscription = ClaudeSubscription::home()?;
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .map_err(|_| ClaudeSubscriptionError::Host)?;
-        let port = listener
-            .local_addr()
-            .map_err(|_| ClaudeSubscriptionError::Host)?
-            .port();
-        let origin = format!("http://localhost:{port}");
-        let login = subscription
-            .begin_login(ClaudeLoginMode::Callback {
-                redirect_uri: format!("{origin}{CALLBACK_PATH}"),
-            })
-            .await?;
-        Ok(Self {
-            subscription,
-            listener,
-            origin,
-            authorization_url: login.authorization_url,
-            expires_at: login.expires_at,
-        })
+        login::start().await
     }
 
     #[must_use]
@@ -223,22 +205,7 @@ impl ClaudeHomeLogin {
     }
 
     pub async fn complete(self) -> Result<ClaudeSubscriptionStatus, ClaudeSubscriptionError> {
-        let remaining = Duration::from_millis(self.expires_at.saturating_sub(now()));
-        let (mut stream, target) = nanocode_platform::timeout(remaining, callback(&self.listener))
-            .await
-            .map_err(|_| ClaudeSubscriptionError::LoginRequired)?
-            .map_err(|_| ClaudeSubscriptionError::Host)?;
-        let result = self
-            .subscription
-            .complete_login(&format!("{}{target}", self.origin))
-            .await;
-        reply(
-            &mut stream,
-            200,
-            if result.is_ok() { SIGNED_IN } else { FAILED },
-        )
-        .await;
-        result
+        login::complete(self).await
     }
 }
 

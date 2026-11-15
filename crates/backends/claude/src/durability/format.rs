@@ -60,51 +60,53 @@ struct AdmittedBase {
 }
 
 impl PagedConversation {
-    async fn restore(
+    fn restore<'a>(
         self,
-        reader: PayloadReader<'_>,
-        conversation: &mut serde_json::Map<String, Value>,
-        read: &mut HashSet<String>,
-    ) -> Result<()> {
-        let messages: Vec<Value> = load_sequence(reader, self.messages, read).await?;
-        if let Some(code_calls) = self.code_calls {
-            let rounds = load_sequence(reader, code_calls, read).await?;
-            conversation.insert("code_calls".into(), Value::Array(rounds));
-        }
-        if let Some(compacted) = self.compacted {
-            let compacted = load_sequence(reader, compacted, read).await?;
-            conversation.insert("compacted".into(), Value::Array(compacted));
-        }
-        if self.version >= 3 {
-            let mut admitted = match self.admitted_base {
-                Some(base) => {
-                    read.insert(base.key().to_owned());
-                    reader
-                        .load_payload(base)
-                        .await?
-                        .decode::<AdmittedBase>()?
-                        .ids
-                }
-                None => Vec::new(),
-            };
-            admitted.extend(self.admitted_tool_ids);
-            admitted.extend(
-                messages
-                    .iter()
-                    .filter_map(|message| message["content"].as_array())
-                    .flatten()
-                    .filter(|block| block["type"] == "tool_use")
-                    .filter_map(|block| block["id"].as_str())
-                    .filter(|id| !self.unadmitted_tool_ids.contains(*id))
-                    .map(str::to_owned),
-            );
-            conversation.insert(
-                "admitted_tool_ids".into(),
-                Value::Array(admitted.into_iter().map(Value::String).collect()),
-            );
-        }
-        conversation.insert("messages".into(), Value::Array(messages));
-        Ok(())
+        reader: PayloadReader<'a>,
+        conversation: &'a mut serde_json::Map<String, Value>,
+        read: &'a mut HashSet<String>,
+    ) -> crate::agent::AgentFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let messages: Vec<Value> = load_sequence(reader, self.messages, read).await?;
+            if let Some(code_calls) = self.code_calls {
+                let rounds = load_sequence(reader, code_calls, read).await?;
+                conversation.insert("code_calls".into(), Value::Array(rounds));
+            }
+            if let Some(compacted) = self.compacted {
+                let compacted = load_sequence(reader, compacted, read).await?;
+                conversation.insert("compacted".into(), Value::Array(compacted));
+            }
+            if self.version >= 3 {
+                let mut admitted = match self.admitted_base {
+                    Some(base) => {
+                        read.insert(base.key().to_owned());
+                        reader
+                            .load_payload(base)
+                            .await?
+                            .decode::<AdmittedBase>()?
+                            .ids
+                    }
+                    None => Vec::new(),
+                };
+                admitted.extend(self.admitted_tool_ids);
+                admitted.extend(
+                    messages
+                        .iter()
+                        .filter_map(|message| message["content"].as_array())
+                        .flatten()
+                        .filter(|block| block["type"] == "tool_use")
+                        .filter_map(|block| block["id"].as_str())
+                        .filter(|id| !self.unadmitted_tool_ids.contains(*id))
+                        .map(str::to_owned),
+                );
+                conversation.insert(
+                    "admitted_tool_ids".into(),
+                    Value::Array(admitted.into_iter().map(Value::String).collect()),
+                );
+            }
+            conversation.insert("messages".into(), Value::Array(messages));
+            Ok(())
+        })
     }
 }
 
@@ -150,35 +152,37 @@ fn insert(value: &mut Value, pointer: &str, field: &str, items: Vec<Value>) -> R
     Ok(())
 }
 
-pub(super) async fn hydrate_snapshot(
-    reader: PayloadReader<'_>,
+pub(super) fn hydrate_snapshot<'a>(
+    reader: PayloadReader<'a>,
     stored: Value,
-    read: &mut HashSet<String>,
-) -> Result<Value> {
-    if !paged(&stored) {
-        return Ok(stored);
-    }
-    let paged: PagedSnapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
-    let mut snapshot = paged.snapshot;
-    paged
-        .conversation
-        .restore(reader, object(&mut snapshot, "/conversation")?, read)
-        .await?;
-    if let Some(instructions) = paged.instructions {
-        read.insert(instructions.key().to_owned());
-        let text: String = reader.load_payload(instructions).await?.decode()?;
-        object(&mut snapshot, "/context")?.insert("text".into(), Value::String(text));
-    }
-    if let Some(template) = paged.template {
-        let key = template.key().to_owned();
-        read.insert(key.clone());
-        if prefix(&key).is_none() {
-            let loaded: Prefix = reader.load_payload(template).await?.decode()?;
-            keep_prefix(&key, &std::sync::Arc::new(loaded));
+    read: &'a mut HashSet<String>,
+) -> crate::agent::AgentFuture<'a, Result<Value>> {
+    Box::pin(async move {
+        if !paged(&stored) {
+            return Ok(stored);
         }
-        object(&mut snapshot, "/context")?.insert("template".into(), Value::String(key));
-    }
-    Ok(snapshot)
+        let paged: PagedSnapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+        let mut snapshot = paged.snapshot;
+        paged
+            .conversation
+            .restore(reader, object(&mut snapshot, "/conversation")?, read)
+            .await?;
+        if let Some(instructions) = paged.instructions {
+            read.insert(instructions.key().to_owned());
+            let text: String = reader.load_payload(instructions).await?.decode()?;
+            object(&mut snapshot, "/context")?.insert("text".into(), Value::String(text));
+        }
+        if let Some(template) = paged.template {
+            let key = template.key().to_owned();
+            read.insert(key.clone());
+            if prefix(&key).is_none() {
+                let loaded: Prefix = reader.load_payload(template).await?.decode()?;
+                keep_prefix(&key, &std::sync::Arc::new(loaded));
+            }
+            object(&mut snapshot, "/context")?.insert("template".into(), Value::String(key));
+        }
+        Ok(snapshot)
+    })
 }
 
 pub(super) async fn hydrate_cursor(reader: PayloadReader<'_>, stored: Value) -> Result<Value> {

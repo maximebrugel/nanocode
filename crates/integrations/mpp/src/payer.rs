@@ -18,6 +18,8 @@ use super::session::channel::resolve_chain_id;
 use super::signing::{KeychainVersion, TempoSigningMode};
 use super::store::ChannelStore;
 
+mod paying;
+
 type SessionKey = (u64, Option<String>);
 
 #[derive(Clone)]
@@ -254,32 +256,7 @@ impl Payer {
         url: &str,
         body: String,
     ) -> Result<(), Fault> {
-        let challenges = self.probe(client, url, body.clone(), None).await?;
-        let candidates: Vec<&Challenge> = challenges.iter().collect();
-        let Some(challenge) = self
-            .select_challenge(&candidates)
-            .filter(|challenge| challenge.intent == INTENT_SESSION)
-        else {
-            return Ok(());
-        };
-        let session = self.session_provider_for(challenge, Some(url))?;
-        session.bind_origin(url)?;
-        if !session.restore(challenge).await? {
-            return Ok(());
-        }
-        let Some(channel_id) = session.restored_channel_id(challenge) else {
-            return Ok(());
-        };
-        let described = self
-            .probe(client, url, body, Some((&channel_id, &session)))
-            .await?;
-        for challenge in &described {
-            if self.check_expected_chain(challenge).is_ok() && session.prime_prepaid(url, challenge)
-            {
-                break;
-            }
-        }
-        Ok(())
+        paying::preconnect(self, client, url, body).await
     }
 
     async fn probe(
@@ -433,13 +410,7 @@ impl PaymentProvider for Payer {
         challenge: &Challenge,
         context: PaymentContext,
     ) -> Result<Credential, Fault> {
-        if challenge.intent == INTENT_SESSION {
-            return self
-                .session_provider_for(challenge, Some(context.url.as_str()))?
-                .pay_with_context(challenge, context)
-                .await;
-        }
-        self.pay_charge(challenge).await
+        paying::pay_with_context(self, challenge, context).await
     }
 
     async fn pay_with_management(
@@ -448,13 +419,7 @@ impl PaymentProvider for Payer {
         context: PaymentContext,
         management: &dyn ManagementTransport,
     ) -> Result<Credential, Fault> {
-        if challenge.intent == INTENT_SESSION {
-            return self
-                .session_provider_for(challenge, Some(context.url.as_str()))?
-                .pay_with_management(challenge, context, management)
-                .await;
-        }
-        self.pay_charge(challenge).await
+        paying::pay_with_management(self, challenge, context, management).await
     }
 
     async fn commit_payment(
@@ -462,15 +427,7 @@ impl PaymentProvider for Payer {
         challenge: &Challenge,
         credential: &Credential,
     ) -> Result<(), Fault> {
-        if challenge.intent == INTENT_SESSION {
-            return self
-                .session_provider_holding(challenge, credential)?
-                .commit_payment(challenge, credential)
-                .await;
-        }
-        self.forget_funding(challenge);
-        self.take_authorization(challenge, credential)?;
-        Ok(())
+        paying::commit_payment(self, challenge, credential).await
     }
 
     async fn rollback_payment(
@@ -478,17 +435,7 @@ impl PaymentProvider for Payer {
         challenge: &Challenge,
         credential: &Credential,
     ) -> Result<(), Fault> {
-        if challenge.intent == INTENT_SESSION {
-            return self
-                .session_provider_holding(challenge, credential)?
-                .rollback_payment(challenge, credential)
-                .await;
-        }
-        self.forget_funding(challenge);
-        if let Some(reservation) = self.take_authorization(challenge, credential)? {
-            self.accounts.release_authorization(reservation);
-        }
-        Ok(())
+        paying::rollback_payment(self, challenge, credential).await
     }
 
     async fn invalidate_payment(
@@ -496,13 +443,7 @@ impl PaymentProvider for Payer {
         challenge: &Challenge,
         credential: &Credential,
     ) -> Result<(), Fault> {
-        if challenge.intent == INTENT_SESSION {
-            return self
-                .session_provider_holding(challenge, credential)?
-                .invalidate_payment(challenge, credential)
-                .await;
-        }
-        self.rollback_payment(challenge, credential).await
+        paying::invalidate_payment(self, challenge, credential).await
     }
 
     fn abandon_payment(&self, challenge: &Challenge, credential: &Credential) {
@@ -514,16 +455,7 @@ impl PaymentProvider for Payer {
     }
 
     async fn prepaid_credential(&self, context: PaymentContext) -> Option<(Challenge, Credential)> {
-        self.session.as_ref()?;
-        let provider = self
-            .configured_session_provider(Some(context.url.as_str()))
-            .ok()?;
-        let (challenge, credential) = provider.prepaid_credential(context).await?;
-        if self.check_expected_chain(&challenge).is_err() {
-            provider.abandon_payment(&challenge, &credential);
-            return None;
-        }
-        Some((challenge, credential))
+        paying::prepaid_credential(self, context).await
     }
 
     fn record_receipt(

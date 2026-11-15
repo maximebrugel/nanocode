@@ -163,6 +163,8 @@ pub struct BlockingOptions {
 /// parsed arguments, typically) to its exit status.
 pub type SyncFn<T> = fn(&mut SyncCtx, T) -> i32;
 
+type Body = Box<dyn FnOnce(&mut SyncCtx) -> i32 + Send>;
+
 /// What a blocking utility sees (D1130): the shell's cwd and environment as the command
 /// sees them, std stdio, TTY state, a cancel flag and a synchronous file system. Paths
 /// are the shell's (bytes, absolute after [`SyncCtx::path`]).
@@ -803,108 +805,120 @@ impl UtilCtx<'_> {
         arg: T,
         f: SyncFn<T>,
     ) -> i32 {
-        let _ = self.flush().await;
-        let terminal = [
-            self.is_terminal(0),
-            self.is_terminal(1),
-            self.is_terminal(2),
-        ];
-        let host = self.vp.core.host.clone();
-        let native = host.native_paths();
-        let stdin_readable = self.stdin_readable();
-        // A body opens files itself, on a thread or through the host, and neither can
-        // open a pipe of the engine: what the arguments name of those is read here, to
-        // its end (once: a replayed run finds it).
-        let held = self.replay.borrow().streams.clone();
-        let streams = match held {
-            Some(streams) => streams,
-            None => {
-                let mut streams = Vec::new();
-                for n in self.named_fds.clone() {
-                    if let Some(fd) = self.fd(n)
-                        && matches!(*fd, crate::fd::FdObj::PipeRead(_))
-                    {
-                        let mut data = Vec::new();
-                        if fd.read_to_end(&mut data).await.is_ok() {
-                            streams.push((n, Stream(Arc::new(data))));
+        self.run_body(opts, Box::new(move |ctx: &mut SyncCtx| f(ctx, arg)))
+            .await
+    }
+
+    #[inline(never)]
+    fn run_body(
+        &mut self,
+        opts: BlockingOptions,
+        body: Body,
+    ) -> crate::util::LocalBoxFuture<'_, i32> {
+        Box::pin(async move {
+            let _ = self.flush().await;
+            let terminal = [
+                self.is_terminal(0),
+                self.is_terminal(1),
+                self.is_terminal(2),
+            ];
+            let host = self.vp.core.host.clone();
+            let native = host.native_paths();
+            let stdin_readable = self.stdin_readable();
+            // A body opens files itself, on a thread or through the host, and neither can
+            // open a pipe of the engine: what the arguments name of those is read here, to
+            // its end (once: a replayed run finds it).
+            let held = self.replay.borrow().streams.clone();
+            let streams = match held {
+                Some(streams) => streams,
+                None => {
+                    let mut streams = Vec::new();
+                    for n in self.named_fds.clone() {
+                        if let Some(fd) = self.fd(n)
+                            && matches!(*fd, crate::fd::FdObj::PipeRead(_))
+                        {
+                            let mut data = Vec::new();
+                            if fd.read_to_end(&mut data).await.is_ok() {
+                                streams.push((n, Stream(Arc::new(data))));
+                            }
                         }
                     }
+                    self.replay.borrow_mut().streams = Some(streams.clone());
+                    streams
                 }
-                self.replay.borrow_mut().streams = Some(streams.clone());
-                streams
-            }
-        };
-        let mut sync = SyncCtx {
-            name: self.name.clone(),
-            cwd: self.vp.cwd.clone(),
-            env: self.env.clone(),
-            terminal,
-            stdin_readable,
-            configured: !self.vp.core.utilities.unconfigured,
-            streams,
-            io: Io::Inline {
-                host,
-                stdin: io::Cursor::new(Held(Rc::default())),
-                out: Arc::default(),
-                replay: self.replay.clone(),
-            },
-            out: Vec::new(),
-            write_error: None,
-        };
-        match native {
-            Some(native) => self.run_thread(sync, native, arg, f).await,
-            None => {
-                if opts.stdin {
-                    // A replayed run reads what the first one read.
-                    let held = self.replay.borrow().stdin.clone();
-                    let held = match held {
-                        Some(held) => held,
-                        None => match self.read_limited(INLINE_INPUT_LIMIT).await {
-                            Ok(data) => {
-                                let held = Held(Rc::new(data));
-                                self.replay.borrow_mut().stdin = Some(held.clone());
-                                held
-                            }
-                            Err(msg) => {
-                                self.error(&msg).await;
-                                return 2;
-                            }
-                        },
-                    };
-                    if let Io::Inline { stdin, .. } = &mut sync.io {
-                        *stdin = io::Cursor::new(held);
+            };
+            let mut sync = SyncCtx {
+                name: self.name.clone(),
+                cwd: self.vp.cwd.clone(),
+                env: self.env.clone(),
+                terminal,
+                stdin_readable,
+                configured: !self.vp.core.utilities.unconfigured,
+                streams,
+                io: Io::Inline {
+                    host,
+                    stdin: io::Cursor::new(Held(Rc::default())),
+                    out: Arc::default(),
+                    replay: self.replay.clone(),
+                },
+                out: Vec::new(),
+                write_error: None,
+            };
+            match native {
+                Some(native) => self.run_thread(sync, native, body).await,
+                None => {
+                    if opts.stdin {
+                        // A replayed run reads what the first one read.
+                        let held = self.replay.borrow().stdin.clone();
+                        let held = match held {
+                            Some(held) => held,
+                            None => match self.read_limited(INLINE_INPUT_LIMIT).await {
+                                Ok(data) => {
+                                    let held = Held(Rc::new(data));
+                                    self.replay.borrow_mut().stdin = Some(held.clone());
+                                    held
+                                }
+                                Err(msg) => {
+                                    self.error(&msg).await;
+                                    return 2;
+                                }
+                            },
+                        };
+                        if let Io::Inline { stdin, .. } = &mut sync.io {
+                            *stdin = io::Cursor::new(held);
+                        }
                     }
-                }
-                let status = run_guarded(&mut sync, arg, f);
-                let open = !self.replay.borrow().waiting.is_empty();
-                if open && !self.replay.borrow().changed {
-                    // The body ran on answers the host had not given: nothing it
-                    // printed is kept, and the utility's runner starts it again once
-                    // they are there (`util::run_with`). This run ends here.
-                    self.replay.borrow_mut().again = true;
-                    return std::future::pending().await;
-                }
-                // A body that changed files is never run twice: the questions it got
-                // an error for stay unanswered.
-                self.replay.borrow_mut().waiting.clear();
-                let _ = sync.flush();
-                let Io::Inline { out, .. } = sync.io else {
-                    unreachable!()
-                };
-                // Writers the body cloned are gone with its threads; take what they wrote.
-                let output = std::mem::take(&mut lock_out(&out).output);
-                for (fd, data) in output {
-                    let r = match self.fd(fd) {
-                        Some(file) => file.write_all(&data).await,
-                        None => Err(crate::fd::bad_fd()),
-                    };
-                    if r.is_err() && fd == 1 {
-                        break;
+                    let status = run_guarded(&mut sync, body);
+                    let open = !self.replay.borrow().waiting.is_empty();
+                    if open && !self.replay.borrow().changed {
+                        // The body ran on answers the host had not given: nothing it
+                        // printed is kept, and the utility's runner starts it again once
+                        // they are there (`util::run_with`). This run ends here.
+                        self.replay.borrow_mut().again = true;
+                        return std::future::pending().await;
                     }
+                    // A body that changed files is never run twice: the questions it got
+                    // an error for stay unanswered.
+                    self.replay.borrow_mut().waiting.clear();
+                    let _ = sync.flush();
+                    let Io::Inline { out, .. } = sync.io else {
+                        unreachable!()
+                    };
+                    // Writers the body cloned are gone with its threads; take what they wrote.
+                    let output = std::mem::take(&mut lock_out(&out).output);
+                    for (fd, data) in output {
+                        let r = match self.fd(fd) {
+                            Some(file) => file.write_all(&data).await,
+                            None => Err(crate::fd::bad_fd()),
+                        };
+                        if r.is_err() && fd == 1 {
+                            break;
+                        }
+                    }
+                    status
                 }
-                status
             }
-        }
+        })
     }
 
     /// stdin to its end, or an error message past `limit` bytes.
@@ -928,13 +942,7 @@ impl UtilCtx<'_> {
         }
     }
 
-    async fn run_thread<T: Send + 'static>(
-        &mut self,
-        sync: SyncCtx,
-        native: NativePathFn,
-        arg: T,
-        f: SyncFn<T>,
-    ) -> i32 {
+    async fn run_thread(&mut self, sync: SyncCtx, native: NativePathFn, body: Body) -> i32 {
         let pipe = Arc::new(Pipe {
             state: Mutex::new(PipeState::default()),
             cv: Condvar::new(),
@@ -973,7 +981,7 @@ impl UtilCtx<'_> {
                     out: Vec::new(),
                     write_error: None,
                 };
-                let status = run_guarded(&mut ctx, arg, f);
+                let status = run_guarded(&mut ctx, body);
                 let _ = ctx.flush();
                 thread_pipe.finish(Some(status));
             }),
@@ -1044,8 +1052,8 @@ impl UtilCtx<'_> {
 
 /// Runs `f`, turning a panic into status 2 and a message (a bug in ported code must not
 /// take the shell down).
-fn run_guarded<T>(ctx: &mut SyncCtx, arg: T, f: SyncFn<T>) -> i32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx, arg))) {
+fn run_guarded(ctx: &mut SyncCtx, body: Body) -> i32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(ctx))) {
         Ok(status) => status,
         Err(p) => {
             let msg = p

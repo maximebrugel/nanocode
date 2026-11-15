@@ -28,8 +28,16 @@ pub fn map_with<'a, T: Clone + 'a, U: 'a, V: 'a>(
 ) -> BoxIter<'a, V> {
     match single(&mut l) {
         Some(y) => box_once(r(y, x)),
-        None => Box::new(l.map(move |y| r(y, x.clone()))),
+        None => map_dyn(l, x, Box::new(r)),
     }
+}
+
+fn map_dyn<'a, T: Clone + 'a, U: 'a, V: 'a>(
+    l: impl Iterator<Item = U> + 'a,
+    x: T,
+    r: Box<dyn Fn(U, T) -> V + 'a>,
+) -> BoxIter<'a, V> {
+    Box::new(l.map(move |y| r(y, x.clone())))
 }
 
 pub fn flat_map_with<'a, T: Clone + 'a, U: 'a, V: 'a>(
@@ -39,8 +47,16 @@ pub fn flat_map_with<'a, T: Clone + 'a, U: 'a, V: 'a>(
 ) -> BoxIter<'a, V> {
     match single(&mut l) {
         Some(y) => r(y, x),
-        None => Box::new(l.flat_map(move |y| r(y, x.clone()))),
+        None => flat_map_dyn(l, x, Box::new(r)),
     }
+}
+
+fn flat_map_dyn<'a, T: Clone + 'a, U: 'a, V: 'a>(
+    l: impl Iterator<Item = U> + 'a,
+    x: T,
+    r: Box<dyn Fn(U, T) -> BoxIter<'a, V> + 'a>,
+) -> BoxIter<'a, V> {
+    Box::new(l.flat_map(move |y| r(y, x.clone())))
 }
 
 pub fn flat_map_then<'a, T: 'a, U: 'a, E: 'a>(
@@ -49,8 +65,15 @@ pub fn flat_map_then<'a, T: 'a, U: 'a, E: 'a>(
 ) -> BoxIter<'a, Result<U, E>> {
     match single(&mut l) {
         Some(y) => then(y, r),
-        None => Box::new(l.flat_map(move |y| then(y, &r))),
+        None => flat_map_then_dyn(l, Box::new(r)),
     }
+}
+
+fn flat_map_then_dyn<'a, T: 'a, U: 'a, E: 'a>(
+    l: impl Iterator<Item = Result<T, E>> + 'a,
+    r: Box<dyn Fn(T) -> BoxIter<'a, Result<U, E>> + 'a>,
+) -> BoxIter<'a, Result<U, E>> {
+    Box::new(l.flat_map(move |y| then(y, &r)))
 }
 
 pub fn flat_map_then_with<'a, T: Clone + 'a, U: 'a, V: 'a, E: 'a>(

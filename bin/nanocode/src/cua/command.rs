@@ -1,0 +1,120 @@
+use super::*;
+
+#[inline(never)]
+pub(super) fn cua(args: CuaArgs) -> nanocode_sync::future::LocalBoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        let home = home()?;
+        let state = state()?;
+        match args.command {
+            CuaCommand::Install {
+                browser: names,
+                skip_driver,
+            } => {
+                if !skip_driver && cfg!(target_os = "macos") {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let driver = embedded_driver()?;
+                        println!(
+                            "cua-driver is built into nanocode ({}), so macOS asks for Accessibility and Screen & System Audio Recording for the app that runs it",
+                            driver.display()
+                        );
+                        run(Command::new(driver).arg("request-permissions"))?;
+                    }
+                } else if !skip_driver {
+                    match driver() {
+                        Some(path) => println!("cua-driver: {}", path.display()),
+                        None => {
+                            println!("Installing cua-driver from {CUA_DRIVER_INSTALLER}");
+                            run(Command::new("/bin/bash").arg("-c").arg(format!(
+                                "set -o pipefail; curl -fsSL '{CUA_DRIVER_INSTALLER}' | bash"
+                            )))?;
+                        }
+                    }
+                    driver().ok_or(
+                        "cua-driver is still missing (or Node.js 22+ is not installed); set CUA_DRIVER_PATH and CUA_REPL_NODE",
+                    )?;
+                }
+                let browsers = selected(&home, &names)?;
+                if browsers.is_empty() {
+                    println!(
+                        "No Chromium browser found; pass --browser NAME or a user data directory"
+                    );
+                    return Ok(());
+                }
+                let extension = browser::install(
+                    &state,
+                    &std::env::current_exe()?,
+                    &["cua", "browser-host"],
+                    &browsers,
+                )?;
+                for browser in &browsers {
+                    println!(
+                        "{}: native host {} — extension {}",
+                        browser.name,
+                        browser.host_manifest().display(),
+                        if browser.extension_loaded() {
+                            "loaded"
+                        } else {
+                            "not loaded yet"
+                        }
+                    );
+                }
+                if browsers.iter().any(|browser| !browser.extension_loaded()) {
+                    println!(
+                        "\nLoad the nanocode extension once in each browser: open chrome://extensions, turn on Developer mode, choose Load unpacked and pick\n  {}\nIts ID is {}.",
+                        extension.display(),
+                        browser::EXTENSION_ID
+                    );
+                }
+            }
+            CuaCommand::Uninstall { browser: names } => {
+                let browsers = selected(&home, &names)?;
+                let removed = browser::uninstall(&state, &browsers)?;
+                println!(
+                    "Removed the nanocode native host from {}; remove the nanocode extension from chrome://extensions",
+                    if removed.is_empty() {
+                        "no browser".to_owned()
+                    } else {
+                        removed.join(", ")
+                    }
+                );
+            }
+            CuaCommand::Status => {
+                match ComputerConfig::cua_driver() {
+                    Ok(config) => println!(
+                        "node: {}\ncua-driver: {}",
+                        config.executable.display(),
+                        driver().map_or_else(String::new, |path| path.display().to_string())
+                    ),
+                    Err(error) => println!("cua-driver backend unavailable: {error}"),
+                }
+                #[cfg(target_os = "macos")]
+                run(Command::new(embedded_driver()?).arg("permissions"))?;
+                for browser in browser::browsers(&home) {
+                    println!(
+                        "{}: native host {}, extension {}",
+                        browser.name,
+                        if browser.host_manifest().is_file() {
+                            "installed"
+                        } else {
+                            "missing"
+                        },
+                        if browser.extension_loaded() {
+                            "loaded"
+                        } else {
+                            "not loaded"
+                        }
+                    );
+                }
+                println!("browser socket: {}", browser_socket(&home).display());
+            }
+            #[cfg(target_os = "macos")]
+            CuaCommand::DriverMcp => run(Command::new(embedded_driver()?).arg("mcp"))?,
+            CuaCommand::BrowserHost { .. } => {
+                let socket = browser_socket(&home);
+                nanocode_platform::spawn_blocking(move || browser::serve_host(&socket)).await??;
+            }
+        }
+        Ok(())
+    })
+}

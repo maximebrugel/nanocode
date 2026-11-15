@@ -512,15 +512,21 @@ fn command_state(command: &Command) -> Option<&str> {
     }
 }
 
-async fn run_grouped<S: StateStore + ?Sized>(store: &mut S, mut group: Vec<Grouped>) {
-    match group.pop() {
-        Some(single) if group.is_empty() => run(store, single.into_request()).await,
-        Some(last) => {
-            group.push(last);
-            run_group(store, group).await;
+#[inline(never)]
+fn run_grouped<'a>(
+    store: &'a mut dyn StateStore,
+    mut group: Vec<Grouped>,
+) -> crate::format::FormatFuture<'a, ()> {
+    Box::pin(async move {
+        match group.pop() {
+            Some(single) if group.is_empty() => run(store, single.into_request()).await,
+            Some(last) => {
+                group.push(last);
+                run_group(store, group).await;
+            }
+            None => {}
         }
-        None => {}
-    }
+    })
 }
 
 struct Completion(mpsc::UnboundedSender<Vec<String>>, Vec<String>);
@@ -960,344 +966,376 @@ struct Acquisition {
     result: oneshot::Sender<Result<OwnedState, StoreError>>,
 }
 
-async fn run_group<S: StateStore + ?Sized>(store: &mut S, group: Vec<Grouped>) {
-    let mut writes = Vec::with_capacity(group.len());
-    let mut acquisitions = Vec::new();
-    let mut owners = Vec::new();
-    for grouped in group {
-        grouped.span.record(
-            "queue.duration_ms",
-            nanocode_platform::now()
-                .saturating_duration_since(grouped.queued)
-                .as_secs_f64()
-                * 1_000.0,
-        );
-        match grouped.work {
-            Work::Commit {
-                commit,
-                reply,
-                content,
-            } => writes.push((commit, reply, content)),
-            Work::Acquire {
-                state_id,
-                owner_id,
-                #[cfg(not(target_family = "wasm"))]
-                update,
-                result,
-            } => {
-                acquisitions.push(Acquisition {
-                    #[cfg(not(target_family = "wasm"))]
-                    state_id: state_id.clone(),
+#[inline(never)]
+fn run_group<'a>(
+    store: &'a mut dyn StateStore,
+    group: Vec<Grouped>,
+) -> crate::format::FormatFuture<'a, ()> {
+    Box::pin(async move {
+        let mut writes = Vec::with_capacity(group.len());
+        let mut acquisitions = Vec::new();
+        let mut owners = Vec::new();
+        for grouped in group {
+            grouped.span.record(
+                "queue.duration_ms",
+                nanocode_platform::now()
+                    .saturating_duration_since(grouped.queued)
+                    .as_secs_f64()
+                    * 1_000.0,
+            );
+            match grouped.work {
+                Work::Commit {
+                    commit,
+                    reply,
+                    content,
+                } => writes.push((commit, reply, content)),
+                Work::Acquire {
+                    state_id,
+                    owner_id,
                     #[cfg(not(target_family = "wasm"))]
                     update,
                     result,
-                });
-                owners.push((state_id, owner_id));
-            }
-        }
-    }
-    let contents = nanocode_sync::join_in_order(
-        writes
-            .iter_mut()
-            .map(|(_, _, content)| content.take())
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|content| async move {
-                match content {
-                    Some(content) => Some(content.await),
-                    None => None,
+                } => {
+                    acquisitions.push(Acquisition {
+                        #[cfg(not(target_family = "wasm"))]
+                        state_id: state_id.clone(),
+                        #[cfg(not(target_family = "wasm"))]
+                        update,
+                        result,
+                    });
+                    owners.push((state_id, owner_id));
                 }
-            }),
-    );
-    let count = owners.len();
-    let acquired = async {
-        if owners.is_empty() {
-            return Vec::new();
+            }
         }
-        store
-            .acquire_many(owners)
-            .instrument(nanocode_trace::info_span!(
-                "durability.store.acquire_group",
-                acquire.count = count
-            ))
-            .await
-    };
-    let (contents, mut acquired) = nanocode_sync::future::join(contents, acquired).await;
-    if acquired.len() != count {
-        let error = StoreError::Backend(format!(
-            "durability store answered {} of {count} grouped acquisitions",
-            acquired.len()
-        ));
-        acquired = (0..count).map(|_| Err(error.clone())).collect();
-    }
-    let mut commits = Vec::with_capacity(writes.len());
-    let mut answers = Vec::with_capacity(writes.len());
-    for ((mut commit, reply, _), content) in writes.into_iter().zip(contents) {
-        match content {
-            Some(Ok((payload, records))) => {
-                commit.payload = payload;
-                commit.records = records;
+        let contents = nanocode_sync::join_in_order(
+            writes
+                .iter_mut()
+                .map(|(_, _, content)| content.take())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|content| async move {
+                    match content {
+                        Some(content) => Some(content.await),
+                        None => None,
+                    }
+                }),
+        );
+        let count = owners.len();
+        let acquired = async {
+            if owners.is_empty() {
+                return Vec::new();
             }
-            Some(Err(error)) => {
-                reply.send(Err(error));
-                continue;
-            }
-            None => {}
-        }
-        commits.push(commit);
-        answers.push(Answer::Write(reply));
-    }
-    for (acquisition, owned) in acquisitions.into_iter().zip(acquired) {
-        let owned = match owned {
-            Ok(owned) => owned,
-            Err(error) => {
-                drop(acquisition.result.send(Err(error)));
-                continue;
-            }
+            store
+                .acquire_many(owners)
+                .instrument(nanocode_trace::info_span!(
+                    "durability.store.acquire_group",
+                    acquire.count = count
+                ))
+                .await
         };
-        #[cfg(not(target_family = "wasm"))]
-        if let Some(update) = acquisition.update {
-            match update(&owned.state) {
-                Ok(Some(replacement)) => {
-                    commits.push(OwnedCommit {
-                        state_id: acquisition.state_id,
-                        owner: owned.owner.clone(),
-                        expected_revision: owned.state.revision,
-                        payload: replacement.payload.clone(),
-                        records: replacement.records,
-                        events: Vec::new(),
-                        summary: SummaryUpdate::Unchanged,
-                        settle: Settle::Durable,
-                    });
-                    answers.push(Answer::Acquired {
-                        result: acquisition.result,
-                        owned,
-                        payload: replacement.payload,
-                    });
+        let (contents, mut acquired) = nanocode_sync::future::join(contents, acquired).await;
+        if acquired.len() != count {
+            let error = StoreError::Backend(format!(
+                "durability store answered {} of {count} grouped acquisitions",
+                acquired.len()
+            ));
+            acquired = (0..count).map(|_| Err(error.clone())).collect();
+        }
+        let mut commits = Vec::with_capacity(writes.len());
+        let mut answers = Vec::with_capacity(writes.len());
+        for ((mut commit, reply, _), content) in writes.into_iter().zip(contents) {
+            match content {
+                Some(Ok((payload, records))) => {
+                    commit.payload = payload;
+                    commit.records = records;
                 }
-                Ok(None) => drop(acquisition.result.send(Ok(owned))),
-                Err(error) => drop(acquisition.result.send(Err(updated_after_acquiring(error)))),
+                Some(Err(error)) => {
+                    reply.send(Err(error));
+                    continue;
+                }
+                None => {}
             }
-            continue;
+            commits.push(commit);
+            answers.push(Answer::Write(reply));
         }
-        drop(acquisition.result.send(Ok(owned)));
-    }
-    let count = commits.len();
-    assert_eq!(
-        answers.len(),
-        count,
-        "every grouped commit has one answer waiting"
-    );
-    if count == 0 {
-        return;
-    }
-    let results = store
-        .commit_many(commits)
-        .instrument(nanocode_trace::info_span!(
-            "durability.store.group",
-            commit.count = count
-        ))
-        .await;
-    if results.len() != count {
-        let error = StoreError::Backend(format!(
-            "durability store answered {} of {count} grouped commits",
-            results.len()
-        ));
-        for answer in answers {
-            answer.send(Err(error.clone()));
+        for (acquisition, owned) in acquisitions.into_iter().zip(acquired) {
+            let owned = match owned {
+                Ok(owned) => owned,
+                Err(error) => {
+                    drop(acquisition.result.send(Err(error)));
+                    continue;
+                }
+            };
+            #[cfg(not(target_family = "wasm"))]
+            if let Some(update) = acquisition.update {
+                match update(&owned.state) {
+                    Ok(Some(replacement)) => {
+                        commits.push(OwnedCommit {
+                            state_id: acquisition.state_id,
+                            owner: owned.owner.clone(),
+                            expected_revision: owned.state.revision,
+                            payload: replacement.payload.clone(),
+                            records: replacement.records,
+                            events: Vec::new(),
+                            summary: SummaryUpdate::Unchanged,
+                            settle: Settle::Durable,
+                        });
+                        answers.push(Answer::Acquired {
+                            result: acquisition.result,
+                            owned,
+                            payload: replacement.payload,
+                        });
+                    }
+                    Ok(None) => drop(acquisition.result.send(Ok(owned))),
+                    Err(error) => {
+                        drop(acquisition.result.send(Err(updated_after_acquiring(error))))
+                    }
+                }
+                continue;
+            }
+            drop(acquisition.result.send(Ok(owned)));
         }
-        return;
-    }
-    for (answer, result) in answers.into_iter().zip(results) {
-        answer.send(result);
-    }
+        let count = commits.len();
+        assert_eq!(
+            answers.len(),
+            count,
+            "every grouped commit has one answer waiting"
+        );
+        if count == 0 {
+            return;
+        }
+        let results = store
+            .commit_many(commits)
+            .instrument(nanocode_trace::info_span!(
+                "durability.store.group",
+                commit.count = count
+            ))
+            .await;
+        if results.len() != count {
+            let error = StoreError::Backend(format!(
+                "durability store answered {} of {count} grouped commits",
+                results.len()
+            ));
+            for answer in answers {
+                answer.send(Err(error.clone()));
+            }
+            return;
+        }
+        for (answer, result) in answers.into_iter().zip(results) {
+            answer.send(result);
+        }
+    })
 }
 
-async fn run<S: StateStore + ?Sized>(store: &mut S, request: StoreRequest) {
-    let StoreRequest {
-        command,
-        span,
-        queued,
-    } = request;
-    span.record(
-        "queue.duration_ms",
-        nanocode_platform::now()
-            .saturating_duration_since(queued)
-            .as_secs_f64()
-            * 1_000.0,
-    );
-    async {
-        match command {
-            Command::ReadRecords {
-                state_id,
-                keys,
-                result,
-            } => {
-                drop(result.send(store.read_records(&state_id, &keys).await));
-            }
+#[inline(never)]
+fn run<'a>(
+    store: &'a mut dyn StateStore,
+    request: StoreRequest,
+) -> crate::format::FormatFuture<'a, ()> {
+    Box::pin(async move {
+        let StoreRequest {
+            command,
+            span,
+            queued,
+        } = request;
+        span.record(
+            "queue.duration_ms",
+            nanocode_platform::now()
+                .saturating_duration_since(queued)
+                .as_secs_f64()
+                * 1_000.0,
+        );
+        async {
+            match command {
+                Command::ReadRecords {
+                    state_id,
+                    keys,
+                    result,
+                } => {
+                    drop(result.send(store.read_records(&state_id, &keys).await));
+                }
 
-            Command::Acquire {
-                state_id,
-                owner_id,
-                result,
-            } => {
-                drop(result.send(store.acquire(&state_id, owner_id).await));
-            }
-            Command::Replace {
-                state_id,
-                owner,
-                expected_revision,
-                payload,
-                records: new_records,
-                result,
-            } => {
-                drop(
-                    result.send(
-                        store
-                            .replace(&state_id, &owner, expected_revision, &payload, &new_records)
-                            .await,
-                    ),
-                );
-            }
-            Command::ReplaceLatest {
-                state_id,
-                owner,
-                expected_revision,
-                write,
-                result,
-            } => {
-                let (payload, new_records) = write.take();
-                drop(
-                    result.send(
-                        store
-                            .replace(&state_id, &owner, expected_revision, &payload, &new_records)
-                            .await,
-                    ),
-                );
-            }
-            Command::ReplaceDeferred {
-                state_id,
-                owner,
-                expected_revision,
-                content,
-                result,
-            } => {
-                let replaced = match content.await {
-                    Ok((payload, new_records)) => {
-                        store
-                            .replace(&state_id, &owner, expected_revision, &payload, &new_records)
-                            .await
-                    }
-                    Err(error) => Err(error),
-                };
-                drop(result.send(replaced));
-            }
-            Command::Commit {
-                state_id,
-                owner,
-                expected_revision,
-                payload,
-                records: new_records,
-                events,
-                summary,
-                settle,
-                result,
-            } => {
-                drop(
-                    result.send(
-                        store
-                            .commit(
-                                &state_id,
-                                &owner,
-                                expected_revision,
-                                StateCommit {
-                                    payload: &payload,
-                                    records: &new_records,
-                                    events: &events,
-                                    summary: &summary,
-                                    settle,
-                                },
-                            )
-                            .await,
-                    ),
-                );
-            }
-            #[cfg(not(target_family = "wasm"))]
-            Command::AcquireWith {
-                state_id,
-                owner_id,
-                update,
-                result,
-            } => {
-                drop(result.send(store.acquire_with(&state_id, owner_id, update).await));
-            }
-            #[cfg(not(target_family = "wasm"))]
-            Command::AcquireWithCompanion {
-                state_id,
-                owner_id,
-                update,
-                companion_id,
-                companion_owner,
-                result,
-            } => {
-                drop(
-                    result.send(
-                        store
-                            .acquire_with_companion(
-                                &state_id,
-                                owner_id,
-                                update,
-                                &companion_id,
-                                companion_owner,
-                            )
-                            .await,
-                    ),
-                );
-            }
-            Command::Peek { state_id, result } => {
-                drop(result.send(store.peek(&state_id).await));
-            }
-            Command::Owner { state_id, result } => {
-                drop(result.send(store.owner(&state_id).await));
-            }
-            Command::CollectUnreachable { state_id, result } => {
-                drop(result.send(store.collect_unreachable(&state_id).await));
-            }
-            Command::ListStates { limit, result } => {
-                drop(result.send(store.list_states(limit).await));
-            }
-            Command::ListRecords { state_id, result } => {
-                drop(result.send(store.list_records(&state_id).await));
-            }
-            Command::ListSummaries { limit, result } => {
-                drop(result.send(store.list_summaries(limit).await));
-            }
-            Command::NewestSummaries {
-                scope,
-                limit,
-                keep,
-                result,
-            } => {
-                drop(result.send(store.newest_summaries(scope, limit, keep).await));
-            }
-            Command::ListBriefs {
-                scope,
-                limit,
-                keep,
-                result,
-            } => {
-                drop(result.send(store.list_briefs(scope, limit, keep).await));
-            }
-            Command::RememberSummaries { summaries, result } => {
-                drop(result.send(store.remember_summaries(summaries).await));
-            }
-            Command::Flush { result } => {
-                drop(result.send(store.flush().await));
+                Command::Acquire {
+                    state_id,
+                    owner_id,
+                    result,
+                } => {
+                    drop(result.send(store.acquire(&state_id, owner_id).await));
+                }
+                Command::Replace {
+                    state_id,
+                    owner,
+                    expected_revision,
+                    payload,
+                    records: new_records,
+                    result,
+                } => {
+                    drop(
+                        result.send(
+                            store
+                                .replace(
+                                    &state_id,
+                                    &owner,
+                                    expected_revision,
+                                    &payload,
+                                    &new_records,
+                                )
+                                .await,
+                        ),
+                    );
+                }
+                Command::ReplaceLatest {
+                    state_id,
+                    owner,
+                    expected_revision,
+                    write,
+                    result,
+                } => {
+                    let (payload, new_records) = write.take();
+                    drop(
+                        result.send(
+                            store
+                                .replace(
+                                    &state_id,
+                                    &owner,
+                                    expected_revision,
+                                    &payload,
+                                    &new_records,
+                                )
+                                .await,
+                        ),
+                    );
+                }
+                Command::ReplaceDeferred {
+                    state_id,
+                    owner,
+                    expected_revision,
+                    content,
+                    result,
+                } => {
+                    let replaced = match content.await {
+                        Ok((payload, new_records)) => {
+                            store
+                                .replace(
+                                    &state_id,
+                                    &owner,
+                                    expected_revision,
+                                    &payload,
+                                    &new_records,
+                                )
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+                    drop(result.send(replaced));
+                }
+                Command::Commit {
+                    state_id,
+                    owner,
+                    expected_revision,
+                    payload,
+                    records: new_records,
+                    events,
+                    summary,
+                    settle,
+                    result,
+                } => {
+                    drop(
+                        result.send(
+                            store
+                                .commit(
+                                    &state_id,
+                                    &owner,
+                                    expected_revision,
+                                    StateCommit {
+                                        payload: &payload,
+                                        records: &new_records,
+                                        events: &events,
+                                        summary: &summary,
+                                        settle,
+                                    },
+                                )
+                                .await,
+                        ),
+                    );
+                }
+                #[cfg(not(target_family = "wasm"))]
+                Command::AcquireWith {
+                    state_id,
+                    owner_id,
+                    update,
+                    result,
+                } => {
+                    drop(result.send(store.acquire_with(&state_id, owner_id, update).await));
+                }
+                #[cfg(not(target_family = "wasm"))]
+                Command::AcquireWithCompanion {
+                    state_id,
+                    owner_id,
+                    update,
+                    companion_id,
+                    companion_owner,
+                    result,
+                } => {
+                    drop(
+                        result.send(
+                            store
+                                .acquire_with_companion(
+                                    &state_id,
+                                    owner_id,
+                                    update,
+                                    &companion_id,
+                                    companion_owner,
+                                )
+                                .await,
+                        ),
+                    );
+                }
+                Command::Peek { state_id, result } => {
+                    drop(result.send(store.peek(&state_id).await));
+                }
+                Command::Owner { state_id, result } => {
+                    drop(result.send(store.owner(&state_id).await));
+                }
+                Command::CollectUnreachable { state_id, result } => {
+                    drop(result.send(store.collect_unreachable(&state_id).await));
+                }
+                Command::ListStates { limit, result } => {
+                    drop(result.send(store.list_states(limit).await));
+                }
+                Command::ListRecords { state_id, result } => {
+                    drop(result.send(store.list_records(&state_id).await));
+                }
+                Command::ListSummaries { limit, result } => {
+                    drop(result.send(store.list_summaries(limit).await));
+                }
+                Command::NewestSummaries {
+                    scope,
+                    limit,
+                    keep,
+                    result,
+                } => {
+                    drop(result.send(store.newest_summaries(scope, limit, keep).await));
+                }
+                Command::ListBriefs {
+                    scope,
+                    limit,
+                    keep,
+                    result,
+                } => {
+                    drop(result.send(store.list_briefs(scope, limit, keep).await));
+                }
+                Command::RememberSummaries { summaries, result } => {
+                    drop(result.send(store.remember_summaries(summaries).await));
+                }
+                Command::Flush { result } => {
+                    drop(result.send(store.flush().await));
+                }
             }
         }
-    }
-    .instrument(span)
-    .await;
+        .instrument(span)
+        .await;
+    })
 }
 
 impl SharedStore {

@@ -838,68 +838,56 @@ impl UtilCtx<'_> {
     /// what `which -a` lists. A relative directory gives a relative path, as in
     /// `type`.
     pub async fn search_path(&self, name: &[u8], path: &[u8]) -> Vec<Vec<u8>> {
-        let host = self.vp.host();
-        let mut found = Vec::new();
-        for dir in host.path_entries(path) {
-            let Some(hit) = host.resolve(name, &dir, &self.vp.cwd).await else {
-                continue;
-            };
-            if dir.is_empty() || self.vp.abs_path(&dir) == dir {
-                found.push(hit);
-            } else {
-                // The host may have added an extension (PATHEXT): keep its file name.
-                let base = hit.rsplit(|&b| b == b'/').next().unwrap_or(name);
-                let mut shown = dir.clone();
-                shown.push(b'/');
-                shown.extend_from_slice(base);
-                found.push(shown);
+        self.search_path_boxed(name, path).await
+    }
+
+    #[inline(never)]
+    fn search_path_boxed<'a>(
+        &'a self,
+        name: &'a [u8],
+        path: &'a [u8],
+    ) -> crate::util::LocalBoxFuture<'a, Vec<Vec<u8>>> {
+        Box::pin(async move {
+            let host = self.vp.host();
+            let mut found = Vec::new();
+            for dir in host.path_entries(path) {
+                let Some(hit) = host.resolve(name, &dir, &self.vp.cwd).await else {
+                    continue;
+                };
+                if dir.is_empty() || self.vp.abs_path(&dir) == dir {
+                    found.push(hit);
+                } else {
+                    // The host may have added an extension (PATHEXT): keep its file name.
+                    let base = hit.rsplit(|&b| b == b'/').next().unwrap_or(name);
+                    let mut shown = dir.clone();
+                    shown.push(b'/');
+                    shown.extend_from_slice(base);
+                    found.push(shown);
+                }
             }
-        }
-        found
+            found
+        })
     }
 
     /// Runs the real program of this name from `PATH` with these arguments, for an
     /// option the utility does not implement (D1082): its status, or `None` when there
     /// is no such program (or the shell is a sandbox, where none exist).
     pub async fn run_program(&mut self, argv: Vec<Vec<u8>>) -> Option<i32> {
-        if self.vp.core.utilities.sandbox || argv.is_empty() {
-            return None;
-        }
-        crate::builtins::hash::search(self.vp, &argv[0], None).await?;
-        let _ = self.flush().await;
-        let mut sub = self.vp.subshell();
-        for (k, v) in &self.env {
-            if let Ok(name) = std::str::from_utf8(k)
-                && crate::state::is_name(k)
-            {
-                let var = sub.vars.entry(name);
-                var.set(v.clone());
-                var.exported = true;
-            }
-        }
-        let r = crate::exec::run_external(&mut sub, argv, Vec::new()).await;
-        let last = sub.status;
-        Some(r.unwrap_or_else(|u| u.status(last)))
+        self.run_program_boxed(argv).await
     }
 
-    /// Starts a command for a wrapper (`env`, `timeout`, `xargs`, `find -exec`): a
-    /// standalone builtin ([`STANDALONE_BUILTINS`]), a utility or an external, with this
-    /// context's descriptors and cwd and the environment changed by `env`. stdout is
-    /// flushed first. The command runs when the returned child is awaited.
-    pub async fn spawn(&mut self, argv: Vec<Vec<u8>>, env: SpawnEnv) -> UtilChild {
-        let _ = self.flush().await;
-        let mut sub = self.vp.subshell();
-        // The command sees the environment of the utility (prefix assignments
-        // included), changed by `env`.
-        if env.clear {
-            let names: Vec<String> = sub.vars.iter().map(|(n, _)| n.clone()).collect();
-            for n in names {
-                if let Some(var) = sub.vars.get_mut(&n) {
-                    var.exported = false;
-                }
+    #[inline(never)]
+    fn run_program_boxed(
+        &mut self,
+        argv: Vec<Vec<u8>>,
+    ) -> crate::util::LocalBoxFuture<'_, Option<i32>> {
+        Box::pin(async move {
+            if self.vp.core.utilities.sandbox || argv.is_empty() {
+                return None;
             }
-            sub.foreign_env = Rc::new(Vec::new());
-        } else {
+            crate::builtins::hash::search(self.vp, &argv[0], None).await?;
+            let _ = self.flush().await;
+            let mut sub = self.vp.subshell();
             for (k, v) in &self.env {
                 if let Ok(name) = std::str::from_utf8(k)
                     && crate::state::is_name(k)
@@ -909,36 +897,80 @@ impl UtilCtx<'_> {
                     var.exported = true;
                 }
             }
-        }
-        for name in &env.unset {
-            sub.vars.remove(name);
-        }
-        // Set as variables of the child, not as prefix assignments: the command is
-        // looked up with them (`env PATH=/x cmd` searches /x).
-        for (name, value) in env.set {
-            let var = sub.vars.entry(&name);
-            var.set(value);
-            var.exported = true;
-        }
-        if let Some(cwd) = env.cwd {
-            sub.cwd = cwd;
-        }
-        if let Some(path) = env.stdin {
-            match self.vp.host().open(&path, OpenOptions::read()).await {
-                Ok(f) => sub.fds.set(0, Rc::new(FdObj::File(f))),
-                Err(_) => sub.fds.close(0),
+            let r = crate::exec::run_external(&mut sub, argv, Vec::new()).await;
+            let last = sub.status;
+            Some(r.unwrap_or_else(|u| u.status(last)))
+        })
+    }
+
+    /// Starts a command for a wrapper (`env`, `timeout`, `xargs`, `find -exec`): a
+    /// standalone builtin ([`STANDALONE_BUILTINS`]), a utility or an external, with this
+    /// context's descriptors and cwd and the environment changed by `env`. stdout is
+    /// flushed first. The command runs when the returned child is awaited.
+    pub async fn spawn(&mut self, argv: Vec<Vec<u8>>, env: SpawnEnv) -> UtilChild {
+        self.spawn_boxed(argv, env).await
+    }
+
+    #[inline(never)]
+    fn spawn_boxed(
+        &mut self,
+        argv: Vec<Vec<u8>>,
+        env: SpawnEnv,
+    ) -> crate::util::LocalBoxFuture<'_, UtilChild> {
+        Box::pin(async move {
+            let _ = self.flush().await;
+            let mut sub = self.vp.subshell();
+            // The command sees the environment of the utility (prefix assignments
+            // included), changed by `env`.
+            if env.clear {
+                let names: Vec<String> = sub.vars.iter().map(|(n, _)| n.clone()).collect();
+                for n in names {
+                    if let Some(var) = sub.vars.get_mut(&n) {
+                        var.exported = false;
+                    }
+                }
+                sub.foreign_env = Rc::new(Vec::new());
+            } else {
+                for (k, v) in &self.env {
+                    if let Ok(name) = std::str::from_utf8(k)
+                        && crate::state::is_name(k)
+                    {
+                        let var = sub.vars.entry(name);
+                        var.set(v.clone());
+                        var.exported = true;
+                    }
+                }
             }
-        }
-        let cleared = env.clear || env.unset.iter().any(|n| n == "_");
-        UtilChild {
-            fut: Box::pin(async move {
-                let mut sub = sub;
-                let r = run_wrapped(&mut sub, argv, Vec::new(), cleared).await;
-                let last = sub.status;
-                r.unwrap_or_else(|u| u.status(last))
-            }),
-            status: None,
-        }
+            for name in &env.unset {
+                sub.vars.remove(name);
+            }
+            // Set as variables of the child, not as prefix assignments: the command is
+            // looked up with them (`env PATH=/x cmd` searches /x).
+            for (name, value) in env.set {
+                let var = sub.vars.entry(&name);
+                var.set(value);
+                var.exported = true;
+            }
+            if let Some(cwd) = env.cwd {
+                sub.cwd = cwd;
+            }
+            if let Some(path) = env.stdin {
+                match self.vp.host().open(&path, OpenOptions::read()).await {
+                    Ok(f) => sub.fds.set(0, Rc::new(FdObj::File(f))),
+                    Err(_) => sub.fds.close(0),
+                }
+            }
+            let cleared = env.clear || env.unset.iter().any(|n| n == "_");
+            UtilChild {
+                fut: Box::pin(async move {
+                    let mut sub = sub;
+                    let r = run_wrapped(&mut sub, argv, Vec::new(), cleared).await;
+                    let last = sub.status;
+                    r.unwrap_or_else(|u| u.status(last))
+                }),
+                status: None,
+            }
+        })
     }
 
     /// Starts `sh -c SCRIPT` in psh (D1191): for `awk`'s `system()` and pipes, `sed`'s
@@ -948,47 +980,58 @@ impl UtilCtx<'_> {
     /// stdin and stdout as `stdio` says. stdout is flushed first. It runs concurrently
     /// from now on, as its own task.
     pub async fn spawn_shell(&mut self, script: &[u8], stdio: ShellStdio) -> ShellChild {
-        let _ = self.flush().await;
-        let mut child = ShellChild {
-            stdin: None,
-            stdout: None,
-            task: None,
-            join: None,
-            status: None,
-        };
-        let mut sub = match self.afresh().await {
-            Ok(sub) => sub,
-            Err(status) => {
-                child.status = Some(status);
-                return child;
+        self.spawn_shell_boxed(script, stdio).await
+    }
+
+    #[inline(never)]
+    fn spawn_shell_boxed<'a>(
+        &'a mut self,
+        script: &'a [u8],
+        stdio: ShellStdio,
+    ) -> crate::util::LocalBoxFuture<'a, ShellChild> {
+        Box::pin(async move {
+            let _ = self.flush().await;
+            let mut child = ShellChild {
+                stdin: None,
+                stdout: None,
+                task: None,
+                join: None,
+                status: None,
+            };
+            let mut sub = match self.afresh().await {
+                Ok(sub) => sub,
+                Err(status) => {
+                    child.status = Some(status);
+                    return child;
+                }
+            };
+            sub.opts.dash_c = true;
+            sub.arg0 = b"sh".to_vec();
+            sub.args = Vec::new();
+            if stdio.stdin == ShellIo::Pipe {
+                let (r, w) = crate::pipe::pipe();
+                sub.fds.set(0, Rc::new(FdObj::PipeRead(r)));
+                child.stdin = Some(UtilFile {
+                    file: Rc::new(FdObj::PipeWrite(w)),
+                });
             }
-        };
-        sub.opts.dash_c = true;
-        sub.arg0 = b"sh".to_vec();
-        sub.args = Vec::new();
-        if stdio.stdin == ShellIo::Pipe {
-            let (r, w) = crate::pipe::pipe();
-            sub.fds.set(0, Rc::new(FdObj::PipeRead(r)));
-            child.stdin = Some(UtilFile {
-                file: Rc::new(FdObj::PipeWrite(w)),
+            if stdio.stdout == ShellIo::Pipe {
+                let (r, w) = crate::pipe::pipe();
+                sub.fds.set(1, Rc::new(FdObj::PipeWrite(w)));
+                child.stdout = Some(UtilFile {
+                    file: Rc::new(FdObj::PipeRead(r)),
+                });
+            }
+            let script = script.to_vec();
+            let sched = self.vp.core.sched.clone();
+            let (id, join) = sched.spawn_with_id(async move {
+                let (status, _) = crate::run_script(sub, crate::Input::Text(script)).await;
+                status
             });
-        }
-        if stdio.stdout == ShellIo::Pipe {
-            let (r, w) = crate::pipe::pipe();
-            sub.fds.set(1, Rc::new(FdObj::PipeWrite(w)));
-            child.stdout = Some(UtilFile {
-                file: Rc::new(FdObj::PipeRead(r)),
-            });
-        }
-        let script = script.to_vec();
-        let sched = self.vp.core.sched.clone();
-        let (id, join) = sched.spawn_with_id(async move {
-            let (status, _) = crate::run_script(sub, crate::Input::Text(script)).await;
-            status
-        });
-        child.task = Some((sched, id));
-        child.join = Some(join);
-        child
+            child.task = Some((sched, id));
+            child.join = Some(join);
+            child
+        })
     }
 }
 

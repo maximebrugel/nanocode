@@ -13,6 +13,7 @@
 use super::hot::{fill, ld, ld32, object_slot, st, window, write_values};
 use super::*;
 use crate::builtins::dense::index;
+use crate::heap::EachSite;
 use crate::heap::cells::{Object, ValueArray};
 
 const EACH_DENSE: u16 = super::intrinsics::id("EachDense");
@@ -984,13 +985,14 @@ impl Exec<'_> {
         leaf_of(c, self.get(self.bp - STATE + MODE).as_int()?)
     }
 
-    pub(super) fn each_fused(&mut self) -> bool {
-        let b = self.heap.arena().bytes();
+    /// What `each_fused` derives from the call site at `pc` and the callee `fo`, before
+    /// it looks at the receiver.
+    fn each_site(&self, fo: Obj) -> Option<EachSite> {
         let mut at = self.pc + OPS[Op::FClosure as usize].size as u32;
         let mut fixed = OPS[Op::FClosure as usize].cost.fuel() as i64;
         let mut init = None;
-        if at >= self.code_len || self.opts.gc_stress {
-            return false;
+        if at >= self.code_len {
+            return None;
         }
         let op = self.byte(at);
         if op != super::fast::CALL1 {
@@ -1000,34 +1002,86 @@ impl Exec<'_> {
                 }
                 _ if op == Op::PushI8 as u8 => (i32::from(self.byte(at + 1) as i8), 2),
                 _ if op == Op::PushI32 as u8 => (i32::from_le_bytes([1, 2, 3, 4].map(|i| self.byte(at + i))), 5),
-                _ => return false,
+                _ => return None,
             };
             fixed += OPS[op as usize].cost.fuel() as i64;
             at += size;
             if at >= self.code_len || self.byte(at) != super::fast::CALL2 {
-                return false;
+                return None;
             }
-            init = Some(Value::int(v));
+            init = Some(v);
         }
-        let (fv, ov) = (self.get(self.sp - 2), self.get(self.sp - 1));
-        let Some(fo) = fv
-            .as_object()
-            .filter(|&f| self.is_class(f, ObjectClass::Function))
-        else {
-            return false;
-        };
+        fixed += OPS[Op::Call as usize].cost.fuel() as i64;
+        if !self.is_class(fo, ObjectClass::Function) {
+            return None;
+        }
         let ft = self.template_of(fo);
-        if u32::from(self.heap.arena().get::<u16>(ft, FuncTemplate::FLAGS))
+        let a = self.heap.arena();
+        if u32::from(a.get::<u16>(ft, FuncTemplate::FLAGS))
             & self.slow_call_flags
             & func_flags::FAST
             == 0
         {
+            return None;
+        }
+        let mode = crate::builtins::fast::each_mode(a.get(ft, FuncTemplate::FAST) as usize)?;
+        let t = template::child(self.heap, self.template, self.imm_u32(1))?.0;
+        let b = a.bytes();
+        let code = FuncTemplate::DATA.at(t, 0) as usize;
+        let leaf = b
+            .get(code..code + super::hot::template_head(b, t).code_len as usize)
+            .and_then(|c| leaf_of(c, mode))?;
+        Some(EachSite {
+            callee: fo.offset(),
+            cap: leaf.cap.map(|c| template::capture_desc(self.heap, t, c)),
+            child: t,
+            code: self.code + self.pc,
+            end: at,
+            fixed,
+            fuel: leaf.fuel,
+            init,
+            mode,
+            op: leaf.op,
+            template: ft,
+            y: leaf.y,
+        })
+    }
+
+    pub(super) fn each_fused(&mut self) -> bool {
+        if self.opts.gc_stress {
             return false;
         }
-        let Some(mode) =
-            crate::builtins::fast::each_mode(self.heap.arena().get(ft, FuncTemplate::FAST) as usize)
-        else {
+        let (fv, ov) = (self.get(self.sp - 2), self.get(self.sp - 1));
+        let Some(fo) = fv.as_object() else {
             return false;
+        };
+        let site = self.heap.each_site;
+        let site = if site.code == self.code + self.pc && site.callee == fo.offset() {
+            site
+        } else {
+            let Some(site) = self.each_site(fo) else {
+                return false;
+            };
+            self.heap.each_site = site;
+            site
+        };
+        let a = self.heap.arena();
+        if u32::from(a.get::<u16>(site.template, FuncTemplate::FLAGS))
+            & self.slow_call_flags
+            & func_flags::FAST
+            == 0
+            || u32::from(a.get::<u16>(site.child, FuncTemplate::FLAGS)) & self.slow_call_flags != 0
+        {
+            return false;
+        }
+        let b = a.bytes();
+        let (at, fixed, mode) = (site.end, site.fixed, site.mode);
+        let init = site.init.map(Value::int);
+        let leaf = Leaf {
+            cap: site.cap,
+            fuel: site.fuel,
+            op: site.op,
+            y: site.y,
         };
         let Some(o) = ov
             .as_object()
@@ -1038,24 +1092,8 @@ impl Exec<'_> {
         if matches!(mode, MAP | FILTER) && !crate::builtins::fast::plain_species(self.heap, o) {
             return false;
         }
-        let Some(t) = template::child(self.heap, self.template, self.imm_u32(1)) else {
-            return false;
-        };
-        let t = t.0;
-        let th = super::hot::template_head(b, t);
-        if th.flags & self.slow_call_flags != 0 {
-            return false;
-        }
-        let code = FuncTemplate::DATA.at(t, 0) as usize;
-        let Some(leaf) = b
-            .get(code..code + th.code_len as usize)
-            .and_then(|c| leaf_of(c, mode))
-        else {
-            return false;
-        };
-        let cap = match leaf.cap {
-            Some(c) => {
-                let d = template::capture_desc(self.heap, t, c);
+        let cap = match site.cap {
+            Some(d) => {
                 let bx = if d & 0x8000_0000 != 0 {
                     self.capture(d & 0xFFFF)
                 } else {
@@ -1083,7 +1121,6 @@ impl Exec<'_> {
             return false;
         }
         let cost = leaf.fuel + super::native::CALL_FUEL;
-        fixed += OPS[Op::Call as usize].cost.fuel() as i64;
         let budget = self.fuel - fixed - 1;
         if budget < cost {
             return false;
@@ -1390,9 +1427,13 @@ const INT_HI: u64 = Value::int(0).to_bits() >> 32;
 const HOLE_BITS: [u8; 8] = Value::HOLE.to_bits().to_le_bytes();
 const CHUNK: usize = 8;
 
-fn until_run<const OP: u8>(xs: &[[u8; 8]], q: i32, stop: bool) -> usize {
-    const BIAS: u64 = INT_HI << 32 | 0x8000_0000;
-    const INTS: u64 = 1 << 32;
+const BIAS: u64 = INT_HI << 32 | 0x8000_0000;
+const INTS: u64 = 1 << 32;
+
+/// The int32 elements `p` with `compare::<OP>(p, q) != stop` as one range of a word:
+/// `(key, lo, c)` such that `x = (w ^ key) - lo` passes iff `(x | x + c) >> 32 == 0`.
+#[inline(always)]
+fn test_range<const OP: u8>(q: i32, stop: bool) -> (u64, u64, u64) {
     let qb = u64::from(q as u32 ^ 0x8000_0000);
     let (key, lo, hi) = match (OP, stop) {
         (LT, true) | (GE, false) => (BIAS, qb, INTS),
@@ -1402,16 +1443,20 @@ fn until_run<const OP: u8>(xs: &[[u8; 8]], q: i32, stop: bool) -> usize {
         (STRICT_EQ, true) | (STRICT_NE, false) => (INT_HI << 32 | u64::from(q as u32), 1, INTS),
         _ => (BIAS, qb, qb + 1),
     };
-    let c = INTS - hi.saturating_sub(lo);
+    (key, lo, INTS - hi.saturating_sub(lo))
+}
+
+fn until_run<const OP: u8>(xs: &[[u8; 8]], q: i32, stop: bool) -> usize {
+    let (key, lo, c) = test_range::<OP>(q, stop);
     let bad = |x: &[u8; 8]| {
         let x = (u64::from_le_bytes(*x) ^ key).wrapping_sub(lo);
         (x | x.wrapping_add(c)) >> 32 != 0
     };
     let mut i = 0;
-    for c in xs.chunks_exact(CHUNK) {
-        let m = c.iter().fold(0, |m, x| {
+    for chunk in xs.as_chunks::<CHUNK>().0 {
+        let m = chunk.iter().fold(0, |m, x| {
             let x = (u64::from_le_bytes(*x) ^ key).wrapping_sub(lo);
-            m | x | x.wrapping_add(INTS - hi.saturating_sub(lo))
+            m | x | x.wrapping_add(c)
         });
         if m >> 32 != 0 {
             break;
@@ -1467,13 +1512,69 @@ fn scan<const KIND: u8, const OP: u8>(b: &mut [u8], r: &mut Run) {
         return;
     }
     let (mut acc, mut i, mut n) = (r.acc, 0usize, 0usize);
+    if KIND == MAP_TO
+        && let Some(q) = q0
+        && (OP != MUL || q > 0)
+    {
+        let (min, max, q64) = (i64::from(i32::MIN), i64::from(i32::MAX), i64::from(q));
+        let (lo, hi) = match OP {
+            ADD => ((min - q64).max(min), (max - q64).min(max)),
+            SUB => ((min + q64).max(min), (max + q64).min(max)),
+            _ => (min / q64, max / q64),
+        };
+        let lo_b = (lo - min) as u64;
+        let c = INTS - (hi - lo + 1) as u64;
+        let qu = q as u32;
+        while i + CHUNK <= len && n + CHUNK <= os.len() {
+            let c8 = &xs[i..=i + CHUNK];
+            let m = c8[..CHUNK].iter().fold(0, |m, x| {
+                let x = (word(x) ^ BIAS).wrapping_sub(lo_b);
+                m | x | x.wrapping_add(c)
+            });
+            if m >> 32 != 0 || c8[CHUNK] == HOLE_BITS {
+                break;
+            }
+            for (o, x) in os[n..n + CHUNK].iter_mut().zip(&c8[..CHUNK]) {
+                let p = word(x) as u32;
+                let v = match OP {
+                    ADD => p.wrapping_add(qu),
+                    SUB => p.wrapping_sub(qu),
+                    _ => p.wrapping_mul(qu),
+                };
+                *o = (INT_HI << 32 | u64::from(v)).to_le_bytes();
+            }
+            n += CHUNK;
+            i += CHUNK;
+        }
+    }
+    if KIND == FOLD && OP != MUL {
+        const KEY: u64 = INT_HI << 32 | 0x8000_0000;
+        while i + CHUNK <= len {
+            let c = &xs[i..=i + CHUNK];
+            let (mut m, mut t) = (0u64, 0u64);
+            for x in &c[..CHUNK] {
+                let v = word(x) ^ KEY;
+                m |= v;
+                t = t.wrapping_add(v);
+            }
+            let s = t as i64 - ((CHUNK as i64) << 31);
+            let next = i64::from(acc) + if OP == ADD { s } else { -s };
+            if m >> 32 != 0 || c[CHUNK] == HOLE_BITS {
+                break;
+            }
+            let Ok(next) = i32::try_from(next) else {
+                break;
+            };
+            acc = next;
+            i += CHUNK;
+        }
+    }
     while i + CHUNK <= len
-        && !(KIND == FOLD && OP == MUL)
+        && KIND != FOLD
         && (!matches!(KIND, KEEP | MAP_TO) || n + CHUNK <= os.len())
     {
         let c = &xs[i..=i + CHUNK];
         let mut bad = c[CHUNK] == HOLE_BITS;
-        let mut sum = i64::from(acc);
         let mut keep = 0u32;
         for (j, x) in c[..CHUNK].iter().enumerate() {
             let w = word(x);
@@ -1483,15 +1584,7 @@ fn scan<const KIND: u8, const OP: u8>(b: &mut [u8], r: &mut Run) {
             match KIND {
                 UNTIL => bad |= compare::<OP>(p, q) == stop,
                 KEEP => keep |= u32::from(compare::<OP>(p, q)) << j,
-                MAP_TO => bad |= arith::<OP>(p, q).is_none(),
-                _ => {
-                    sum = if OP == ADD {
-                        sum + i64::from(p)
-                    } else {
-                        sum - i64::from(p)
-                    };
-                    bad |= i32::try_from(sum).is_err();
-                }
+                _ => bad |= arith::<OP>(p, q).is_none(),
             }
         }
         if bad {
@@ -1514,7 +1607,6 @@ fn scan<const KIND: u8, const OP: u8>(b: &mut [u8], r: &mut Run) {
                 }
                 n += CHUNK;
             }
-            FOLD => acc = sum as i32,
             _ => {}
         }
         i += CHUNK;

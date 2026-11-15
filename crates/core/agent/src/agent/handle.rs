@@ -5,6 +5,14 @@ use super::*;
 use nanocode_sync::{Swap, SwapOption};
 use std::sync::atomic::AtomicBool;
 
+mod resume;
+
+#[cfg(not(target_family = "wasm"))]
+type HandleFuture<'a, T> = nanocode_sync::future::BoxFuture<'a, T>;
+
+#[cfg(target_family = "wasm")]
+type HandleFuture<'a, T> = nanocode_sync::future::LocalBoxFuture<'a, T>;
+
 pub struct Agent {
     pub(super) backend: Arc<dyn LifecycleBackend>,
     pub(super) events: nanocode_types::events::AgentEventPublisher,
@@ -405,16 +413,7 @@ impl AgentHandle {
         options: SpawnOptions,
         host_context: Option<Arc<str>>,
     ) -> Result<(Agent, AgentEvents)> {
-        options.validate_harness()?;
-        self.native.ensure_available(self.clone()).await?;
-        created(
-            self.factory
-                .as_ref()
-                .unwrap_or(&self.native)
-                .spawn(self.clone(), options, host_context)
-                .await,
-        )
-        .await
+        resume::spawn_with_host_context(self, options, host_context).await
     }
 
     pub async fn spawn_native_with_host_context(
@@ -431,21 +430,7 @@ impl AgentHandle {
         checkpoint: SessionCheckpoint,
         host_context: Option<Arc<str>>,
     ) -> Result<(Agent, AgentEvents)> {
-        self.native.ensure_available(self.clone()).await?;
-        let restored = if let Some(factory) = &self.factory {
-            factory
-                .restore(self.clone(), checkpoint, host_context)
-                .await
-        } else if checkpoint.family() == self.harness_family() {
-            self.native
-                .restore(self.clone(), checkpoint, host_context)
-                .await
-        } else {
-            return Err(NanocodeError::UnsupportedCapability {
-                capability: "cross_family_restore",
-            });
-        };
-        created(restored).await
+        resume::restore_runtime(self, checkpoint, host_context).await
     }
 
     pub async fn restore_native_runtime(
@@ -644,28 +629,7 @@ impl Agent {
     }
 
     async fn resume_interrupted(&self, request_id: Option<&str>) -> Result<bool> {
-        loop {
-            let Some(resumption) = self.interrupted.turns.load_full() else {
-                return Ok(false);
-            };
-            if resumption.claimed.swap(true, Ordering::AcqRel) {
-                resumption.done.wait().await;
-                continue;
-            }
-            let interrupted = request_id
-                .is_some_and(|id| resumption.turns.iter().any(|(turn, _)| turn == id));
-            let mut claim = ResumptionClaim {
-                interrupted: &self.interrupted,
-                resumption,
-                resumed: 0,
-                remaining: None,
-            };
-            let (result, remaining) = self
-                .resume_turns(&claim.resumption.turns, request_id, &mut claim.resumed)
-                .await;
-            claim.remaining = Some(remaining);
-            return result.map(|()| interrupted);
-        }
+        resume::resume_interrupted(self, request_id).await
     }
 
     async fn resume_turns(
@@ -674,46 +638,11 @@ impl Agent {
         request_id: Option<&str>,
         progress: &mut usize,
     ) -> (Result<()>, Vec<InterruptedTurn>) {
-        let (resumed, mut kept) =
-            match request_id.and_then(|id| turns.iter().position(|(turn, _)| turn == id)) {
-                Some(position) => (&turns[..position], turns[position + 1..].to_vec()),
-                None => (turns, Vec::new()),
-            };
-        for (index, (id, input)) in resumed.iter().enumerate() {
-            match self.resume_turn(id.clone(), input.clone()).await {
-                Ok(()) => {}
-                Err(error)
-                    if error.execution_policy_disposition()
-                        == Some(crate::ExecutionPolicyDisposition::Retry) => {}
-                Err(error) => {
-                    let mut remaining = resumed[index..].to_vec();
-                    remaining.append(&mut kept);
-                    return (Err(error), remaining);
-                }
-            }
-            *progress = index + 1;
-        }
-        (Ok(()), kept)
+        resume::resume_turns(self, turns, request_id, progress).await
     }
 
     async fn resume_turn(&self, id: String, input: serde_json::Value) -> Result<()> {
-        let prompt = self.backend.decode_durable_prompt(input)?;
-        let claim = self.claim_request(&id).await;
-        let key = claim.admitted.key;
-        let (events, _turn_events) = self.events.mirrored_channel();
-        let events = events.with_turn_id(id.clone());
-        let turn = self
-            .backend
-            .submit(BackendPrompt {
-                key,
-                prompt,
-                request_id: Some(id),
-                cancel_on_admission: false,
-                events,
-            })
-            .await?;
-        drop(tracked(Some(claim), turn.result));
-        Ok(())
+        resume::resume_turn(self, id, input).await
     }
 
     fn next_key(&self) -> BackendTurnKey {
@@ -724,44 +653,11 @@ impl Agent {
         &self,
         id: Option<&str>,
     ) -> Result<(Option<RequestClaim>, BackendTurnKey, bool)> {
-        if id.is_some_and(|id| id.trim().is_empty()) {
-            return Err(NanocodeError::InvalidRequest(
-                "request ID must not be empty".to_owned(),
-            ));
-        }
-        let interrupted = self.resume_interrupted(id).await?;
-        let Some(id) = id else {
-            return Ok((None, self.next_key(), false));
-        };
-        let claim = self.claim_request(id).await;
-        let key = claim.admitted.key;
-        Ok((Some(claim), key, interrupted))
+        resume::admit(self, id).await
     }
 
     async fn claim_request(&self, id: &str) -> RequestClaim {
-        loop {
-            let admitted = Arc::new(Admitted {
-                key: self.next_key(),
-                settled: Signal::new(),
-            });
-            let previous = self.requests.0.rcu(|requests| {
-                let mut requests = std::collections::HashMap::clone(requests);
-                requests
-                    .entry(id.to_owned())
-                    .or_insert_with(|| Arc::clone(&admitted));
-                requests
-            });
-            match previous.get(id) {
-                Some(running) => running.settled.wait().await,
-                None => {
-                    return RequestClaim {
-                        requests: Arc::clone(&self.requests),
-                        id: id.to_owned(),
-                        admitted,
-                    };
-                }
-            }
-        }
+        resume::claim_request(self, id).await
     }
 
     #[doc(hidden)]
@@ -1062,49 +958,7 @@ impl Agent {
     }
 
     async fn claim_seed(&self, prompt: Prompt) -> Result<(Prompt, Option<SeedClaim>)> {
-        let pending = {
-            let state = self.seed.load();
-            if state.in_flight {
-                None
-            } else {
-                state.transcript.clone()
-            }
-        };
-        let Some(seed) = pending else {
-            return Ok((prompt, None));
-        };
-        let committed = match self.backend.transcript().await {
-            Ok(transcript) => !transcript.is_empty(),
-            Err(NanocodeError::UnsupportedCapability { .. }) => false,
-            Err(error) => return Err(error),
-        };
-        let mut claimed = false;
-        self.seed.rcu(|state| {
-            claimed = !committed && !state.in_flight && state.transcript.is_some();
-            SeedState {
-                transcript: if committed {
-                    None
-                } else {
-                    state.transcript.clone()
-                },
-                in_flight: state.in_flight || claimed,
-            }
-        });
-        if !claimed {
-            return Ok((prompt, None));
-        }
-        let transcript = seed
-            .iter()
-            .cloned()
-            .chain(prompt.transcript().iter().cloned())
-            .collect::<Vec<_>>();
-        Ok((
-            prompt.with_transcript(transcript),
-            Some(SeedClaim {
-                seed: Arc::clone(&self.seed),
-                completed: false,
-            }),
-        ))
+        resume::claim_seed(self, prompt).await
     }
 
     fn settle_seed(
@@ -1164,8 +1018,6 @@ impl Agent {
 
     #[doc(hidden)]
     pub async fn abandon_created(&self) {
-        let _ = self.backend.persist_initial().await;
-        let _ = self.backend.discard_initial().await;
-        let _ = self.shutdown().await;
+        resume::abandon_created(self).await
     }
 }

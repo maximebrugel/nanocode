@@ -7,6 +7,8 @@ use crate::{
 use nanocode_agent_core::{NanocodeError, SideAnswer, UsdAmount};
 use std::sync::Arc;
 
+mod control;
+
 struct SideQuestion {
     lease: Option<SideQuestionLease>,
     registry: Arc<Registry>,
@@ -32,20 +34,7 @@ impl SubagentControl {
         priority: MessagePriority,
         body: impl Into<String>,
     ) -> std::io::Result<MessageReceipt> {
-        self.require_root(root_session_id).await?;
-        self.registry.await_restored(root_session_id).await?;
-        self.registry
-            .deliver_message(
-                root_session_id,
-                None,
-                id,
-                priority,
-                MessagePurpose::Coordinate,
-                None,
-                body.into(),
-                true,
-            )
-            .await
+        control::send_user_message(self, root_session_id, id, priority, body.into()).await
     }
 
     pub async fn interrupt(
@@ -53,8 +42,7 @@ impl SubagentControl {
         root_session_id: &str,
         id: AgentId,
     ) -> std::io::Result<Vec<AgentSummary>> {
-        self.require_root(root_session_id).await?;
-        self.registry.interrupt(root_session_id, id).await
+        control::interrupt(self, root_session_id, id).await
     }
 
     pub async fn close(
@@ -62,8 +50,7 @@ impl SubagentControl {
         root_session_id: &str,
         id: AgentId,
     ) -> std::io::Result<Vec<AgentSummary>> {
-        self.require_root(root_session_id).await?;
-        self.registry.close(root_session_id, id).await
+        control::close(self, root_session_id, id).await
     }
 
     pub async fn set_budget(
@@ -72,18 +59,15 @@ impl SubagentControl {
         id: AgentId,
         budget: Option<UsdAmount>,
     ) -> std::io::Result<AgentSummary> {
-        self.require_root(root_session_id).await?;
-        self.registry.await_restored(root_session_id).await?;
-        self.registry.set_budget(root_session_id, id, budget).await
+        control::set_budget(self, root_session_id, id, budget).await
     }
 
     pub async fn budgets(&self, session_id: &str) -> Vec<(AgentId, UsdAmount)> {
-        self.registry.budgets(session_id).await
+        control::budgets(self, session_id).await
     }
 
     pub async fn agents(&self, root_session_id: &str) -> std::io::Result<Vec<AgentDirectoryEntry>> {
-        self.require_root(root_session_id).await?;
-        self.registry.directory(root_session_id, true, false).await
+        control::agents(self, root_session_id).await
     }
 
     pub async fn agents_page(
@@ -92,26 +76,18 @@ impl SubagentControl {
         after: Option<AgentId>,
         limit: std::num::NonZeroUsize,
     ) -> std::io::Result<(Vec<AgentDirectoryEntry>, Option<AgentId>)> {
-        self.require_root(root_session_id).await?;
-        self.registry
-            .directory_page(root_session_id, true, false, after, Some(limit))
-            .await
+        control::agents_page(self, root_session_id, after, limit).await
     }
 
     pub(super) async fn active(
         &self,
         root_session_id: &str,
     ) -> std::io::Result<Vec<AgentDirectoryEntry>> {
-        self.require_root(root_session_id).await?;
-        self.registry.await_restored(root_session_id).await?;
-        self.registry
-            .listed(root_session_id, true, false, None)
-            .await
+        control::active(self, root_session_id).await
     }
 
     pub async fn session_id(&self, root_session_id: &str, id: AgentId) -> std::io::Result<String> {
-        self.require_root(root_session_id).await?;
-        self.registry.child_session_id(root_session_id, id).await
+        control::session_id(self, root_session_id, id).await
     }
 
     pub async fn side_question(
@@ -134,28 +110,7 @@ impl SubagentControl {
         root_session_id: &str,
         id: AgentId,
     ) -> std::io::Result<(HarnessHandle, SideQuestion)> {
-        self.require_root(root_session_id).await?;
-        self.registry.await_restored(root_session_id).await?;
-        let _target = self
-            .registry
-            .rehydrate(root_session_id, id, MessagePurpose::Coordinate)
-            .await?;
-        let root = root_session_id.to_owned();
-        let (harness, side_lease) = self
-            .registry
-            .when_messages_flow(root_session_id, move |state| {
-                state.harness_in_scope(&root, id).map(|harness| {
-                    let lease = harness.lease_side_question();
-                    (harness, lease)
-                })
-            })
-            .await??;
-        let lease = SideQuestion {
-            lease: Some(side_lease),
-            registry: Arc::clone(&self.registry),
-            root_session_id: root_session_id.to_owned(),
-        };
-        Ok((harness, lease))
+        control::lease_side_question(self, root_session_id, id).await
     }
 
     async fn require_root(&self, root_session_id: &str) -> std::io::Result<()> {

@@ -7,6 +7,8 @@ use nanocode_http::header::HeaderMap;
 use super::error::Fault;
 use super::protocol::{Challenge, Credential, Receipt};
 
+pub(crate) type Boxed<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 pub type PaymentEventFuture = Pin<Box<dyn Future<Output = Result<(), Fault>> + Send>>;
 pub type ManagementFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<Receipt>, Fault>> + Send + 'a>>;

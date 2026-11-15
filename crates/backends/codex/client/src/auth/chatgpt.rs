@@ -22,6 +22,8 @@ use nanocode_trace::Instrument;
 use nanocode_url::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+mod login;
+
 const AUTH_ISSUER: &str = "https://auth.openai.com";
 const AUTH_API_BASE_URL: &str = "https://auth.openai.com/api/accounts";
 const AUTH_API_BASE_URL_ENV: &str = "CODEX_AUTHAPI_BASE_URL";
@@ -149,27 +151,7 @@ impl ChatGptLogin {
     }
 
     async fn start_with_issuer(auth_file: PathBuf, issuer: &str) -> Result<Self, ChatGptAuthError> {
-        let listener = bind_callback().await?;
-        let port = listener
-            .local_addr()
-            .map_err(|_| ChatGptAuthError::CallbackUnavailable)?
-            .port();
-        let redirect_uri = format!("http://localhost:{port}{CALLBACK_PATH}");
-        let state = random_urlsafe()?;
-        let code_verifier = random_urlsafe()?;
-        let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
-        let authorization_url = authorize_url(issuer, &redirect_uri, &state, &code_challenge)?;
-
-        Ok(Self {
-            issuer: issuer.to_owned(),
-            authorization_url,
-            redirect_uri,
-            state,
-            code_verifier,
-            auth_file,
-            listener,
-            client: auth_client()?,
-        })
+        login::start_with_issuer(auth_file, issuer).await
     }
 
     #[must_use]
@@ -178,15 +160,7 @@ impl ChatGptLogin {
     }
 
     pub async fn complete(self) -> Result<ChatGptAuthStatus, ChatGptAuthError> {
-        let callback = timeout(LOGIN_TIMEOUT, receive_callback(&self.listener))
-            .await
-            .map_err(|_| ChatGptAuthError::CallbackTimeout)??;
-        let result = self.complete_callback(&callback.target).await;
-        let reply = callback.reply(result.is_ok()).await;
-        match (result, reply) {
-            (Ok(status), Ok(())) => Ok(status),
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        }
+        login::complete(self).await
     }
 
     async fn complete_callback(

@@ -2,7 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
 pub enum ToolDefinition {
     Function {
         name: Box<str>,
@@ -52,6 +52,22 @@ pub enum ToolDefinition {
 
         parameters: JsonSchema,
     },
+}
+
+impl Serialize for ToolDefinition {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolDefinition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        decode_definition(Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn decode_definition(value: Value) -> Result<ToolDefinition, serde_json::Error> {
+    ToolDefinition::deserialize(value)
 }
 
 const fn is_false(value: &bool) -> bool {

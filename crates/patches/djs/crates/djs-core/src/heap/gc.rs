@@ -344,6 +344,7 @@ impl Heap {
         self.mega_ic.fill(0);
         self.iterator_ic = Default::default();
         self.return_ic = Default::default();
+        self.each_site = Default::default();
         self.regexp_shape = 0;
         self.rest_shape = 0;
         self.iter_result_shape = 0;

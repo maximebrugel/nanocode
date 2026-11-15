@@ -1,6 +1,6 @@
 use super::backend::{
     BackendFuture, BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey,
-    LifecycleBackend, SteerReceiptStatus,
+    ContinuationAhead, LifecycleBackend, Prefetched, SteerReceiptStatus,
 };
 use super::handle::{Interrupted, OwnershipProbe, Signal};
 use super::*;
@@ -430,6 +430,13 @@ impl LifecycleBackend for Owned {
     }
     fn prefetch_request(&self, id: String) -> BackendFuture<Result<bool>> {
         self.0.backend().prefetch_request(id)
+    }
+    fn prefetch_request_ahead(
+        &self,
+        id: String,
+        ahead: BackendFuture<Option<ContinuationAhead>>,
+    ) -> BackendFuture<Result<Prefetched>> {
+        self.0.backend().prefetch_request_ahead(id, ahead)
     }
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>> {
         self.0.backend().cancel(key)

@@ -122,6 +122,58 @@ pub type BackendFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BackendTurnKey(pub u64);
 
+/// A recovered operation's continuation read ahead from the durable store,
+/// without an acquired owner: its stored payload's content key and its
+/// hydrated cursor. An agent keeps it only under that key, so a run whose
+/// operation's continuation changed since reads its own.
+#[derive(Clone, Debug)]
+pub struct ContinuationAhead {
+    operation_id: String,
+    key: String,
+    cursor: serde_json::Value,
+}
+
+impl ContinuationAhead {
+    #[must_use]
+    pub const fn new(operation_id: String, key: String, cursor: serde_json::Value) -> Self {
+        Self {
+            operation_id,
+            key,
+            cursor,
+        }
+    }
+
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (String, serde_json::Value) {
+        (self.key, self.cursor)
+    }
+}
+
+/// What reading a recovered operation's continuation ahead did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Prefetched {
+    /// Nothing stored to read, or nothing that reads ahead.
+    Nothing,
+    /// Read and hydrated through the session's owner.
+    Read,
+    /// The continuation read ahead had the stored continuation's key: kept
+    /// without reading it again.
+    Kept,
+    /// Kept for the owner the session hasn't acquired yet: its run checks
+    /// the key when it reads the continuation.
+    Seeded,
+}
+
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct BackendPrompt {
@@ -386,6 +438,22 @@ pub trait LifecycleBackend: Send + Sync + 'static {
 
     fn prefetch_request(&self, _id: String) -> BackendFuture<Result<bool>> {
         Box::pin(async { Ok(false) })
+    }
+
+    fn prefetch_request_ahead(
+        &self,
+        id: String,
+        ahead: BackendFuture<Option<ContinuationAhead>>,
+    ) -> BackendFuture<Result<Prefetched>> {
+        drop(ahead);
+        let reading = self.prefetch_request(id);
+        Box::pin(async move {
+            Ok(if reading.await? {
+                Prefetched::Read
+            } else {
+                Prefetched::Nothing
+            })
+        })
     }
 
     fn cancel(&self, key: BackendTurnKey) -> BackendFuture<Result<()>>;

@@ -270,6 +270,14 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         Box::pin(hydrate_snapshot(reader, stored, read))
     }
 
+    fn hydrate_cursor<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        continuation: Value,
+    ) -> FormatFuture<'a, Result<Option<Value>>> {
+        Box::pin(async move { hydrate_cursor(reader, continuation).await.map(Some) })
+    }
+
     fn hydrate_continuation<'a>(
         &'a self,
         reader: PayloadReader<'a>,

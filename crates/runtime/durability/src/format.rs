@@ -47,6 +47,17 @@ pub trait CheckpointFormat: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// A stored continuation hydrated as the family's own execution reads
+    /// it before running the operation; `None` when the family reads none
+    /// ahead (`SessionStore::continuation_ahead`).
+    fn hydrate_cursor<'a>(
+        &'a self,
+        _reader: PayloadReader<'a>,
+        _continuation: Value,
+    ) -> FormatFuture<'a, Result<Option<Value>>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn encode(&self, checkpoint: Value) -> Result<EncodedPayload> {
         EncodedPayload::encode(&checkpoint)
     }

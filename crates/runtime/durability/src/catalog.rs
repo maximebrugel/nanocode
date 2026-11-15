@@ -257,11 +257,11 @@ mod store {
 
     use super::{BranchBoundary, SessionRecord};
     use crate::{
-        AdmittedTurn, CheckpointFormat, DurableSession, DurableState, EncodedPayload, Error,
-        EventHits, EventPage, EventQuery, EventRange, KnownSummary, ListedState, ListedSummary,
-        OperationState, OperationStatus, OwnerId, PayloadReader, Result, SessionWrite, StateCommit,
-        StateCursor, StateQuery, StateReader, StateStore, StateSummary, StoreError, SummaryFilter,
-        SummaryUpdate, Transition,
+        AdmittedTurn, CheckpointFormat, ContinuationAhead, DurableSession, DurableState,
+        EncodedPayload, Error, EventHits, EventPage, EventQuery, EventRange, KnownSummary,
+        ListedState, ListedSummary, OperationState, OperationStatus, OwnerId, PayloadReader,
+        Result, SessionWrite, StateCommit, StateCursor, StateQuery, StateReader, StateStore,
+        StateSummary, StoreError, SummaryFilter, SummaryUpdate, Transition,
         format::Formats,
         session::reduce_peeked,
         shared_store::{SharedReader, SharedStore, WeakSharedStore},
@@ -990,6 +990,58 @@ mod store {
                 .stored_turns(id, vec![(request_id, operation)], false)
                 .await?
                 .pop())
+        }
+
+        /// Operation `request_id`'s stored continuation (the head's first
+        /// pending operation's when `None`), read and hydrated from the store
+        /// as its family's execution reads it, without an owner or a claim:
+        /// it only reads. `None` when the operation, its continuation or its
+        /// family's reading ahead is missing. Its content key is the stored
+        /// payload's, which an agent checks against its owner's
+        /// (`Agent::prefetch_request_ahead`).
+        pub async fn continuation_ahead(
+            &self,
+            id: &str,
+            request_id: Option<&str>,
+        ) -> Result<Option<ContinuationAhead>> {
+            let mut state = self.require_head(id).await?;
+            let found = |state: &DurableState| match request_id {
+                Some(request_id) => state.operation(request_id).is_some(),
+                None => state.first_pending_operation().is_some(),
+            };
+            if !found(&state) {
+                state
+                    .hydrate(&mut self.store.clone(), id, &mut HashSet::new())
+                    .await?;
+            }
+            let operation = match request_id {
+                Some(request_id) => state.operation(request_id).map(|op| (request_id, op)),
+                None => state.first_pending_operation(),
+            };
+            let Some((operation_id, operation)) = operation else {
+                return Ok(None);
+            };
+            let Some(continuation) = &operation.continuation else {
+                return Ok(None);
+            };
+            let Some(family) = state.session().map(SessionRecord::family) else {
+                return Ok(None);
+            };
+            let loaded = self.load_payload(id, continuation).await?;
+            let key = loaded.key().to_owned();
+            let Some(cursor) = self
+                .formats
+                .family(family)?
+                .hydrate_cursor(PayloadReader::store(&self.store, id), loaded.decode()?)
+                .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(ContinuationAhead::new(
+                operation_id.to_owned(),
+                key,
+                cursor,
+            )))
         }
 
         pub async fn session(&self, record: SessionRecord) -> Result<DurableSession> {

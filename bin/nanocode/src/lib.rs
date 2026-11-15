@@ -585,6 +585,13 @@ impl Stall {
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 static MODEL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn model_call_started() {
+    if (MODEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_power_of_two() {
+        nanocode_sys::entry::release_file_pages();
+    }
+}
+
 async fn stream_turn(
     mut turn: nanocode::agent::Turn,
     answers: impl Write,
@@ -610,11 +617,8 @@ async fn stream_turn(
             }
         };
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        if event.event.kind == nanocode::agent::events::AgentEventKind::ModelCallStarted
-            && (MODEL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1)
-                .is_power_of_two()
-        {
-            nanocode_sys::entry::release_file_pages();
+        if event.event.kind == nanocode::agent::events::AgentEventKind::ModelCallStarted {
+            model_call_started();
         }
         printer.event(&event.event, event.delta.as_ref().map(SharedTextDelta::borrowed))?;
         if stall.as_mut().is_some_and(|stall| stall.cancels(&event.event)) {

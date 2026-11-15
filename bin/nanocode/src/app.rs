@@ -1342,6 +1342,10 @@ impl App {
     }
 
     fn agent_event(&mut self, event: &AgentEvent, delta: Option<TextDeltaRef<'_>>) -> Redraw {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        if event.kind == AgentEventKind::ModelCallStarted {
+            crate::model_call_started();
+        }
         let session_id = self.agent.as_ref().map(Agent::session_id);
         self.spans.event(event, session_id);
         if event.kind == AgentEventKind::ToolCall {

@@ -288,6 +288,7 @@ struct Journals {
     finished: Atom<Vec<Arc<CellRecord>>>,
     dormant: Atom<Vec<(Arc<CellJournal>, Arc<Restored>)>>,
     loaded: Atom<HashSet<String>>,
+    preempted: Atom<HashSet<String>>,
     stored: Atom<HashMap<String, HashMap<String, Arc<RawValue>>>>,
     saving_stored: Arc<Owned<()>>,
     sink: Option<Arc<dyn CellJournalSink>>,
@@ -520,6 +521,25 @@ impl CellJournals {
             cells.retain(|cell| cell.strong_count() > 0);
             cells.push(Weak::clone(&record));
         });
+    }
+
+    /// Let a steer cut short the call of `session_id` that a move cut and
+    /// the runtime recovers (`CodeModeRuntime::recover_with_updates`), as it
+    /// cuts any `wait` short. Off by default: a moved subagent's runtime
+    /// steers it with its resume note at once, and that note must not cut
+    /// its recovered `exec` short.
+    pub fn preempt_recovery(&self, session_id: &str) {
+        self.0
+            .preempted
+            .update(|preempted| preempted.insert(session_id.to_owned()));
+    }
+
+    /// Whether [`Self::preempt_recovery`] marked `session_id`.
+    #[must_use]
+    pub fn preempts_recovery(&self, session_id: &str) -> bool {
+        self.0
+            .preempted
+            .read(|preempted| preempted.contains(session_id))
     }
 
     #[must_use]

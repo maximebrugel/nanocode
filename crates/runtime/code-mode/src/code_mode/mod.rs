@@ -847,18 +847,23 @@ impl CodeModeRuntime {
         cell.turn_id
             .store(self.current_turn.load(Ordering::Acquire), Ordering::Release);
         cell.tools.cell_observed(&cell.origin_call_id, true);
-        let preempt = Preemption {
-            signal: self.preempt.subscribe(),
-            turn: self.current_turn.load(Ordering::Acquire),
-            seen: self.preempt_consumed.load(Ordering::Acquire),
-            consumed: Arc::clone(&self.preempt_consumed),
-        };
+        // Only a session its embedder marked (`CellJournals::preempt_recovery`).
+        let preempt = self
+            .journals
+            .as_ref()
+            .is_some_and(|journals| journals.preempts_recovery(&context.session_id))
+            .then(|| Preemption {
+                signal: self.preempt.subscribe(),
+                turn: self.current_turn.load(Ordering::Acquire),
+                seen: self.preempt_consumed.load(Ordering::Acquire),
+                consumed: Arc::clone(&self.preempt_consumed),
+            });
         let yield_after = observer_yield_timeout(Duration::from_millis(yield_time_ms));
         let (mut execution, running) = observe_cell(
             &cell,
             observation,
             started_at,
-            ObservationMode::YieldAfter(yield_after, yield_after, Some(preempt)),
+            ObservationMode::YieldAfter(yield_after, yield_after, preempt),
             record.max_output_tokens,
             Some(call_id),
             observer,

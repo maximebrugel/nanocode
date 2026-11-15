@@ -59,7 +59,14 @@ pub(super) async fn spawn(
             }
         }));
     }
-    taken?.start(&input).await.ok()
+    let idle = match taken {
+        Some(idle) => idle,
+        None => nanocode_platform::spawn_blocking(move || lane.launch())
+            .await
+            .ok()?
+            .ok()?,
+    };
+    idle.start(&input).await.ok()
 }
 
 fn identity(directory: &Path) -> Option<(u64, u64)> {

@@ -23,7 +23,7 @@
 // Linux counterpart of runstat.c. Runs a command in its own process group as a child subreaper, so every helper it
 // starts stays in the tree, samples /proc for the tree's summed RSS and process count, kills what is left when the
 // command exits, and writes JSON. At each new peak of the summed RSS it reads the tree's smaps_rollup for PSS and the
-// anonymous and file-backed parts of that peak. Env: RUNSTAT_INTERVAL_US (sampler period, default 2000, 0 = off),
+// anonymous and file-backed parts of that peak, and at each new peak of the command's own RSS its own smaps_rollup (own_peak_*). Env: RUNSTAT_INTERVAL_US (sampler period, default 2000, 0 = off),
 // RUNSTAT_CGROUP (a writable cgroup v2 directory to create the run's cgroup in; default the parent of our own),
 // RUNSTAT_PERF=1 (count instructions with perf_event_open; off by default because on a VM the counter's context
 // switch cost inflated nc --version from 2.4 to 8 ms of CPU and an nc TUI session from 160 to 380 ms).
@@ -34,8 +34,9 @@ static proc_t seen[MAXP];
 static int nseen, procs_max, helpers_max, samples, self_pid, main_pid;
 static uint64_t rss_max;
 typedef struct { uint64_t rss, pss, pss_anon, pss_file, pss_shmem, anon; } rollup_t;
-static rollup_t peak_rollup;
-static int peak_rollups;
+static rollup_t peak_rollup, own_rollup;
+static int peak_rollups, own_rollups;
+static uint64_t own_max;
 static long tick, page;
 static atomic_int stop;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -138,16 +139,20 @@ static void sample(void) {
     static int pids[MAXP];
     static stat_t st[MAXP];
     int n = tree(pids, MAXP, st);
-    uint64_t rss = 0;
+    uint64_t rss = 0, own = 0;
     int helpers = 0;
     for (int i = 0; i < n; i++) {
-        rss += rss_of(pids[i]);
+        uint64_t k = rss_of(pids[i]);
+        rss += k;
         if (pids[i] != main_pid) helpers++;
+        else own = k;
     }
-    rollup_t r = {0};
+    rollup_t r = {0}, o = {0};
     if (rss > rss_max) for (int i = 0; i < n; i++) rollup_add(pids[i], &r);
+    if (own > own_max) rollup_add(main_pid, &o);
     pthread_mutex_lock(&mu);
     if (rss > rss_max) { rss_max = rss; peak_rollup = r; peak_rollups++; }
+    if (own > own_max) { own_max = own; own_rollup = o; own_rollups++; }
     for (int i = 0; i < n; i++) {
         int j;
         for (j = 0; j < nseen && !(seen[j].pid == st[i].pid && seen[j].start == st[i].start); j++) {}
@@ -324,6 +329,11 @@ int main(int argc, char **argv) {
         json_num(f, "tree_peak_pss_shmem_bytes", (long long)peak_rollup.pss_shmem, peak_rollups > 0);
         json_num(f, "tree_peak_anon_bytes", (long long)peak_rollup.anon, peak_rollups > 0);
         json_num(f, "tree_peak_file_bytes", (long long)(peak_rollup.rss - peak_rollup.anon), peak_rollups > 0);
+        json_num(f, "own_max_rss_sampled_bytes", (long long)own_max, own_rollups > 0);
+        json_num(f, "own_peak_smaps_rss_bytes", (long long)own_rollup.rss, own_rollups > 0);
+        json_num(f, "own_peak_pss_bytes", (long long)own_rollup.pss, own_rollups > 0);
+        json_num(f, "own_peak_anon_bytes", (long long)own_rollup.anon, own_rollups > 0);
+        json_num(f, "own_peak_file_bytes", (long long)(own_rollup.rss - own_rollup.anon), own_rollups > 0);
         fprintf(f, ",\"tree_procs_max\":%d,\"helpers_max\":%d,\"helpers_seen\":%d,\"helpers_left\":%d,\"helpers_killed\":%d,\"helpers_sigkilled\":%d,\"samples\":%d,\"interval_us\":%ld,\"runstat_cpu_us\":%ld",
                 procs_max, helpers_max, nseen > 0 ? nseen - 1 : 0, nleft, killed, sigkilled, samples, interval_us,
                 (long)(self.ru_utime.tv_sec * 1000000 + self.ru_utime.tv_usec + self.ru_stime.tv_sec * 1000000 + self.ru_stime.tv_usec));

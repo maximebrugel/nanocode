@@ -69,8 +69,8 @@ export function usageOf(rs) {
     max_rss_mb: megabytes(rs.maxrss_bytes), max_footprint_mb: megabytes(rs.lifetime_max_footprint), instructions: rs.instructions ?? null,
     tree_cpu_ms: Math.max(cpu ?? 0, rs.cgroup_cpu_us != null ? rs.cgroup_cpu_us / 1000 : rs.tree_cpu_us != null ? rs.tree_cpu_us / 1000 : 0) || cpu,
     tree_max_rss_mb: megabytes(Math.max(rs.maxrss_bytes ?? 0, rs.cgroup_memory_peak_bytes ?? rs.tree_max_rss_bytes ?? 0)) || null,
-    tree_peak_pss_mb: megabytes(rs.tree_peak_pss_bytes), tree_peak_anon_mb: megabytes(rs.tree_peak_anon_bytes), tree_peak_file_mb: megabytes(rs.tree_peak_file_bytes),
+    tree_peak_rss_mb: megabytes(rs.tree_peak_smaps_rss_bytes), own_peak_rss_mb: megabytes(rs.own_peak_smaps_rss_bytes), own_peak_pss_mb: megabytes(rs.own_peak_pss_bytes), own_peak_anon_mb: megabytes(rs.own_peak_anon_bytes), own_peak_file_mb: megabytes(rs.own_peak_file_bytes), tree_peak_pss_mb: megabytes(rs.tree_peak_pss_bytes), tree_peak_anon_mb: megabytes(rs.tree_peak_anon_bytes), tree_peak_file_mb: megabytes(rs.tree_peak_file_bytes),
     tree_source: rs.cgroup_cpu_us != null ? "cgroup" : rs.tree_cpu_us != null ? "proc-sampler" : "rusage",
-    helpers_max: rs.helpers_max ?? null, helpers_left: rs.helpers_left ?? null,
+    minflt: rs.minflt ?? null, majflt: rs.majflt ?? null, helpers_max: rs.helpers_max ?? null, helpers_left: rs.helpers_left ?? null,
   };
 }

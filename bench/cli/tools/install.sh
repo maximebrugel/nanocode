@@ -37,12 +37,22 @@ for lane in $lanes; do
       curl -fsSL "$nc_release/SHA256SUMS" -o "$tmp/SHA256SUMS"
       sum="$(grep " nanocode-$nc_target.gz$" "$tmp/SHA256SUMS" | cut -d' ' -f1)"
       [ -n "$sum" ] || { echo "install.sh: the nanocode-cli release has no build for $nc_target" >&2; exit 1; }
-      if [ ! -x "$dir/nc/nanocode" ] || [ "$(cat "$dir/nc/.sha256" 2>/dev/null)" != "$sum" ]; then
+      front="$(grep " nanocode-front-$nc_target.gz$" "$tmp/SHA256SUMS" | cut -d' ' -f1 || true)"
+      agent=nanocode
+      [ -z "$front" ] || agent=nanocode-agent
+      if [ ! -x "$dir/nc/$agent" ] || [ "$(cat "$dir/nc/.sha256" 2>/dev/null)" != "$sum" ]; then
         curl -fsSL "$nc_release/nanocode-$nc_target.gz" -o "$tmp/nc.gz"
         [ "$(digest "$tmp/nc.gz")" = "$sum" ] || { echo "install.sh: checksum mismatch for nanocode-$nc_target.gz" >&2; exit 1; }
-        gunzip -c "$tmp/nc.gz" > "$dir/nc/nanocode"
-        chmod +x "$dir/nc/nanocode"
+        gunzip -c "$tmp/nc.gz" > "$dir/nc/$agent"
+        chmod +x "$dir/nc/$agent"
         echo "$sum" > "$dir/nc/.sha256"
+      fi
+      if [ -n "$front" ] && [ "$(cat "$dir/nc/.front.sha256" 2>/dev/null)" != "$front" ]; then
+        curl -fsSL "$nc_release/nanocode-front-$nc_target.gz" -o "$tmp/front.gz"
+        [ "$(digest "$tmp/front.gz")" = "$front" ] || { echo "install.sh: checksum mismatch for nanocode-front-$nc_target.gz" >&2; exit 1; }
+        gunzip -c "$tmp/front.gz" > "$dir/nc/nanocode"
+        chmod +x "$dir/nc/nanocode"
+        echo "$front" > "$dir/nc/.front.sha256"
       fi
       ;;
     fx)
@@ -80,7 +90,7 @@ done
 info() {
   m="$dir/$1/node_modules"
   case "$1" in
-    nc) bin="$dir/nc/nanocode" var=NC_BIN how="curl $nc_release/nanocode-$nc_target.gz (the asset https://nanocode.xyz/install fetches; its optional macOS computer-use driver is left out)" runtime=none ;;
+    nc) bin="$dir/nc/nanocode" var=NC_BIN how="curl $nc_release/nanocode-$nc_target.gz, and nanocode-front-$nc_target.gz as nanocode with the full binary as nanocode-agent beside it when the release lists a front (the assets https://nanocode.xyz/install fetches; its optional macOS computer-use driver is left out)" runtime=none ;;
     nclite) bin="$dir/nclite/nc-lite" var=NCLITE_BIN how="PROFILE=lite scripts/build-cli.sh nc-lite nc-lite at $nclite_repo $nclite_rev" runtime=none ;;
     fx) bin="$dir/fx/fx" var=FX_BIN how="curl $fx_cdn/\$(latest.txt)/fx-$fx_target.tar.gz (the archive https://fx.sh/setup.sh fetches; binary only)" runtime=none ;;
     pi) bin="$m/@earendil-works/pi-coding-agent/dist/bundle/cli.js" var=PI_CLI how="npm install --prefix tools/install/pi @earendil-works/pi-coding-agent@latest" runtime="Node $(node --version)" ;;

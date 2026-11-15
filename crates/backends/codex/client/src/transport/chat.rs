@@ -754,6 +754,7 @@ fn effort(model: Model, value: Option<&Value>) -> Result<Option<String>, Respons
 
     let supported = match model {
         Model::Kimi => matches!(value, "low" | "high"),
+        Model::Custom(_) => matches!(value, "none" | "low" | "medium" | "high"),
         _ => matches!(value, "low" | "medium" | "high"),
     };
     if !supported {

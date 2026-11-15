@@ -3,17 +3,33 @@ use std::{ops::Range, sync::Arc};
 use nanocode_durability_core::{Sql, SqlStatement, StoreError, StoreFuture};
 use nanocode_sync::Atom;
 
+#[derive(Clone)]
 pub struct Compaction<'a> {
     pub archived: &'a [(u64, String)],
     pub dropped: Range<u64>,
     pub superseded: &'a [Range<u64>],
 }
 
+#[derive(Clone, Copy)]
 pub struct Extension<'a> {
     pub cut: usize,
     pub row: u64,
     pub seq: u64,
     pub tail: &'a str,
+}
+
+pub enum Write<'a> {
+    Append {
+        rows: &'a [(u64, String)],
+        compaction: Compaction<'a>,
+    },
+    Extend(Extension<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub struct Rider<'a> {
+    pub host: usize,
+    pub statements: &'a [SqlStatement<'a>],
 }
 
 pub trait LogHost: Send + Sync {
@@ -48,6 +64,15 @@ pub trait LogHost: Send + Sync {
         &'a self,
         _scope: &'a str,
         _extension: Extension<'a>,
+    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
+        None
+    }
+
+    fn carry<'a>(
+        &'a self,
+        _scope: &'a str,
+        _write: Write<'a>,
+        _rider: Rider<'a>,
     ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
         None
     }
@@ -99,6 +124,66 @@ impl<H: Sql + ?Sized> SqlLog<H> {
     fn pick(&self, statements: &Dialects) -> &'static str {
         self.host.dialect().pick(statements)
     }
+
+    fn appending<'a>(
+        &self,
+        scope: &'a str,
+        rows: &'a [(u64, String)],
+        compaction: &Compaction<'a>,
+        seqs: &'a [String],
+        ranges: &'a [(String, String)],
+    ) -> Vec<SqlStatement<'a>> {
+        let mut statements = rows
+            .iter()
+            .chain(compaction.archived)
+            .zip(seqs)
+            .enumerate()
+            .map(|(index, ((_, body), seq))| SqlStatement {
+                sql: self.pick(if index < rows.len() {
+                    &APPEND
+                } else {
+                    &ARCHIVE
+                }),
+                params: vec![scope, seq, body],
+            })
+            .collect::<Vec<_>>();
+        for (from, to) in ranges {
+            statements.push(SqlStatement {
+                sql: self.pick(&DROP),
+                params: vec![scope, from, to],
+            });
+        }
+        statements
+    }
+}
+
+pub fn host_id<H: ?Sized>(host: &Arc<H>) -> usize {
+    Arc::as_ptr(host).cast::<()>() as usize
+}
+
+fn seqs(
+    rows: &[(u64, String)],
+    compaction: &Compaction<'_>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    (
+        rows.iter()
+            .chain(compaction.archived)
+            .map(|(seq, _)| seq.to_string())
+            .collect(),
+        std::iter::once(&compaction.dropped)
+            .chain(compaction.superseded)
+            .filter(|range| !range.is_empty())
+            .map(|range| (range.start.to_string(), range.end.to_string()))
+            .collect(),
+    )
+}
+
+fn extending(extension: &Extension<'_>) -> [String; 3] {
+    [
+        extension.row.to_string(),
+        extension.seq.to_string(),
+        extension.cut.to_string(),
+    ]
 }
 
 fn invalid(detail: impl std::fmt::Display) -> StoreError {
@@ -194,36 +279,8 @@ impl<H: Sql + Send + Sync + ?Sized> LogHost for SqlLog<H> {
         compaction: Compaction<'a>,
     ) -> StoreFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
-            let seqs = rows
-                .iter()
-                .chain(compaction.archived)
-                .map(|(seq, _)| seq.to_string())
-                .collect::<Vec<_>>();
-            let ranges = std::iter::once(&compaction.dropped)
-                .chain(compaction.superseded)
-                .filter(|range| !range.is_empty())
-                .map(|range| (range.start.to_string(), range.end.to_string()))
-                .collect::<Vec<_>>();
-            let mut statements = rows
-                .iter()
-                .chain(compaction.archived)
-                .zip(&seqs)
-                .enumerate()
-                .map(|(index, ((_, body), seq))| SqlStatement {
-                    sql: self.pick(if index < rows.len() {
-                        &APPEND
-                    } else {
-                        &ARCHIVE
-                    }),
-                    params: vec![scope, seq, body],
-                })
-                .collect::<Vec<_>>();
-            for (from, to) in &ranges {
-                statements.push(SqlStatement {
-                    sql: self.pick(&DROP),
-                    params: vec![scope, from, to],
-                });
-            }
+            let (seqs, dropped) = seqs(rows, &compaction);
+            let statements = self.appending(scope, rows, &compaction, &seqs, &dropped);
             self.host
                 .transaction("turn_log_append", &statements)
                 .await
@@ -237,11 +294,7 @@ impl<H: Sql + Send + Sync + ?Sized> LogHost for SqlLog<H> {
         extension: Extension<'a>,
     ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
         Some(Box::pin(async move {
-            let (row, seq, cut) = (
-                extension.row.to_string(),
-                extension.seq.to_string(),
-                extension.cut.to_string(),
-            );
+            let [row, seq, cut] = extending(&extension);
             let statements = [SqlStatement {
                 sql: self.pick(&EXTEND),
                 params: vec![scope, &row, &seq, &cut, extension.tail],
@@ -253,6 +306,43 @@ impl<H: Sql + Send + Sync + ?Sized> LogHost for SqlLog<H> {
             match rows.first() {
                 Some(moved) if !moved.is_empty() => Ok(()),
                 _ => Err(StoreError::Fenced),
+            }
+        }))
+    }
+
+    fn carry<'a>(
+        &'a self,
+        scope: &'a str,
+        write: Write<'a>,
+        rider: Rider<'a>,
+    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
+        if rider.host != host_id(&self.host) {
+            return None;
+        }
+        Some(Box::pin(async move {
+            match write {
+                Write::Append { rows, compaction } => {
+                    let (seqs, dropped) = seqs(rows, &compaction);
+                    let mut statements = self.appending(scope, rows, &compaction, &seqs, &dropped);
+                    statements.extend(rider.statements.iter().cloned());
+                    self.host
+                        .transaction("turn_log_carry", &statements)
+                        .await
+                        .map(drop)
+                }
+                Write::Extend(extension) => {
+                    let [row, seq, cut] = extending(&extension);
+                    let mut statements = vec![SqlStatement {
+                        sql: self.pick(&EXTEND),
+                        params: vec![scope, &row, &seq, &cut, extension.tail],
+                    }];
+                    statements.extend(rider.statements.iter().cloned());
+                    let rows = self.host.transaction("turn_log_carry", &statements).await?;
+                    match rows.first() {
+                        Some(moved) if !moved.is_empty() => Ok(()),
+                        _ => Err(StoreError::Fenced),
+                    }
+                }
             }
         }))
     }

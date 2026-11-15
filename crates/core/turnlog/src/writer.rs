@@ -9,7 +9,7 @@ use nanocode_durability_core::StoreError;
 use nanocode_sync::{Held, Owned};
 
 use crate::{
-    Compaction, Event, Extension, Fold, LogHost, Record, Segment,
+    Compaction, Event, Extension, Fold, LogHost, Record, Rider, Segment, Write,
     codec::{
         self, ARCHIVE, BOUNDARY, History, PART, RECORDS, SEAL, SECTION, SNAPSHOT, Stream, WINDOW,
     },
@@ -858,6 +858,22 @@ impl Lease<'_> {
     }
 
     pub async fn commit(&mut self, point: Point) -> Result<u64, StoreError> {
+        self.committed(point, None).await.map(|(seq, _)| seq)
+    }
+
+    pub async fn commit_carrying(
+        &mut self,
+        point: Point,
+        rider: Rider<'_>,
+    ) -> Result<(u64, bool), StoreError> {
+        self.committed(point, Some(rider)).await
+    }
+
+    async fn committed(
+        &mut self,
+        point: Point,
+        rider: Option<Rider<'_>>,
+    ) -> Result<(u64, bool), StoreError> {
         let writer = &mut *self.writer;
         let revived = writer.fold.revive(&writer.buffer);
         writer.buffer.extend(revived);
@@ -932,9 +948,7 @@ impl Lease<'_> {
             let size = packed.packed.len();
             let rewrite = sections.rewrite();
             let tail = writer.tail + body.len();
-            if due
-                || (writer.snapshot + tail > self.ratio * size && self.ratio * tail >= rewrite)
-            {
+            if due || (writer.snapshot + tail > self.ratio * size && self.ratio * tail >= rewrite) {
                 snapshot = Some(Partitioned {
                     head: packed,
                     sections,
@@ -1011,11 +1025,7 @@ impl Lease<'_> {
             }
             _ => None,
         };
-        let (extending, extended) = match extension {
-            Some((extension, merged)) => (self.host.extend(self.scope, extension), Some(merged)),
-            None => (None, None),
-        };
-        let extended = extending.is_some().then_some(extended).flatten();
+        let (extension, merged) = extension.unzip();
         let (sectioned, superseded) = match &mut snapshot {
             Some(part) => (
                 std::mem::take(&mut part.sections.rows),
@@ -1034,30 +1044,53 @@ impl Lease<'_> {
                     .collect::<Vec<_>>(),
             )
         };
-        match (extending, &archived) {
-            (Some(extending), _) => extending.await?,
-            (None, archived) if archived.is_some() || !superseded.is_empty() => {
-                let (rows, dropped) = match archived {
-                    Some((rows, from, parts)) => (
-                        rows.as_slice(),
-                        from + rows.len() as u64..from + *parts as u64,
-                    ),
-                    None => (&[][..], 0..0),
+        let (kept, dropped) = match &archived {
+            Some((rows, from, parts)) => (
+                rows.as_slice(),
+                from + rows.len() as u64..from + *parts as u64,
+            ),
+            None => (&[][..], 0..0),
+        };
+        let compaction = Compaction {
+            archived: kept,
+            dropped,
+            superseded: &superseded,
+        };
+        let (carried, extended) = {
+            let carrying = rider.and_then(|rider| {
+                let write = match extension {
+                    Some(extension) => Write::Extend(extension),
+                    None => Write::Append {
+                        rows: &appended,
+                        compaction: compaction.clone(),
+                    },
                 };
-                self.host
-                    .append_compacting(
-                        self.scope,
-                        &appended,
-                        Compaction {
-                            archived: rows,
-                            dropped,
-                            superseded: &superseded,
-                        },
-                    )
-                    .await?;
-            }
-            (None, _) => self.host.append(self.scope, &appended).await?,
-        }
+                self.host.carry(self.scope, write, rider)
+            });
+            let carried = carrying.is_some();
+            let extended = match carrying {
+                Some(carrying) => {
+                    carrying.await?;
+                    extension.and(merged)
+                }
+                None => {
+                    let extending =
+                        extension.and_then(|extension| self.host.extend(self.scope, extension));
+                    let extended = extending.is_some().then_some(merged).flatten();
+                    match extending {
+                        Some(extending) => extending.await?,
+                        None if archived.is_some() || !superseded.is_empty() => {
+                            self.host
+                                .append_compacting(self.scope, &appended, compaction)
+                                .await?;
+                        }
+                        None => self.host.append(self.scope, &appended).await?,
+                    }
+                    extended
+                }
+            };
+            (carried, extended)
+        };
         drop(appended);
         let added = if extended.is_some() {
             body_len - 1 - SEAL
@@ -1135,6 +1168,6 @@ impl Lease<'_> {
             Point::Progress => writer.stats.progress += 1,
             Point::Recovery => writer.stats.recoveries += 1,
         }
-        Ok(seq)
+        Ok((seq, carried))
     }
 }

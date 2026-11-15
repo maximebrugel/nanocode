@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::reactor::{Armed, reactor};
+use crate::reactor::{Armed, shared};
 
 const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
 
@@ -93,11 +93,11 @@ impl Future for Sleep {
                         sleep.arming = Arming::Fired;
                         return Poll::Ready(());
                     }
-                    let reactor = match reactor() {
-                        Ok(reactor) => reactor,
+                    let armed = match shared().and_then(|reactor| reactor.arm(sleep.deadline)) {
+                        Ok(armed) => armed,
                         Err(error) => panic!("a timer could not reach the reactor: {error}"),
                     };
-                    sleep.arming = Arming::Armed(reactor.arm(sleep.deadline));
+                    sleep.arming = Arming::Armed(armed);
                 }
             }
         }

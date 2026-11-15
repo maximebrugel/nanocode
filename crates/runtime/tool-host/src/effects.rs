@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+pub use nanocode_code_mode::remote::{Carried, RemoteBarrier};
 use nanocode_tools::{ToolContext, ToolInput, ToolOutput};
 pub use nanocode_turnlog::EffectClass;
 
@@ -20,6 +21,10 @@ pub trait EffectGate: Send + Sync + 'static {
     fn before<'a>(&'a self, call: EffectCall<'a>) -> HostFuture<'a, Result<(), String>>;
 
     fn after<'a>(&'a self, call_id: &'a str, output: &'a ToolOutput) -> HostFuture<'a, ()>;
+
+    fn settle(&self) -> HostFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub(crate) async fn gated<'c, E, F>(
@@ -32,9 +37,17 @@ pub(crate) async fn gated<'c, E, F>(
 where
     F: Future<Output = Result<ToolOutput, E>>,
 {
-    let Some(gate) = gate.filter(|gate| gate.effect(tool).needs_row()) else {
+    let Some(gate) = gate else {
         return run(input, context).await;
     };
+    if !gate.effect(tool).needs_row() {
+        if let Err(error) = gate.settle().await {
+            return Ok(ToolOutput::error(format!(
+                "tool `{tool}` was not run because the turn log could not be saved: {error}"
+            )));
+        }
+        return run(input, context).await;
+    }
     let recorded = gate
         .before(EffectCall {
             call_id: context.call_id(),

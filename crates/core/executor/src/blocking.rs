@@ -84,7 +84,7 @@ impl Pool {
 
     fn add_thread(&self) -> bool {
         self.threads
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |threads| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |threads| {
                 (threads < self.max).then_some(threads + 1)
             })
             .is_ok()

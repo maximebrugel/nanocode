@@ -11,12 +11,17 @@ use std::{
     time::Duration,
 };
 
+use nanocode::turnlog::{Compaction, LogHost, OneLog, Policy, Rider, Write};
 use nanocode_code_mode::embedded::{CodeModeHostError, HostFuture};
 use nanocode_code_mode::remote::{
-    NOT_RECEIVED, PEER_CLOSED, RemoteCatalog, RemoteContext, RemoteDelivery, RemoteFrame,
-    RemoteLink, RemoteOperation, RemoteReply, RemoteTransport,
+    Carried, NOT_RECEIVED, PEER_CLOSED, RemoteBarrier, RemoteCatalog, RemoteContext,
+    RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation, RemoteReply, RemoteTransport,
+};
+use nanocode_durability_core::{
+    OwnerId, Settle, StateCommit, StateStore, StoreError, StoreFuture, SummaryUpdate,
 };
 use nanocode_http::StatusCode;
+use nanocode_sync::FutureExt;
 use nanocode_sync::{Atom, Owned, mpsc};
 use nanocode_tool_runtime::remote::accept::{
     Acceptor, AcceptorOptions, AcceptorRoute, HandRequests, PendingRequest, Refusal,
@@ -31,6 +36,10 @@ use crate::{
 const KEY: &str = "hand";
 const SESSION: &str = "session";
 const TURN: &str = "turn";
+const SCOPE: &str = "hands";
+const SENT: &str = "hand_request_sent";
+const ADMITTED: &str = "admitted";
+const SNAPSHOT_RATIO: usize = 2;
 const CALLS_MAX: u64 = 5;
 const START_MS_MAX: u64 = 300;
 const RUN_MS_MAX: u64 = 400;
@@ -57,16 +66,22 @@ pub enum HandsMutation {
     ForgetPending,
     CrossReplies,
     MangleRuntime,
+    CarryDropsLog,
+    CarryDropsRequest,
+    DispatchUnsettled,
 }
 
 impl HandsMutation {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 9] = [
         Self::None,
         Self::AckBeforeStore,
         Self::SkipRecord,
         Self::ForgetPending,
         Self::CrossReplies,
         Self::MangleRuntime,
+        Self::CarryDropsLog,
+        Self::CarryDropsRequest,
+        Self::DispatchUnsettled,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -83,6 +98,9 @@ impl HandsMutation {
             Self::ForgetPending => "forget_pending",
             Self::CrossReplies => "cross_replies",
             Self::MangleRuntime => "mangle_runtime",
+            Self::CarryDropsLog => "carry_drops_log",
+            Self::CarryDropsRequest => "carry_drops_request",
+            Self::DispatchUnsettled => "dispatch_unsettled",
         }
     }
 
@@ -104,6 +122,8 @@ pub struct HandsStats {
     pub calls: u64,
     pub recovered: u64,
     pub unknown: u64,
+    pub folded: u64,
+    pub replayed: u64,
 }
 
 impl HandsStats {
@@ -115,6 +135,8 @@ impl HandsStats {
         self.calls += other.calls;
         self.recovered += other.recovered;
         self.unknown += other.unknown;
+        self.folded += other.folded;
+        self.replayed += other.replayed;
     }
 }
 
@@ -196,6 +218,33 @@ impl Store {
         nanocode_platform::sleep(Duration::from_millis(delay)).await;
     }
 
+    fn insert(&self, request: &PendingRequest) {
+        if self.mutation == HandsMutation::SkipRecord {
+            return;
+        }
+        let runtime = if self.mutation == HandsMutation::MangleRuntime {
+            String::new()
+        } else {
+            request.runtime.clone()
+        };
+        let row = Row {
+            id: request.id,
+            key: request.key.clone(),
+            runtime,
+            turn_id: request.turn_id.clone(),
+            reply: None,
+        };
+        let at = (request.session_id.clone(), request.call_id.clone());
+        self.rows.update(|rows| {
+            rows.insert(at.clone(), row.clone());
+        });
+    }
+
+    fn recorded(&self, session_id: &str, call_id: &str) -> bool {
+        self.rows
+            .read(|rows| rows.contains_key(&(session_id.to_owned(), call_id.to_owned())))
+    }
+
     fn unanswered(&self, id: u64) -> bool {
         self.rows
             .read(|rows| rows.values().any(|row| row.id == id && row.reply.is_none()))
@@ -206,26 +255,35 @@ impl HandRequests for Store {
     fn sent<'a>(&'a self, request: &'a PendingRequest) -> HostFuture<'a, Result<(), String>> {
         Box::pin(async move {
             self.write().await;
-            if self.mutation == HandsMutation::SkipRecord {
+            self.insert(request);
+            Ok(())
+        })
+    }
+
+    fn sent_after<'a>(
+        &'a self,
+        request: &'a PendingRequest,
+        barrier: &'a dyn RemoteBarrier,
+    ) -> HostFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let turn =
+                serde_json::to_string(&request.turn_id).map_err(|error| error.to_string())?;
+            let params = vec![
+                request.session_id.clone(),
+                request.call_id.clone(),
+                request.id.to_string(),
+                request.key.clone(),
+                request.runtime.clone(),
+                turn,
+            ];
+            let carried = Carried {
+                host: std::ptr::from_ref(self) as usize,
+                statements: vec![(SENT, params)],
+            };
+            if barrier.carry(carried).await? {
                 return Ok(());
             }
-            let runtime = if self.mutation == HandsMutation::MangleRuntime {
-                String::new()
-            } else {
-                request.runtime.clone()
-            };
-            let row = Row {
-                id: request.id,
-                key: request.key.clone(),
-                runtime,
-                turn_id: request.turn_id.clone(),
-                reply: None,
-            };
-            let at = (request.session_id.clone(), request.call_id.clone());
-            self.rows.update(|rows| {
-                rows.insert(at.clone(), row.clone());
-            });
-            Ok(())
+            self.sent(request).await
         })
     }
 
@@ -308,6 +366,165 @@ impl HandRequests for Store {
             Ok(())
         })
     }
+}
+
+struct StepHost {
+    rows: Atom<BTreeMap<u64, String>>,
+    store: Arc<Store>,
+    folded: AtomicU64,
+}
+
+impl StepHost {
+    fn applied(&self, rows: &[(u64, String)], compaction: &Compaction<'_>) {
+        self.rows.update(|stored| {
+            stored.extend(rows.iter().chain(compaction.archived).cloned());
+            for range in std::iter::once(&compaction.dropped).chain(compaction.superseded) {
+                for seq in range.clone() {
+                    stored.remove(&seq);
+                }
+            }
+        });
+    }
+
+    fn carried(&self, statements: &[nanocode_durability_core::SqlStatement<'_>]) {
+        for statement in statements {
+            let [session_id, call_id, id, key, runtime, turn] = statement.params[..] else {
+                panic!("the simulated ledger statement has six parameters");
+            };
+            assert_eq!(
+                statement.sql, SENT,
+                "only the ledger's sent statement rides"
+            );
+            self.store.insert(&PendingRequest {
+                id: id.parse().expect("request ids are numbers"),
+                key: key.to_owned(),
+                runtime: runtime.to_owned(),
+                session_id: session_id.to_owned(),
+                call_id: call_id.to_owned(),
+                turn_id: serde_json::from_str(turn).expect("the turn id is JSON"),
+                reply: None,
+            });
+        }
+    }
+}
+
+impl LogHost for StepHost {
+    fn scan<'a>(
+        &'a self,
+        _scope: &'a str,
+        from: u64,
+        to: u64,
+    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
+        let rows = self.rows.read(|rows| {
+            rows.range(from..to)
+                .map(|(seq, body)| (*seq, body.clone()))
+                .collect()
+        });
+        Box::pin(async move { Ok(rows) })
+    }
+
+    fn load<'a>(
+        &'a self,
+        _scope: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
+        let rows = self.rows.read(|rows| {
+            let start = rows
+                .iter()
+                .rev()
+                .find(|(_, body)| body.starts_with('s'))
+                .map_or(0, |(seq, _)| *seq);
+            rows.range(start..)
+                .map(|(seq, body)| (*seq, body.clone()))
+                .collect()
+        });
+        Box::pin(async move { Ok(rows) })
+    }
+
+    fn append<'a>(
+        &'a self,
+        _scope: &'a str,
+        rows: &'a [(u64, String)],
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.store.write().await;
+            self.applied(
+                rows,
+                &Compaction {
+                    archived: &[],
+                    dropped: 0..0,
+                    superseded: &[],
+                },
+            );
+            Ok(())
+        })
+    }
+
+    fn append_compacting<'a>(
+        &'a self,
+        _scope: &'a str,
+        rows: &'a [(u64, String)],
+        compaction: Compaction<'a>,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.store.write().await;
+            self.applied(rows, &compaction);
+            Ok(())
+        })
+    }
+
+    fn carry<'a>(
+        &'a self,
+        _scope: &'a str,
+        write: Write<'a>,
+        rider: Rider<'a>,
+    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
+        if rider.host != Arc::as_ptr(&self.store) as usize {
+            return None;
+        }
+        let Write::Append { rows, compaction } = write else {
+            return None;
+        };
+        Some(Box::pin(async move {
+            self.store.write().await;
+            if self.store.mutation != HandsMutation::CarryDropsLog {
+                self.applied(rows, &compaction);
+            }
+            if self.store.mutation != HandsMutation::CarryDropsRequest {
+                self.carried(rider.statements);
+            }
+            self.folded.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }))
+    }
+}
+
+fn policy() -> Policy {
+    Policy {
+        snapshot_ratio: SNAPSHOT_RATIO,
+        ..Policy::default()
+    }
+}
+
+fn step(index: usize) -> String {
+    format!("step-{index}")
+}
+
+fn durable_step(host: &Arc<StepHost>, index: usize) -> bool {
+    let host = Arc::clone(host) as Arc<dyn LogHost>;
+    let read = async move {
+        let log = OneLog::open(host, SCOPE, policy())
+            .await
+            .expect("the simulated turn log opens");
+        let mut store = log.store();
+        store
+            .peek(&step(index))
+            .await
+            .expect("the simulated turn log reads")
+            .payload
+            .is_some_and(|payload| payload == ADMITTED)
+    };
+    read.now_or_never()
+        .expect("the simulated turn log answers at once")
 }
 
 struct SimLink {
@@ -399,6 +616,7 @@ struct Hand {
 struct World {
     script: Script,
     store: Arc<Store>,
+    log: Arc<StepHost>,
     hand: RefCell<Hand>,
     calls: RefCell<Vec<Call>>,
     restarts: RefCell<Vec<u64>>,
@@ -483,6 +701,18 @@ impl World {
                     return;
                 }
                 let index: usize = context.call_id.parse().expect("calls are numbered");
+                if !durable_step(&self.log, index) {
+                    self.fail(
+                        "folded",
+                        format!("call {index} reached the hand before its step was durable"),
+                    );
+                }
+                if !self.store.recorded(&context.session_id, &context.call_id) {
+                    self.fail(
+                        "folded",
+                        format!("call {index} reached the hand before its request was recorded"),
+                    );
+                }
                 let runs = hand.executions.entry(index).or_default();
                 let value = json!(format!("call {index} run {}", runs.len()));
                 runs.push(value.clone());
@@ -594,7 +824,38 @@ impl World {
         }
     }
 
-    async fn session_call(&self, route: &AcceptorRoute, index: usize) {
+    async fn admit(&self, log: &Arc<OneLog>, index: usize) -> bool {
+        let mut store = log.store();
+        let step = step(index);
+        let result = async {
+            let owned = store.acquire(&step, OwnerId::new()).await?;
+            let commit = StateCommit {
+                payload: ADMITTED,
+                records: &[],
+                events: &[],
+                summary: &SummaryUpdate::Unchanged,
+                settle: Settle::Durable,
+            };
+            store
+                .commit(&step, &owned.owner, owned.state.revision, commit)
+                .await
+        };
+        match result.await {
+            Ok(_) => true,
+            Err(error) => {
+                self.note(format!("call {index} step not committed: {error}"));
+                false
+            }
+        }
+    }
+
+    async fn session_call(
+        &self,
+        route: &AcceptorRoute,
+        log: &Arc<OneLog>,
+        barrier: &Arc<dyn RemoteBarrier>,
+        index: usize,
+    ) {
         let context =
             RemoteContext::new(SESSION.to_owned(), index.to_string(), Some(TURN.to_owned()));
         let operation = || RemoteOperation::Call {
@@ -618,8 +879,15 @@ impl World {
                 if start > now {
                     self.clock.sleep(Duration::from_nanos(start - now)).await;
                 }
+                if !self.admit(log, index).await {
+                    return;
+                }
                 self.calls.borrow_mut()[index].state = CallState::Admitted;
-                live(route.call(operation()).await)
+                if self.store.mutation == HandsMutation::DispatchUnsettled {
+                    live(route.call(operation()).await)
+                } else {
+                    live(route.call_after(operation(), Arc::clone(barrier)).await)
+                }
             }
             CallState::Admitted => {
                 self.stats.borrow_mut().recovered += 1;
@@ -630,7 +898,9 @@ impl World {
                 match recovered {
                     Ok(Some(value)) => Outcome::Value(value),
                     Ok(None) => Outcome::Unknown,
-                    Err(error) if error.is_unsent() => live(route.call(operation()).await),
+                    Err(error) if error.is_unsent() => {
+                        live(route.call_after(operation(), Arc::clone(barrier)).await)
+                    }
                     Err(_) => Outcome::Unknown,
                 }
             }
@@ -696,6 +966,19 @@ fn options() -> AcceptorOptions {
 }
 
 async fn process(world: &World) {
+    let host = Arc::clone(&world.log) as Arc<dyn LogHost>;
+    let log = OneLog::open(host, SCOPE, policy())
+        .await
+        .expect("the simulated turn log opens");
+    log.settle_durably();
+    let barrier = log.barrier();
+    for (index, call) in world.calls.borrow_mut().iter_mut().enumerate() {
+        if matches!(call.state, CallState::Admitted) && !durable_step(&world.log, index) {
+            world.note(format!("call {index} step was lost; the model asks again"));
+            world.stats.borrow_mut().replayed += 1;
+            call.state = CallState::Fresh;
+        }
+    }
     let (acceptor, _attaches) = Acceptor::new(
         options(),
         Arc::clone(&world.store) as Arc<dyn HandRequests>,
@@ -707,7 +990,8 @@ async fn process(world: &World) {
         },
     );
     let route = acceptor.route(Arc::new(|| Box::pin(async { Some(KEY.to_owned()) })));
-    let calls = (0..world.script.starts.len()).map(|index| world.session_call(&route, index));
+    let calls = (0..world.script.starts.len())
+        .map(|index| world.session_call(&route, &log, &barrier, index));
     let sessions = nanocode_sync::join_in_order(calls);
     nanocode_sync::future::join(sessions, world.hand(&acceptor)).await;
 }
@@ -731,16 +1015,22 @@ fn simulate(seed: u64, mutation: HandsMutation) -> HandsOutcome {
         })
         .collect();
     let crashes = script.crashes.clone();
+    let store = Arc::new(Store {
+        rows: Atom::default(),
+        writes: AtomicU64::new(0),
+        seed,
+        mutation,
+    });
     let world = World {
         restarts: RefCell::new(script.restarts.clone()),
         drops: RefCell::new(script.drops.clone()),
         script,
-        store: Arc::new(Store {
+        log: Arc::new(StepHost {
             rows: Atom::default(),
-            writes: AtomicU64::new(0),
-            seed,
-            mutation,
+            store: Arc::clone(&store),
+            folded: AtomicU64::new(0),
         }),
+        store,
         hand: RefCell::new(Hand::default()),
         calls: RefCell::new(calls),
         rng: RefCell::new(Rng::derive(seed, "hands world")),
@@ -786,6 +1076,7 @@ fn simulate(seed: u64, mutation: HandsMutation) -> HandsOutcome {
         }
     }
     world.check();
+    world.stats.borrow_mut().folded = world.log.folded.load(Ordering::Relaxed);
     let trace = world.trace.borrow();
     let mut digest = fnv(FNV_OFFSET, shape.as_bytes());
     for line in trace.iter() {

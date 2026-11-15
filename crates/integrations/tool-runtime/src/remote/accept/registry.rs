@@ -14,9 +14,9 @@ use crate::embedded::{
     CodeModeExecution, CodeModeHostError, CodeModeObserver, HandCalls, HostFuture,
 };
 use crate::remote::{
-    HAND_RESTARTED, NOT_RECEIVED, PEER_CLOSED, REQUEST_IN_USE, RemoteCatalog, RemoteClient,
-    RemoteContext, RemoteDelivery, RemoteFrame, RemoteLedger, RemoteLink, RemoteOperation,
-    RemoteReply, RemoteRequest, RemoteTransport,
+    HAND_RESTARTED, NOT_RECEIVED, PEER_CLOSED, REQUEST_IN_USE, RemoteBarrier, RemoteCatalog,
+    RemoteClient, RemoteContext, RemoteDelivery, RemoteFrame, RemoteLedger, RemoteLink,
+    RemoteOperation, RemoteReply, RemoteRequest, RemoteTransport,
 };
 
 #[derive(Clone, Debug)]
@@ -217,19 +217,34 @@ struct Ledger {
     changes: Arc<Changes>,
 }
 
+impl Ledger {
+    fn record(&self, request: RemoteRequest) -> PendingRequest {
+        PendingRequest {
+            id: request.id,
+            key: self.key.clone(),
+            runtime: self.runtime.clone(),
+            session_id: request.session_id,
+            call_id: request.call_id,
+            turn_id: request.turn_id,
+            reply: None,
+        }
+    }
+}
+
 impl RemoteLedger for Ledger {
     fn sent(&self, request: RemoteRequest) -> HostFuture<'_, Result<(), String>> {
+        Box::pin(async move { self.requests.sent(&self.record(request)).await })
+    }
+
+    fn sent_after<'a>(
+        &'a self,
+        request: RemoteRequest,
+        barrier: &'a dyn RemoteBarrier,
+    ) -> HostFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let record = PendingRequest {
-                id: request.id,
-                key: self.key.clone(),
-                runtime: self.runtime.clone(),
-                session_id: request.session_id,
-                call_id: request.call_id,
-                turn_id: request.turn_id,
-                reply: None,
-            };
-            self.requests.sent(&record).await
+            self.requests
+                .sent_after(&self.record(request), barrier)
+                .await
         })
     }
 
@@ -650,8 +665,32 @@ impl RemoteTransport for AcceptorRoute {
         })
     }
 
+    fn request_after<'a>(
+        &'a self,
+        operation: RemoteOperation,
+        local_tools: Vec<Arc<dyn Tool>>,
+        observer: Option<&'a mut dyn CodeModeObserver>,
+        barrier: Arc<dyn RemoteBarrier>,
+    ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
+        Box::pin(async move {
+            let client = self.client().await?;
+            let observer = observer.map(|observer| observer as &mut dyn CodeModeObserver);
+            client
+                .request_after(operation, local_tools, observer, barrier)
+                .await
+        })
+    }
+
     fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
         Box::pin(async move { self.client().await?.call(operation).await })
+    }
+
+    fn call_after(
+        &self,
+        operation: RemoteOperation,
+        barrier: Arc<dyn RemoteBarrier>,
+    ) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
+        Box::pin(async move { self.client().await?.call_after(operation, barrier).await })
     }
 
     fn recover<'a>(

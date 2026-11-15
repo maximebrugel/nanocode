@@ -54,8 +54,28 @@ pub struct RemoteRequest {
     pub turn_id: Option<String>,
 }
 
+pub struct Carried {
+    pub host: usize,
+    pub statements: Vec<(&'static str, Vec<String>)>,
+}
+
+pub trait RemoteBarrier: Send + Sync + 'static {
+    fn settle(&self) -> HostFuture<'_, Result<(), String>>;
+    fn carry(&self, carried: Carried) -> HostFuture<'_, Result<bool, String>>;
+}
+
 pub trait RemoteLedger: Send + Sync + 'static {
     fn sent(&self, request: RemoteRequest) -> HostFuture<'_, Result<(), String>>;
+    fn sent_after<'a>(
+        &'a self,
+        request: RemoteRequest,
+        barrier: &'a dyn RemoteBarrier,
+    ) -> HostFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            barrier.settle().await?;
+            self.sent(request).await
+        })
+    }
     fn replied<'a>(&'a self, id: u64, reply: &'a RemoteReply)
     -> HostFuture<'a, Result<(), String>>;
 }
@@ -703,8 +723,16 @@ impl Client {
         &self,
         id: u64,
         recorded: Option<&(String, String, Option<String>)>,
+        barrier: Option<&dyn RemoteBarrier>,
     ) -> Result<(), CodeModeHostError> {
         let (Some(ledger), Some((session_id, call_id, turn_id))) = (&self.ledger, recorded) else {
+            if let Some(barrier) = barrier {
+                barrier.settle().await.map_err(|issue| {
+                    CodeModeHostError::unsent(format!(
+                        "the turn log was not saved: {issue}; the operation was not dispatched"
+                    ))
+                })?;
+            }
             return Ok(());
         };
         let request = RemoteRequest {
@@ -713,7 +741,11 @@ impl Client {
             call_id: call_id.clone(),
             turn_id: turn_id.clone(),
         };
-        ledger.sent(request).await.map_err(|issue| {
+        let sent = match barrier {
+            Some(barrier) => ledger.sent_after(request, barrier).await,
+            None => ledger.sent(request).await,
+        };
+        sent.map_err(|issue| {
             CodeModeHostError::unsent(format!(
                 "the request was not recorded: {issue}; the operation was not dispatched"
             ))
@@ -1483,6 +1515,211 @@ impl Drop for Pending {
     }
 }
 
+impl RemoteClient {
+    async fn requested(
+        &self,
+        mut operation: RemoteOperation,
+        tools: Vec<Arc<dyn Tool>>,
+        mut observer: Option<&mut dyn CodeModeObserver>,
+        barrier: Option<&dyn RemoteBarrier>,
+    ) -> Result<Option<CodeModeExecution>, CodeModeHostError> {
+        let client = &self.client;
+        client.not_dispatched()?;
+        if client.operation_timeout.is_some() {
+            name_yield(&mut operation);
+        }
+        let executed = match &operation {
+            RemoteOperation::Execute { context, .. } => Some(context.clone()),
+            _ => None,
+        };
+        let origin_call_id = executed.as_ref().map(|context| context.call_id.clone());
+        let carrier = match &operation {
+            RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } => {
+                Some(context.call_id.clone())
+            }
+            _ => None,
+        };
+        let session_id = match &operation {
+            RemoteOperation::Execute { context, .. } | RemoteOperation::Wait { context, .. } => {
+                Some(context.session_id.clone())
+            }
+            _ => None,
+        };
+        let requested = requested_yield(&operation);
+        let delivery = delivery(&operation);
+        let recorded = recorded(&operation);
+        let (operation, mut full) = client.elide_local_tools(operation);
+        let id = client.next.fetch_add(1, Ordering::Relaxed);
+        let frame = client.request_frame(id, operation);
+        let text = fits(&frame, client.max_frame_bytes)
+            .map_err(|issue| error(format!("{issue}; the operation was not dispatched")))?;
+        client.record(id, recorded.as_ref(), barrier).await?;
+        if let Some(context) = executed {
+            let generation = client
+                .turns
+                .read(|turns| turns.get(&context.session_id).copied())
+                .unwrap_or(0);
+            let key = (context.session_id.clone(), context.call_id.clone());
+            let state = CallbackState {
+                tools,
+                context,
+                generation,
+                observer: Arc::default(),
+            };
+            client.callbacks.modify(|callbacks| {
+                if callbacks.contains_key(&key) {
+                    return Err(error("callback origin is already active"));
+                }
+                callbacks.insert(key.clone(), state.clone());
+                Ok(())
+            })?;
+        }
+        let (registered, mut replies) = waiter();
+        let mut guard = Pending {
+            client: Arc::clone(client),
+            id,
+            session_id: session_id.clone(),
+            origin: session_id.clone().zip(origin_call_id.clone()),
+            complete: false,
+        };
+        client
+            .dispatch((frame, text), delivery, Some((id, registered)))
+            .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
+        let reply = async {
+            let mut received = match &session_id {
+                Some(session_id) => {
+                    ReceivedCalls::default().answered(Arc::clone(&client.answers), session_id)
+                }
+                None => ReceivedCalls::default(),
+            };
+            let mut undelivered = None;
+            while let Some((frame, from_hand)) = replies.recv().await {
+                match frame {
+                    Frame::Reply {
+                        result: Err(message),
+                        ..
+                    } if message == LOCAL_TOOLS_UNKNOWN && full.is_some() => {
+                        let Some(operation) = full.take() else {
+                            continue;
+                        };
+                        if from_hand && client.ledger.is_some() {
+                            let _ = client.outgoing.send(Outgoing::frames(
+                                vec![Frame::Ack {
+                                    ids: vec![guard.id],
+                                }],
+                                RemoteDelivery::Immediate,
+                            ));
+                        }
+                        let id = client.next.fetch_add(1, Ordering::Relaxed);
+                        let frame = client.request_frame(id, operation);
+                        let text = fits(&frame, client.max_frame_bytes).map_err(|issue| {
+                            error(format!("{issue}; the operation was not dispatched"))
+                        })?;
+                        client.record(id, recorded.as_ref(), barrier).await?;
+                        let registered;
+                        (registered, replies) = waiter();
+                        guard.id = id;
+                        client
+                            .dispatch((frame, text), delivery, Some((id, registered)))
+                            .map_err(|_| {
+                                error("remote connection closed; the operation was not dispatched")
+                            })?;
+                    }
+                    Frame::Reply { result, .. } => {
+                        let result = match result {
+                            Ok(Some(mut value)) => {
+                                received.execution(&mut value)?;
+                                Ok(Some(value))
+                            }
+                            other => other,
+                        };
+                        if from_hand {
+                            client.settle_reply_behind(guard.id, &result);
+                        }
+                        let result = result.map_err(replied)?;
+                        if let Some(issue) = undelivered {
+                            return Err(issue);
+                        }
+                        return result
+                            .map(|value| {
+                                serde_json::from_value::<CodeModeExecution>(value).map_err(error)
+                            })
+                            .transpose();
+                    }
+                    Frame::Update { update, .. } => {
+                        if undelivered.is_none()
+                            && let Err(issue) = received.deliver(observer.as_deref_mut(), update)
+                        {
+                            undelivered = Some(issue);
+                        }
+                    }
+                    _ => return Err(error("unexpected operation reply")),
+                }
+            }
+            Err(error(
+                "remote reply channel closed; operation outcome unknown",
+            ))
+        };
+        let result = client
+            .deadline(
+                reply,
+                requested,
+                "remote operation deadline elapsed; outcome unknown; cancellation requested; no retry",
+            )
+            .await?;
+        if let (Some(session), Ok(Some(execution))) = (&session_id, &result)
+            && let Some(cell) = execution.cell.as_ref().filter(|cell| cell.running)
+        {
+            let generation = client
+                .turns
+                .read(|turns| turns.get(session).copied())
+                .unwrap_or(0);
+            let key = (session.clone(), cell.origin_call_id.clone());
+            client.callbacks.update(|callbacks| {
+                if let Some(state) = callbacks.get_mut(&key) {
+                    state.generation = generation;
+                }
+            });
+        }
+        if let Some(session_id) = session_id {
+            let completed = match &result {
+                Ok(Some(execution)) => match &execution.cell {
+                    Some(cell) if cell.running => None,
+                    Some(cell) => Some(cell.origin_call_id.clone()),
+                    None => origin_call_id,
+                },
+                Err(_) => origin_call_id,
+                Ok(None) => None,
+            };
+            if let Some(origin) = completed {
+                let carrier = match (&result, &carrier) {
+                    (Ok(Some(_)), Some(carrier)) => Some(carrier.as_str()),
+                    _ => None,
+                };
+                client.settle(session_id, origin, carrier);
+            }
+        }
+        guard.complete = true;
+        result
+    }
+
+    async fn called(
+        &self,
+        operation: RemoteOperation,
+        barrier: Option<&dyn RemoteBarrier>,
+    ) -> Result<Value, CodeModeHostError> {
+        let client = &self.client;
+        let id = client.next.fetch_add(1, Ordering::Relaxed);
+        let recorded = recorded(&operation);
+        let (frame, registered, reply) = prepare_call(client, id, operation)?;
+        client.record(id, recorded.as_ref(), barrier).await?;
+        client
+            .dispatch(frame, RemoteDelivery::Immediate, Some(registered))
+            .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
+        reply.await
+    }
+}
+
 impl RemoteTransport for RemoteClient {
     fn supports_tool_selection(&self) -> bool {
         self.client.tool_selection
@@ -1514,204 +1751,36 @@ impl RemoteTransport for RemoteClient {
     }
     fn request<'a>(
         &'a self,
-        mut operation: RemoteOperation,
+        operation: RemoteOperation,
         tools: Vec<Arc<dyn Tool>>,
-        mut observer: Option<&'a mut dyn CodeModeObserver>,
+        observer: Option<&'a mut dyn CodeModeObserver>,
+    ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
+        Box::pin(self.requested(operation, tools, observer, None))
+    }
+
+    fn request_after<'a>(
+        &'a self,
+        operation: RemoteOperation,
+        tools: Vec<Arc<dyn Tool>>,
+        observer: Option<&'a mut dyn CodeModeObserver>,
+        barrier: Arc<dyn RemoteBarrier>,
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
         Box::pin(async move {
-            let client = &self.client;
-            client.not_dispatched()?;
-            if client.operation_timeout.is_some() {
-                name_yield(&mut operation);
-            }
-            let executed = match &operation {
-                RemoteOperation::Execute { context, .. } => Some(context.clone()),
-                _ => None,
-            };
-            let origin_call_id = executed.as_ref().map(|context| context.call_id.clone());
-            let carrier = match &operation {
-                RemoteOperation::Execute { context, .. }
-                | RemoteOperation::Wait { context, .. } => Some(context.call_id.clone()),
-                _ => None,
-            };
-            let session_id = match &operation {
-                RemoteOperation::Execute { context, .. }
-                | RemoteOperation::Wait { context, .. } => Some(context.session_id.clone()),
-                _ => None,
-            };
-            let requested = requested_yield(&operation);
-            let delivery = delivery(&operation);
-            let recorded = recorded(&operation);
-            let (operation, mut full) = client.elide_local_tools(operation);
-            let id = client.next.fetch_add(1, Ordering::Relaxed);
-            let frame = client.request_frame(id, operation);
-            let text = fits(&frame, client.max_frame_bytes)
-                .map_err(|issue| error(format!("{issue}; the operation was not dispatched")))?;
-            client.record(id, recorded.as_ref()).await?;
-            if let Some(context) = executed {
-                let generation = client
-                    .turns
-                    .read(|turns| turns.get(&context.session_id).copied())
-                    .unwrap_or(0);
-                let key = (context.session_id.clone(), context.call_id.clone());
-                let state = CallbackState {
-                    tools,
-                    context,
-                    generation,
-                    observer: Arc::default(),
-                };
-                client.callbacks.modify(|callbacks| {
-                    if callbacks.contains_key(&key) {
-                        return Err(error("callback origin is already active"));
-                    }
-                    callbacks.insert(key.clone(), state.clone());
-                    Ok(())
-                })?;
-            }
-            let (registered, mut replies) = waiter();
-            let mut guard = Pending {
-                client: Arc::clone(client),
-                id,
-                session_id: session_id.clone(),
-                origin: session_id.clone().zip(origin_call_id.clone()),
-                complete: false,
-            };
-            client
-                .dispatch((frame, text), delivery, Some((id, registered)))
-                .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
-            let reply = async {
-                let mut received = match &session_id {
-                    Some(session_id) => {
-                        ReceivedCalls::default().answered(Arc::clone(&client.answers), session_id)
-                    }
-                    None => ReceivedCalls::default(),
-                };
-                let mut undelivered = None;
-                while let Some((frame, from_hand)) = replies.recv().await {
-                    match frame {
-                        Frame::Reply {
-                            result: Err(message),
-                            ..
-                        } if message == LOCAL_TOOLS_UNKNOWN && full.is_some() => {
-                            let Some(operation) = full.take() else {
-                                continue;
-                            };
-                            if from_hand && client.ledger.is_some() {
-                                let _ = client.outgoing.send(Outgoing::frames(
-                                    vec![Frame::Ack {
-                                        ids: vec![guard.id],
-                                    }],
-                                    RemoteDelivery::Immediate,
-                                ));
-                            }
-                            let id = client.next.fetch_add(1, Ordering::Relaxed);
-                            let frame = client.request_frame(id, operation);
-                            let text = fits(&frame, client.max_frame_bytes).map_err(|issue| {
-                                error(format!("{issue}; the operation was not dispatched"))
-                            })?;
-                            client.record(id, recorded.as_ref()).await?;
-                            let registered;
-                            (registered, replies) = waiter();
-                            guard.id = id;
-                            client
-                                .dispatch((frame, text), delivery, Some((id, registered)))
-                                .map_err(|_| {
-                                    error("remote connection closed; the operation was not dispatched")
-                                })?;
-                        }
-                        Frame::Reply { result, .. } => {
-                            let result = match result {
-                                Ok(Some(mut value)) => {
-                                    received.execution(&mut value)?;
-                                    Ok(Some(value))
-                                }
-                                other => other,
-                            };
-                            if from_hand {
-                                client.settle_reply_behind(guard.id, &result);
-                            }
-                            let result = result.map_err(replied)?;
-                            if let Some(issue) = undelivered {
-                                return Err(issue);
-                            }
-                            return result
-                                .map(|value| {
-                                    serde_json::from_value::<CodeModeExecution>(value)
-                                        .map_err(error)
-                                })
-                                .transpose();
-                        }
-                        Frame::Update { update, .. } => {
-                            if undelivered.is_none()
-                                && let Err(issue) =
-                                    received.deliver(observer.as_deref_mut(), update)
-                            {
-                                undelivered = Some(issue);
-                            }
-                        }
-                        _ => return Err(error("unexpected operation reply")),
-                    }
-                }
-                Err(error(
-                    "remote reply channel closed; operation outcome unknown",
-                ))
-            };
-            let result = client
-                .deadline(
-                    reply,
-                    requested,
-                    "remote operation deadline elapsed; outcome unknown; cancellation requested; no retry",
-                )
-                .await?;
-            if let (Some(session), Ok(Some(execution))) = (&session_id, &result)
-                && let Some(cell) = execution.cell.as_ref().filter(|cell| cell.running)
-            {
-                let generation = client
-                    .turns
-                    .read(|turns| turns.get(session).copied())
-                    .unwrap_or(0);
-                let key = (session.clone(), cell.origin_call_id.clone());
-                client.callbacks.update(|callbacks| {
-                    if let Some(state) = callbacks.get_mut(&key) {
-                        state.generation = generation;
-                    }
-                });
-            }
-            if let Some(session_id) = session_id {
-                let completed = match &result {
-                    Ok(Some(execution)) => match &execution.cell {
-                        Some(cell) if cell.running => None,
-                        Some(cell) => Some(cell.origin_call_id.clone()),
-                        None => origin_call_id,
-                    },
-                    Err(_) => origin_call_id,
-                    Ok(None) => None,
-                };
-                if let Some(origin) = completed {
-                    let carrier = match (&result, &carrier) {
-                        (Ok(Some(_)), Some(carrier)) => Some(carrier.as_str()),
-                        _ => None,
-                    };
-                    client.settle(session_id, origin, carrier);
-                }
-            }
-            guard.complete = true;
-            result
+            self.requested(operation, tools, observer, Some(&*barrier))
+                .await
         })
     }
 
     fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
-        Box::pin(async move {
-            let client = &self.client;
-            let id = client.next.fetch_add(1, Ordering::Relaxed);
-            let recorded = recorded(&operation);
-            let (frame, registered, reply) = prepare_call(client, id, operation)?;
-            client.record(id, recorded.as_ref()).await?;
-            client
-                .dispatch(frame, RemoteDelivery::Immediate, Some(registered))
-                .map_err(|_| error("remote connection closed; the operation was not dispatched"))?;
-            reply.await
-        })
+        Box::pin(self.called(operation, None))
+    }
+
+    fn call_after(
+        &self,
+        operation: RemoteOperation,
+        barrier: Arc<dyn RemoteBarrier>,
+    ) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
+        Box::pin(async move { self.called(operation, Some(&*barrier)).await })
     }
 
     fn route_hands(&self, hands: Arc<dyn HandCalls>) {

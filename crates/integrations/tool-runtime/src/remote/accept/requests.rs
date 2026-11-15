@@ -3,7 +3,7 @@ use std::sync::Arc;
 use nanocode_durability_core::{Migration, Sql, SqlRow, SqlStatement, StoreError, migrate_format};
 
 use crate::embedded::HostFuture;
-use crate::remote::RemoteReply;
+use crate::remote::{Carried, RemoteBarrier, RemoteReply};
 
 pub struct PendingRequest {
     pub id: u64,
@@ -17,6 +17,16 @@ pub struct PendingRequest {
 
 pub trait HandRequests: Send + Sync + 'static {
     fn sent<'a>(&'a self, request: &'a PendingRequest) -> HostFuture<'a, Result<(), String>>;
+    fn sent_after<'a>(
+        &'a self,
+        request: &'a PendingRequest,
+        barrier: &'a dyn RemoteBarrier,
+    ) -> HostFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            barrier.settle().await?;
+            self.sent(request).await
+        })
+    }
     fn replied<'a>(
         &'a self,
         key: &'a str,
@@ -118,7 +128,35 @@ impl SqlRequests {
     }
 }
 
+fn sent_params(request: &PendingRequest) -> Result<Vec<String>, String> {
+    Ok(vec![
+        request.session_id.clone(),
+        request.call_id.clone(),
+        request.id.to_string(),
+        request.key.clone(),
+        request.runtime.clone(),
+        serde_json::to_string(&request.turn_id).map_err(encoded)?,
+    ])
+}
+
 impl HandRequests for SqlRequests {
+    fn sent_after<'a>(
+        &'a self,
+        request: &'a PendingRequest,
+        barrier: &'a dyn RemoteBarrier,
+    ) -> HostFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let carried = Carried {
+                host: Arc::as_ptr(&self.host).cast::<()>() as usize,
+                statements: vec![(self.host.dialect().pick(&SENT), sent_params(request)?)],
+            };
+            if barrier.carry(carried).await? {
+                return Ok(());
+            }
+            self.sent(request).await
+        })
+    }
+
     fn sent<'a>(&'a self, request: &'a PendingRequest) -> HostFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let id = request.id.to_string();

@@ -163,6 +163,10 @@ pub trait CodeModeHost: Send + Sync + 'static {
         false
     }
 
+    fn carries_barrier(&self) -> bool {
+        false
+    }
+
     fn wait_with_updates<'a>(
         &'a self,
         _input: &'a str,
@@ -401,6 +405,9 @@ impl<T: CodeModeHost + ?Sized> CodeModeHost for std::sync::Arc<T> {
     }
     fn supports_cells(&self) -> bool {
         (**self).supports_cells()
+    }
+    fn carries_barrier(&self) -> bool {
+        (**self).carries_barrier()
     }
     fn tool_definitions(&self, session_id: &str) -> Result<Vec<ToolDefinition>, CodeModeHostError> {
         (**self).tool_definitions(session_id)

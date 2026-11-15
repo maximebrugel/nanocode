@@ -11,11 +11,11 @@ use nanocode_tool_host::{
         CellJournal, CellJournalSink, CellJournalUpdate, CellJournals, JournalEntry,
         JournaledCallState,
     },
-    effects::{EffectCall, EffectGate},
+    effects::{Carried, EffectCall, EffectGate, RemoteBarrier},
     embedded::HostFuture,
 };
 use nanocode_turnlog::{
-    EffectClass, Effects, Fold, LogHost, Outcome, Phase, Point, Record, Stats, Status, Turn,
+    EffectClass, Effects, Fold, LogHost, Outcome, Phase, Point, Record, Rider, Stats, Status, Turn,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json, value::RawValue};
@@ -23,8 +23,8 @@ use serde_json::{Map, Value, json, value::RawValue};
 use crate::{
     SessionEvent,
     durability::{
-        Committed, OwnedState, OwnerId, OwnerToken, Settle, StateCommit, StateStore, StoreError,
-        StoreFuture, StoreRecord, StoredState,
+        Committed, OwnedState, OwnerId, OwnerToken, Settle, SqlStatement, StateCommit, StateStore,
+        StoreError, StoreFuture, StoreRecord, StoredState,
     },
     events::AgentEventKind,
     input::Prompt,
@@ -53,10 +53,12 @@ pub struct Policy {
 pub struct OneLog {
     answered: Atom<BTreeMap<(String, u64), u64>>,
     dispatched: Atom<BTreeMap<(String, u64), BTreeSet<u64>>>,
+    deferred_settles: Atom<bool>,
     durable_settles: Atom<bool>,
     effects: Atom<Effects>,
     live: Atom<BTreeSet<(String, u64)>>,
     log: nanocode_turnlog::TurnLog,
+    owed: Atom<bool>,
     owners: Atom<nanocode_sync::Map<String, OwnerToken>>,
     recovering: Atom<BTreeSet<String>>,
     restarts: u64,
@@ -260,11 +262,13 @@ impl OneLog {
             .await;
         Ok(Arc::new(Self {
             answered: Atom::default(),
+            deferred_settles: Atom::new(false),
             dispatched: Atom::default(),
             durable_settles: Atom::new(false),
             effects: Atom::new(Effects::builtin().merged(policy.effects)),
             live: Atom::default(),
             log,
+            owed: Atom::new(false),
             owners: Atom::default(),
             recovering: Atom::new(recovering),
             restarts: policy.restarts,
@@ -279,6 +283,44 @@ impl OneLog {
 
     pub fn settle_durably(&self) {
         self.durable_settles.set(true);
+    }
+
+    #[must_use]
+    pub fn barrier(self: &Arc<Self>) -> Arc<dyn RemoteBarrier> {
+        self.deferred_settles.set(true);
+        Arc::clone(self) as Arc<dyn RemoteBarrier>
+    }
+
+    pub async fn settle_deferred(&self) -> Result<(), StoreError> {
+        let mut lease = self.log.lease().await;
+        if *self.owed.get() && lease.buffered() > 0 {
+            lease.commit(Point::Progress).await?;
+        }
+        self.owed.set(false);
+        Ok(())
+    }
+
+    async fn carried(&self, carried: Carried) -> Result<bool, StoreError> {
+        let mut lease = self.log.lease().await;
+        if !*self.owed.get() || lease.buffered() == 0 {
+            self.owed.set(false);
+            return Ok(false);
+        }
+        let statements = carried
+            .statements
+            .iter()
+            .map(|(sql, params)| SqlStatement {
+                sql,
+                params: params.iter().map(String::as_str).collect(),
+            })
+            .collect::<Vec<_>>();
+        let rider = Rider {
+            host: carried.host,
+            statements: &statements,
+        };
+        let (_, carried) = lease.commit_carrying(Point::Progress, rider).await?;
+        self.owed.set(false);
+        Ok(carried)
     }
 
     pub fn declare(&self, tool: impl Into<String>, class: EffectClass) {
@@ -1087,7 +1129,7 @@ impl EventLog for OneLog {
     }
 
     fn flush(&self) -> Logged<'_, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(self.settle_deferred())
     }
 }
 
@@ -1158,7 +1200,16 @@ impl EffectGate for OneLog {
             lease
                 .commit(Point::Call)
                 .await
-                .map(drop)
+                .map_err(|error| error.to_string())?;
+            self.owed.set(false);
+            Ok(())
+        })
+    }
+
+    fn settle(&self) -> HostFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.settle_deferred()
+                .await
                 .map_err(|error| error.to_string())
         })
     }
@@ -1174,6 +1225,24 @@ impl EffectGate for OneLog {
             }) {
                 nanocode_trace::warn!(%error, call_id, "turn log could not record a tool result");
             }
+        })
+    }
+}
+
+impl RemoteBarrier for OneLog {
+    fn settle(&self) -> HostFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            self.settle_deferred()
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn carry(&self, carried: Carried) -> HostFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            self.carried(carried)
+                .await
+                .map_err(|error| error.to_string())
         })
     }
 }
@@ -1586,10 +1655,13 @@ impl StateStore for OneLogStore {
                 commit.payload,
                 commit.records,
             )?;
-            if commit.settle == Settle::Durable
-                && (lease.fold().recovering() || *self.0.durable_settles.get())
-            {
-                lease.commit(Point::Progress).await?;
+            let recovering = lease.fold().recovering();
+            if commit.settle == Settle::Durable && (recovering || *self.0.durable_settles.get()) {
+                if !recovering && *self.0.deferred_settles.get() {
+                    self.0.owed.set(true);
+                } else {
+                    lease.commit(Point::Progress).await?;
+                }
             }
             Ok(Committed {
                 revision,

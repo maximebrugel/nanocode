@@ -120,6 +120,13 @@ impl EmbeddedToolRuntime {
     }
 
     #[must_use]
+    pub fn carries_barrier(&self) -> bool {
+        self.host
+            .as_ref()
+            .is_some_and(|host| host.carries_barrier())
+    }
+
+    #[must_use]
     pub const fn default_shell_name(&self) -> &'static str {
         "javascript"
     }

@@ -26,6 +26,22 @@ enum RuntimeControl {
 }
 
 impl ToolRuntime {
+    async fn barrier(&self) -> Result<(), CodeModeHostError> {
+        let Some(gate) = &self.effect_gate else {
+            return Ok(());
+        };
+        if let Runtime::Host(runtime) = &self.inner
+            && runtime.carries_barrier()
+        {
+            return Ok(());
+        }
+        gate.settle().await.map_err(|issue| {
+            CodeModeHostError::unsent(format!(
+                "the turn log was not saved: {issue}; the cell was not started"
+            ))
+        })
+    }
+
     pub fn new(workspace: impl Into<PathBuf>, builtin_tools: Vec<Arc<dyn Tool>>) -> Self {
         Self {
             inner: Runtime::Native(NativeToolRuntime::new(workspace, builtin_tools)),
@@ -168,6 +184,7 @@ impl ToolRuntime {
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
         Box::pin(async move {
+            self.barrier().await?;
             match &self.inner {
                 Runtime::Native(runtime) => runtime.execute_code(source, context).await,
                 Runtime::Host(runtime) => runtime.execute_code(source, context).await,
@@ -185,6 +202,7 @@ impl ToolRuntime {
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
         Box::pin(async move {
+            self.barrier().await?;
             match &self.inner {
                 Runtime::Native(runtime) => {
                     runtime
@@ -209,6 +227,7 @@ impl ToolRuntime {
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
         Box::pin(async move {
+            self.barrier().await?;
             match &self.inner {
                 Runtime::Native(runtime) => runtime.execute_code_owned(source, context).await,
                 Runtime::Host(runtime) => runtime.execute_code_owned(source, context).await,
@@ -226,6 +245,7 @@ impl ToolRuntime {
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
         Box::pin(async move {
+            self.barrier().await?;
             match &self.inner {
                 Runtime::Native(runtime) => {
                     runtime
@@ -250,6 +270,7 @@ impl ToolRuntime {
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
         Box::pin(async move {
+            self.barrier().await?;
             match &self.inner {
                 Runtime::Native(runtime) => runtime.wait_for_code(input, context).await,
                 Runtime::Host(runtime) => runtime.wait_for_code(input, context).await,
@@ -267,6 +288,7 @@ impl ToolRuntime {
         Result<CodeModeExecution, crate::embedded::CodeModeHostError>,
     > {
         Box::pin(async move {
+            self.barrier().await?;
             match &self.inner {
                 Runtime::Native(runtime) => {
                     runtime

@@ -12,7 +12,7 @@ use nanocode_io::{AsyncRead, AsyncWrite, ReadBuf};
 use nanocode_sys::{AtomicBox, AtomicWaker};
 
 use crate::{
-    reactor::{Direction, Ready, Registration, reactor},
+    reactor::{Direction, Ready, Registration, shared},
     sys::AsRaw,
 };
 
@@ -28,7 +28,7 @@ pub struct Source<T: AsRaw> {
 
 impl<T: AsRaw> Source<T> {
     pub fn new(inner: T) -> io::Result<Self> {
-        let registration = reactor()?.register(inner.as_raw_source())?;
+        let registration = shared()?.register(inner.as_raw_source())?;
         Ok(Self {
             inner: Some(inner),
             registration,

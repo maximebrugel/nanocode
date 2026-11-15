@@ -234,13 +234,7 @@ pub fn shared() -> io::Result<&'static Reactor> {
         .map_err(|message| io::Error::other(message.clone()))
 }
 
-pub fn reactor() -> io::Result<&'static Reactor> {
-    let reactor = shared()?;
-    if reactor.drivers.load(Ordering::SeqCst) == 0 {
-        reactor.fallback()?;
-    }
-    Ok(reactor)
-}
+
 
 fn start() -> Result<Reactor, String> {
     let poller = Poller::new().map_err(|error| format!("the reactor's poller failed: {error}"))?;
@@ -434,11 +428,29 @@ impl Reactor {
         if self.drivers.fetch_sub(1, Ordering::SeqCst) == 1 {
             if let Some(thread) = self.fallback.get() {
                 thread.unpark();
-            } else {
+            } else if !self.idle() {
                 let _ = self.fallback();
             }
         }
         self.notify_waiting();
+    }
+
+    fn idle(&self) -> bool {
+        let Some(mut driver) = self.driver.take() else {
+            return false;
+        };
+        driver.drain(self);
+        let idle = driver.sources.is_empty() && driver.timers.is_empty();
+        self.release(driver);
+        idle
+    }
+
+    fn driven(&'static self) -> io::Result<()> {
+        fence(Ordering::SeqCst);
+        if self.drivers.load(Ordering::SeqCst) == 0 {
+            self.fallback()?;
+        }
+        Ok(())
     }
 
     pub fn try_turn(
@@ -509,11 +521,12 @@ impl Reactor {
             #[cfg(windows)]
             retry: [AtomicBox::empty(), AtomicBox::empty()],
         };
+        self.driven()?;
         self.poller.register(fd, token)?;
         Ok(registration)
     }
 
-    pub fn arm(&'static self, deadline: Instant) -> Armed {
+    pub fn arm(&'static self, deadline: Instant) -> io::Result<Armed> {
         let id = self.token();
         let timer = Arc::new(Timer {
             fired: AtomicBool::new(false),
@@ -525,12 +538,14 @@ impl Reactor {
         if self.nanos(deadline) < self.next_wake_ns.load(Ordering::SeqCst) {
             self.wake();
         }
-        Armed {
+        let armed = Armed {
             reactor: self,
             deadline,
             id,
             timer,
-        }
+        };
+        self.driven()?;
+        Ok(armed)
     }
 }
 
@@ -561,7 +576,10 @@ impl Registration {
     ) -> Poll<io::Result<R>> {
         match operation() {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                let armed = self.reactor.arm(Instant::now() + POLL_RETRY);
+                let armed = match self.reactor.arm(Instant::now() + POLL_RETRY) {
+                    Ok(armed) => armed,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
                 if armed.poll_fired(context).is_ready() {
                     context.waker().wake_by_ref();
                 }

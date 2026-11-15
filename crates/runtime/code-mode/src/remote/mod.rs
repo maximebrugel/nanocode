@@ -14,8 +14,8 @@ use nanocode_sync::Atom;
 
 pub use admission::{Admission, CatalogError, admit_runtime, read_catalog};
 pub use client::{
-    CallReply, LOCAL_CLOSED, PEER_CLOSED, RemoteActivity, RemoteClient, RemoteDelivery,
-    RemoteLedger, RemoteLink, RemoteReply, RemoteRequest, ResumedReply,
+    CallReply, Carried, LOCAL_CLOSED, PEER_CLOSED, RemoteActivity, RemoteBarrier, RemoteClient,
+    RemoteDelivery, RemoteLedger, RemoteLink, RemoteReply, RemoteRequest, ResumedReply,
 };
 pub use compact::{
     Answers, ReceivedCalls, SentCalls, answer_key, asked_key, encode_output,
@@ -431,6 +431,12 @@ pub enum RemoteOperation {
     HostInfo,
 }
 
+fn unsaved(issue: String) -> CodeModeHostError {
+    CodeModeHostError::unsent(format!(
+        "the turn log was not saved: {issue}; the operation was not dispatched"
+    ))
+}
+
 pub trait RemoteTransport: Send + Sync + 'static {
     fn supports_tool_selection(&self) -> bool {
         false
@@ -442,7 +448,29 @@ pub trait RemoteTransport: Send + Sync + 'static {
         local_tools: Vec<Arc<dyn Tool>>,
         observer: Option<&'a mut dyn CodeModeObserver>,
     ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>>;
+    fn request_after<'a>(
+        &'a self,
+        operation: RemoteOperation,
+        local_tools: Vec<Arc<dyn Tool>>,
+        observer: Option<&'a mut dyn CodeModeObserver>,
+        barrier: Arc<dyn RemoteBarrier>,
+    ) -> HostFuture<'a, Result<Option<CodeModeExecution>, CodeModeHostError>> {
+        Box::pin(async move {
+            barrier.settle().await.map_err(unsaved)?;
+            self.request(operation, local_tools, observer).await
+        })
+    }
     fn call(&self, operation: RemoteOperation) -> HostFuture<'_, Result<Value, CodeModeHostError>>;
+    fn call_after(
+        &self,
+        operation: RemoteOperation,
+        barrier: Arc<dyn RemoteBarrier>,
+    ) -> HostFuture<'_, Result<Value, CodeModeHostError>> {
+        Box::pin(async move {
+            barrier.settle().await.map_err(unsaved)?;
+            self.call(operation).await
+        })
+    }
     fn recover<'a>(
         &'a self,
         _context: &'a RemoteContext,
@@ -472,6 +500,7 @@ pub struct RemoteCodeModeHost {
     backends: Atom<HashMap<String, String>>,
     description: Option<HandDescription>,
     job_notices: bool,
+    barrier: Option<Arc<dyn RemoteBarrier>>,
 }
 
 impl RemoteCodeModeHost {
@@ -484,7 +513,14 @@ impl RemoteCodeModeHost {
             backends: Atom::default(),
             description: None,
             job_notices: false,
+            barrier: None,
         }
+    }
+
+    #[must_use]
+    pub fn barrier(mut self, barrier: Arc<dyn RemoteBarrier>) -> Self {
+        self.barrier = Some(barrier);
+        self
     }
 
     #[must_use]
@@ -574,16 +610,24 @@ impl RemoteCodeModeHost {
         tools: Vec<Arc<dyn Tool>>,
         observer: Option<&'a mut dyn CodeModeObserver>,
     ) -> Result<CodeModeExecution, CodeModeHostError> {
-        self.transport
-            .request(operation, tools, observer)
-            .await?
-            .ok_or_else(|| CodeModeHostError::new("remote runner omitted execution result"))
+        match &self.barrier {
+            Some(barrier) => {
+                self.transport
+                    .request_after(operation, tools, observer, Arc::clone(barrier))
+                    .await?
+            }
+            None => self.transport.request(operation, tools, observer).await?,
+        }
+        .ok_or_else(|| CodeModeHostError::new("remote runner omitted execution result"))
     }
 }
 
 impl CodeModeHost for RemoteCodeModeHost {
     fn tool_mode(&self) -> EmbeddedToolMode {
         EmbeddedToolMode::CodeOnly
+    }
+    fn carries_barrier(&self) -> bool {
+        self.barrier.is_some()
     }
     fn describe(&self) -> Option<HandDescription> {
         self.description.clone()
@@ -768,7 +812,15 @@ impl CodeModeHost for RemoteCodeModeHost {
                 context: RemoteContext::from_context(context),
                 selected_tools,
             };
-            output_from_wire(self.transport.call(operation).await?)
+            let reply = match &self.barrier {
+                Some(barrier) => {
+                    self.transport
+                        .call_after(operation, Arc::clone(barrier))
+                        .await?
+                }
+                None => self.transport.call(operation).await?,
+            };
+            output_from_wire(reply)
         })
     }
     fn recover<'a>(

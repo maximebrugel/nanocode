@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,7 +22,8 @@
 
 // Linux counterpart of runstat.c. Runs a command in its own process group as a child subreaper, so every helper it
 // starts stays in the tree, samples /proc for the tree's summed RSS and process count, kills what is left when the
-// command exits, and writes JSON. Env: RUNSTAT_INTERVAL_US (sampler period, default 2000, 0 = off),
+// command exits, and writes JSON. At each new peak of the summed RSS it reads the tree's smaps_rollup for PSS and the
+// anonymous and file-backed parts of that peak. Env: RUNSTAT_INTERVAL_US (sampler period, default 2000, 0 = off),
 // RUNSTAT_CGROUP (a writable cgroup v2 directory to create the run's cgroup in; default the parent of our own),
 // RUNSTAT_PERF=1 (count instructions with perf_event_open; off by default because on a VM the counter's context
 // switch cost inflated nc --version from 2.4 to 8 ms of CPU and an nc TUI session from 160 to 380 ms).
@@ -31,6 +33,9 @@ typedef struct { int pid; unsigned long long start, cpu; } proc_t;
 static proc_t seen[MAXP];
 static int nseen, procs_max, helpers_max, samples, self_pid, main_pid;
 static uint64_t rss_max;
+typedef struct { uint64_t rss, pss, pss_anon, pss_file, pss_shmem, anon; } rollup_t;
+static rollup_t peak_rollup;
+static int peak_rollups;
 static long tick, page;
 static atomic_int stop;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
@@ -115,6 +120,20 @@ static uint64_t rss_of(int pid) {
     return res * page;
 }
 
+static void rollup_add(int pid, rollup_t *r) {
+    char path[64], buf[4096];
+    snprintf(path, sizeof path, "/proc/%d/smaps_rollup", pid);
+    if (readfile(path, buf, sizeof buf) <= 0) return;
+    static const struct { const char *key; size_t off; } keys[] = {
+        {"\nRss:", offsetof(rollup_t, rss)}, {"\nPss:", offsetof(rollup_t, pss)}, {"\nPss_Anon:", offsetof(rollup_t, pss_anon)},
+        {"\nPss_File:", offsetof(rollup_t, pss_file)}, {"\nPss_Shmem:", offsetof(rollup_t, pss_shmem)}, {"\nAnonymous:", offsetof(rollup_t, anon)},
+    };
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        char *p = strstr(buf, keys[i].key);
+        if (p) *(uint64_t *)((char *)r + keys[i].off) += strtoull(p + strlen(keys[i].key), NULL, 10) * 1024;
+    }
+}
+
 static void sample(void) {
     static int pids[MAXP];
     static stat_t st[MAXP];
@@ -125,14 +144,16 @@ static void sample(void) {
         rss += rss_of(pids[i]);
         if (pids[i] != main_pid) helpers++;
     }
+    rollup_t r = {0};
+    if (rss > rss_max) for (int i = 0; i < n; i++) rollup_add(pids[i], &r);
     pthread_mutex_lock(&mu);
+    if (rss > rss_max) { rss_max = rss; peak_rollup = r; peak_rollups++; }
     for (int i = 0; i < n; i++) {
         int j;
         for (j = 0; j < nseen && !(seen[j].pid == st[i].pid && seen[j].start == st[i].start); j++) {}
         if (j == nseen && nseen < MAXP) seen[nseen++] = (proc_t){st[i].pid, st[i].start, 0};
         if (j < MAXP) seen[j].cpu = st[i].cpu;
     }
-    if (rss > rss_max) rss_max = rss;
     if (n > procs_max) procs_max = n;
     if (helpers > helpers_max) helpers_max = helpers;
     samples++;
@@ -296,6 +317,13 @@ int main(int argc, char **argv) {
         fprintf(f, ",\"tree_cpu_us\":%ld,\"tree_user_us\":%ld,\"tree_sys_us\":%ld,\"tree_children_maxrss_bytes\":%ld", tu + ts, tu, ts, ch.ru_maxrss * 1024);
         json_num(f, "tree_cpu_sampled_us", (long long)(sampled * 1000000ull / tick), samples > 0);
         json_num(f, "tree_max_rss_bytes", (long long)rss_max, samples > 0);
+        json_num(f, "tree_peak_smaps_rss_bytes", (long long)peak_rollup.rss, peak_rollups > 0);
+        json_num(f, "tree_peak_pss_bytes", (long long)peak_rollup.pss, peak_rollups > 0);
+        json_num(f, "tree_peak_pss_anon_bytes", (long long)peak_rollup.pss_anon, peak_rollups > 0);
+        json_num(f, "tree_peak_pss_file_bytes", (long long)peak_rollup.pss_file, peak_rollups > 0);
+        json_num(f, "tree_peak_pss_shmem_bytes", (long long)peak_rollup.pss_shmem, peak_rollups > 0);
+        json_num(f, "tree_peak_anon_bytes", (long long)peak_rollup.anon, peak_rollups > 0);
+        json_num(f, "tree_peak_file_bytes", (long long)(peak_rollup.rss - peak_rollup.anon), peak_rollups > 0);
         fprintf(f, ",\"tree_procs_max\":%d,\"helpers_max\":%d,\"helpers_seen\":%d,\"helpers_left\":%d,\"helpers_killed\":%d,\"helpers_sigkilled\":%d,\"samples\":%d,\"interval_us\":%ld,\"runstat_cpu_us\":%ld",
                 procs_max, helpers_max, nseen > 0 ? nseen - 1 : 0, nleft, killed, sigkilled, samples, interval_us,
                 (long)(self.ru_utime.tv_sec * 1000000 + self.ru_utime.tv_usec + self.ru_stime.tv_sec * 1000000 + self.ru_stime.tv_usec));
@@ -310,7 +338,7 @@ int main(int argc, char **argv) {
         json_num(f, "cgroup_sys_us", cg_sys, cg_sys >= 0);
         json_num(f, "cgroup_pids_peak", cg_pids, cg_pids >= 0);
         fprintf(f, ",\"sources\":{\"user_us\":\"rusage\",\"sys_us\":\"rusage\",\"maxrss_bytes\":\"rusage\",\"tree_cpu_us\":\"rusage-children-subreaper\",\"tree_cpu_sampled_us\":\"proc-sampler\","
-                   "\"tree_max_rss_bytes\":\"proc-sampler-statm\",\"helpers\":\"proc-sampler\",\"instructions\":%s,\"cgroup\":%s}}\n",
+                   "\"tree_max_rss_bytes\":\"proc-sampler-statm\",\"tree_peak\":\"proc-sampler-smaps_rollup-at-statm-peak\",\"helpers\":\"proc-sampler\",\"instructions\":%s,\"cgroup\":%s}}\n",
                 instructions >= 0 ? "\"perf\"" : "null", have_cg ? "\"cgroup-v2\"" : "null");
         fclose(f);
     }

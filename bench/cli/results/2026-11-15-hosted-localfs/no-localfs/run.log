@@ -1,0 +1,15 @@
+2026-11-15T11:09:15Z start startup (load 4.24)
+11:10:27 startup done
+2026-11-15T11:10:27Z end rc=0
+2026-11-15T11:10:27Z start oneshot (load 5.62)
+11:10:34 oneshot done
+2026-11-15T11:10:34Z end rc=0
+2026-11-15T11:10:34Z start firstframe (load 5.14)
+11:11:27 firstframe done
+2026-11-15T11:11:27Z end rc=0
+2026-11-15T11:11:27Z start tools (load 2.85)
+11:11:35 tools done
+2026-11-15T11:11:35Z end rc=0
+2026-11-15T11:11:35Z done
+2026-11-15T11:11:36Z report written
+2026-11-15T11:11:36Z done

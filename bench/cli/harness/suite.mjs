@@ -68,6 +68,7 @@ async function terminal(spec) {
 const tuiUsage = (t) => ({
   cpu_ms: t.cpu_ms, max_rss_mb: t.max_rss == null ? null : t.max_rss / kib,
   tree_cpu_ms: t.tree_cpu_ms ?? t.cpu_ms, tree_max_rss_mb: t.tree_max_rss_bytes != null ? megabytes(t.tree_max_rss_bytes) : t.max_rss == null ? null : t.max_rss / kib,
+  tree_peak_pss_mb: megabytes(t.tree_peak_pss_bytes), tree_peak_anon_mb: megabytes(t.tree_peak_anon_bytes), tree_peak_file_mb: megabytes(t.tree_peak_file_bytes),
   helpers_max: t.helpers_max ?? null, helpers_left: t.helpers_left ?? null,
 });
 
@@ -116,7 +117,7 @@ async function frames(part, cold) {
       if (cold && !dropCaches()) { emit({ part, harness: name, round: r, error: "cannot drop the page cache" }); continue; }
       const t = await terminal({ ...lane.tui(home, server.base), env, cwd: ws, window: 2, timeout: 30, memory_after_ms: 1000 });
       const m = t.memory;
-      emit({ part, harness: name, round: r, mem_rss_mb: m ? m.rss / 1048576 : null, mem_pss_mb: m ? m.pss / 1048576 : null, mem_uss_mb: m ? m.uss / 1048576 : null, mem_anon_mb: m ? m.anon / 1048576 : null, first_byte_ms: t.first_byte_ms, first_frame_ms: t.first_frame_ms, exit_after_ms: t.exit_after_ms, ...tuiUsage(t), bytes: t.bytes_total, status: t.status, error: t.error ?? (t.first_frame_ms == null ? "no first frame" : undefined) });
+      emit({ part, harness: name, round: r, mem_rss_mb: m ? m.rss / 1048576 : null, mem_pss_mb: m ? m.pss / 1048576 : null, mem_uss_mb: m ? m.uss / 1048576 : null, mem_anon_mb: m ? m.anon / 1048576 : null, mem_file_mb: m?.file == null ? null : m.file / 1048576, mem_pss_anon_mb: m?.pss_anon == null ? null : m.pss_anon / 1048576, mem_pss_file_mb: m?.pss_file == null ? null : m.pss_file / 1048576, first_byte_ms: t.first_byte_ms, first_frame_ms: t.first_frame_ms, exit_after_ms: t.exit_after_ms, ...tuiUsage(t), bytes: t.bytes_total, status: t.status, error: t.error ?? (t.first_frame_ms == null ? "no first frame" : undefined) });
     }
   }
   say(part + " done");

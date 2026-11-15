@@ -48,7 +48,7 @@ def tree_memory(root, skip_root):
     while todo:
         pid = todo.pop()
         pids.append(pid); todo += kids.get(pid, [])
-    total = {"rss": 0, "pss": 0, "anon": 0, "uss": 0, "procs": 0}
+    total = {"rss": 0, "pss": 0, "pss_anon": 0, "pss_file": 0, "anon": 0, "file": 0, "uss": 0, "procs": 0}
     for pid in pids:
         if skip_root and pid == root: continue
         try:
@@ -56,6 +56,7 @@ def tree_memory(root, skip_root):
         except OSError: continue
         v = {l.split(":")[0]: int(l.split()[1]) for l in lines[1:] if l.endswith("kB")}
         total["rss"] += v.get("Rss", 0); total["pss"] += v.get("Pss", 0); total["anon"] += v.get("Anonymous", 0)
+        total["pss_anon"] += v.get("Pss_Anon", 0); total["pss_file"] += v.get("Pss_File", 0); total["file"] += v.get("Rss", 0) - v.get("Anonymous", 0)
         total["uss"] += v.get("Private_Clean", 0) + v.get("Private_Dirty", 0); total["procs"] += 1
     return {k: (x * 1024 if k != "procs" else x) for k, x in total.items()}
 
@@ -131,7 +132,7 @@ def main():
         finished = False
         if keys is not None and len(key_log) >= len(keys) and exit_sent is None:
             finished = True
-        if window is not None and frame_at is not None and send is None and keys is None and t - start >= window * 1e9:
+        if window is not None and frame_at is not None and send is None and keys is None and t - start >= window * 1e9 and (mem_at is None or mem is not None or not sys.platform.startswith("linux")):
             finished = True
         if target is not None and done_at is not None and t - last_data >= quiet_ns:
             finished = True
@@ -216,6 +217,7 @@ def main():
         tree_cpu = rs.get("cgroup_cpu_us") if rs.get("cgroup_cpu_us") is not None else rs.get("tree_cpu_us")
         tree = {
             "tree_cpu_ms": tree_cpu / 1000 if tree_cpu is not None else cpu_ms, "tree_max_rss_bytes": rs.get("tree_max_rss_bytes"),
+            "tree_peak_pss_bytes": rs.get("tree_peak_pss_bytes"), "tree_peak_anon_bytes": rs.get("tree_peak_anon_bytes"), "tree_peak_file_bytes": rs.get("tree_peak_file_bytes"),
             "helpers_max": rs.get("helpers_max"), "helpers_left": rs.get("helpers_left"), "helpers_killed": rs.get("helpers_killed"),
             "instructions": rs.get("instructions"), "cgroup_memory_peak_bytes": rs.get("cgroup_memory_peak_bytes"),
             "tree_source": "cgroup" if rs.get("cgroup_cpu_us") is not None else "runstat" if rs.get("tree_cpu_us") is not None else "rusage",

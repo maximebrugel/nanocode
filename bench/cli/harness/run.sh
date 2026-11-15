@@ -2,6 +2,7 @@
 # Full benchmark run into results/<date>-<machine>/. Usage: harness/run.sh [machine-name] [steps...]
 # Steps (default all): smoke netaudit startup coldstart firstframe coldframe idle keys oneshot tools fleet store store14600 disk cli tui tui50k tuisize report post
 # ROUNDS, SAMPLES, ONLY (comma lanes), BENCH_NC_VARIANTS and QUIET_LOAD (1-minute load to wait for, default 0.5) tune it.
+# On Linux every measured step runs under tools/localfs.sh (LOCALFS=0 turns it off) and tools/netguard.sh (NETGUARD=0).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -18,6 +19,7 @@ rounds=${ROUNDS:-30}
 samples=${SAMPLES:-10}
 guard=""
 [ "${NETGUARD:-1}" = 1 ] && [ -x tools/netguard.sh ] && guard=tools/netguard.sh
+[ "${LOCALFS:-1}" = 1 ] && [ "$(uname -s)" = Linux ] && guard="tools/localfs.sh $guard"
 
 note() { echo "$(date -u +%FT%TZ) $*" | tee -a "$log"; }
 quiet() {

@@ -1,0 +1,19 @@
+{
+ "name": "hosted-localfs",
+ "cpu": "AMD EPYC 9555 64-Core Processor",
+ "cores": 5,
+ "memory_gb": 14,
+ "os": "Ubuntu 24.04.5 LTS",
+ "kernel": "6.18.56",
+ "arch": "x64",
+ "governor": null,
+ "node": "v24.22.3",
+ "load_at_start": [
+  3.02,
+  3.67,
+  3.53
+ ],
+ "virtualization": "docker",
+ "at": "2026-11-15T11:11:36.052Z",
+ "commit": "fb6e53fc03bf4de0aeb6f84e0eb3579b3ba6be99"
+}

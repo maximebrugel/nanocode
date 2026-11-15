@@ -3,6 +3,7 @@
 # tools/install/env.sh (the variables the harness reads) and tools/install/VERSIONS.md.
 # sh tools/install.sh            all six lanes
 # LANES=nc,fx sh tools/install.sh
+# FX_VERSION=v0.0.16 installs that fx release instead of latest.txt (v0.0.17 retries "Offline" forever against the fixture)
 # LANES=nclite builds nc-lite (bin/nc-lite in the nanocode repository) with its scripts/build-cli.sh at NCLITE_REV (llvm-bolt on PATH or LLVM_BOLT on Linux)
 set -eu
 cd "$(dirname "$0")/.."
@@ -57,7 +58,7 @@ for lane in $lanes; do
       ;;
     fx)
       mkdir -p "$dir/fx"
-      version="$(curl -fsSL "$fx_cdn/latest.txt" | tr -d '[:space:]')"
+      version="${FX_VERSION:-$(curl -fsSL "$fx_cdn/latest.txt" | tr -d '[:space:]')}"
       [ -n "$version" ] || { echo "install.sh: no fx version at $fx_cdn/latest.txt" >&2; exit 1; }
       if [ ! -x "$dir/fx/fx" ] || [ "$(cat "$dir/fx/.version" 2>/dev/null)" != "$version" ]; then
         curl -fsSL "$fx_cdn/$version/fx-$fx_target.tar.gz" -o "$tmp/fx.tar.gz"

@@ -1,0 +1,53 @@
+2026-11-15T11:02:48Z start startup (load 2.41)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:03:37 startup done
+2026-11-15T11:03:37Z end rc=0
+2026-11-15T11:03:37Z start oneshot (load 2.67)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:03:46 oneshot done
+2026-11-15T11:03:46Z end rc=0
+2026-11-15T11:03:46Z start firstframe (load 2.53)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:04:40 firstframe done
+2026-11-15T11:04:40Z end rc=0
+2026-11-15T11:04:40Z start tools (load 2.37)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:04:51 tools done
+2026-11-15T11:04:51Z end rc=0
+2026-11-15T11:04:51Z done
+2026-11-15T11:04:51Z start startup (load 2.77)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:05:51 startup done
+2026-11-15T11:05:52Z end rc=0
+2026-11-15T11:05:52Z start oneshot (load 5.39)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:06:02 oneshot done
+2026-11-15T11:06:02Z end rc=0
+2026-11-15T11:06:02Z start firstframe (load 5.11)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:06:59 firstframe done
+2026-11-15T11:06:59Z end rc=0
+2026-11-15T11:06:59Z start tools (load 4.40)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:07:10 tools done
+2026-11-15T11:07:10Z end rc=0
+2026-11-15T11:07:10Z done
+2026-11-15T11:07:10Z start startup (load 4.26)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:07:57 startup done
+2026-11-15T11:07:57Z end rc=0
+2026-11-15T11:07:57Z start oneshot (load 3.63)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:08:05 oneshot done
+2026-11-15T11:08:05Z end rc=0
+2026-11-15T11:08:05Z start firstframe (load 3.46)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:09:01 firstframe done
+2026-11-15T11:09:01Z end rc=0
+2026-11-15T11:09:01Z start tools (load 3.82)
+localfs: 22 files from virtiofs bind-mounted from /home/hand/sw/membench/bench/cli/work/localfs/files
+11:09:14 tools done
+2026-11-15T11:09:14Z end rc=0
+2026-11-15T11:09:14Z done
+2026-11-15T11:11:36Z report written
+2026-11-15T11:11:36Z done

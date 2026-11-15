@@ -351,6 +351,9 @@ pub(super) fn object_has_rest(lx: Lexer<'_>, open: Token) -> bool {
 /// `finally` clause? (`break`/`return` inside the try block must know before it is
 /// parsed, D1080.)
 pub(super) fn try_has_finally(lx: Lexer<'_>, open: Token) -> bool {
+    if crate::builtins::string::find_latin1(lx.rest(), b"finally", 0).is_none() {
+        return false;
+    }
     let mut s = Scanner::new(lx, open, BLOCK);
     let skip_group = |s: &mut Scanner<'_>| -> Option<()> {
         while !s.stack.is_empty() {

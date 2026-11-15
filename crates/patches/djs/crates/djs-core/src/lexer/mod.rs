@@ -89,6 +89,10 @@ impl<'a> Lexer<'a> {
 
 
 
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.src[self.pos as usize..]
+    }
+
     /// The source text of a token.
     pub fn text(&self, tok: &Token) -> &'a [u8] {
         tok.span().slice(self.src)

@@ -388,7 +388,7 @@ impl<'a> Simple<'a> {
             return Some(None);
         }
         let found = match input {
-            Input::Latin1(b) => self.scan(start, b.len(), |i| b[i] as u32),
+            Input::Latin1(b) => self.scan_latin1(start, b),
             Input::Utf16(u) => self.scan(start, u.len(), |i| u[i] as u32),
             Input::Utf16Le(b) => self.scan(start, b.len() / 2, |i| {
                 u16::from_le_bytes([b[2 * i], b[2 * i + 1]]) as u32
@@ -404,6 +404,31 @@ impl<'a> Simple<'a> {
         }
         *fuel -= cost;
         Some(found)
+    }
+
+    fn scan_latin1(self, start: usize, b: &[u8]) -> Option<Option<(usize, usize)>> {
+        let n = self.code.at(self.first) as usize;
+        let map = self.code.sub(self.first + 1 + 2 * n, 8);
+        let mut bits = [0u32; 8];
+        for (k, w) in bits.iter_mut().enumerate() {
+            *w = map.at(k);
+        }
+        let hit = |c: u8| bits[(c >> 5) as usize] >> (c & 31) & 1 != 0;
+        let Some(at) = b[start..].iter().position(|&c| hit(c)).map(|i| start + i) else {
+            return Some(None);
+        };
+        if !self.matches(u32::from(b[at])) {
+            return None;
+        }
+        let end = if self.plus {
+            b[at + 1..]
+                .iter()
+                .position(|&c| !hit(c) || !self.matches(u32::from(c)))
+                .map_or(b.len(), |i| at + 1 + i)
+        } else {
+            at + 1
+        };
+        Some(Some((at, end)))
     }
 
     #[inline(always)]
@@ -753,7 +778,12 @@ impl Machine<'_, '_> {
         if word & F_ICASE != 0 {
             c = canonicalize(c, self.unicode);
         }
-        let ok = match word & OP_MASK {
+        self.unit_matches(pc, word, c).then_some(next as u32)
+    }
+
+    #[inline(always)]
+    fn unit_matches(&self, pc: usize, word: u32, c: u32) -> bool {
+        match word & OP_MASK {
             CHAR => c == self.code.at(pc + 1),
             CLASS => {
                 let n = self.code.at(pc + 1) as usize;
@@ -761,8 +791,34 @@ impl Machine<'_, '_> {
             }
             DOT => !is_line_terminator(c),
             _ => true,
-        };
-        ok.then_some(next as u32)
+        }
+    }
+
+    fn star_settle_latin1(&mut self, pc: usize, b: &[u8], mut n: u32, max: u32) -> Option<u32> {
+        let code = self.code;
+        let word = code.at(pc);
+        let body = code.at(pc + 6);
+        let follow = code.sub(pc + 6 + code.at(pc + 4) as usize, 2 * code.at(pc + 5) as usize);
+        let mut pos = self.s.pos as usize;
+        loop {
+            let Some(&c) = b.get(pos) else {
+                if word & F_END != 0 {
+                    break;
+                }
+                return None;
+            };
+            let c = u32::from(c);
+            if in_ranges(follow, c) {
+                break;
+            }
+            if n >= max || !self.unit_matches(pc + 6, body, c) {
+                return None;
+            }
+            pos += 1;
+            n += 1;
+        }
+        self.s.pos = pos as u32;
+        Some(n)
     }
 
     /// Matches up to `cap` characters forward with the case-sensitive one-character
@@ -886,6 +942,13 @@ impl Machine<'_, '_> {
         let (min, max) = (code.at(pc + 2), code.at(pc + 3));
         let back = word & F_BACK != 0;
         let n0 = n;
+        if let Input::Latin1(b) = self.input
+            && word & (F_GREEDY | F_BACK) == 0
+            && word & F_CHECK != 0
+            && code.at(pc + 6) & F_ICASE == 0
+        {
+            n = self.star_settle_latin1(pc, b, n, max)?;
+        }
         while !self.star_follows(pc) {
             if word & F_GREEDY != 0 {
                 if n <= min || word & F_DISJOINT != 0 {

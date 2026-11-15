@@ -1219,7 +1219,7 @@ pub(crate) fn split_now(
     let flat = heap.contiguous(s)?;
     let size = heap.str_len(flat) as usize;
     // The pieces: a range of the string, or an undefined capture.
-    let mut cuts: Vec<Option<(usize, usize)>> = Vec::new();
+    let mut cuts: Vec<Option<(usize, usize)>> = crate::buf::vec_with_capacity(16);
     let full = |cuts: &Vec<Option<(usize, usize)>>| cuts.len() as u32 == lim;
     let (mut p, mut q) = (0, 0);
     if too_long(size) {
@@ -1256,12 +1256,12 @@ pub(crate) fn split_now(
                 q = advance(view, at, unicode);
                 continue;
             }
-            cuts.push_out(Some((p, at)));
+            cuts.push(Some((p, at)));
             if full(&cuts) {
                 break true;
             }
             for g in 1..prog.capture_count() {
-                cuts.push_out(st.captures(prog).get(g));
+                cuts.push(st.captures(prog).get(g));
                 if full(&cuts) {
                     break 'matches true;
                 }
@@ -1279,7 +1279,7 @@ pub(crate) fn split_now(
     }
     let mut values = crate::buf::vec_with_capacity(cuts.len());
     for cut in cuts {
-        values.push_out(match cut {
+        values.push(match cut {
             Some((a, b)) => substring(heap, flat, a, b)?,
             None => Value::UNDEFINED,
         });

@@ -898,16 +898,23 @@ impl Exec<'_> {
         if op != fast::ADD {
             return super::construct::takes(op) && self.decline_construct(op);
         }
-        use crate::value::Kind;
         let (a, c) = (self.get(self.sp - 2), self.get(self.sp - 1));
-        let plain = |v: Value| !matches!(v.kind(), Kind::Object | Kind::Symbol);
+        let plain = |v: Value| v.as_object().is_none() && v.as_symbol().is_none();
         if (a.as_string().is_none() && c.as_string().is_none()) || !plain(a) || !plain(c) {
             return false;
         }
-        let r = conv::to_string(self.heap, a)
-            .and_then(|x| Ok((x, conv::to_string(self.heap, c)?)))
-            .ok()
-            .and_then(|(x, y)| self.heap.concat(x, y).ok());
+        let r = match (a.as_string(), c.as_string(), a.as_int(), c.as_int()) {
+            (Some(x), Some(y), _, _) => self.heap.concat(x, y).ok(),
+            (Some(x), _, _, Some(i)) => self.heap.concat_int(x, i, false).ok().flatten(),
+            (_, Some(y), Some(i), _) => self.heap.concat_int(y, i, true).ok().flatten(),
+            _ => None,
+        }
+        .or_else(|| {
+            conv::to_string(self.heap, a)
+                .and_then(|x| Ok((x, conv::to_string(self.heap, c)?)))
+                .ok()
+                .and_then(|(x, y)| self.heap.concat(x, y).ok())
+        });
         let Some(s) = r else {
             return false;
         };

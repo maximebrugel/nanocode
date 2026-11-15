@@ -726,7 +726,7 @@ fn split(heap: &mut Heap, this: Value, args: &[Value], fuel: &mut i64) -> Fast {
         let mut cuts: Vec<(u32, u32)> = crate::buf::vec_with_capacity(16);
         let mut p = 0;
         while let Some(q) = string::find_latin1(h, t, p) {
-            cuts.push_out((p as u32, q as u32));
+            cuts.push((p as u32, q as u32));
             if cuts.len() as u32 == lim {
                 break;
             }
@@ -740,7 +740,7 @@ fn split(heap: &mut Heap, this: Value, args: &[Value], fuel: &mut i64) -> Fast {
         let empty = Value::string(heap.atom_string(atoms::EMPTY)?);
         parts.reserve_exact(cuts.len());
         for (a, b) in cuts {
-            parts.push_out(if a == b {
+            parts.push(if a == b {
                 empty
             } else if a == 0 && b == n {
                 Value::string(s)

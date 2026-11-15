@@ -1234,6 +1234,48 @@ impl Heap {
         Ok(Some(Str(dst)))
     }
 
+    pub(crate) fn concat_int(
+        &mut self,
+        s: Str,
+        i: i32,
+        int_first: bool,
+    ) -> Result<Option<Str>, HeapError> {
+        if self.cell_kind(s.0) != CellKind::Str8 {
+            return Ok(None);
+        }
+        let ls = self.str_len(s);
+        let mut m = i.unsigned_abs();
+        let digits = u32::from(i < 0) + m.checked_ilog10().unwrap_or(0) + 1;
+        let len = ls + digits;
+        if len >= ROPE_MIN_LEN {
+            return Ok(None);
+        }
+        let dst = self.alloc_flat(len, false)?;
+        let (src, out) = self.arena_mut().split_mut(dst);
+        let data = Str8::DATA.offset as usize;
+        let (at_s, at_i) = if int_first {
+            (digits as usize, 0)
+        } else {
+            (0, ls as usize)
+        };
+        let from = s.0 as usize + data;
+        out[data + at_s..data + at_s + ls as usize].copy_from_slice(&src[from..from + ls as usize]);
+        let d = &mut out[data + at_i..data + at_i + digits as usize];
+        let mut at = d.len();
+        loop {
+            at -= 1;
+            d[at] = b'0' + (m % 10) as u8;
+            m /= 10;
+            if m == 0 {
+                break;
+            }
+        }
+        if i < 0 {
+            d[0] = b'-';
+        }
+        Ok(Some(Str(dst)))
+    }
+
     /// Concatenates two strings. Results shorter than [`ROPE_MIN_LEN`] are flat copies;
     /// longer ones are ropes.
     pub fn concat(&mut self, a: Str, b: Str) -> Result<Str, HeapError> {

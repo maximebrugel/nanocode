@@ -2316,28 +2316,15 @@ pub(super) fn in_flight_evidence(calls: &[InFlightCall], omitted: u32) -> Option
 
 const RESUME_ARGUMENT_BYTES: usize = 2 * 1024;
 
-const CUT_TASK: &str = "\n\n[The task is cut here to fit this message; your history begins with \
-                        it whole.]";
-
-const RESUME_TASK_BYTES: usize = 16 * 1024;
-
-pub(super) fn resume_message(calls: &[InFlightCall], omitted: u32, task: Option<&str>) -> String {
-    let compose = |calls: &[InFlightCall], omitted: u32, task: Option<&str>| {
+pub(super) fn resume_message(calls: &[InFlightCall], omitted: u32) -> String {
+    let compose = |calls: &[InFlightCall], omitted: u32| {
         let mut message = RESUME_MESSAGE.to_owned();
         if let Some(evidence) = in_flight_evidence(calls, omitted) {
             message.push_str("\n\n");
             message.push_str(&evidence);
         }
-        if let Some(task) = task {
-            message.push_str("\n\nDelegated task:\n");
-            message.push_str(task);
-        }
         message
     };
-    let whole = compose(calls, omitted, task);
-    if whole.len() <= MAX_MESSAGE_BYTES {
-        return whole;
-    }
     let quoted = calls
         .iter()
         .map(|call| InFlightCall {
@@ -2345,33 +2332,15 @@ pub(super) fn resume_message(calls: &[InFlightCall], omitted: u32, task: Option<
             ..call.clone()
         })
         .collect::<Vec<_>>();
-    let short = task.map(|task| cut_task(task, RESUME_TASK_BYTES));
-    for dropped in 0..=quoted.len() {
+    for dropped in 0..quoted.len() {
         let more = u32::try_from(dropped).unwrap_or(u32::MAX);
-        let message = compose(
-            &quoted[dropped..],
-            omitted.saturating_add(more),
-            short.as_deref(),
-        );
+        let message = compose(&quoted[dropped..], omitted.saturating_add(more));
         if message.len() <= MAX_MESSAGE_BYTES {
             return message;
         }
     }
     let more = u32::try_from(quoted.len()).unwrap_or(u32::MAX);
-    let head = compose(&[], omitted.saturating_add(more), Some(""));
-    let room = MAX_MESSAGE_BYTES.saturating_sub(head.len());
-    format!("{head}{}", cut_task(task.unwrap_or_default(), room))
-}
-
-fn cut_task(task: &str, max: usize) -> String {
-    if task.len() <= max {
-        return task.to_owned();
-    }
-    let mut end = max.saturating_sub(CUT_TASK.len());
-    while !task.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{CUT_TASK}", &task[..end])
+    compose(&[], omitted.saturating_add(more))
 }
 
 fn clip(text: &str, max: usize) -> String {

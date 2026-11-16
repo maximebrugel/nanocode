@@ -78,10 +78,16 @@ fn is_rustc(path: &OsStr) -> bool {
 }
 
 fn cache_dir() -> PathBuf {
-    env::var_os("XDG_CACHE_HOME")
+    env::var_os("NANOCODE_BUILDCACHE_SHARED")
+        .filter(|shared| !shared.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache"))
-        .join("nanocode/build")
+        .unwrap_or_else(|| {
+            env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".cache"))
+                .join("nanocode")
+        })
+        .join("build")
 }
 
 fn exec(args: &[OsString], environment: &Environment) -> ExitCode {

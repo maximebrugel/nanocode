@@ -2,7 +2,7 @@
 set -eu
 command -v zstd > /dev/null && packs=buildcache || packs=buildcache-gz
 release=${NANOCODE_BUILDCACHE_RELEASE:-https://api.github.com/repos/nanocodexyz/nanocode/releases/tags/$packs}
-dir=${XDG_CACHE_HOME:-$HOME/.cache}/nanocode/remote
+dir=${NANOCODE_BUILDCACHE_SHARED:-${XDG_CACHE_HOME:-$HOME/.cache}/nanocode}/remote
 rm -rf "$dir.next"
 mkdir -p "$dir.next/units" "$dir.next/workspace"
 base=$(printf %s "$release" | sed -n 's,^https://api.github.com/repos/\([^/]*/[^/]*\)/releases/tags/\([^/]*\)$,https://github.com/\1/releases/download/\2,p')

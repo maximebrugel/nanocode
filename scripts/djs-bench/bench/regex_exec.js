@@ -1,0 +1,1 @@
+function main(){ const re = /(\w+)=(\d+)/g; const t = 'a=1 bb=22 ccc=333 dddd=4444 e=5 ff=66 ggg=777'; let s = 0; for (let i = 0; i < 40000; i++){ re.lastIndex = 0; let m; while ((m = re.exec(t)) !== null) s += m[2].length + m[1].length; } return s; }

@@ -1,0 +1,1 @@
+function main(){ const a = []; for (let i = 0; i < 100; i++) a.push(i); let s = 0; for (let k = 0; k < 30000; k++){ const b = a.slice(10, 60).concat(a.slice(0, 20)); b.reverse(); s += b[k % 70] + b.indexOf(5); } return s; }

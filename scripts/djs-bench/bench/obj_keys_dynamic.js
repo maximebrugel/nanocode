@@ -1,0 +1,1 @@
+function main(){ const o = {}; const ks = []; for (let i = 0; i < 50; i++){ ks.push('k' + i); o['k' + i] = i; } let s = 0; for (let r = 0; r < 40000; r++) for (let j = 0; j < 50; j++) s += o[ks[j]]; return s; }

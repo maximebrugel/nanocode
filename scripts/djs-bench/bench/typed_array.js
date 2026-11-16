@@ -1,0 +1,1 @@
+function main(){ const a = new Float64Array(10000); const b = new Int32Array(10000); for (let r = 0; r < 200; r++) for (let i = 0; i < 10000; i++){ a[i] = a[i] * 0.5 + i; b[i] = (b[i] + i) | 0; } return Math.round(a[9999]) + b[123]; }

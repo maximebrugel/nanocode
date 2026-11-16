@@ -1,0 +1,1 @@
+function main(){ const a = []; for (let i = 0; i < 1000; i++) a.push({ id: i, status: i % 3 === 0 ? 'open' : 'done', v: i }); let s = 0; for (let k = 0; k < 3000; k++){ s += a.filter(t => t.status === 'open').length + a.findIndex(t => t.id === 999); } return s; }

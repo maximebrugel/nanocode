@@ -1,0 +1,1 @@
+function main(){ const t = 'The quick brown fox jumps over the lazy dog'; let s = 0; for (let i = 0; i < 200000; i++){ s += t.indexOf('lazy') + t.slice(4, 9).toUpperCase().length + (t.includes('fox') ? 1 : 0) + t.trim().padStart(50, '.').length; } return s; }

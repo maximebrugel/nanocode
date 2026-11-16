@@ -1,0 +1,2 @@
+function rng(seed){ let s = seed >>> 0; return function(){ s = (Math.imul(s, 1103515245) + 12345) >>> 0; return s >>> 8; }; }
+function main(){ const r = rng(2); const base = []; for (let i = 0; i < 2000; i++){ let w = ''; const n = 4 + r() % 8; for (let j = 0; j < n; j++) w += String.fromCharCode(97 + r() % 26); base.push(w); } let s = 0; for (let k = 0; k < 40; k++){ const a = base.slice(); a.sort(); s += a[k].length; } return s; }

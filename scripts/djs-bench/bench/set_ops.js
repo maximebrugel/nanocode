@@ -1,0 +1,1 @@
+function main(){ let s = 0; for (let r = 0; r < 100; r++){ const a = new Set(); for (let i = 0; i < 5000; i++) a.add(i % 3000); for (let i = 0; i < 5000; i++) if (a.has(i)) s++; for (const v of a) s += v & 1; } return s; }

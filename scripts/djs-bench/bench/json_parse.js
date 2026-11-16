@@ -1,0 +1,1 @@
+function main(){ const recs = []; for (let i = 0; i < 200; i++) recs.push({ id: i, name: 'item' + i, tags: ['a', 'b'], ok: i % 2 === 0, v: i * 1.5 }); const txt = JSON.stringify(recs); let s = 0; for (let r = 0; r < 300; r++){ const v = JSON.parse(txt); s += v.length + v[r % 200].id; } return s; }

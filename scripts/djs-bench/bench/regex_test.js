@@ -1,0 +1,1 @@
+function main(){ const lines = []; for (let i = 0; i < 1000; i++) lines.push(i % 10 === 0 ? 'x TODO: fix ' + i : 'plain line ' + i); let s = 0; for (let r = 0; r < 100; r++) s += lines.filter(l => /TODO:/.test(l)).length; return s; }

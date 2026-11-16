@@ -1,0 +1,15 @@
+[package]
+name = "djsrun"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone: not a member of the nanocode workspace.
+[workspace]
+
+[dependencies]
+djs-embed = { path = "../../../crates/patches/djs/crates/djs-embed" }
+
+[profile.release]
+opt-level = 3
+debug = 1

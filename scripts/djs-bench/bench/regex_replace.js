@@ -1,0 +1,1 @@
+function main(){ const t = 'Hello World, hello again. HELLO there, hello!'; let s = 0; for (let i = 0; i < 60000; i++){ s += t.replace(/hello/gi, 'bye').length + t.split(/[ ,.!]+/).length; } return s; }

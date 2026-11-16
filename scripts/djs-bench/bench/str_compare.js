@@ -1,0 +1,1 @@
+function main(){ const ws = []; for (let i = 0; i < 100; i++) ws.push('w' + ((i * 7919) % 1000)); let s = 0; for (let r = 0; r < 10000; r++) for (let i = 1; i < 100; i++){ if (ws[i] < ws[i - 1]) s++; if (ws[i] === ws[(i * 3) % 100]) s += 2; } return s; }

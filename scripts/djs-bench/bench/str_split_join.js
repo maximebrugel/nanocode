@@ -1,0 +1,1 @@
+function main(){ const line = 'alpha beta gamma delta epsilon zeta eta theta iota kappa'; let s = 0; for (let i = 0; i < 100000; i++){ const p = line.split(' '); s += p.join('-').length + p.length; } return s; }

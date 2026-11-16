@@ -1,0 +1,1 @@
+function main(){ let str = ''; for (let i = 0; i < 1000; i++) str += String.fromCharCode(97 + (i % 26)); let h = 0; for (let r = 0; r < 2000; r++) for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0; return h; }

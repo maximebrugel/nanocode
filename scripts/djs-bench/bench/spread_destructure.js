@@ -1,0 +1,1 @@
+function main(){ let s = 0; for (let i = 0; i < 300000; i++){ const a = [i, i + 1, i + 2]; const [x, y, z] = a; const b = [...a, x]; const { p, q } = { p: y, q: z }; s = (s + b.length + p + q) | 0; } return s; }

@@ -795,7 +795,7 @@ impl Follower {
             .scan(&self.scope, from, i64::MAX.unsigned_abs())
             .await?;
         let taken = self.take(stored)?;
-        for owner in self.fold.take_forgets() {
+        for owner in self.fold.take_deferred() {
             warm(
                 &*self.host,
                 &self.scope,

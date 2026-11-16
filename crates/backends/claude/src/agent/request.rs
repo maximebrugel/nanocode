@@ -21,7 +21,8 @@ pub(super) fn request_response<'a>(
                          dispatch: Option<u64>,
                          mut timing: telemetry::CallTiming,
                          thread: Option<ThreadMode>,
-                         hedge: HedgeOutcome| {
+                         hedge: HedgeOutcome,
+                         speed: Option<crate::Speed>| {
             let Some(events) = events else { return };
             let duration_ns = elapsed_ns();
             timing.total_ns = duration_ns;
@@ -68,6 +69,10 @@ pub(super) fn request_response<'a>(
                         },
                         output_tokens: response.usage.output_tokens,
                         total_tokens: input_tokens.saturating_add(response.usage.output_tokens),
+                    },
+                    speed: match speed {
+                        Some(crate::Speed::Fast) => "fast",
+                        Some(crate::Speed::Standard) | None => "standard",
                     },
                     timing,
                     message_thread: thread.map(|mode| event::MessageThread {
@@ -185,6 +190,7 @@ pub(super) fn request_response<'a>(
                     },
                     None,
                     HedgeOutcome::Unneeded,
+                    None,
                 );
                 return Ok(ResponseOutcome {
                     hedge: HedgeOutcome::Unneeded,
@@ -255,6 +261,7 @@ pub(super) fn request_response<'a>(
                     },
                     None,
                     HedgeOutcome::Unneeded,
+                    None,
                 );
                 return Ok(ResponseOutcome {
                     hedge: HedgeOutcome::Unneeded,
@@ -652,6 +659,7 @@ pub(super) fn request_response<'a>(
                         },
                         turn.as_ref().map(ThreadTurn::mode),
                         hedge,
+                        request.speed,
                     );
                     return Ok(ResponseOutcome {
                         hedge,

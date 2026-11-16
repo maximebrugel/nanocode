@@ -283,6 +283,7 @@ impl ModelRun {
                 tool_calls: response.code_calls.len(),
                 usage: response.usage.as_ref(),
                 hedge: response.hedge,
+                speed: service_tier.as_str(),
                 timing: ModelCallTiming::new(
                     replayed,
                     preparation_ns,

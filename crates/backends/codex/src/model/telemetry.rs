@@ -69,6 +69,7 @@ pub(super) struct ModelCallCompleted<'a> {
     pub(super) usage: Option<&'a Usage>,
     #[serde(skip_serializing_if = "HedgeOutcome::unneeded")]
     pub(super) hedge: HedgeOutcome,
+    pub(super) speed: &'static str,
     pub(super) timing: ModelCallTiming,
 }
 

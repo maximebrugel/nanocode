@@ -75,6 +75,7 @@ pub(super) struct ModelCallCompleted<'a> {
     pub(super) time_to_dispatch_ns: Option<u64>,
     pub(super) tool_calls: usize,
     pub(super) usage: ModelCallUsage,
+    pub(super) speed: &'static str,
     pub(super) timing: CallTiming,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) message_thread: Option<MessageThread>,

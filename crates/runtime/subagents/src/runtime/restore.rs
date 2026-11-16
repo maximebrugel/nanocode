@@ -18,8 +18,7 @@ pub async fn resumable_sessions(
         )));
     }
     let mut written = durable::JournalCache::default().written_as(scope.version);
-    let deltas =
-        durable::load_deltas(&store, root_session_id, scope.deltas, &mut written).await?;
+    let deltas = durable::load_deltas(&store, root_session_id, scope.deltas, &mut written).await?;
     let mut records = scope.agent_records;
     if let Some(pages) = scope.agent_pages {
         records.extend(pages.agent_records(&store, root_session_id).await?);
@@ -42,7 +41,7 @@ pub async fn resumable_sessions(
         let checkpoint = agent.snapshot(&lineage)?;
         let (session, resume, _) = durable::restored_session(agent, checkpoint)?;
         if resume {
-            sessions.push(session.descriptor.session_id.clone());
+            sessions.push(session.descriptor.session_id);
         }
     }
     Ok(sessions)

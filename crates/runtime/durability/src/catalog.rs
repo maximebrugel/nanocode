@@ -681,6 +681,11 @@ mod store {
         #[must_use]
         pub fn sharing_payloads(mut self, other: &Self) -> Self {
             self.store.payload_memo.clone_from(&other.store.payload_memo);
+            self
+        }
+
+        #[must_use]
+        pub fn sharing_children(mut self, other: &Self) -> Self {
             self.store
                 .kept_checkpoints
                 .clone_from(&other.store.kept_checkpoints);

@@ -80,6 +80,11 @@ fn to_primitive_unsupported<T>() -> Result<T, Fault> {
     type_error("not supported yet: conversion of an object to a primitive")
 }
 
+#[inline(always)]
+pub(crate) fn int_rem(x: i32, y: i32) -> Option<i32> {
+    x.checked_rem(y).filter(|&r| r != 0 || x >= 0)
+}
+
 pub(crate) fn rem(x: f64, y: f64) -> f64 {
     let (i, j) = (x as i64, y as i64);
     if i as f64 == x

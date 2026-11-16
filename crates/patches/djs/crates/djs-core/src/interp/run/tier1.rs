@@ -1985,8 +1985,8 @@ impl Exec<'_> {
                 ),
                 K::Div => arith!(|_: i32, _: i32| None, |x: f64, y: f64| Some(number(x / y))),
                 K::Mod => arith!(
-                    |x: i32, y: i32| (x >= 0 && y != 0).then(|| Value::int(x % y)),
-                    no_float!()
+                    |x: i32, y: i32| conv::int_rem(x, y).map(Value::int),
+                    |x: f64, y: f64| Some(number(conv::rem(x, y)))
                 ),
                 K::BAnd => arith!(|x: i32, y: i32| Some(Value::int(x & y)), no_float!()),
                 K::BOr => arith!(|x: i32, y: i32| Some(Value::int(x | y)), no_float!()),

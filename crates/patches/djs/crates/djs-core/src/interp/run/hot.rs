@@ -1499,8 +1499,8 @@ impl Exec<'_> {
                         }
                         fast::MOD => binary!(
                             Op::Mod,
-                            |x: i32, y: i32| (x >= 0 && y != 0).then(|| Value::int(x % y)),
-                            no_float!()
+                            |x: i32, y: i32| conv::int_rem(x, y).map(Value::int),
+                            |x: f64, y: f64| Some(conv::number(conv::rem(x, y)))
                         ),
                         fast::BAND => {
                             binary!(

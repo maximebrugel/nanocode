@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -815,6 +815,7 @@ async fn settled(runtime: &Nanocode, shape: &Shape, world: &World) -> Result<(),
     let Some(control) = runtime.subagents() else {
         return Ok(());
     };
+    let mut listed_labels: BTreeMap<String, u64> = BTreeMap::new();
     for root in 0..shape.roots {
         let session = session_of(root);
         let listed = control
@@ -822,6 +823,16 @@ async fn settled(runtime: &Nanocode, shape: &Shape, world: &World) -> Result<(),
             .await
             .map_err(|error| format!("the directory of {session} did not answer: {error}"))?;
         for entry in listed {
+            if let Some(label) = word_after(&entry.task, CHILD_MARK) {
+                let seen = listed_labels.entry(label.to_owned()).or_default();
+                *seen += 1;
+                if *seen == 2 {
+                    world.wrong(format!(
+                        "child_run_twice: {session} lists {label} more than once, the last as agent {} {:?}",
+                        entry.agent_id, entry.status
+                    ));
+                }
+            }
             world.trace(&format!(
                 "{session} agent {} {:?}",
                 entry.agent_id,
@@ -845,6 +856,15 @@ async fn settled(runtime: &Nanocode, shape: &Shape, world: &World) -> Result<(),
                 ));
             }
         }
+    }
+    if shape.stop == Stop::Never
+        && shape.cancel_turn.is_none()
+        && shape.children == ChildMode::Local
+        && let Some(label) = world.children().into_iter().find(|label| !listed_labels.contains_key(label))
+    {
+        world.wrong(format!(
+            "child_lost: {label} ran its model but no directory lists it after its root settled"
+        ));
     }
     Ok(())
 }

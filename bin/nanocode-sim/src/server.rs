@@ -520,6 +520,9 @@ impl ModelServer {
         self.world.count(|counts| counts.requests += 1);
         self.check(&label, &messages);
         self.check_tool_results(&label, &messages);
+        if matches!(conversation.agent, Agent::Child { .. }) {
+            self.world.child(&label);
+        }
         let receipted =
             matches!(conversation.agent, Agent::Child { .. }) && accepted_receipt(&messages);
         if receipted {

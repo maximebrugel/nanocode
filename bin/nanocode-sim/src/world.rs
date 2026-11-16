@@ -34,6 +34,7 @@ struct State {
     seen: BTreeMap<String, BTreeSet<u64>>,
     cancelled: BTreeMap<String, BTreeSet<u64>>,
     receipts: BTreeSet<String>,
+    children: BTreeSet<String>,
     holds_receipts: bool,
     crash_pending: bool,
     violations: Vec<String>,
@@ -164,6 +165,14 @@ impl World {
         if self.with(|state| state.receipts.insert(label.to_owned())) {
             self.trace(&format!("receipt {label}"));
         }
+    }
+
+    pub fn child(&self, label: &str) {
+        self.with(|state| state.children.insert(label.to_owned()));
+    }
+
+    pub fn children(&self) -> BTreeSet<String> {
+        self.with(|state| state.children.clone())
     }
 
     pub fn receipted(&self, label: &str) -> bool {

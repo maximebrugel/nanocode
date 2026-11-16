@@ -2860,10 +2860,39 @@ impl ArmedRoot {
             .poll(&mut Context::from_waker(Waker::noop()))
             .is_pending()
         {
-            nanocode_platform::spawn(async move {
+            drive_root(async move {
                 let _aborted = posting.await;
             });
         }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn drive_root(posting: impl Future<Output = ()> + 'static) {
+    nanocode_platform::spawn(posting);
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn drive_root(posting: impl Future<Output = ()> + Send + 'static) {
+    if nanocode_platform::host().is_some() {
+        nanocode_platform::spawn(posting);
+        return;
+    }
+    let driven = std::thread::Builder::new()
+        .name("nanocode-root-region".to_owned())
+        .spawn(move || {
+            match nanocode_executor::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(posting),
+                Err(error) => {
+                    nanocode_trace::warn!(%error, "mapped root request runtime failed");
+                }
+            }
+        });
+    if let Err(error) = driven {
+        nanocode_trace::warn!(%error, "mapped root request thread failed");
     }
 }
 

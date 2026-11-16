@@ -944,10 +944,14 @@ impl State {
                     units <= 200
                 })
                 .collect();
-            ContentBlock::tool_result_content(id, ToolResultContent::Text(format!(
-                "<tool_use_error>InputValidationError: {name} was called with input that could not be parsed as JSON.\nYou sent (first {} of {len} bytes): {shown}\nCommon causes: unescaped backslashes in file paths (use / or \\\\), unescaped control characters, or truncated output. Retry with valid JSON.</tool_use_error>",
-                shown.encode_utf16().count()
-            )), true)
+            ContentBlock::tool_result_content(
+                id,
+                ToolResultContent::Text(format!(
+                    "<tool_use_error>InputValidationError: {name} was called with input that could not be parsed as JSON.\nYou sent (first {} of {len} bytes): {shown}\nCommon causes: unescaped backslashes in file paths (use / or \\\\), unescaped control characters, or truncated output. Retry with valid JSON.</tool_use_error>",
+                    shown.encode_utf16().count()
+                )),
+                true,
+            )
         } else if let Some(Err(error)) = &checked {
             ContentBlock::tool_result_content(
                 id,
@@ -1169,11 +1173,7 @@ impl Detached {
                 None
             } else {
                 let unchanged = paging.compacted.unchanged(&self.compacted);
-                Some(
-                    paging
-                        .compacted
-                        .page(&self.compacted, unchanged, records)?,
-                )
+                Some(paging.compacted.page(&self.compacted, unchanged, records)?)
             },
             admitted_base: admitted_base.as_ref().map(EncodedPayload::reference),
             admitted_tool_ids: tools.recent.iter().cloned().collect(),
@@ -1711,6 +1711,50 @@ pub fn decode_checkpoint(checkpoint: Value) -> Result<ClaudeCheckpointView> {
     snapshot.view()
 }
 
+/// The thinking level [`session_checkpoint`] gives `checkpoint`, read from
+/// only the fields it derives it from (the provider, version, model, effort
+/// and whether thinking is disabled) rather than decoding and re-encoding
+/// the whole conversation: opening a stored session asks for it first, and
+/// on a session of thousands of messages the full round trip took as long
+/// as the rest of the open.
+pub fn checkpoint_thinking(checkpoint: &Value) -> Result<Thinking> {
+    let invalid = |message: String| NanocodeError::InvalidCheckpoint(message);
+    if checkpoint.get("provider").and_then(Value::as_str) != Some("claude")
+        || checkpoint.get("version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(invalid(
+            "unsupported Claude checkpoint version/provider".into(),
+        ));
+    }
+    let model = match checkpoint.get("model") {
+        None | Some(Value::Null) => None,
+        Some(model) => Some(
+            model
+                .as_str()
+                .ok_or_else(|| invalid("checkpoint model must be a string".into()))?,
+        ),
+    }
+    .filter(|model| !model.trim().is_empty())
+    .ok_or_else(|| invalid("checkpoint records no Claude model".into()))?;
+    let effort = match checkpoint.get("effort") {
+        None | Some(Value::Null) => None,
+        Some(effort) => {
+            Some(crate::Effort::deserialize(effort).map_err(|error| invalid(error.to_string()))?)
+        }
+    };
+    let thinking_disabled = match checkpoint.get("thinking_disabled") {
+        None => false,
+        Some(disabled) => {
+            bool::deserialize(disabled).map_err(|error| invalid(error.to_string()))?
+        }
+    };
+    Ok(if effort.is_none() && !thinking_disabled {
+        ModelSelection::new(HarnessFamily::Claude, model.to_owned()).default_thinking()
+    } else {
+        effort_thinking(effort)
+    })
+}
+
 pub fn session_checkpoint(
     session_id: &str,
     lineage: Lineage,
@@ -1873,4 +1917,122 @@ fn unavailable(name: &str, tools: &[ClaudeToolSpec]) -> String {
         },
     };
     format!("<tool_use_error>Error: No such tool available: {name}{hint}</tool_use_error>")
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    fn stored(fields: Value) -> Value {
+        let mut snapshot = serde_json::to_value(Snapshot::default()).unwrap();
+        snapshot["model"] = json!("claude-opus-5-5");
+        for (key, value) in fields.as_object().unwrap() {
+            snapshot[key] = value.clone();
+        }
+        snapshot
+    }
+
+    #[test]
+    fn checkpoint_thinking_matches_session_checkpoint() {
+        for fields in [
+            json!({}),
+            json!({"effort": "low"}),
+            json!({"effort": "max"}),
+            json!({"effort": null}),
+            json!({"thinking_disabled": true}),
+            json!({"thinking_disabled": true, "effort": "high"}),
+            json!({"model": "claude-sonnet-4-6"}),
+            json!({"model": "claude-haiku-4-5", "effort": "medium"}),
+        ] {
+            let checkpoint = stored(fields.clone());
+            let full = session_checkpoint("s", Lineage::root("s"), checkpoint.clone())
+                .unwrap()
+                .thinking();
+            assert_eq!(checkpoint_thinking(&checkpoint).unwrap(), full, "{fields}");
+        }
+    }
+
+    #[test]
+    fn checkpoint_thinking_refuses_what_session_checkpoint_refuses() {
+        for fields in [
+            json!({"model": null}),
+            json!({"model": "  "}),
+            json!({"provider": "codex"}),
+            json!({"version": 2}),
+            json!({"effort": "loud"}),
+            json!({"thinking_disabled": "yes"}),
+        ] {
+            let checkpoint = stored(fields.clone());
+            assert!(
+                session_checkpoint("s", Lineage::root("s"), checkpoint.clone()).is_err(),
+                "{fields}"
+            );
+            assert!(checkpoint_thinking(&checkpoint).is_err(), "{fields}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn string_scan_matches_serialized_search() {
+        let needle = "0193-abc-bash-";
+        let blocks = [
+            json!({"type": "text", "text": "nothing here"}),
+            json!({"type": "text", "text": "running in background with ID: 0193-abc-bash-7"}),
+            json!({"type": "tool_use", "id": "toolu_1", "name": "exec", "input": {"nested": [{"deep": "x 0193-abc-bash-2 y"}]}}),
+            json!({"type": "tool_use", "id": "toolu_2", "name": "exec", "input": {"0193-abc-bash-key": 1}}),
+            json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "<task-id>0193-abc-bash-7</task-id>"}]}),
+            json!({"type": "tool_result", "tool_use_id": "toolu_1", "content": "0193-abc-"}),
+        ];
+        for block in blocks {
+            let block: ContentBlock = serde_json::from_value(block.clone()).unwrap();
+            let json = serde_json::to_string(&block).unwrap();
+            assert_eq!(
+                serializes_str_containing(&block, needle),
+                json.contains(needle),
+                "{json}"
+            );
+        }
+    }
+
+    fn history(messages: Value) -> Vec<HistoryMessage> {
+        serde_json::from_value(messages).unwrap()
+    }
+
+    #[test]
+    fn stopped_background_notices_finds_unsettled_commands() {
+        for session in ["0193-abc", "odd \"session\""] {
+            let messages = history(json!([
+                {"role": "user", "content": [{"type": "text", "text": "start"}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": format!("Command running in background with ID: {session}-bash-1. Output is being written to /tmp/1")}
+                ]}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_2", "content": [
+                    {"type": "text", "text": format!("Command running in background with ID: {session}-bash-2.")}
+                ]}]},
+                {"role": "user", "content": [{"type": "text", "text": format!("<task-notification><task-id>{session}-bash-2</task-id></task-notification>")}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Command running in background with ID: other-bash-3"}]}
+            ]));
+            let ids = stopped_background_notices(session, &messages, &[])
+                .into_iter()
+                .map(|(notice, _)| notice)
+                .collect::<Vec<_>>();
+            let first = format!("{BACKGROUND_NOTICE_PREFIX}{session}-bash-1");
+            if session.contains('"') {
+                // A session ID JSON escapes takes the old path: every block
+                // serialized, matched against its escaped form.
+                assert!(ids.is_empty(), "{ids:?}");
+            } else {
+                assert_eq!(ids, vec![first], "{session}");
+            }
+            let queued = ids
+                .iter()
+                .map(|id| (id.clone(), String::new()))
+                .collect::<Vec<_>>();
+            assert!(stopped_background_notices(session, &messages, &queued).is_empty());
+        }
+    }
 }

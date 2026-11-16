@@ -324,9 +324,14 @@ impl RuntimeBackend for ClaudeHarness {
                         Err(error) => return Err(error),
                     }
                 }
-                builder = builder.durability(state).await?;
+                builder = nanocode_trace::Instrument::instrument(
+                    builder.durability(state),
+                    nanocode_trace::info_span!(target: "nanocode", "claude.open.durability"),
+                )
+                .await?;
             }
-            builder.build()
+            nanocode_trace::info_span!(target: "nanocode", "claude.open.build")
+                .in_scope(|| builder.build())
         })
     }
 }

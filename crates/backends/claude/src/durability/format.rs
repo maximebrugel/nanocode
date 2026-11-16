@@ -555,6 +555,15 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
             .map_err(|error| Error::InvalidState(error.to_string()))
     }
 
+    fn thinking(
+        &self,
+        _record: &SessionRecord,
+        checkpoint: &Value,
+    ) -> Result<nanocode_agent_core::Thinking> {
+        crate::agent::checkpoint_thinking(checkpoint)
+            .map_err(|error| Error::InvalidState(error.to_string()))
+    }
+
     fn transcript(&self, checkpoint: &Value, turns: &[AdmittedTurn<'_>]) -> Vec<TranscriptItem> {
         claude_transcript(checkpoint, &admitted_prompts(turns))
     }

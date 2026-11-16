@@ -42,8 +42,8 @@ mod turn;
 mod web;
 use crate::execution::{Admission, ClaudeExecutionPolicy, Step};
 pub use durable::{
-    ClaudeCheckpointView, decode_checkpoint, decode_session_checkpoint, rewind_checkpoint,
-    session_checkpoint,
+    ClaudeCheckpointView, checkpoint_thinking, decode_checkpoint, decode_session_checkpoint,
+    rewind_checkpoint, session_checkpoint,
 };
 use durable::{Cursor, Effect, Journal, Snapshot};
 use history::HistoryMessage;
@@ -2367,6 +2367,201 @@ const BACKGROUND_STARTED: [&str; 2] = [
     "running in background with ID: ",
     "moved to the background (ID: ",
 ];
+/// Whether any string `value` would serialize (values, map keys, field and
+/// variant names) contains `needle`, without serializing it.
+fn serializes_str_containing<T: Serialize + ?Sized>(value: &T, needle: &str) -> bool {
+    use serde::ser;
+
+    struct Scan<'a> {
+        needle: &'a str,
+    }
+    #[derive(Debug)]
+    struct Found;
+    impl std::fmt::Display for Found {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("found")
+        }
+    }
+    impl std::error::Error for Found {}
+    impl ser::Error for Found {
+        fn custom<M: std::fmt::Display>(_: M) -> Self {
+            Self
+        }
+    }
+    impl Scan<'_> {
+        fn text(&self, text: &str) -> std::result::Result<(), Found> {
+            if text.contains(self.needle) {
+                return Err(Found);
+            }
+            Ok(())
+        }
+    }
+    macro_rules! ignore {
+        ($($name:ident: $type:ty),*) => {
+            $(fn $name(self, _: $type) -> std::result::Result<(), Found> { Ok(()) })*
+        };
+    }
+    impl ser::Serializer for &mut Scan<'_> {
+        type Ok = ();
+        type Error = Found;
+        type SerializeSeq = Self;
+        type SerializeTuple = Self;
+        type SerializeTupleStruct = Self;
+        type SerializeTupleVariant = Self;
+        type SerializeMap = Self;
+        type SerializeStruct = Self;
+        type SerializeStructVariant = Self;
+        ignore!(serialize_bool: bool, serialize_i8: i8, serialize_i16: i16, serialize_i32: i32,
+            serialize_i64: i64, serialize_i128: i128, serialize_u8: u8, serialize_u16: u16,
+            serialize_u32: u32, serialize_u64: u64, serialize_u128: u128, serialize_f32: f32,
+            serialize_f64: f64, serialize_unit_struct: &'static str, serialize_bytes: &[u8]);
+        fn serialize_char(self, value: char) -> std::result::Result<(), Found> {
+            self.text(value.encode_utf8(&mut [0; 4]))
+        }
+        fn serialize_str(self, value: &str) -> std::result::Result<(), Found> {
+            self.text(value)
+        }
+        fn serialize_none(self) -> std::result::Result<(), Found> {
+            Ok(())
+        }
+        fn serialize_some<T: Serialize + ?Sized>(
+            self,
+            value: &T,
+        ) -> std::result::Result<(), Found> {
+            value.serialize(self)
+        }
+        fn serialize_unit(self) -> std::result::Result<(), Found> {
+            Ok(())
+        }
+        fn serialize_unit_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            variant: &'static str,
+        ) -> std::result::Result<(), Found> {
+            self.text(variant)
+        }
+        fn serialize_newtype_struct<T: Serialize + ?Sized>(
+            self,
+            _: &'static str,
+            value: &T,
+        ) -> std::result::Result<(), Found> {
+            value.serialize(self)
+        }
+        fn serialize_newtype_variant<T: Serialize + ?Sized>(
+            self,
+            _: &'static str,
+            _: u32,
+            variant: &'static str,
+            value: &T,
+        ) -> std::result::Result<(), Found> {
+            self.text(variant)?;
+            value.serialize(self)
+        }
+        fn serialize_seq(self, _: Option<usize>) -> std::result::Result<Self, Found> {
+            Ok(self)
+        }
+        fn serialize_tuple(self, _: usize) -> std::result::Result<Self, Found> {
+            Ok(self)
+        }
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> std::result::Result<Self, Found> {
+            Ok(self)
+        }
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            variant: &'static str,
+            _: usize,
+        ) -> std::result::Result<Self, Found> {
+            self.text(variant)?;
+            Ok(self)
+        }
+        fn serialize_map(self, _: Option<usize>) -> std::result::Result<Self, Found> {
+            Ok(self)
+        }
+        fn serialize_struct(self, _: &'static str, _: usize) -> std::result::Result<Self, Found> {
+            Ok(self)
+        }
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            variant: &'static str,
+            _: usize,
+        ) -> std::result::Result<Self, Found> {
+            self.text(variant)?;
+            Ok(self)
+        }
+        fn collect_str<T: std::fmt::Display + ?Sized>(
+            self,
+            value: &T,
+        ) -> std::result::Result<(), Found> {
+            self.text(&value.to_string())
+        }
+    }
+    macro_rules! compound {
+        ($($trait:ident: $method:ident),*) => {$(
+            impl ser::$trait for &mut Scan<'_> {
+                type Ok = ();
+                type Error = Found;
+                fn $method<T: Serialize + ?Sized>(&mut self, value: &T) -> std::result::Result<(), Found> {
+                    value.serialize(&mut **self)
+                }
+                fn end(self) -> std::result::Result<(), Found> {
+                    Ok(())
+                }
+            }
+        )*};
+    }
+    compound!(SerializeSeq: serialize_element, SerializeTuple: serialize_element,
+        SerializeTupleStruct: serialize_field, SerializeTupleVariant: serialize_field);
+    impl ser::SerializeMap for &mut Scan<'_> {
+        type Ok = ();
+        type Error = Found;
+        fn serialize_key<T: Serialize + ?Sized>(
+            &mut self,
+            key: &T,
+        ) -> std::result::Result<(), Found> {
+            key.serialize(&mut **self)
+        }
+        fn serialize_value<T: Serialize + ?Sized>(
+            &mut self,
+            value: &T,
+        ) -> std::result::Result<(), Found> {
+            value.serialize(&mut **self)
+        }
+        fn end(self) -> std::result::Result<(), Found> {
+            Ok(())
+        }
+    }
+    macro_rules! fields {
+        ($($trait:ident),*) => {$(
+            impl ser::$trait for &mut Scan<'_> {
+                type Ok = ();
+                type Error = Found;
+                fn serialize_field<T: Serialize + ?Sized>(
+                    &mut self,
+                    key: &'static str,
+                    value: &T,
+                ) -> std::result::Result<(), Found> {
+                    self.text(key)?;
+                    value.serialize(&mut **self)
+                }
+                fn end(self) -> std::result::Result<(), Found> {
+                    Ok(())
+                }
+            }
+        )*};
+    }
+    fields!(SerializeStruct, SerializeStructVariant);
+    value.serialize(&mut Scan { needle }).is_err()
+}
+
 const BACKGROUND_NOTICE_PREFIX: &str = "background-stopped-";
 
 fn stopped_background_notices(
@@ -2375,9 +2570,18 @@ fn stopped_background_notices(
     queued: &[(String, String)],
 ) -> Vec<(String, String)> {
     let local = format!("{session_id}-bash-");
+    // Every ID this looks for, and every marker that settles one, holds
+    // `local`. When `local` is only characters JSON never escapes, a block's
+    // JSON holds it exactly when one of its strings does, so a block whose
+    // strings don't is skipped without serializing it: on a session of
+    // thousands of messages, serializing every block was most of an open.
+    let plain = local
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_');
     let texts = messages
         .iter()
         .flat_map(|message| message.content.iter())
+        .filter(|block| !plain || serializes_str_containing(block, &local))
         .filter_map(|block| serde_json::to_string(block).ok())
         .collect::<Vec<_>>();
     let mut started = Vec::new();

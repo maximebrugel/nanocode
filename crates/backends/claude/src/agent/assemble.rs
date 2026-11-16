@@ -358,15 +358,20 @@ pub(super) fn build(mut builder: ClaudeBuilder) -> Result<(Agent, AgentEvents)> 
             "durable Claude session ID must equal the policy state ID",
         ));
     }
+    let restore_span =
+        nanocode_trace::info_span!(target: "nanocode", "claude.build.restore").entered();
     let mut restored = builder.restored.unwrap_or_default();
     restored
         .developer_notices
         .extend(std::mem::take(&mut builder.initial_developer_notices));
-    let stopped = stopped_background_notices(
-        &session_id,
-        &restored.conversation.messages,
-        &restored.developer_notices,
-    );
+    let stopped =
+        nanocode_trace::info_span!(target: "nanocode", "claude.build.stopped").in_scope(|| {
+            stopped_background_notices(
+                &session_id,
+                &restored.conversation.messages,
+                &restored.developer_notices,
+            )
+        });
     restored.developer_notices.extend(stopped);
     let kept_prefix = restored
         .context
@@ -386,7 +391,8 @@ pub(super) fn build(mut builder: ClaudeBuilder) -> Result<(Agent, AgentEvents)> 
         .filter(|kept| durable::is_code_only_catalog(&kept.tools) == builder.code_only);
     match &mut restored.context {
         Some(kept) if kept_prefix.is_some() => kept.prefix.clone_from(&kept_prefix),
-        _ => strip_tool_changes(&mut restored.conversation.messages),
+        _ => nanocode_trace::info_span!(target: "nanocode", "claude.build.strip")
+            .in_scope(|| strip_tool_changes(&mut restored.conversation.messages)),
     }
 
     let accepted_turns = u64::from(
@@ -421,10 +427,13 @@ pub(super) fn build(mut builder: ClaudeBuilder) -> Result<(Agent, AgentEvents)> 
         .or_else(|| restored.conversation_id.clone())
         .unwrap_or_else(|| session_id.clone());
     discovered.set(restored.discovered.clone());
+    let clone_span = nanocode_trace::info_span!(target: "nanocode", "claude.build.clone").entered();
     let mut round_boundary = restored.clone();
     round_boundary.lineage = Some(lineage.clone());
     round_boundary.conversation_id = Some(conversation_id.clone());
     let round_boundary = Arc::new(round_boundary);
+    drop(clone_span);
+    drop(restore_span);
     let (runtime, events) = BackendRuntime::new(session_id.clone());
     let runtime = runtime.with_lineage(lineage.clone());
     let session_events = runtime.events();

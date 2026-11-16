@@ -1037,11 +1037,15 @@ impl AgentRuntime {
             Opened::Live(agent) => return Ok(attached(agent)),
             Opened::Vacant(opening) => opening,
         };
-        let thinking = stored.checkpoint_thinking().map_err(catalog_error)?;
-        let durable_state = configured
-            .prepare_resume_taking(&mut stored)
-            .await
+        let thinking = nanocode_trace::info_span!(target: "nanocode", "agent.open.thinking")
+            .in_scope(|| stored.checkpoint_thinking())
             .map_err(catalog_error)?;
+        let durable_state = nanocode_trace::Instrument::instrument(
+            configured.prepare_resume_taking(&mut stored),
+            nanocode_trace::info_span!(target: "nanocode", "agent.open.prepare"),
+        )
+        .await
+        .map_err(catalog_error)?;
         self.open_stored_prepared(&stored, durable_state, thinking, Some(opening))
             .await
     }
@@ -1062,10 +1066,12 @@ impl AgentRuntime {
         opening: Option<SessionOpening>,
     ) -> AgentResult {
         let thinking = stored.checkpoint_thinking().map_err(catalog_error)?;
-        let durable_state = configured
-            .prepare_resume_loaded(stored)
-            .await
-            .map_err(catalog_error)?;
+        let durable_state = nanocode_trace::Instrument::instrument(
+            configured.prepare_resume_loaded(stored),
+            nanocode_trace::info_span!(target: "nanocode", "agent.open.prepare"),
+        )
+        .await
+        .map_err(catalog_error)?;
         self.open_stored_prepared(stored, durable_state, thinking, opening)
             .await
     }
@@ -1119,7 +1125,8 @@ impl AgentRuntime {
             .filter(|transcript| !transcript.is_empty());
         let _preload = CheckpointPreload(durable_state.clone());
         let _journal = match &self.inner.subagents {
-            Some(control) => JournalReservation::new(control.registry(), &durable_state)
+            Some(control) => nanocode_trace::info_span!(target: "nanocode", "agent.open.journal")
+                .in_scope(|| JournalReservation::new(control.registry(), &durable_state))
                 .map_err(catalog_error)?,
             None => None,
         };
@@ -1143,6 +1150,7 @@ impl AgentRuntime {
             Some(_) => self.construct(spec).await?,
             None => self.inner.recipe(spec.model.family())?(spec).await?,
         };
+        let _finish = nanocode_trace::info_span!(target: "nanocode", "agent.open.finish").entered();
         let agent = agent.with_interrupted_turns(
             pending
                 .iter()
@@ -1279,6 +1287,7 @@ impl AgentRuntime {
         let recipe = self.inner.recipe(spec.model.family())?;
         let ownership = Arc::clone(&self.inner.ownership);
         let span = nanocode_trace::info_span!(
+            target: "nanocode",
             "agent.session.create",
             model = %spec.model,
             resume = spec.checkpoint.is_some() || spec.durable_state.is_some()

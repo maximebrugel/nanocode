@@ -67,20 +67,24 @@ impl DurableAgentExt for ClaudeBuilder {
     async fn durability(self, state: DurableSession) -> AgentResult<Self> {
         let state_id = state.state_id().to_owned();
         let journal = state.child_journal();
-        let (owner, checkpoint) = match self.durable_initial_settings() {
-            Ok(initial) => state.acquire_agent_with_initial(initial).await,
-            Err(error) => {
-                if state
-                    .record()
-                    .await
-                    .map_err(agent_error)?
-                    .is_some_and(|record| record.initial.is_none())
-                {
-                    return Err(error);
+        let (owner, checkpoint) = async {
+            match self.durable_initial_settings() {
+                Ok(initial) => Ok(state.acquire_agent_with_initial(initial).await),
+                Err(error) => {
+                    if state
+                        .record()
+                        .await
+                        .map_err(agent_error)?
+                        .is_some_and(|record| record.initial.is_none())
+                    {
+                        return Err(error);
+                    }
+                    Ok(state.acquire_agent().await)
                 }
-                state.acquire_agent().await
             }
         }
+        .instrument(nanocode_trace::info_span!(target: "nanocode", "claude.open.acquire"))
+        .await?
         .map_err(agent_error)?;
         owner
             .abandon_stale_kinds(MAINTENANCE_KINDS)
@@ -113,16 +117,28 @@ impl DurableAgentExt for ClaudeBuilder {
             builder
         };
         let checkpoint = match (checkpoint, preloaded) {
-            (Some(_), Some(preloaded)) => {
-                Some(hydrate(PayloadReader::from(&owner), preloaded).await?)
-            }
-            (Some(value), None) => Some(
-                hydrate(
-                    PayloadReader::from(&owner),
-                    value.decode().map_err(agent_error)?,
-                )
-                .await?,
+            (Some(_), Some(preloaded)) => Some(
+                hydrate(PayloadReader::from(&owner), preloaded)
+                    .instrument(nanocode_trace::info_span!(
+                        target: "nanocode",
+                        "claude.open.hydrate",
+                        preloaded = true
+                    ))
+                    .await?,
             ),
+            (Some(value), None) => {
+                let span = nanocode_trace::info_span!(
+                    target: "nanocode",
+                    "claude.open.hydrate",
+                    preloaded = false
+                );
+                let decoded = span.in_scope(|| value.decode()).map_err(agent_error)?;
+                Some(
+                    hydrate(PayloadReader::from(&owner), decoded)
+                        .instrument(span)
+                        .await?,
+                )
+            }
             (None, _) => {
                 let imported = builder.configured_checkpoint()?;
                 if let Some(checkpoint) = &imported
@@ -141,6 +157,8 @@ impl DurableAgentExt for ClaudeBuilder {
                 imported
             }
         };
+        let _decode =
+            nanocode_trace::info_span!(target: "nanocode", "claude.open.decode").entered();
         builder.child_journal(journal).execution_policy(
             Arc::new(ClaudeExecution {
                 state_id,

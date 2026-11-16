@@ -10,7 +10,24 @@ helper=helper-$(cksum < "${0%/*}/buildcache.rs" | cut -d' ' -f1)-$(uname -sm | t
 bundle=
 rm -rf "$dir.bundle"
 if [ -n "$base" ] && command -v xz > /dev/null && mkdir "$dir.bundle" && mkfifo "$dir.bundle/done"; then
-  { { curl -sfL "$base/workspace-eager-blocks" || curl -sfL "$base/workspace-eager-packs"; } | xz -dcq -T0 > "$dir.bundle/packs"; : > "$dir.bundle/done"; } < /dev/null > /dev/null 2>&1 &
+  {
+    : > "$dir.bundle/packs"
+    parts=
+    for part in 1 2 3; do
+      { curl -sfL "$base/workspace-eager-blocks-$part" | xz -dcq -T0 > "$dir.bundle/part$part"; } &
+      parts="$parts $!"
+    done
+    if curl -sfL "$base/workspace-eager-blocks-0" | xz -dcq -T0 >> "$dir.bundle/packs"; then
+      part=1
+      for pid in $parts; do
+        wait "$pid" && cat "$dir.bundle/part$part" >> "$dir.bundle/packs" || break
+        part=$((part + 1))
+      done
+    elif [ ! -s "$dir.bundle/packs" ]; then
+      { curl -sfL "$base/workspace-eager-blocks" || curl -sfL "$base/workspace-eager-packs"; } | xz -dcq -T0 > "$dir.bundle/packs"
+    fi
+    : > "$dir.bundle/done"
+  } < /dev/null > /dev/null 2>&1 &
   bundle=$!
   trap 'if [ -n "$bundle" ]; then kill "$bundle" 2> /dev/null; rm -rf "$dir.bundle"; fi' EXIT
 fi

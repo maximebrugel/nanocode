@@ -20,6 +20,7 @@ const RUST_KEY: &str = "nanocode-rustc-cache-6";
 const WORKSPACE_KEY: &str = "nanocode-workspace-cache-2";
 const C_KEY: &str = "nanocode-c-cache-3 -ffile-prefix-map=<out>=. -MD";
 const MEMO: &str = ".nanocode-sha256";
+const BUNDLE_PARTS: usize = 4;
 
 type Environment = BTreeMap<OsString, OsString>;
 
@@ -1948,34 +1949,61 @@ fn publish(cache: &Path, to: &Path) -> io::Result<()> {
     fs::rename(&staging, &destination)?;
     bundle.sort_by_key(|(_, packed)| packed.len());
     let chunk = 1 << 20;
-    let mut blocks = Vec::new();
+    let mut rounds = Vec::new();
     let mut offset = 0;
     while offset == 0 || bundle.iter().any(|(_, packed)| packed.len() > offset) {
+        let mut round = Vec::new();
         for (name, packed) in &bundle {
             if offset > 0 && packed.len() <= offset {
                 continue;
             }
             let part = &packed[offset.min(packed.len())..packed.len().min(offset + chunk)];
-            blocks.extend_from_slice(format!("{name}\n{} {}\n", part.len(), packed.len()).as_bytes());
-            blocks.extend_from_slice(part);
+            round.extend_from_slice(format!("{name}\n{} {}\n", part.len(), packed.len()).as_bytes());
+            round.extend_from_slice(part);
         }
+        rounds.push(round);
         offset += chunk;
     }
+    let total: usize = rounds.iter().map(Vec::len).sum();
+    let mut parts = vec![Vec::new()];
+    let mut written = 0;
+    for round in rounds {
+        if parts.len() < BUNDLE_PARTS && written >= parts.len() * total / BUNDLE_PARTS {
+            parts.push(Vec::new());
+        }
+        written += round.len();
+        if let Some(part) = parts.last_mut() {
+            part.extend_from_slice(&round);
+        }
+    }
+    parts.resize(BUNDLE_PARTS, Vec::new());
     let packs: Vec<u8> = bundle.into_iter().flat_map(|(name, packed)| format!("{name}\n{}\n", packed.len()).into_bytes().into_iter().chain(packed)).collect();
     let dictionary = format!("--lzma2=dict={}", packs.len());
-    for (name, data, args) in [
-        ("eager-packs", packs, &["-q", "-c", &dictionary][..]),
-        ("eager-blocks", blocks, &["-q", "-c", "-6e", "-T0", "--block-size=16MiB"][..]),
-    ] {
+    let blocks = std::thread::scope(|scope| {
+        let workers: Vec<_> = parts
+            .iter()
+            .map(|part| scope.spawn(move || filter(Command::new("xz").args(["-q", "-c", "-6e", "-T0", "--block-size=16MiB"]), part)))
+            .collect();
+        workers.into_iter().map(|worker| worker.join().unwrap_or_else(|_| Err(io::Error::other("xz panicked")))).collect::<io::Result<Vec<_>>>().ok()
+    });
+    let mut outputs = vec![
+        ("eager-packs".to_string(), filter(Command::new("xz").args(["-q", "-c", &dictionary]), &packs).ok()),
+        ("eager-blocks".to_string(), blocks.as_ref().map(|blocks| blocks.concat())),
+    ];
+    match blocks {
+        Some(blocks) => outputs.extend(blocks.into_iter().enumerate().map(|(index, block)| (format!("eager-blocks-{index}"), Some(block)))),
+        None => outputs.extend((0..BUNDLE_PARTS).map(|index| (format!("eager-blocks-{index}"), None))),
+    }
+    for (name, data) in outputs {
         let destination = to.join("workspace").join(name);
-        match filter(Command::new("xz").args(args), &data) {
-            Ok(packed) => {
+        match data {
+            Some(packed) => {
                 let mut staging = destination.clone().into_os_string();
                 staging.push(format!(".{}", std::process::id()));
                 fs::write(&staging, packed)?;
                 fs::rename(&staging, &destination)?;
             }
-            Err(_) => {
+            None => {
                 let _ = fs::remove_file(&destination);
             }
         }

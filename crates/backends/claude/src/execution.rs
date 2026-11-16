@@ -161,6 +161,14 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         })
     }
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>>;
+    fn continuation_model(&self, id: String) -> PolicyFuture<'_, Option<String>> {
+        Box::pin(async move {
+            Ok(self
+                .continuation(id)
+                .await?
+                .and_then(|cursor| cursor["template"]["model"].as_str().map(str::to_owned)))
+        })
+    }
     fn prefetch_continuation(&self, _id: String) -> PolicyFuture<'_, bool> {
         Box::pin(async { Ok(false) })
     }

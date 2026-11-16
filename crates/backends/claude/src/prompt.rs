@@ -477,15 +477,19 @@ pub(crate) async fn freeze_admitted(
     resolution: ImageResolution,
     images: &ImageHistory,
 ) -> Result<(Prompt, ImageResolution)> {
+    let has_local = matches!(&prompt.instruction, PromptInput::Content(items) if items.iter().any(|item| matches!(item, UserInput::LocalImage { .. })));
+    if !has_local {
+        let resolution = policy
+            .continuation_model(id.into())
+            .await?
+            .map_or(resolution, |model| ImageResolution::of(&model));
+        return Ok((freeze(prompt, resolution, images).await?, resolution));
+    }
     let continuation = policy.continuation(id.into()).await?;
     let resolution = continuation
         .as_ref()
         .and_then(|cursor| cursor["template"]["model"].as_str())
         .map_or(resolution, ImageResolution::of);
-    let has_local = matches!(&prompt.instruction, PromptInput::Content(items) if items.iter().any(|item| matches!(item, UserInput::LocalImage { .. })));
-    if !has_local {
-        return Ok((freeze(prompt, resolution, images).await?, resolution));
-    }
 
     if let Some(cursor) = continuation {
         let frozen: Prompt = serde_json::from_value(

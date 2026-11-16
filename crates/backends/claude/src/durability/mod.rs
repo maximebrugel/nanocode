@@ -484,6 +484,10 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         Box::pin(async move { self.get().await?.continuation(id).await })
     }
 
+    fn continuation_model(&self, id: String) -> PolicyFuture<'_, Option<String>> {
+        Box::pin(async move { self.get().await?.continuation_model(id).await })
+    }
+
     fn prefetch_continuation(&self, id: String) -> PolicyFuture<'_, bool> {
         Box::pin(async move {
             match self.acquired() {
@@ -936,6 +940,48 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             self.hydrated
                 .put((value.key().to_owned(), hydrated.clone(), false));
             Ok(Some(hydrated))
+        })
+    }
+
+    fn continuation_model(&self, id: String) -> PolicyFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let span = nanocode_trace::info_span!(
+                target: "nanocode",
+                "agent.continuation",
+                hydrated = nanocode_trace::field::Empty,
+                model_only = true,
+            );
+            let _hydrating = self.hydrating.enter().instrument(span.clone()).await;
+            let Some(value) = self
+                .owner
+                .continuation(id)
+                .instrument(span.clone())
+                .await
+                .map_err(agent_error)?
+            else {
+                self.hydrated.take();
+                return Ok(None);
+            };
+            let (key, hydrated) = match self.hydrated.take() {
+                Some((key, hydrated, ahead)) if key == value.key() => {
+                    span.record("hydrated", if ahead { "ahead" } else { "kept" });
+                    (key, hydrated)
+                }
+                _ => {
+                    span.record("hydrated", "read");
+                    let hydrated = format::hydrate_cursor(
+                        PayloadReader::from(&self.owner),
+                        value.decode().map_err(agent_error)?,
+                    )
+                    .instrument(span)
+                    .await
+                    .map_err(agent_error)?;
+                    (value.key().to_owned(), hydrated)
+                }
+            };
+            let model = hydrated["template"]["model"].as_str().map(str::to_owned);
+            self.hydrated.put((key, hydrated, false));
+            Ok(model)
         })
     }
 

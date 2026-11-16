@@ -1,5 +1,53 @@
 use super::*;
 
+pub async fn resumable_sessions(
+    journal: &nanocode_agent_core::backend::ChildJournal,
+    root_session_id: &str,
+) -> std::io::Result<Vec<String>> {
+    let store = durable::JournalStore(journal.store());
+    let Some(payload) = store.load(root_session_id).await? else {
+        return Ok(Vec::new());
+    };
+    let scope: durable::PersistedScope = serde_json::from_str(&payload)
+        .map_err(|error| std::io::Error::other(format!("invalid subagent journal: {error}")))?;
+    drop(payload);
+    if !(durable::MIN_JOURNAL_VERSION..=durable::JOURNAL_VERSION).contains(&scope.version) {
+        return Err(std::io::Error::other(format!(
+            "unsupported subagent journal version {}",
+            scope.version
+        )));
+    }
+    let mut written = durable::JournalCache::default().written_as(scope.version);
+    let deltas =
+        durable::load_deltas(&store, root_session_id, scope.deltas, &mut written).await?;
+    let mut records = scope.agent_records;
+    if let Some(pages) = scope.agent_pages {
+        records.extend(pages.agent_records(&store, root_session_id).await?);
+    }
+    let mut agents = scope.agents;
+    agents.extend(durable::load_agents(&store, root_session_id, records).await?);
+    let leaves = durable::load_leaves(
+        &store,
+        root_session_id,
+        scope.agent_leaves,
+        deltas.agents,
+        &mut written,
+    )
+    .await?;
+    agents.extend(leaves.agents);
+    agents.sort_by_key(|agent| agent.descriptor.id);
+    let lineages = durable::journaled_lineages(root_session_id, &agents);
+    let mut sessions = Vec::new();
+    for (agent, lineage) in agents.into_iter().zip(lineages) {
+        let checkpoint = agent.snapshot(&lineage)?;
+        let (session, resume, _) = durable::restored_session(agent, checkpoint)?;
+        if resume {
+            sessions.push(session.descriptor.session_id.clone());
+        }
+    }
+    Ok(sessions)
+}
+
 #[inline(never)]
 pub(super) fn restore_missing<'a>(
     reg: &'a Arc<Registry>,

@@ -54,6 +54,7 @@ mod focus;
 mod journal;
 mod lifecycle;
 mod restore;
+pub use restore::resumable_sessions;
 
 pub use activity::{Restoration, SubagentActivity};
 pub use completion::{RunningSubagents, SubagentCompletion};

@@ -681,7 +681,98 @@ mod store {
         #[must_use]
         pub fn sharing_payloads(mut self, other: &Self) -> Self {
             self.store.payload_memo.clone_from(&other.store.payload_memo);
+            self.store
+                .kept_checkpoints
+                .clone_from(&other.store.kept_checkpoints);
             self
+        }
+
+        #[must_use]
+        pub fn with_child_preload(mut self) -> Self {
+            self.store.kept_checkpoints = Some(std::sync::Arc::new(
+                crate::kept_checkpoints::KeptCheckpoints::new(),
+            ));
+            self
+        }
+
+        #[must_use]
+        pub fn peeked_journal(
+            &self,
+            root_session_id: &str,
+        ) -> nanocode_agent_core::backend::ChildJournal {
+            crate::child_journal::peeked_journal(self.store.clone(), root_session_id)
+        }
+
+        pub fn forget_children(&self) {
+            if let Some(kept) = &self.store.kept_checkpoints {
+                kept.forget();
+            }
+        }
+
+        #[must_use]
+        pub fn kept_children(&self) -> usize {
+            self.store
+                .kept_checkpoints
+                .as_deref()
+                .map_or(0, crate::kept_checkpoints::KeptCheckpoints::len)
+        }
+
+        #[must_use]
+        pub fn child_reuse(&self) -> crate::ChildReuse {
+            self.store
+                .kept_checkpoints
+                .as_deref()
+                .map(crate::kept_checkpoints::KeptCheckpoints::reuse)
+                .unwrap_or_default()
+        }
+
+        pub async fn preload_child(&self, id: &str) -> Result<crate::ChildPreload> {
+            let Some(kept) = self.store.kept_checkpoints.clone() else {
+                return Ok(crate::ChildPreload::default());
+            };
+            let Some(state) = self.peek_head(id).await? else {
+                return Ok(crate::ChildPreload::default());
+            };
+            let Some(key) = state
+                .latest_checkpoint()
+                .map(|payload| payload.key().to_owned())
+            else {
+                return Ok(crate::ChildPreload::default());
+            };
+            if kept.key(id).as_deref() == Some(key.as_str()) {
+                return Ok(crate::ChildPreload {
+                    kept: true,
+                    unchanged: true,
+                    ..crate::ChildPreload::default()
+                });
+            }
+            let previous = kept
+                .take(id)
+                .map(crate::kept_checkpoints::KeptCheckpoint::into_previous);
+            let Some(((checkpoint, payload, records, hydrated), advance)) =
+                self.advanced_checkpoint(id, &state, previous).await?
+            else {
+                return Ok(crate::ChildPreload::default());
+            };
+            let bytes = crate::kept_checkpoints::value_bytes(&checkpoint);
+            let kept = kept.keep(
+                id,
+                crate::kept_checkpoints::KeptCheckpoint {
+                    key,
+                    checkpoint,
+                    payload,
+                    records,
+                    hydrated,
+                },
+            );
+            Ok(crate::ChildPreload {
+                kept,
+                unchanged: false,
+                whole: advance.whole,
+                reused: advance.reused,
+                decoded: advance.decoded,
+                bytes,
+            })
         }
 
         pub fn forget_payloads(&self) {
@@ -1524,6 +1615,40 @@ mod store {
             let Some(payload) = state.latest_checkpoint() else {
                 return Ok(None);
             };
+            let Some((kept, checkpoint)) = self
+                .store
+                .kept_checkpoints
+                .as_deref()
+                .and_then(|kept| kept.take(id).map(|checkpoint| (kept, checkpoint)))
+            else {
+                return self.whole_checkpoint(id, state).await;
+            };
+            if checkpoint.key == payload.key() {
+                kept.note_exact();
+                return Ok(Some((
+                    checkpoint.checkpoint,
+                    checkpoint.payload,
+                    checkpoint.records,
+                    checkpoint.hydrated,
+                )));
+            }
+            let advanced = self
+                .advanced_checkpoint(id, state, Some(checkpoint.into_previous()))
+                .await?;
+            Ok(advanced.map(|(checkpoint, advance)| {
+                kept.note_advanced(advance.reused, advance.decoded);
+                checkpoint
+            }))
+        }
+
+        async fn whole_checkpoint(
+            &self,
+            id: &str,
+            state: &DurableState,
+        ) -> Result<Option<HydratedCheckpoint>> {
+            let Some(payload) = state.latest_checkpoint() else {
+                return Ok(None);
+            };
             let mut records = HashSet::new();
             let loaded = payload
                 .load_noting(&mut self.store.clone(), id, &mut records)
@@ -1552,7 +1677,7 @@ mod store {
                 return Ok(None);
             };
             let Some(previous) = previous else {
-                return Ok(self.loaded_checkpoint(id, state).await?.map(|loaded| {
+                return Ok(self.whole_checkpoint(id, state).await?.map(|loaded| {
                     (
                         loaded,
                         Advance {

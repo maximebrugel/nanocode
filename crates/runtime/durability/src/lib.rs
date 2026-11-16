@@ -6,6 +6,7 @@ mod branch;
 mod catalog;
 mod child_journal;
 mod format;
+mod kept_checkpoints;
 mod memory;
 mod paged;
 mod payload_memo;
@@ -28,6 +29,7 @@ pub use catalog::{
 };
 pub use catalog::{BranchBoundary, InitialSettings, SessionRecord};
 pub use child_journal::{JournalClaim, JournalSeed};
+pub use kept_checkpoints::{ChildPreload, ChildReuse};
 pub use format::{AdmittedTurn, Advanced, CheckpointFormat, FormatFuture, Hydrated, Previous};
 pub use memory::MemoryStore;
 pub use nanocode_agent_core::backend::{ContinuationAhead, Prefetched};

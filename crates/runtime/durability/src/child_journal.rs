@@ -667,6 +667,62 @@ fn journal(
     }))
 }
 
+#[derive(Clone)]
+struct PeekedJournal(SharedJournal);
+
+impl ChildJournalStore for PeekedJournal {
+    fn load(&self) -> BackendFuture<std::io::Result<Option<String>>> {
+        let mut store = self.0.store.clone();
+        let state_id = Arc::clone(&self.0.state_id);
+        Box::pin(async move {
+            Ok(store
+                .peek(&state_id)
+                .await
+                .map_err(std::io::Error::other)?
+                .payload)
+        })
+    }
+
+    fn save(
+        &self,
+        _payload: String,
+        _records: Vec<(Arc<str>, Arc<str>)>,
+    ) -> BackendFuture<std::io::Result<()>> {
+        Box::pin(async { Err(writer_stopped()) })
+    }
+
+    fn save_deferred(&self) -> BackendFuture<std::io::Result<Option<DeferredJournal>>> {
+        Box::pin(async { Err(writer_stopped()) })
+    }
+
+    fn load_record(&self, key: String) -> BackendFuture<std::io::Result<String>> {
+        self.0.load_record(key)
+    }
+
+    fn load_records(&self, keys: Vec<String>) -> BackendFuture<std::io::Result<Vec<String>>> {
+        self.0.load_records(keys)
+    }
+
+    fn records_children(&self) -> bool {
+        false
+    }
+
+    fn verifies_records(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) fn peeked_journal(store: SharedStore, root_state_id: &str) -> ChildJournal {
+    let (writes, _) = mpsc::unbounded_channel();
+    ChildJournal::new(Arc::new(PeekedJournal(SharedJournal {
+        state_id: Arc::from(format!("{root_state_id}:subagents")),
+        store,
+        writes,
+        manifests: Arc::default(),
+        pending: Pending::default(),
+    })))
+}
+
 pub(crate) fn child_journal(store: SharedStore, root_state_id: &str) -> ChildJournal {
     journal(store, format!("{root_state_id}:subagents"), None)
 }

@@ -270,6 +270,12 @@ impl<F> CodexBuilder<F> {
     }
 
     #[must_use]
+    pub const fn verification_requested(mut self, requested: bool) -> Self {
+        self.config.verification_requested = requested;
+        self
+    }
+
+    #[must_use]
     pub const fn working_state(
         mut self,
         policy: crate::client::session::working_state::WorkingStatePolicy,

@@ -76,6 +76,8 @@ pub struct ModelConfig {
 
     pub persist_finish: bool,
 
+    pub verification_requested: bool,
+
     pub working_state: Option<crate::session::working_state::WorkingStatePolicy>,
 
     pub headless: bool,
@@ -120,6 +122,13 @@ pub struct ModelConfig {
 
 const SKILLS_SECTION_HEADING: &str = "# Using skills";
 const SKILL_CATALOG_HEADING: &str = "### Available skills";
+const VERIFICATION_REQUEST: &str = concat!(
+    "<verification_request>\n",
+    "The user asks you to test and verify the implementation of every task in this session. ",
+    "Before your final message, run the tests and checks that come with the task, and test the ",
+    "result directly on the cases the task states. Fix what fails, then run them again.\n",
+    "</verification_request>"
+);
 
 fn without_section(prompt: &str, heading: &str) -> String {
     let mut kept = String::with_capacity(prompt.len());
@@ -217,6 +226,17 @@ impl ModelConfig {
 
     #[doc(hidden)]
     pub fn host_instructions(&self) -> String {
+        let mut instructions = self.standing_instructions();
+        if self.verification_requested {
+            if !instructions.is_empty() {
+                instructions.push_str("\n\n");
+            }
+            instructions.push_str(VERIFICATION_REQUEST);
+        }
+        instructions
+    }
+
+    fn standing_instructions(&self) -> String {
         let mut instructions = String::new();
         if let Some(additional) = self.additional_instructions.as_deref()
             && !additional.is_empty()
@@ -285,6 +305,7 @@ impl ModelConfig {
             custom_tool_output_tokens: None,
             lean_custom_tool_arguments: false,
             persist_finish: false,
+            verification_requested: false,
             working_state: None,
             headless: false,
             compaction_thinking: None,

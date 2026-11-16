@@ -358,6 +358,28 @@ impl fmt::Debug for SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    pub(crate) fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    pub(crate) fn history_from(&self, start: usize) -> impl Iterator<Item = &ResponseItem> {
+        self.history.iter_from(start)
+    }
+
+    pub(crate) fn request_prefix(&self) -> Option<&[ResponseItem]> {
+        self.request_prefix.as_deref()
+    }
+
+    pub(crate) fn without_context(&self) -> Self {
+        let mut head = self.clone();
+        head.history = ResponseHistory::default();
+        head.request_prefix = self
+            .request_prefix
+            .as_ref()
+            .map(|_| Arc::from(Vec::<ResponseItem>::new()));
+        head
+    }
+
     #[must_use]
     pub fn into_context_parts(
         mut self,

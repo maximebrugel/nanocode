@@ -69,6 +69,94 @@ pub(super) fn load<'a>(
 }
 
 #[inline(never)]
+pub(super) fn advance<'a>(
+    this: &'a SessionStore,
+    id: &'a str,
+    mut previous: StoredSession,
+) -> FormatFuture<'a, Result<(StoredSession, Advance)>> {
+    Box::pin(async move {
+        let state = this.require(id).await?;
+        let usable = previous.loaded.store.is(&this.store) && previous.loaded.state_id == id;
+        let head_key = state
+            .latest_checkpoint()
+            .map(|payload| payload.key().to_owned());
+        let (checkpoint, checkpoint_payload, hydrated, advance) = if usable
+            && head_key.is_some()
+            && head_key == previous.loaded.checkpoint_key
+            && previous.checkpoint.is_some()
+        {
+            (
+                previous.checkpoint.take(),
+                previous.loaded.checkpoint_payload.take(),
+                previous.loaded.hydrated.take(),
+                Advance {
+                    kept: true,
+                    ..Advance::default()
+                },
+            )
+        } else {
+            let earlier = match previous.checkpoint.take() {
+                Some(checkpoint) if usable => Some(crate::Previous {
+                    checkpoint,
+                    hydrated: previous.loaded.hydrated.take(),
+                }),
+                _ => None,
+            };
+            match this.advanced_checkpoint(id, &state, earlier).await? {
+                Some(((checkpoint, payload, records, hydrated), advance)) => (
+                    Some(checkpoint),
+                    Some((payload, Arc::new(records))),
+                    hydrated,
+                    advance,
+                ),
+                None => (
+                    None,
+                    None,
+                    None,
+                    Advance {
+                        whole: true,
+                        ..Advance::default()
+                    },
+                ),
+            }
+        };
+        let record = match (state.session(), &checkpoint) {
+            (Some(record), _) => record.clone(),
+            (None, Some(checkpoint)) => this.infer_record(id, checkpoint)?,
+            (None, None) => {
+                return Err(Error::SessionNotFound {
+                    session_id: id.to_owned(),
+                });
+            }
+        };
+        let turns = this.state_turns(id, &state).await?;
+        let preview = turns
+            .iter()
+            .find_map(|turn| turn.preview.clone())
+            .or(previous.summary.preview);
+        Ok((
+            StoredSession {
+                summary: SessionSummary { record, preview },
+                transcript: Vec::new(),
+                turns,
+                in_progress: None,
+                checkpoint,
+                formats: this.formats.clone(),
+                loaded: Loaded {
+                    store: this.store.downgrade(),
+                    state_id: id.to_owned(),
+                    checkpoint_key: head_key,
+                    checkpoint_payload,
+                    hydrated,
+                    record_inferred: state.session().is_none(),
+                },
+            },
+            advance,
+        ))
+    })
+}
+
+#[inline(never)]
 pub(super) fn load_resumable<'a>(
     this: &'a SessionStore,
     id: &'a str,

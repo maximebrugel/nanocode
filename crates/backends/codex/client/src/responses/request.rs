@@ -278,6 +278,30 @@ impl ResponseHistory {
         }
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn extended_loaded(&self, keep: usize, entries: Vec<(ResponseItem, Arc<str>)>) -> Self {
+        let mut history = self.clone();
+        if keep < history.len() {
+            history.replace_suffix(keep, Vec::new());
+        }
+        history.commit_tail();
+        if entries.is_empty() {
+            return history;
+        }
+        let (items, stored): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+        let previous_len = history.head.as_ref().map_or(0, |segment| segment.len);
+        history.head = Some(Arc::new(HistorySegment {
+            previous: history.head.take(),
+            len: previous_len + items.len(),
+            items: Arc::new(items),
+            encoded: std::array::from_fn(|_| std::sync::OnceLock::new()),
+            totals: std::sync::OnceLock::new(),
+            stored: Some(stored.into()),
+        }));
+        history
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.head.as_ref().map_or(0, |segment| segment.len) + self.tail.len()

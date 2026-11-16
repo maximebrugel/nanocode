@@ -1019,6 +1019,13 @@ mod store {
             opening::prepare_resume_loaded(self, stored).await
         }
 
+        pub async fn prepare_resume_taking(
+            &self,
+            stored: &mut StoredSession,
+        ) -> Result<DurableSession> {
+            opening::prepare_resume_taking(self, stored).await
+        }
+
         pub async fn prepare_resume_resumable(
             &self,
             resumable: &ResumableSession,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::format::FormatFuture;
+use std::borrow::Cow;
 
 #[inline(never)]
 pub(super) fn session<'a>(
@@ -81,8 +82,9 @@ pub(super) fn prepare_resume_loaded<'a>(
     prepare_loaded(
         this,
         &stored.summary.record,
-        stored.checkpoint.as_ref(),
+        stored.checkpoint.as_ref().map(Cow::Borrowed),
         &stored.loaded,
+        stored.loaded.hydrated.clone(),
     )
 }
 
@@ -94,16 +96,37 @@ pub(super) fn prepare_resume_resumable<'a>(
     prepare_loaded(
         this,
         &resumable.record,
-        resumable.checkpoint.as_ref(),
+        resumable.checkpoint.as_ref().map(Cow::Borrowed),
         &resumable.loaded,
+        resumable.loaded.hydrated.clone(),
     )
+}
+
+#[inline(never)]
+pub(super) fn prepare_resume_taking<'a>(
+    this: &'a SessionStore,
+    stored: &'a mut StoredSession,
+) -> FormatFuture<'a, Result<DurableSession>> {
+    Box::pin(async move {
+        let checkpoint = stored.checkpoint.take();
+        let hydrated = stored.loaded.hydrated.take();
+        prepare_loaded(
+            this,
+            &stored.summary.record,
+            checkpoint.map(Cow::Owned),
+            &stored.loaded,
+            hydrated,
+        )
+        .await
+    })
 }
 
 fn prepare_loaded<'a>(
     this: &'a SessionStore,
     record: &'a SessionRecord,
-    checkpoint: Option<&'a Value>,
+    checkpoint: Option<Cow<'a, Value>>,
     loaded: &'a Loaded,
+    hydrated: Option<crate::Hydrated>,
 ) -> FormatFuture<'a, Result<DurableSession>> {
     Box::pin(async move {
         if !loaded.store.is(&this.store) {
@@ -118,7 +141,7 @@ fn prepare_loaded<'a>(
             ));
         }
         let state = if loaded.record_inferred {
-            let inferred = match (&loaded.checkpoint_key, checkpoint) {
+            let inferred = match (&loaded.checkpoint_key, checkpoint.as_deref()) {
                 (Some(key), Some(checkpoint)) => Some((key.as_str(), checkpoint)),
                 _ => None,
             };
@@ -130,9 +153,9 @@ fn prepare_loaded<'a>(
         if let (Some(key), Some(checkpoint)) = (&loaded.checkpoint_key, checkpoint) {
             state.preload_checkpoint(
                 key.clone(),
-                checkpoint.clone(),
+                checkpoint.into_owned(),
                 loaded.checkpoint_payload.clone(),
-                loaded.hydrated.clone(),
+                hydrated,
             );
         }
         Ok(state)

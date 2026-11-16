@@ -511,13 +511,28 @@ struct Client {
 
 async fn open_root(
     runtime: &Nanocode,
+    store: &SessionStore,
     root: u64,
     epoch: u64,
     world: &World,
 ) -> Result<nanocode::Agent, String> {
     let session = session_of(root);
     if epoch > 0 {
-        match runtime.open_session(&session).await {
+        let opened = if (root + epoch) % 2 == 1 {
+            match store.load(&session).await {
+                Ok(stored) => runtime
+                    .open_loaded_owned(store, stored)
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            }
+        } else {
+            runtime
+                .open_session(&session)
+                .await
+                .map_err(|error| error.to_string())
+        };
+        match opened {
             Ok((agent, _events)) => {
                 world.trace(&format!("opened {session}"));
                 if let Some(control) = runtime.subagents() {
@@ -672,7 +687,7 @@ async fn run_root(
     world: &World,
     client: &Client,
 ) -> Result<nanocode::Agent, String> {
-    let agent = open_root(runtime, root, epoch, world).await?;
+    let agent = open_root(runtime, store, root, epoch, world).await?;
     if epoch > 0 {
         check_acked(store, root, world).await;
     }
@@ -871,7 +886,7 @@ async fn verify(
     let runtime = runtime(store.clone(), parts.as_ref(), wire, world, children.as_ref())?;
     let mut agents = Vec::new();
     for root in 0..shape.roots {
-        agents.push(open_root(&runtime, root, number, world).await?);
+        agents.push(open_root(&runtime, &store, root, number, world).await?);
         check_acked(&store, root, world).await;
     }
     let (after, completed) = listing(&runtime, shape).await?;

@@ -1157,9 +1157,9 @@ impl<L: TurnLog + ?Sized> TurnInbox<L> {
         }
         let subagents = runtime.take_subagent_updates();
         let stored = store.load(&session_id).await.map_err(catalog)?;
-        let (agent, events) = runtime.open_loaded(store, &stored).await?;
-        agent.leave_interrupted_turns_to_host();
         let model = stored.summary.record.model.as_str().to_owned();
+        let (agent, events) = runtime.open_loaded_owned(store, stored).await?;
+        agent.leave_interrupted_turns_to_host();
         Ok(Self::attach(
             Attach {
                 runtime,

@@ -1022,6 +1022,30 @@ impl AgentRuntime {
         self.open_stored(configured, stored, Some(opening)).await
     }
 
+    pub async fn open_loaded_owned(
+        &self,
+        store: &crate::durability::SessionStore,
+        mut stored: crate::durability::StoredSession,
+    ) -> AgentResult {
+        let configured = self.configured_store(store)?;
+        let opening = match self
+            .inner
+            .ownership
+            .open_session(&stored.summary.record.session_id)
+            .await
+        {
+            Opened::Live(agent) => return Ok(attached(agent)),
+            Opened::Vacant(opening) => opening,
+        };
+        let thinking = stored.checkpoint_thinking().map_err(catalog_error)?;
+        let durable_state = configured
+            .prepare_resume_taking(&mut stored)
+            .await
+            .map_err(catalog_error)?;
+        self.open_stored_prepared(&stored, durable_state, thinking, Some(opening))
+            .await
+    }
+
     async fn reconstruct(&self, session_id: &str) -> AgentResult {
         let configured = self.inner.durability.as_ref().ok_or_else(|| {
             NanocodeError::InvalidRequest("runtime durability is not configured".into())
@@ -1042,6 +1066,17 @@ impl AgentRuntime {
             .prepare_resume_loaded(stored)
             .await
             .map_err(catalog_error)?;
+        self.open_stored_prepared(stored, durable_state, thinking, opening)
+            .await
+    }
+
+    async fn open_stored_prepared(
+        &self,
+        stored: &crate::durability::StoredSession,
+        durable_state: crate::durability::DurableSession,
+        thinking: Option<nanocode_agent_core::Thinking>,
+        opening: Option<SessionOpening>,
+    ) -> AgentResult {
         let pending: Vec<_> = stored
             .turns
             .iter()

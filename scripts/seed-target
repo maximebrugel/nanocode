@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+root=$(cd "${0%/*}/.." && pwd -P)
+golden=$(cd "${1:?usage: scripts/seed-target GOLDEN_CHECKOUT}" && pwd -P)
+head=$(git -C "$root" rev-parse HEAD)
+[ "$(git -C "$golden" rev-parse HEAD)" = "$head" ] || { echo "scripts/seed-target: $golden is not at $head" >&2; exit 1; }
+for tree in "$root" "$golden"; do
+  [ -z "$(git -C "$tree" status --porcelain --untracked-files=no)" ] || { echo "scripts/seed-target: $tree has uncommitted changes" >&2; exit 1; }
+done
+[ -d "$golden/target/release" ] || { echo "scripts/seed-target: $golden/target/release is missing" >&2; exit 1; }
+[ ! -e "$root/target" ] || { echo "scripts/seed-target: $root/target already exists" >&2; exit 1; }
+mkdir "$root/target"
+find "$golden/target" -maxdepth 1 -type f -exec cp {} "$root/target/" \;
+cp -R "$golden/target/release" "$root/target/release"

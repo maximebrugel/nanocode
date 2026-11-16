@@ -20,31 +20,32 @@ pub use backend::{
 };
 pub use blob::MemoryBlobStore;
 pub use branch::{BranchTurn, CheckpointBranch};
-pub use catalog::{BranchBoundary, InitialSettings, SessionRecord};
 pub use catalog::{
-    BranchCursor, BranchExport, BranchExportMode, BranchImport, BranchPage, BranchPoint, CancelTo,
-    CancelledPending, IntoSessionStore, LIST_LIMIT, Resumable, ResumableSession, SessionBrief,
-    SessionPage, SessionQuery, SessionReader, SessionStore, SessionSummary, StoredSession,
-    StoredTurn, TranscriptItem, TurnStatus,
+    Advance, BranchCursor, BranchExport, BranchExportMode, BranchImport, BranchPage, BranchPoint,
+    CancelTo, CancelledPending, IntoSessionStore, LIST_LIMIT, Resumable, ResumableSession,
+    SessionBrief, SessionPage, SessionQuery, SessionReader, SessionStore, SessionSummary,
+    StoredSession, StoredTurn, TranscriptItem, TurnStatus,
 };
+pub use catalog::{BranchBoundary, InitialSettings, SessionRecord};
 pub use child_journal::{JournalClaim, JournalSeed};
-pub use format::{AdmittedTurn, CheckpointFormat, FormatFuture, Hydrated};
+pub use format::{AdmittedTurn, Advanced, CheckpointFormat, FormatFuture, Hydrated, Previous};
 pub use memory::MemoryStore;
 pub use nanocode_agent_core::backend::{ContinuationAhead, Prefetched};
 pub use nanocode_durability_core::{
-    BlobKey, BlobStore, BlobUrl, BriefFilter, BriefState, Colocation, Committed, EncodedPayload, Error, EventCursor,
-    EventHit, EventHits, EventOrder, EventPage, EventQuery, EventRange, Examined, IndexedState,
-    KeyValue, KeyValueStore, KnownSummary, ListedState, ListedSummary, LockKey, LocksHeld,
-    Migration, MissingColumn, OwnedCommit, OwnedState, OwnerId, OwnerToken, PageCodec, Result,
-    RowStore, Settle, SharedBlobStore, Sql, SqlAccess, SqlDialect, SqlRow, SqlStatement, SqlStore,
-    StagedStore, StagedWrites, StateCommit, StateCursor, StatePage, StateQuery, StateReader,
-    StateStore, StateSummary, StoreError, StoreEvent, StoreFuture, StoreHandles, StoreRecord,
-    StoreReplacement, StoreUpdate, StoredEvent, StoredState, SummaryFilter, SummaryUpdate,
-    Versioned, base64_data_url, get_blob, migrate_format, migrate_format_then,
+    BlobKey, BlobStore, BlobUrl, BriefFilter, BriefState, Colocation, Committed, EncodedPayload,
+    Error, EventCursor, EventHit, EventHits, EventOrder, EventPage, EventQuery, EventRange,
+    Examined, IndexedState, KeyValue, KeyValueStore, KnownSummary, ListedState, ListedSummary,
+    LockKey, LocksHeld, Migration, MissingColumn, OwnedCommit, OwnedState, OwnerId, OwnerToken,
+    PageCodec, Result, RowStore, Settle, SharedBlobStore, Sql, SqlAccess, SqlDialect, SqlRow,
+    SqlStatement, SqlStore, StagedStore, StagedWrites, StateCommit, StateCursor, StatePage,
+    StateQuery, StateReader, StateStore, StateSummary, StoreError, StoreEvent, StoreFuture,
+    StoreHandles, StoreRecord, StoreReplacement, StoreUpdate, StoredEvent, StoredState,
+    SummaryFilter, SummaryUpdate, Versioned, base64_data_url, get_blob, migrate_format,
+    migrate_format_then,
 };
 pub use paged::{
     PagedWriter, PayloadReader, Prepared, Sequence, SequenceLog, load_sequence,
-    load_sequence_payloads,
+    load_sequence_payloads, sequence_references,
 };
 pub use pool::pool_state;
 pub use record_cache::{CachedStore, RecordCache};

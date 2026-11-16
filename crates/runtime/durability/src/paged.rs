@@ -121,6 +121,11 @@ impl SequenceLog {
         self.len() == 0
     }
 
+    #[must_use]
+    pub fn items(&self) -> &[EncodedPayload] {
+        self.levels.first().map_or(&[], Vec::as_slice)
+    }
+
     pub fn truncate(&mut self, len: usize) {
         let mut count = len;
         for level in &mut self.levels {
@@ -277,18 +282,27 @@ pub async fn load_sequence_payloads(
     sequence: Sequence,
     keys: &mut HashSet<String>,
 ) -> Result<Vec<EncodedPayload>> {
+    let references = sequence_references(reader, sequence, keys).await?;
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    reader.load_payloads(references).await
+}
+
+pub async fn sequence_references(
+    reader: PayloadReader<'_>,
+    sequence: Sequence,
+    keys: &mut HashSet<String>,
+) -> Result<Vec<EncodedPayload>> {
     let references = match sequence.tail {
         None => return Ok(Vec::new()),
         Some(Tail::Chained(tail)) => chained(reader, tail, keys).await?,
         Some(Tail::Sealed(sealed)) => unsealed(reader, sealed, keys).await?,
     };
-    if references.is_empty() {
-        return Ok(Vec::new());
-    }
     for reference in &references {
         keys.insert(reference.key().to_owned());
     }
-    reader.load_payloads(references).await
+    Ok(references)
 }
 
 async fn unsealed(

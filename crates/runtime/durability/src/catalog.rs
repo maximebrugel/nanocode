@@ -482,6 +482,14 @@ mod store {
 
     type RecordAndBase = (SessionRecord, Option<String>);
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Advance {
+        pub whole: bool,
+        pub kept: bool,
+        pub reused: usize,
+        pub decoded: usize,
+    }
+
     type RevisedSummary = (u64, Option<SessionSummary>);
 
     #[derive(Clone, Debug)]
@@ -904,6 +912,14 @@ mod store {
 
         pub async fn load(&self, id: &str) -> Result<StoredSession> {
             loading::load(self, id).await
+        }
+
+        pub async fn advance(
+            &self,
+            id: &str,
+            previous: StoredSession,
+        ) -> Result<(StoredSession, Advance)> {
+            loading::advance(self, id, previous).await
         }
 
         pub async fn load_resumable(&self, id: &str) -> Result<ResumableSession> {
@@ -1518,6 +1534,62 @@ mod store {
                 .hydrate_typed(PayloadReader::store(&self.store, id), value, &mut records)
                 .await?;
             Ok(Some((value, loaded, records, hydrated)))
+        }
+
+        async fn advanced_checkpoint(
+            &self,
+            id: &str,
+            state: &DurableState,
+            previous: Option<crate::Previous>,
+        ) -> Result<Option<(HydratedCheckpoint, Advance)>> {
+            let Some(payload) = state.latest_checkpoint() else {
+                return Ok(None);
+            };
+            let Some(previous) = previous else {
+                return Ok(self.loaded_checkpoint(id, state).await?.map(|loaded| {
+                    (
+                        loaded,
+                        Advance {
+                            whole: true,
+                            ..Advance::default()
+                        },
+                    )
+                }));
+            };
+            let mut records = HashSet::new();
+            let loaded = payload
+                .load_noting(&mut self.store.clone(), id, &mut records)
+                .await?;
+            let value: Value = loaded.decode()?;
+            let whole = Advance {
+                whole: true,
+                ..Advance::default()
+            };
+            if is_portable(&value) {
+                return Ok(Some(((value, loaded, records, None), whole)));
+            }
+            let format = match state.session().map(SessionRecord::family) {
+                Some(family) => self.formats.family(family)?,
+                None => self.formats.owner(&value)?,
+            };
+            let advanced = format
+                .advance_typed(
+                    PayloadReader::store(&self.store, id),
+                    value,
+                    &mut records,
+                    previous,
+                )
+                .await?;
+            let advance = Advance {
+                whole: advanced.whole,
+                kept: false,
+                reused: advanced.reused,
+                decoded: advanced.decoded,
+            };
+            Ok(Some((
+                (advanced.checkpoint, loaded, records, advanced.hydrated),
+                advance,
+            )))
         }
 
         async fn native_checkpoint(&self, id: &str, state: &DurableState) -> Result<Option<Value>> {

@@ -6,7 +6,7 @@ use std::{
 use nanocode_agent_core::TurnUsage;
 use nanocode_durability::{
     EncodedPayload, Error, PagedWriter, PayloadReader, Prepared, Result, Sequence, SequenceLog,
-    load_sequence, load_sequence_payloads,
+    load_sequence, sequence_references,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
@@ -174,17 +174,120 @@ pub(crate) fn prepare_continuation(
 static LOADED: nanocode_sync::SwapOption<(ResponseHistory, SequenceLog)> =
     nanocode_sync::SwapOption::const_empty();
 
-fn loaded_history(payloads: Vec<EncodedPayload>) -> Result<ResponseHistory> {
+fn loaded_history(
+    base: &ResponseHistory,
+    log: &mut SequenceLog,
+    payloads: Vec<EncodedPayload>,
+) -> Result<ResponseHistory> {
     let mut entries = Vec::with_capacity(payloads.len());
-    let mut log = SequenceLog::default();
+    let keep = log.len();
     for payload in payloads {
         log.push(payload.reference())?;
         entries.push((payload.decode()?, payload.shared_json()?));
     }
     log.release();
-    let history = ResponseHistory::loaded(entries);
-    LOADED.store(Some(Arc::new((history.clone(), log))));
+    let history = if keep == 0 {
+        ResponseHistory::loaded(entries)
+    } else {
+        base.extended_loaded(keep, entries)
+    };
+    LOADED.store(Some(Arc::new((history.clone(), log.clone()))));
     Ok(history)
+}
+
+#[derive(Clone)]
+pub(crate) struct HydratedSnapshot {
+    pub(crate) snapshot: SessionSnapshot,
+    history: SequenceLog,
+    prefix: Option<Vec<EncodedPayload>>,
+}
+
+pub(crate) struct AdvancedSnapshot {
+    pub(crate) hydrated: HydratedSnapshot,
+    pub(crate) keys: HashSet<String>,
+    pub(crate) reused: usize,
+    pub(crate) decoded: usize,
+    pub(crate) prefix_kept: bool,
+}
+
+async fn load_items(
+    reader: PayloadReader<'_>,
+    references: &[EncodedPayload],
+) -> Result<Vec<ResponseItem>> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    reader
+        .load_payloads(references.to_vec())
+        .await?
+        .iter()
+        .map(EncodedPayload::decode)
+        .collect()
+}
+
+fn same_keys(left: &[EncodedPayload], right: &[EncodedPayload]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.key() == right.key())
+}
+
+pub(crate) async fn advance_snapshot(
+    reader: PayloadReader<'_>,
+    saved: Snapshot,
+    previous: HydratedSnapshot,
+) -> Result<AdvancedSnapshot> {
+    let mut keys = HashSet::new();
+    let references = sequence_references(reader, saved.history, &mut keys).await?;
+    let HydratedSnapshot {
+        snapshot,
+        history: mut log,
+        prefix: previous_prefix_references,
+    } = previous;
+    let (_, previous_history, previous_prefix) = snapshot.into_context_parts();
+    let reused = log
+        .items()
+        .iter()
+        .zip(&references)
+        .take_while(|(kept, reference)| kept.key() == reference.key())
+        .count()
+        .min(previous_history.len());
+    log.truncate(reused);
+    let added: Vec<_> = references[reused..].to_vec();
+    let decoded = added.len();
+    let payloads = if added.is_empty() {
+        Vec::new()
+    } else {
+        reader.load_payloads(added).await?
+    };
+    let history = loaded_history(&previous_history, &mut log, payloads)?;
+    let (prefix, prefix_references, prefix_kept) = match saved.prefix {
+        None => (None, None, false),
+        Some(sequence) => {
+            let references = sequence_references(reader, sequence, &mut keys).await?;
+            match (previous_prefix, previous_prefix_references) {
+                (Some(items), Some(kept)) if same_keys(&kept, &references) => {
+                    (Some(items), Some(references), true)
+                }
+                _ => {
+                    let items = load_items(reader, &references).await?;
+                    (Some(Arc::from(items)), Some(references), false)
+                }
+            }
+        }
+    };
+    Ok(AdvancedSnapshot {
+        hydrated: HydratedSnapshot {
+            snapshot: saved.head.with_context(history, prefix),
+            history: log,
+            prefix: prefix_references,
+        },
+        keys,
+        reused,
+        decoded,
+        prefix_kept,
+    })
 }
 
 #[derive(Default)]
@@ -419,8 +522,9 @@ pub(crate) fn preloaded_snapshot(
     hydrated: Option<nanocode_durability::Hydrated>,
     key: &str,
 ) -> Option<(SessionSnapshot, HashSet<String>)> {
-    let snapshot = match hydrated.and_then(nanocode_durability::Hydrated::take::<SessionSnapshot>) {
-        Some(snapshot) => snapshot,
+    let snapshot = match hydrated.and_then(nanocode_durability::Hydrated::take::<HydratedSnapshot>)
+    {
+        Some(hydrated) => hydrated.snapshot,
         None => SessionSnapshot::deserialize(checkpoint).ok()?,
     };
     if let Some(records) = records {
@@ -449,14 +553,38 @@ pub(crate) async fn load_snapshot_with_keys(
     reader: PayloadReader<'_>,
     saved: Snapshot,
 ) -> Result<(SessionSnapshot, HashSet<String>)> {
+    load_hydrated_with_keys(reader, saved)
+        .await
+        .map(|(hydrated, keys)| (hydrated.snapshot, keys))
+}
+
+pub(crate) async fn load_hydrated_with_keys(
+    reader: PayloadReader<'_>,
+    saved: Snapshot,
+) -> Result<(HydratedSnapshot, HashSet<String>)> {
     let mut keys = HashSet::new();
-    let history = loaded_history(load_sequence_payloads(reader, saved.history, &mut keys).await?)?;
-    let prefix = match saved.prefix {
-        Some(value) => Some(load_sequence(reader, value, &mut keys).await?),
-        None => None,
+    let references = sequence_references(reader, saved.history, &mut keys).await?;
+    let payloads = if references.is_empty() {
+        Vec::new()
+    } else {
+        reader.load_payloads(references).await?
+    };
+    let mut log = SequenceLog::default();
+    let history = loaded_history(&ResponseHistory::default(), &mut log, payloads)?;
+    let (prefix, prefix_references) = match saved.prefix {
+        Some(sequence) => {
+            let references = sequence_references(reader, sequence, &mut keys).await?;
+            let items = load_items(reader, &references).await?;
+            (Some(Arc::from(items)), Some(references))
+        }
+        None => (None, None),
     };
     Ok((
-        saved.head.with_context(history, prefix.map(Arc::from)),
+        HydratedSnapshot {
+            snapshot: saved.head.with_context(history, prefix),
+            history: log,
+            prefix: prefix_references,
+        },
         keys,
     ))
 }

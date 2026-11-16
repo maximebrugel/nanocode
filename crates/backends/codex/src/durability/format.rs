@@ -5,8 +5,8 @@ use nanocode_agent_core::{
     session::{ToolOutcome, TranscriptItem},
 };
 use nanocode_durability::{
-    AdmittedTurn, CheckpointFormat, EncodedPayload, Error, FormatFuture, Hydrated, PayloadReader,
-    Result, SessionRecord,
+    AdmittedTurn, Advanced, CheckpointFormat, EncodedPayload, Error, FormatFuture, Hydrated,
+    PayloadReader, Previous, Result, SessionRecord,
 };
 use serde::Deserialize as _;
 use serde_json::Value;
@@ -48,10 +48,23 @@ impl CheckpointFormat for CodexCheckpointFormat {
         read: &'a mut HashSet<String>,
     ) -> FormatFuture<'a, Result<(Value, Option<Hydrated>)>> {
         Box::pin(async move {
-            let snapshot = load(reader, stored, read).await?;
-            let value = serde_json::to_value(&snapshot).map_err(Error::InvalidPayload)?;
-            Ok((value, Some(Hydrated::new(snapshot))))
+            let saved: context::Snapshot =
+                serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+            let (hydrated, keys) = context::load_hydrated_with_keys(reader, saved).await?;
+            read.extend(keys);
+            let value = serde_json::to_value(&hydrated.snapshot).map_err(Error::InvalidPayload)?;
+            Ok((value, Some(Hydrated::new(hydrated))))
         })
+    }
+
+    fn advance_typed<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+        read: &'a mut HashSet<String>,
+        previous: Previous,
+    ) -> FormatFuture<'a, Result<Advanced>> {
+        Box::pin(advance(reader, stored, read, previous))
     }
 
     fn hydrate_continuation<'a>(
@@ -178,6 +191,68 @@ async fn load(
     let (snapshot, keys) = context::load_snapshot_with_keys(reader, saved).await?;
     read.extend(keys);
     Ok(snapshot)
+}
+
+async fn advance(
+    reader: PayloadReader<'_>,
+    stored: Value,
+    read: &mut HashSet<String>,
+    previous: Previous,
+) -> Result<Advanced> {
+    let Previous {
+        checkpoint: mut value,
+        hydrated,
+    } = previous;
+    let earlier = hydrated.and_then(Hydrated::take::<context::HydratedSnapshot>);
+    let values = match value.get_mut("history").map(Value::take) {
+        Some(Value::Array(values)) => Some(values),
+        _ => None,
+    };
+    let (Some(earlier), Some(mut values)) = (earlier, values) else {
+        let saved: context::Snapshot =
+            serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+        let (hydrated, keys) = context::load_hydrated_with_keys(reader, saved).await?;
+        read.extend(keys);
+        let value = serde_json::to_value(&hydrated.snapshot).map_err(Error::InvalidPayload)?;
+        return Ok(Advanced::whole(value, Some(Hydrated::new(hydrated))));
+    };
+    let converted = if values.len() == earlier.snapshot.history_len() {
+        values.len()
+    } else {
+        0
+    };
+    let earlier_prefix = value.get_mut("request_prefix").map(Value::take);
+    let saved: context::Snapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let advanced = context::advance_snapshot(reader, saved, earlier).await?;
+    read.extend(advanced.keys);
+    let snapshot = &advanced.hydrated.snapshot;
+    let reused = advanced.reused.min(converted);
+    values.truncate(reused);
+    for item in snapshot.history_from(reused) {
+        values.push(serde_json::to_value(item).map_err(Error::InvalidPayload)?);
+    }
+    let mut value =
+        serde_json::to_value(snapshot.without_context()).map_err(Error::InvalidPayload)?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(Error::InvalidPayload(
+            <serde_json::Error as serde::de::Error>::custom("a Codex checkpoint is an object"),
+        ));
+    };
+    *object.entry("history").or_insert(Value::Null) = Value::Array(values);
+    if let Some(prefix) = snapshot.request_prefix() {
+        let prefix = match earlier_prefix {
+            Some(kept) if advanced.prefix_kept && !kept.is_null() => kept,
+            _ => serde_json::to_value(prefix).map_err(Error::InvalidPayload)?,
+        };
+        *object.entry("request_prefix").or_insert(Value::Null) = prefix;
+    }
+    Ok(Advanced {
+        checkpoint: value,
+        hydrated: Some(Hydrated::new(advanced.hydrated)),
+        whole: false,
+        reused: advanced.reused,
+        decoded: advanced.decoded,
+    })
 }
 
 fn is_injected_context(text: &str) -> bool {

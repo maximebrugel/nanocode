@@ -5,8 +5,8 @@ use nanocode_agent_core::{
     session::{ToolOutcome, TranscriptItem},
 };
 use nanocode_durability::{
-    AdmittedTurn, CheckpointFormat, EncodedPayload, Error, FormatFuture, PayloadReader, Result,
-    Sequence, SessionRecord, load_sequence,
+    AdmittedTurn, Advanced, CheckpointFormat, EncodedPayload, Error, FormatFuture, Hydrated,
+    PayloadReader, Previous, Result, Sequence, SessionRecord, load_sequence, sequence_references,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -59,7 +59,132 @@ struct AdmittedBase {
     ids: Vec<String>,
 }
 
+#[derive(Clone, Default)]
+struct HydratedConversation {
+    messages: Vec<EncodedPayload>,
+    code_calls: Option<Vec<EncodedPayload>>,
+    compacted: Option<Vec<EncodedPayload>>,
+}
+
+#[derive(Default)]
+struct Reuse {
+    reused: usize,
+    decoded: usize,
+}
+
+async fn advance_sequence(
+    reader: PayloadReader<'_>,
+    sequence: Sequence,
+    read: &mut HashSet<String>,
+    kept: Option<(Vec<EncodedPayload>, Vec<Value>)>,
+    reuse: &mut Reuse,
+) -> Result<(Vec<Value>, Vec<EncodedPayload>)> {
+    let references = sequence_references(reader, sequence, read).await?;
+    let (mut values, reused) = match kept {
+        Some((keys, mut values)) if keys.len() == values.len() => {
+            let reused = keys
+                .iter()
+                .zip(&references)
+                .take_while(|(kept, reference)| kept.key() == reference.key())
+                .count();
+            values.truncate(reused);
+            (values, reused)
+        }
+        _ => (Vec::new(), 0),
+    };
+    let added = references[reused..].to_vec();
+    reuse.reused += reused;
+    reuse.decoded += added.len();
+    if !added.is_empty() {
+        for payload in reader.load_payloads(added).await? {
+            values.push(payload.decode()?);
+        }
+    }
+    Ok((values, references))
+}
+
+fn kept_array(
+    conversation: Option<&mut serde_json::Map<String, Value>>,
+    field: &str,
+    keys: Option<Vec<EncodedPayload>>,
+) -> Option<(Vec<EncodedPayload>, Vec<Value>)> {
+    match (conversation?.remove(field)?, keys?) {
+        (Value::Array(values), keys) => Some((keys, values)),
+        _ => None,
+    }
+}
+
 impl PagedConversation {
+    async fn advance(
+        self,
+        reader: PayloadReader<'_>,
+        conversation: &mut serde_json::Map<String, Value>,
+        read: &mut HashSet<String>,
+        previous: Option<(HydratedConversation, serde_json::Map<String, Value>)>,
+        reuse: &mut Reuse,
+    ) -> Result<HydratedConversation> {
+        let (keys, mut earlier) = match previous {
+            Some((keys, earlier)) => (keys, Some(earlier)),
+            None => (HydratedConversation::default(), None),
+        };
+        let (messages, message_keys) = advance_sequence(
+            reader,
+            self.messages,
+            read,
+            kept_array(earlier.as_mut(), "messages", Some(keys.messages)),
+            reuse,
+        )
+        .await?;
+        let mut hydrated = HydratedConversation {
+            messages: message_keys,
+            code_calls: None,
+            compacted: None,
+        };
+        if let Some(code_calls) = self.code_calls {
+            let kept = kept_array(earlier.as_mut(), "code_calls", keys.code_calls);
+            let (rounds, round_keys) =
+                advance_sequence(reader, code_calls, read, kept, reuse).await?;
+            conversation.insert("code_calls".into(), Value::Array(rounds));
+            hydrated.code_calls = Some(round_keys);
+        }
+        if let Some(compacted) = self.compacted {
+            let kept = kept_array(earlier.as_mut(), "compacted", keys.compacted);
+            let (items, item_keys) = advance_sequence(reader, compacted, read, kept, reuse).await?;
+            conversation.insert("compacted".into(), Value::Array(items));
+            hydrated.compacted = Some(item_keys);
+        }
+        if self.version >= 3 {
+            let mut admitted = match self.admitted_base {
+                Some(base) => {
+                    read.insert(base.key().to_owned());
+                    reader
+                        .load_payload(base)
+                        .await?
+                        .decode::<AdmittedBase>()?
+                        .ids
+                }
+                None => Vec::new(),
+            };
+            admitted.extend(self.admitted_tool_ids);
+            admitted.extend(
+                messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_array())
+                    .flatten()
+                    .filter(|block| block["type"] == "tool_use")
+                    .filter_map(|block| block["id"].as_str())
+                    .filter(|id| !self.unadmitted_tool_ids.contains(*id))
+                    .map(str::to_owned),
+            );
+            conversation.insert(
+                "admitted_tool_ids".into(),
+                Value::Array(admitted.into_iter().map(Value::String).collect()),
+            );
+        }
+        conversation.insert("messages".into(), Value::Array(messages));
+        Ok(hydrated)
+    }
+
     fn restore<'a>(
         self,
         reader: PayloadReader<'a>,
@@ -185,6 +310,51 @@ pub(super) fn hydrate_snapshot<'a>(
     })
 }
 
+async fn advance_snapshot(
+    reader: PayloadReader<'_>,
+    stored: Value,
+    read: &mut HashSet<String>,
+    previous: Option<(HydratedConversation, Value)>,
+) -> Result<(Value, Option<HydratedConversation>, Option<Reuse>)> {
+    if !paged(&stored) {
+        return Ok((stored, None, None));
+    }
+    let paged: PagedSnapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let mut snapshot = paged.snapshot;
+    let previous = previous.and_then(|(keys, mut earlier)| {
+        match earlier.pointer_mut("/conversation").map(Value::take) {
+            Some(Value::Object(conversation)) => Some((keys, conversation)),
+            _ => None,
+        }
+    });
+    let mut reuse = Reuse::default();
+    let hydrated = paged
+        .conversation
+        .advance(
+            reader,
+            object(&mut snapshot, "/conversation")?,
+            read,
+            previous,
+            &mut reuse,
+        )
+        .await?;
+    if let Some(instructions) = paged.instructions {
+        read.insert(instructions.key().to_owned());
+        let text: String = reader.load_payload(instructions).await?.decode()?;
+        object(&mut snapshot, "/context")?.insert("text".into(), Value::String(text));
+    }
+    if let Some(template) = paged.template {
+        let key = template.key().to_owned();
+        read.insert(key.clone());
+        if prefix(&key).is_none() {
+            let loaded: Prefix = reader.load_payload(template).await?.decode()?;
+            keep_prefix(&key, &std::sync::Arc::new(loaded));
+        }
+        object(&mut snapshot, "/context")?.insert("template".into(), Value::String(key));
+    }
+    Ok((snapshot, Some(hydrated), Some(reuse)))
+}
+
 pub(super) async fn hydrate_cursor(reader: PayloadReader<'_>, stored: Value) -> Result<Value> {
     if !paged(&stored) {
         return Ok(stored);
@@ -272,6 +442,50 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         read: &'a mut HashSet<String>,
     ) -> FormatFuture<'a, Result<Value>> {
         Box::pin(hydrate_snapshot(reader, stored, read))
+    }
+
+    fn hydrate_typed<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+        read: &'a mut HashSet<String>,
+    ) -> FormatFuture<'a, Result<(Value, Option<Hydrated>)>> {
+        Box::pin(async move {
+            let (value, hydrated, _) = advance_snapshot(reader, stored, read, None).await?;
+            Ok((value, hydrated.map(Hydrated::new)))
+        })
+    }
+
+    fn advance_typed<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+        read: &'a mut HashSet<String>,
+        previous: Previous,
+    ) -> FormatFuture<'a, Result<Advanced>> {
+        Box::pin(async move {
+            let earlier = previous
+                .hydrated
+                .and_then(Hydrated::take::<HydratedConversation>)
+                .map(|keys| (keys, previous.checkpoint));
+            let (checkpoint, hydrated, reuse) =
+                advance_snapshot(reader, stored, read, earlier).await?;
+            let hydrated = hydrated.map(Hydrated::new);
+            Ok(match reuse {
+                Some(reuse) if reuse.reused > 0 => Advanced {
+                    checkpoint,
+                    hydrated,
+                    whole: false,
+                    reused: reuse.reused,
+                    decoded: reuse.decoded,
+                },
+                Some(reuse) => Advanced {
+                    decoded: reuse.decoded,
+                    ..Advanced::whole(checkpoint, hydrated)
+                },
+                None => Advanced::whole(checkpoint, hydrated),
+            })
+        })
     }
 
     fn hydrate_cursor<'a>(

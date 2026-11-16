@@ -31,6 +31,32 @@ impl fmt::Debug for Hydrated {
     }
 }
 
+pub struct Previous {
+    pub checkpoint: Value,
+    pub hydrated: Option<Hydrated>,
+}
+
+pub struct Advanced {
+    pub checkpoint: Value,
+    pub hydrated: Option<Hydrated>,
+    pub whole: bool,
+    pub reused: usize,
+    pub decoded: usize,
+}
+
+impl Advanced {
+    #[must_use]
+    pub const fn whole(checkpoint: Value, hydrated: Option<Hydrated>) -> Self {
+        Self {
+            checkpoint,
+            hydrated,
+            whole: true,
+            reused: 0,
+            decoded: 0,
+        }
+    }
+}
+
 pub struct AdmittedTurn<'a> {
     pub input: &'a Value,
     pub steers: usize,
@@ -65,6 +91,20 @@ pub trait CheckpointFormat: Send + Sync {
         read: &'a mut HashSet<String>,
     ) -> FormatFuture<'a, Result<(Value, Option<Hydrated>)>> {
         Box::pin(async move { Ok((self.hydrate_noting(reader, stored, read).await?, None)) })
+    }
+
+    fn advance_typed<'a>(
+        &'a self,
+        reader: PayloadReader<'a>,
+        stored: Value,
+        read: &'a mut HashSet<String>,
+        previous: Previous,
+    ) -> FormatFuture<'a, Result<Advanced>> {
+        drop(previous);
+        Box::pin(async move {
+            let (checkpoint, hydrated) = self.hydrate_typed(reader, stored, read).await?;
+            Ok(Advanced::whole(checkpoint, hydrated))
+        })
     }
 
     fn hydrate_continuation<'a>(

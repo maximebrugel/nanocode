@@ -14,6 +14,8 @@ const HEADLESS_SYSTEM_SENTENCES: [&str; 2] = [
     "For actions that are hard to reverse or outward-facing, confirm first unless durably authorized or explicitly told to proceed without asking; approval in one context doesn't extend to the next. ",
 ];
 const HEADLESS_SYSTEM_PARAGRAPH: &str = "\n\nWhen you use a pronoun for someone";
+const HEADLESS_ENVIRONMENT: &str = "\n\n# Environment";
+const HEADLESS_BREVITY: &str = "\n\nBe concise. Between tool calls, write a sentence only when it records a finding or a decision the next step needs; don't announce what you are about to do. End with a short final message: what changed and how you checked it.";
 const HEADLESS_BASH_LINES: [&str; 3] = [
     "\n- Use the `gh` CLI for GitHub operations",
     "\n- GitHub notifies the owner of any",
@@ -51,6 +53,9 @@ fn headless_system(text: &mut String) {
             .find("\n\n")
             .map_or(text.len(), |end| start + 2 + end);
         text.replace_range(start..end, "");
+    }
+    if let Some(at) = text.find(HEADLESS_ENVIRONMENT) {
+        text.insert_str(at, HEADLESS_BREVITY);
     }
 }
 
@@ -228,6 +233,34 @@ mod tests {
                 .collect();
             assert_eq!(blocks.last().unwrap().0, last);
         }
+    }
+
+    #[test]
+    fn headless_system_asks_for_brevity_before_environment() {
+        let upstream = crate::upstream::system_blocks();
+        let upstream = upstream.last().unwrap()["text"].as_str().unwrap();
+        assert_eq!(upstream.matches(HEADLESS_ENVIRONMENT).count(), 1);
+        for code_only in [true, false] {
+            let blocks = default_system_blocks(code_only, "claude-opus-5-5", true, false, true);
+            let text = blocks[1]["text"].as_str().unwrap();
+            assert!(text.contains(&format!("{HEADLESS_BREVITY}{HEADLESS_ENVIRONMENT}")));
+            assert_eq!(text.matches(HEADLESS_BREVITY).count(), 1);
+            assert!(
+                blocks[2..]
+                    .iter()
+                    .all(|block| !block["text"].as_str().unwrap().contains(HEADLESS_BREVITY))
+            );
+            let interactive =
+                default_system_blocks(code_only, "claude-opus-5-5", true, false, false);
+            assert!(
+                interactive
+                    .iter()
+                    .all(|block| !block["text"].as_str().unwrap().contains(HEADLESS_BREVITY))
+            );
+        }
+        let mut missing = "no anchor here".to_owned();
+        headless_system(&mut missing);
+        assert_eq!(missing, "no anchor here");
     }
 
     #[test]

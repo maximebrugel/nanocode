@@ -76,28 +76,28 @@ const LUNA_LONG_CONTEXT_PRIORITY: TokenRates = TokenRates {
     output: 1_500,
 };
 const ASTRA_STANDARD: TokenRates = TokenRates {
-    input: 10_000,
-    cached_input: 1_000,
-    cache_write_input: 12_500,
-    output: 50_000,
+    input: 8_000,
+    cached_input: 400,
+    cache_write_input: 10_000,
+    output: 40_000,
 };
 const ASTRA_PRIORITY: TokenRates = TokenRates {
-    input: 20_000,
-    cached_input: 2_000,
-    cache_write_input: 25_000,
-    output: 100_000,
+    input: 16_000,
+    cached_input: 800,
+    cache_write_input: 20_000,
+    output: 80_000,
 };
 const ASTRA_LONG_CONTEXT_STANDARD: TokenRates = TokenRates {
-    input: 20_000,
-    cached_input: 2_000,
-    cache_write_input: 25_000,
-    output: 75_000,
+    input: 16_000,
+    cached_input: 800,
+    cache_write_input: 20_000,
+    output: 60_000,
 };
 const ASTRA_LONG_CONTEXT_PRIORITY: TokenRates = TokenRates {
-    input: 40_000,
-    cached_input: 4_000,
-    cache_write_input: 50_000,
-    output: 150_000,
+    input: 32_000,
+    cached_input: 1_600,
+    cache_write_input: 40_000,
+    output: 120_000,
 };
 
 const SOL_ULTRAFAST: TokenRates = TokenRates {
@@ -113,16 +113,16 @@ const SOL_LONG_CONTEXT_ULTRAFAST: TokenRates = TokenRates {
     output: 90_000,
 };
 const ASTRA_ULTRAFAST: TokenRates = TokenRates {
-    input: 60_000,
-    cached_input: 6_000,
-    cache_write_input: 75_000,
-    output: 300_000,
+    input: 48_000,
+    cached_input: 2_400,
+    cache_write_input: 60_000,
+    output: 240_000,
 };
 const ASTRA_LONG_CONTEXT_ULTRAFAST: TokenRates = TokenRates {
-    input: 120_000,
-    cached_input: 12_000,
-    cache_write_input: 150_000,
-    output: 450_000,
+    input: 96_000,
+    cached_input: 4_800,
+    cache_write_input: 120_000,
+    output: 360_000,
 };
 
 const GLM53_STANDARD: TokenRates = TokenRates {

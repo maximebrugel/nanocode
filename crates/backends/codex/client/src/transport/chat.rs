@@ -210,7 +210,7 @@ impl ChatGateway {
         match (self.provider, model) {
             (Provider::OpenRouter, Model::Kimi) => "moonshotai/kimi-k3",
             (Provider::OpenRouter, Model::Mimo) => "xiaomi/mimo-v2.6-pro",
-            (Provider::OpenRouter, Model::Astra) => "openai/gpt-6-astra",
+            (Provider::OpenRouter, Model::Astra) => "openai/gpt-6.2-astra",
             (_, Model::Custom(model)) => model.as_str(),
             (Provider::OpenRouter, _) => "z-ai/glm-5.3",
             (Provider::WorkersAi, _) => "@cf/zai-org/glm-5.3",

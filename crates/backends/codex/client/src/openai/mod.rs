@@ -235,7 +235,7 @@ pub fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
             detail: (if config.model == Model::Glm53 {
                 "GLM-5.3 requires low, medium, or high reasoning effort"
             } else if config.model == Model::Sol {
-                "GPT-6.1 Sol requires low, medium, high, xhigh, or max reasoning effort"
+                "GPT-6.2 Sol requires low, medium, high, xhigh, or max reasoning effort"
             } else {
                 "GPT-6 Astra requires low, medium, high, xhigh, or max reasoning effort"
             }),

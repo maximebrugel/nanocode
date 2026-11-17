@@ -138,10 +138,10 @@ impl Model {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Sol => "gpt-6.1-sol",
+            Self::Sol => "gpt-6.2-sol",
             Self::Terra => "gpt-6.1-terra",
             Self::Luna => "gpt-6-luna",
-            Self::Astra => "gpt-6-astra",
+            Self::Astra => "gpt-6.2-astra",
             Self::Glm53 => "@cf/zai-org/glm-5.3",
             Self::Kimi => "kimi-k3",
             Self::Mimo => "mimo-v2.6-pro",
@@ -246,10 +246,10 @@ impl Model {
     #[must_use]
     pub fn known(value: &str) -> Option<Self> {
         match value {
-            "gpt-6.1-sol" | "sol" => Some(Self::Sol),
+            "gpt-6.2-sol" | "gpt-6.1-sol" | "sol" => Some(Self::Sol),
             "gpt-6.1-terra" | "terra" => Some(Self::Terra),
             "gpt-6-luna" | "luna" => Some(Self::Luna),
-            "gpt-6-astra" | "astra" => Some(Self::Astra),
+            "gpt-6.2-astra" | "gpt-6-astra" | "astra" => Some(Self::Astra),
             "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Some(Self::Glm53),
             "kimi-k3" | "kimi" => Some(Self::Kimi),
             "mimo-v2.6-pro" | "mimo" => Some(Self::Mimo),

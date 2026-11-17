@@ -197,7 +197,7 @@ impl ChatGateway {
     const fn served_models(&self) -> &'static str {
         match self.provider {
             Provider::OpenRouter => {
-                "this gateway serves GLM-5.3, GPT-6 Astra, Kimi K3 and MiMo only"
+                "this gateway serves GLM-5.3, GPT-6.2 Astra, Kimi K3 and MiMo only"
             }
             Provider::WorkersAi => "Workers AI serves GLM-5.3 only",
         }

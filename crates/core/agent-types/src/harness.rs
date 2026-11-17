@@ -573,10 +573,10 @@ pub fn model_catalog(transport: ModelTransport) -> impl Iterator<Item = ModelInf
 
 fn display_name(model: &ModelSelection) -> &'static str {
     match (model.as_codex(), model.as_claude()) {
-        (Some(Model::Sol), _) => "GPT-6.1 Sol",
+        (Some(Model::Sol), _) => "GPT-6.2 Sol",
         (Some(Model::Terra), _) => "GPT-6.1 Terra",
         (Some(Model::Luna), _) => "GPT-6 Luna",
-        (Some(Model::Astra), _) => "GPT-6 Astra",
+        (Some(Model::Astra), _) => "GPT-6.2 Astra",
         (Some(Model::Glm53), _) => "GLM-5.3",
         (Some(Model::Kimi), _) => "Kimi K3",
         (Some(Model::Mimo), _) => "MiMo V2.6 Pro",

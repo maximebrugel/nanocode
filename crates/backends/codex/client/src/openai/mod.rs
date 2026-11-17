@@ -237,7 +237,7 @@ pub fn validate(config: &ModelConfig) -> Result<(), OpenAiError> {
             } else if config.model == Model::Sol {
                 "GPT-6.2 Sol requires low, medium, high, xhigh, or max reasoning effort"
             } else {
-                "GPT-6 Astra requires low, medium, high, xhigh, or max reasoning effort"
+                "GPT-6.2 Astra requires low, medium, high, xhigh, or max reasoning effort"
             }),
         });
     }

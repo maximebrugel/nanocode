@@ -829,6 +829,22 @@ pub unsafe extern "C" fn forward_iternext(pointer: *mut Object) -> *mut Object {
     crate::api::PyIter_Next(pointer)
 }
 
+pub unsafe extern "C" fn forward_bool(pointer: *mut Object) -> std::ffi::c_int {
+    crate::api::PyObject_IsTrue(pointer)
+}
+
+pub unsafe extern "C" fn forward_int(pointer: *mut Object) -> *mut Object {
+    crate::api::PyNumber_Long(pointer)
+}
+
+pub unsafe extern "C" fn forward_float(pointer: *mut Object) -> *mut Object {
+    crate::api::PyNumber_Float(pointer)
+}
+
+pub unsafe extern "C" fn forward_index(pointer: *mut Object) -> *mut Object {
+    crate::api::PyNumber_Index(pointer)
+}
+
 fn construct(
     pick: fn(&VirtualMachine) -> &'static rustpython_vm::Py<rustpython_vm::builtins::PyType>,
     subtype: *mut Type,
@@ -932,4 +948,89 @@ pub unsafe extern "C" fn dealloc_free(pointer: *mut Object) {
             None => crate::heap::PyObject_Free(pointer.cast()),
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn PyStaticMethod_New(callable: *mut Object) -> *mut Object {
+    object(|vm| {
+        vm.ctx
+            .types
+            .staticmethod_type
+            .as_object()
+            .call((arg(vm, callable)?,), vm)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn PyClassMethod_New(callable: *mut Object) -> *mut Object {
+    object(|vm| {
+        vm.ctx
+            .types
+            .classmethod_type
+            .as_object()
+            .call((arg(vm, callable)?,), vm)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn PyOS_double_to_string(
+    value: f64,
+    code: c_char,
+    precision: c_int,
+    flags: c_int,
+    kind: *mut c_int,
+) -> *mut c_char {
+    let value = if flags & 0x08 != 0 && value == 0.0 {
+        0.0
+    } else {
+        value
+    };
+    if !kind.is_null() {
+        let tag = if value.is_nan() {
+            2
+        } else if value.is_infinite() {
+            1
+        } else {
+            0
+        };
+        unsafe { *kind = tag };
+    }
+    guard(null_mut(), |vm| {
+        let code = code as u8;
+        let mut text = if code == b'r' {
+            vm.ctx.new_float(value).as_object().repr(vm)?.to_string_lossy().into_owned()
+        } else {
+            let mut spec = String::new();
+            if flags & 0x01 != 0 {
+                spec.push('+');
+            }
+            if flags & 0x04 != 0 {
+                spec.push('#');
+            }
+            spec.push('.');
+            spec.push_str(&precision.to_string());
+            spec.push(char::from(code));
+            vm.format(vm.ctx.new_float(value).as_object(), vm.ctx.new_str(spec))?
+                .to_string_lossy()
+                .into_owned()
+        };
+        if code == b'r' && flags & 0x01 != 0 && !text.starts_with('-') {
+            text.insert(0, '+');
+        }
+        if flags & 0x02 != 0
+            && value.is_finite()
+            && text.bytes().all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'+')
+        {
+            text.push_str(".0");
+        }
+        let buffer = heap::PyMem_Malloc(text.len() + 1).cast::<u8>();
+        if buffer.is_null() {
+            return Err(vm.new_memory_error(String::new()));
+        }
+        unsafe {
+            buffer.copy_from_nonoverlapping(text.as_ptr(), text.len());
+            *buffer.add(text.len()) = 0;
+        }
+        Ok(buffer.cast())
+    })
 }

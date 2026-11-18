@@ -35,32 +35,31 @@ PyAPI_DATA(PyTypeObject) PyCMethod_Type;
 #define PyCMethod_Check(op) PyObject_TypeCheck((op), &PyCMethod_Type)
 
 
-/* Static inline functions for direct access to these values.
-   Type checks are *not* done, so use with care. */
+/* nanocode: builtin functions are RustPython objects, not PyCFunctionObject
+   structs, so these read the method definition and self the runtime keeps
+   for each function PyCMethod_New made, as the PyCFunction_Get* calls do.
+   A function made in Python (no method definition) gives NULL and 0. */
 static inline PyCFunction PyCFunction_GET_FUNCTION(PyObject *func) {
-    return _PyCFunctionObject_CAST(func)->m_ml->ml_meth;
+    return PyCFunction_GetFunction(func);
 }
 #define PyCFunction_GET_FUNCTION(func) PyCFunction_GET_FUNCTION(_PyObject_CAST(func))
 
 static inline PyObject* PyCFunction_GET_SELF(PyObject *func_obj) {
-    PyCFunctionObject *func = _PyCFunctionObject_CAST(func_obj);
-    if (func->m_ml->ml_flags & METH_STATIC) {
+    if (PyCFunction_GetFlags(func_obj) & METH_STATIC) {
         return _Py_NULL;
     }
-    return func->m_self;
+    return PyCFunction_GetSelf(func_obj);
 }
 #define PyCFunction_GET_SELF(func) PyCFunction_GET_SELF(_PyObject_CAST(func))
 
 static inline int PyCFunction_GET_FLAGS(PyObject *func) {
-    return _PyCFunctionObject_CAST(func)->m_ml->ml_flags;
+    return PyCFunction_GetFlags(func);
 }
 #define PyCFunction_GET_FLAGS(func) PyCFunction_GET_FLAGS(_PyObject_CAST(func))
 
+/* The defining class is not kept for builtin functions here. */
 static inline PyTypeObject* PyCFunction_GET_CLASS(PyObject *func_obj) {
-    PyCFunctionObject *func = _PyCFunctionObject_CAST(func_obj);
-    if (func->m_ml->ml_flags & METH_METHOD) {
-        return _PyCMethodObject_CAST(func)->mm_class;
-    }
+    (void)func_obj;
     return _Py_NULL;
 }
 #define PyCFunction_GET_CLASS(func) PyCFunction_GET_CLASS(_PyObject_CAST(func))

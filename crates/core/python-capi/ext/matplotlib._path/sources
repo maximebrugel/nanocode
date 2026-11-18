@@ -1,0 +1,10 @@
+mpl/_path_wrapper.cpp
+mpl/py_converters.cpp
+aggsrc/agg_bezier_arc.cpp
+aggsrc/agg_curves.cpp
+aggsrc/agg_image_filters.cpp
+aggsrc/agg_trans_affine.cpp
+aggsrc/agg_vcgen_contour.cpp
+aggsrc/agg_vcgen_dash.cpp
+aggsrc/agg_vcgen_stroke.cpp
+aggsrc/agg_vpgen_segmentator.cpp

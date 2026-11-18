@@ -281,6 +281,27 @@ fn forward_slots(pointer: *mut Type, class: &Py<PyType>, vm: &VirtualMachine) {
         if (*pointer).iternext.is_none() && has("__next__") {
             (*pointer).iternext = Some(crate::extra::forward_iternext);
         }
+        // C code reads the number slots directly (pybind11 converts to bool
+        // through nb_bool, PyIndex_Check reads nb_index), so a builtin type
+        // gets the ones its class defines, forwarded to the runtime.
+        let (bool_, int, float, index) =
+            (has("__bool__"), has("__int__"), has("__float__"), has("__index__"));
+        if (*pointer).as_number.is_null() && (bool_ || int || float || index) {
+            let mut number: crate::abi::NumberMethods = std::mem::zeroed();
+            if bool_ {
+                number.bool = Some(crate::extra::forward_bool);
+            }
+            if int {
+                number.int = Some(crate::extra::forward_int);
+            }
+            if float {
+                number.float = Some(crate::extra::forward_float);
+            }
+            if index {
+                number.index = Some(crate::extra::forward_index);
+            }
+            (*pointer).as_number = Box::leak(Box::new(number));
+        }
     }
     let types = &vm.ctx.types;
     let new: Constructor = [

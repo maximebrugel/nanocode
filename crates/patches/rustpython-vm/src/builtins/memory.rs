@@ -84,6 +84,16 @@ impl Constructor for PyMemoryView {
 }
 
 impl PyMemoryView {
+    /// The buffer this view looks at, as its exporter gave it.
+    pub fn exporter_buffer(&self) -> &PyBuffer {
+        &self.buffer
+    }
+
+    /// The view's own shape, strides and format, after any slicing or cast.
+    pub fn view_desc(&self) -> &BufferDescriptor {
+        &self.desc
+    }
+
     fn parse_format(format: &str, vm: &VirtualMachine) -> PyResult<FormatSpec> {
         FormatSpec::parse(format.as_bytes(), vm)
     }

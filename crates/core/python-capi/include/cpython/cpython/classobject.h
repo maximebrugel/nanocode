@@ -31,13 +31,15 @@ PyAPI_FUNC(PyObject *) PyMethod_Self(PyObject *);
 
 /* Static inline functions for direct access to these values.
    Type checks are *not* done, so use with care. */
+/* nanocode: bound methods are RustPython objects, not PyMethodObject
+   structs, so these go through PyMethod_Function and PyMethod_Self. */
 static inline PyObject* PyMethod_GET_FUNCTION(PyObject *meth) {
-    return _PyMethod_CAST(meth)->im_func;
+    return PyMethod_Function(meth);
 }
 #define PyMethod_GET_FUNCTION(meth) PyMethod_GET_FUNCTION(_PyObject_CAST(meth))
 
 static inline PyObject* PyMethod_GET_SELF(PyObject *meth) {
-    return _PyMethod_CAST(meth)->im_self;
+    return PyMethod_Self(meth);
 }
 #define PyMethod_GET_SELF(meth) PyMethod_GET_SELF(_PyObject_CAST(meth))
 

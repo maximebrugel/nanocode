@@ -62,15 +62,25 @@ int PyFrame_GetLineNumber(PyFrameObject *frame) {
     return -1;
 }
 
+/* Thread-specific storage: the interpreter runs on one thread, so each key
+   is an index into one table of values. The key field is pthread_key_t
+   (32 bits) on some hosts, too narrow for a pointer, so it holds the index
+   plus one rather than an address. */
+static void **tss_values;
+static size_t tss_count;
+
 int PyThread_tss_create(Py_tss_t *key) {
     if (key->_is_initialized) {
         return 0;
     }
-    void **slot = calloc(1, sizeof(void *));
-    if (slot == NULL) {
+    void **values = realloc(tss_values, (tss_count + 1) * sizeof(void *));
+    if (values == NULL) {
         return -1;
     }
-    key->_key = (unsigned long)(uintptr_t)slot;
+    tss_values = values;
+    tss_values[tss_count] = NULL;
+    tss_count += 1;
+    key->_key = tss_count;
     key->_is_initialized = 1;
     return 0;
 }
@@ -79,17 +89,23 @@ void PyThread_tss_delete(Py_tss_t *key) {
     if (!key->_is_initialized) {
         return;
     }
-    free((void *)(uintptr_t)key->_key);
+    tss_values[key->_key - 1] = NULL;
     key->_key = 0;
     key->_is_initialized = 0;
 }
 
 void *PyThread_tss_get(Py_tss_t *key) {
-    return *(void **)(uintptr_t)key->_key;
+    if (!key->_is_initialized) {
+        return NULL;
+    }
+    return tss_values[key->_key - 1];
 }
 
 int PyThread_tss_set(Py_tss_t *key, void *value) {
-    *(void **)(uintptr_t)key->_key = value;
+    if (!key->_is_initialized) {
+        return -1;
+    }
+    tss_values[key->_key - 1] = value;
     return 0;
 }
 

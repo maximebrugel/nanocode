@@ -38,8 +38,11 @@ typedef struct {
 #define _PyMemoryView_CAST(op) _Py_CAST(PyMemoryViewObject*, op)
 
 /* Get a pointer to the memoryview's private copy of the exporter's buffer. */
+/* nanocode: memoryviews are runtime objects, not this struct, so the view
+   comes from the runtime (the exporter's own C view when it has one). */
+PyAPI_FUNC(Py_buffer *) _PyMemoryView_GetBuffer(PyObject *op);
 static inline Py_buffer* PyMemoryView_GET_BUFFER(PyObject *op) {
-    return (&_PyMemoryView_CAST(op)->view);
+    return _PyMemoryView_GetBuffer(op);
 }
 #define PyMemoryView_GET_BUFFER(op) PyMemoryView_GET_BUFFER(_PyObject_CAST(op))
 

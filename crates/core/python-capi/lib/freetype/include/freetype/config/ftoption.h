@@ -255,7 +255,9 @@ FT_BEGIN_HEADER
    * stream support, in the cases where file stream support is not necessary
    * such as memory loading of font files.
    */
-#define FT_CONFIG_OPTION_DISABLE_STREAM_SUPPORT
+/* nanocode: matplotlib opens fonts through user streams (FT_OPEN_STREAM),
+   which this option removes. */
+/* #define FT_CONFIG_OPTION_DISABLE_STREAM_SUPPORT */
 
 
   /**************************************************************************

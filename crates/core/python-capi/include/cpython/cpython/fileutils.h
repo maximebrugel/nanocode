@@ -6,3 +6,5 @@
 PyAPI_FUNC(FILE*) _Py_fopen_obj(
     PyObject *path,
     const char *mode);
+
+PyAPI_FUNC(Py_ssize_t) _Py_write(int fd, const void *buf, size_t count);

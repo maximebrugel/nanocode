@@ -1,0 +1,4 @@
+../../lib/freetype/include
+../../lib/raqm
+../../lib/harfbuzz/src
+../../lib/sheenbidi/Headers

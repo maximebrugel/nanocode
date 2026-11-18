@@ -30,7 +30,27 @@ thread_local! {
     static CONTEXT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
 }
 
+/// Runs the C and C++ static constructors once, on wasm32.
+///
+/// Nothing called `__wasm_call_ctors` before, so wasm-ld built the module in
+/// its command model: every export ran all constructors again on entry (and
+/// destructors on exit), which reset C++ globals such as ft2font's enum table
+/// and pybind11 state between calls. Calling it here makes wasm-ld drop those
+/// wrappers, so the constructors run exactly once, before any extension.
+#[cfg(target_family = "wasm")]
+pub fn run_constructors() {
+    unsafe extern "C" {
+        fn __wasm_call_ctors();
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe { __wasm_call_ctors() });
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub fn run_constructors() {}
+
 pub fn module_defs(ctx: &rustpython_vm::Context) -> Vec<&'static PyModuleDef> {
+    run_constructors();
     EXTENSIONS
         .iter()
         .map(|extension| {
@@ -52,6 +72,7 @@ fn create(
     spec: &PyObject,
     def: &'static PyModuleDef,
 ) -> PyResult<PyRef<PyModule>> {
+    run_constructors();
     let name = def.name.as_str();
     let extension = EXTENSIONS
         .iter()

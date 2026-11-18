@@ -1,0 +1,7 @@
+src/constraint.cpp
+src/expression.cpp
+src/kiwisolver.cpp
+src/solver.cpp
+src/strength.cpp
+src/term.cpp
+src/variable.cpp

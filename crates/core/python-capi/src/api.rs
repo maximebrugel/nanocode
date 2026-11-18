@@ -29,6 +29,14 @@ use crate::{
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _Py_Dealloc(pointer: *mut Object) {
     unsafe {
+        // A proxy mirrors an object Python owns: when C code drops its last
+        // reference, only the proxy is released, through the bridge's queue.
+        // A type's own tp_dealloc (pybind11's static property inherits one
+        // that frees) must not free it, or the queue frees it a second time.
+        if crate::heap::header(pointer).kind.get() == crate::heap::Kind::Proxy {
+            crate::bridge::dealloc(pointer);
+            return;
+        }
         let ty = (*pointer).ty;
         match (*ty).dealloc {
             Some(dealloc) => crate::cast::call1(dealloc, pointer),
@@ -3463,6 +3471,16 @@ pub extern "C" fn PyMethod_New(function: *mut Object, zelf: *mut Object) -> *mut
             .as_object()
             .call((arg(vm, function)?, arg(vm, zelf)?), vm)
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn PyMethod_Function(method: *mut Object) -> *mut Object {
+    bridge::borrowed_object(|vm| arg(vm, method)?.get_attr("__func__", vm))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn PyMethod_Self(method: *mut Object) -> *mut Object {
+    bridge::borrowed_object(|vm| arg(vm, method)?.get_attr("__self__", vm))
 }
 
 #[unsafe(no_mangle)]

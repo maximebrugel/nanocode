@@ -357,6 +357,30 @@ const INCOMPLETE_ADMISSIONS: &[&str] = &[
     "i didn't",
 ];
 
+const UNVERIFIED_ADMISSIONS: &[&str] = &[
+    "did not confirm",
+    "didn't confirm",
+    "not confirmed",
+    "not been confirmed",
+    "cannot confirm",
+    "can't confirm",
+    "cannot verify",
+    "can't verify",
+    "not verified",
+    "not been verified",
+    "unverified",
+    "without verifying",
+    "not tested",
+    "not been tested",
+    "untested",
+    "did not test",
+    "didn't test",
+    "without testing",
+    "without running",
+    "no way to test",
+    "no way to verify",
+];
+
 #[must_use]
 pub fn admits_incomplete(message: &str) -> bool {
     let message = message
@@ -364,6 +388,7 @@ pub fn admits_incomplete(message: &str) -> bool {
         .to_lowercase();
     INCOMPLETE_ADMISSIONS
         .iter()
+        .chain(UNVERIFIED_ADMISSIONS)
         .any(|admission| message.contains(admission))
 }
 

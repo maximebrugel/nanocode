@@ -6,20 +6,31 @@ pub(super) fn exec(
     clients: ModelClients,
 ) -> nanocode_sync::future::BoxFuture<'static, Result<()>> {
     Box::pin(async move {
-        let piped = match clients.answering() {
-            Some(_) => None,
-            None => piped_prompt().await?,
+        let given = args
+            .prompt
+            .clone()
+            .filter(|prompt| !prompt.trim().is_empty());
+        let reads_stdin = clients.answering().is_none();
+        // With the prompt as an argument, piped stdin only extends it: read it while the
+        // session starts instead of before, so a writer that closes stdin late does not
+        // delay startup. Without one, stdin decides whether there is a prompt at all.
+        let reading = (reads_stdin && given.is_some() && args.attempts.is_none())
+            .then(|| nanocode_platform::spawn_task(piped_prompt()));
+        let piped = match reads_stdin && reading.is_none() {
+            true => piped_prompt().await?,
+            false => None,
         };
-        let prompt = [
-            args.prompt
-                .clone()
-                .filter(|prompt| !prompt.trim().is_empty()),
-            piped.clone().filter(|piped| !piped.trim().is_empty()),
-        ]
-        .into_iter()
-        .flatten()
-        .reduce(|prompt, piped| format!("{prompt}\n{piped}"))
-        .ok_or("exec requires a prompt, as an argument or on stdin")?;
+        let joined = |piped: Option<&String>| {
+            [
+                given.clone(),
+                piped.filter(|piped| !piped.trim().is_empty()).cloned(),
+            ]
+            .into_iter()
+            .flatten()
+            .reduce(|prompt, piped| format!("{prompt}\n{piped}"))
+            .ok_or("exec requires a prompt, as an argument or on stdin")
+        };
+        let mut prompt = joined(piped.as_ref())?;
         if let Some(count) = args.attempts {
             let piped = piped.filter(|piped| !piped.trim().is_empty());
             return attempts::run(&args, count, piped).boxed().await;
@@ -90,6 +101,20 @@ pub(super) fn exec(
                 (agent, events, Vec::new())
             }
         };
+        if let Some(reading) = reading {
+            let piped = match reading.await {
+                Ok(piped) => piped,
+                Err(error) => Err(error.to_string().into()),
+            };
+            match piped {
+                Ok(piped) => prompt = joined(piped.as_ref())?,
+                Err(error) => {
+                    drop(agent.shutdown().await);
+                    drop(host.runtime.shutdown().await);
+                    return Err(error);
+                }
+            }
+        }
         if let Some(reason) = host.runtime.computer_use_unavailable() {
             eprintln!("nanocode: computer use unavailable, continuing without it: {reason}");
         }

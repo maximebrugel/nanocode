@@ -1,5 +1,6 @@
 #include "Python.h"
 #include "datetime.h"
+#include <errno.h>
 #include <string.h>
 
 static const char *start_mode(int start) {
@@ -229,4 +230,26 @@ PyObject *PyVectorcall_Call(PyObject *callable, PyObject *tuple, PyObject *keywo
     Py_XDECREF(names);
     PyMem_Free(items);
     return result;
+}
+
+Py_ssize_t _Py_write(int fd, const void *buf, size_t count) {
+    PyObject *os = PyImport_ImportModule("os");
+    if (os == NULL) {
+        errno = EIO;
+        return -1;
+    }
+    PyObject *written = PyObject_CallMethod(os, "write", "iy#", fd, (const char *)buf, (Py_ssize_t)count);
+    Py_DECREF(os);
+    if (written == NULL) {
+        PyObject *error = PyErr_GetRaisedException();
+        PyObject *code = error ? PyObject_GetAttrString(error, "errno") : NULL;
+        errno = (code && PyLong_Check(code)) ? (int)PyLong_AsLong(code) : EIO;
+        Py_XDECREF(code);
+        PyErr_Clear();
+        PyErr_SetRaisedException(error);
+        return -1;
+    }
+    Py_ssize_t size = PyLong_AsSsize_t(written);
+    Py_DECREF(written);
+    return size;
 }

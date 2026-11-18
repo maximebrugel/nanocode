@@ -1,7 +1,8 @@
 use std::{
     cell::{Cell, OnceCell},
-    ffi::{CStr, c_char, c_int, c_void},
+    ffi::{CStr, c_char, c_int, c_uint, c_void},
     ptr::null_mut,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use nanocode_platform::Instant;
@@ -214,4 +215,73 @@ thread_local! {
 #[unsafe(no_mangle)]
 pub extern "C" fn __errno_location() -> *mut c_int {
     ERRNO.with(Cell::as_ptr)
+}
+
+static STDERR: u8 = 0;
+
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static stderr: &u8 = &STDERR;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strcpy(target: *mut c_char, source: *const c_char) -> *mut c_char {
+    let length = unsafe { CStr::from_ptr(source) }.to_bytes_with_nul().len();
+    unsafe { target.copy_from(source, length) };
+    target
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn strncpy(
+    target: *mut c_char,
+    source: *const c_char,
+    limit: usize,
+) -> *mut c_char {
+    let mut at = 0;
+    while at < limit && unsafe { *source.add(at) } != 0 {
+        unsafe { *target.add(at) = *source.add(at) };
+        at += 1;
+    }
+    while at < limit {
+        unsafe { *target.add(at) = 0 };
+        at += 1;
+    }
+    target
+}
+
+static SEED: AtomicU64 = AtomicU64::new(0);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn srand(seed: c_uint) {
+    SEED.store(u64::from(seed).wrapping_sub(1), Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rand() -> c_int {
+    let step = |seed: u64| seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    let previous = SEED
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |seed| {
+            Some(step(seed))
+        })
+        .unwrap_or_else(|seed| seed);
+    (step(previous) >> 33) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qsort(
+    base: *mut c_void,
+    count: usize,
+    size: usize,
+    compare: unsafe extern "C" fn(*const c_void, *const c_void) -> c_int,
+) {
+    if count < 2 || size == 0 {
+        return;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), count * size) };
+    let mut items: Vec<Vec<u8>> = bytes.chunks_exact(size).map(<[u8]>::to_vec).collect();
+    items.sort_by(|left, right| {
+        unsafe { compare(left.as_ptr().cast(), right.as_ptr().cast()) }.cmp(&0)
+    });
+    for (chunk, item) in bytes.chunks_exact_mut(size).zip(items) {
+        chunk.copy_from_slice(&item);
+    }
 }

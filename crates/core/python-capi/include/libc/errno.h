@@ -8,4 +8,5 @@ int *__errno_location(void);
 #define EDOM 18
 #define EAGAIN 6
 #define EINVAL 28
+#define EIO 29
 #endif

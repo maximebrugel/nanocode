@@ -453,9 +453,67 @@ static int type_error(const char *name, const char *expected, PyObject *got) {
     return -1;
 }
 
+static int convert(PyObject *arg, const char **format, va_list *va, const char *name);
+
+static void skip(const char **format, va_list *va);
+
+static Py_ssize_t group_size(const char *format) {
+    Py_ssize_t count = 0;
+    int depth = 0;
+    for (; *format; format++) {
+        char code = *format;
+        if (code == '(') {
+            if (depth == 0)
+                count++;
+            depth++;
+        } else if (code == ')') {
+            if (depth == 0)
+                return count;
+            depth--;
+        } else if (depth == 0 && code != '!' && code != '&' && code != '#' && code != '*')
+            count++;
+    }
+    return count;
+}
+
+static int convert_group(PyObject *arg, const char **format, va_list *va, const char *name) {
+    Py_ssize_t expected = group_size(*format);
+    if (!PySequence_Check(arg) || PyUnicode_Check(arg) || PyBytes_Check(arg)) {
+        PyErr_Format(PyExc_TypeError, "%s() argument must be %zd-item sequence, not %T", name, expected, arg);
+        return -1;
+    }
+    Py_ssize_t length = PySequence_Size(arg);
+    if (length < 0)
+        return -1;
+    if (length != expected) {
+        PyErr_Format(PyExc_TypeError, "%s() argument must be sequence of length %zd, not %zd", name, expected, length);
+        return -1;
+    }
+    for (Py_ssize_t index = 0; index < expected; index++) {
+        PyObject *item = PySequence_GetItem(arg, index);
+        if (!item)
+            return -1;
+        int failed = convert(item, format, va, name);
+        Py_DECREF(item);
+        if (failed < 0)
+            return -1;
+    }
+    (*format)++;
+    return 0;
+}
+
+static void skip_group(const char **format, va_list *va) {
+    while (**format && **format != ')')
+        skip(format, va);
+    if (**format == ')')
+        (*format)++;
+}
+
 static int convert(PyObject *arg, const char **format, va_list *va, const char *name) {
     char code = *(*format)++;
     switch (code) {
+    case '(':
+        return convert_group(arg, format, va, name);
     case 'O': {
         if (**format == '!') {
             (*format)++;
@@ -596,6 +654,10 @@ static int convert(PyObject *arg, const char **format, va_list *va, const char *
 
 static void skip(const char **format, va_list *va) {
     char code = *(*format)++;
+    if (code == '(') {
+        skip_group(format, va);
+        return;
+    }
     if (code == 'O' && (**format == '!' || **format == '&')) {
         (*format)++;
         (void)va_arg(*va, void *);

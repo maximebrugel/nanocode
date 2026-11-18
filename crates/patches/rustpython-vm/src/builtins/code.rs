@@ -624,10 +624,13 @@ impl PyCode {
                 .store(lookups + 1, core::sync::atomic::Ordering::Relaxed);
             return self.code.location(idx);
         }
-        self.locations
-            .get_or_init(|| self.code.all_locations().into_owned().into_boxed_slice())
-            .get(idx)
-            .copied()
+        let owner: *const Self = self;
+        crate::vm::region::persistent_for(owner.cast(), || {
+            self.locations
+                .get_or_init(|| self.code.all_locations().into_owned().into_boxed_slice())
+                .get(idx)
+                .copied()
+        })
     }
 
     pub fn new(code: CodeObject) -> Self {

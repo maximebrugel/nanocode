@@ -432,6 +432,10 @@ fn ready(vm: &VirtualMachine) {
     let _ = CObject::make_static_type();
     let _ = crate::buffer::CBuffer::make_static_type();
     register_types(vm);
+    rustpython_vm::gc_state::set_host_holds(rustpython_vm::gc_state::HostHolds {
+        visit: visit_parked,
+        release: release_parked,
+    });
     unsafe { nanocode_builtin_slots() };
     let dict_offset = crate::types::function(vm, "__dictoffset__", |vm, args| {
         let class = args
@@ -758,8 +762,10 @@ fn attach(pointer: *mut Object, object: &PyObject) {
     let header = unsafe { heap::header(pointer) };
     header.kind.set(Kind::Proxy);
     header.link.set(own(object));
-    PROXIES.with_borrow_mut(|proxies| {
-        proxies.insert(object as *const PyObject as usize, pointer as usize)
+    crate::address::persistent(|| {
+        PROXIES.with_borrow_mut(|proxies| {
+            proxies.insert(object as *const PyObject as usize, pointer as usize)
+        })
     });
 }
 
@@ -1546,7 +1552,85 @@ unsafe fn destroy(pointer: *mut Object) {
     }
 }
 
+fn idle_link(address: usize) -> Option<NonNull<PyObject>> {
+    let pointer = address as *mut Object;
+    let header = unsafe { heap::header(pointer) };
+    if unsafe { (*pointer).refcnt } != 0 || header.kind.get() != Kind::Proxy {
+        return None;
+    }
+    NonNull::new(header.link.get().cast_mut())
+}
+
+thread_local! {
+    static SWEEPING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn idle() -> Vec<usize> {
+    if SWEEPING.get() {
+        return Vec::new();
+    }
+    let mut idle: Vec<usize> = PARKED.with(|parked| parked.try_borrow().map(|parked| parked.clone()).unwrap_or_default());
+    QUEUE.with(|queue| {
+        if let Ok(queue) = queue.try_borrow() {
+            idle.extend(queue.iter().copied());
+        }
+    });
+    idle.sort_unstable();
+    idle.dedup();
+    idle
+}
+
+fn visit_parked(visit: &mut dyn FnMut(NonNull<PyObject>)) {
+    idle().into_iter().filter_map(idle_link).for_each(visit);
+}
+
+fn release_parked(dead: &dyn Fn(NonNull<PyObject>) -> bool) {
+    let released: Vec<(*mut Object, *const PyObject)> = idle()
+        .into_iter()
+        .filter_map(|address| {
+            idle_link(address)
+                .filter(|&link| dead(link))
+                .map(|link| (address as *mut Object, link.as_ptr().cast_const()))
+        })
+        .collect();
+    if released.is_empty() {
+        return;
+    }
+    let gone: std::collections::BTreeSet<usize> = released.iter().map(|&(pointer, _)| pointer as usize).collect();
+    let Ok(()) = PARKED.with(|parked| parked.try_borrow_mut().map(|mut parked| parked.retain(|address| !gone.contains(address)))) else {
+        return;
+    };
+    let Ok(()) = QUEUE.with(|queue| queue.try_borrow_mut().map(|mut queue| queue.retain(|address| !gone.contains(address)))) else {
+        return;
+    };
+    PROXIES.with_borrow_mut(|proxies| {
+        for &(pointer, link) in &released {
+            if proxies.get(&(link as usize)).copied() == Some(pointer as usize) {
+                proxies.remove(&(link as usize));
+            }
+        }
+    });
+    for &(pointer, _) in &released {
+        let header = unsafe { heap::header(pointer) };
+        header.parked.set(false);
+        header.queued.set(false);
+        header.link.set(null());
+        unsafe { destroy(pointer) };
+    }
+    for (_, link) in released {
+        unsafe { disown(link) };
+    }
+}
+
 fn sweep() {
+    if SWEEPING.replace(true) {
+        return;
+    }
+    sweep_queued();
+    SWEEPING.set(false);
+}
+
+fn sweep_queued() {
     let mut rescan = false;
     loop {
         let mut batch = QUEUE.with_borrow_mut(std::mem::take);
@@ -1584,7 +1668,7 @@ fn sweep() {
                 }
             }
             PARKED_SCAN.set((2 * kept.len()).max(1));
-            PARKED.with_borrow_mut(|parked| parked.extend(kept));
+            crate::address::persistent(|| PARKED.with_borrow_mut(|parked| parked.extend(kept)));
         }
         if batch.is_empty() {
             return;
@@ -1599,9 +1683,14 @@ fn sweep() {
             }
             if unsafe { &*header.link.get() }.strong_count() > 1 {
                 if !header.parked.replace(true) {
-                    PARKED.with_borrow_mut(|parked| parked.push(pointer as usize));
+                    crate::address::persistent(|| {
+                        PARKED.with_borrow_mut(|parked| parked.push(pointer as usize))
+                    });
                 }
                 continue;
+            }
+            if header.parked.replace(false) {
+                PARKED.with_borrow_mut(|parked| parked.retain(|&address| address != pointer as usize));
             }
             dead.push((pointer, header.link.replace(null())));
         }

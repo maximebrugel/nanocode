@@ -21,6 +21,7 @@ use rustpython_vm::{
 };
 
 pub use capi::{Extension, add_extensions};
+pub use host::held;
 pub use psh::UTILITY;
 #[cfg(not(target_family = "wasm"))]
 pub use psh::serve;

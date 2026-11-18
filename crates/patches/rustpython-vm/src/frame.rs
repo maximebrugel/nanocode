@@ -5441,7 +5441,10 @@ impl ExecutingFrame<'_> {
                 if !self.code.quickened.load(atomic::Ordering::Relaxed)
                     && !self.code.quickened.swap(true, atomic::Ordering::Relaxed)
                 {
-                    self.code.instructions.quicken();
+                    let code: *const _ = &self.code.instructions;
+                    crate::vm::region::persistent_for(code.cast(), || {
+                        self.code.instructions.quicken()
+                    });
                     atomic::fence(atomic::Ordering::Release);
                 }
                 // Check if bytecode needs re-instrumentation

@@ -36,6 +36,18 @@ nanocode_flags::flags! {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct HostHolds {
+    pub visit: fn(&mut dyn FnMut(NonNull<PyObject>)),
+    pub release: fn(&dyn Fn(NonNull<PyObject>) -> bool),
+}
+
+static HOST_HOLDS: std::sync::OnceLock<HostHolds> = std::sync::OnceLock::new();
+
+pub fn set_host_holds(holds: HostHolds) {
+    let _ = HOST_HOLDS.set(holds);
+}
+
 /// Result from a single collection run
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CollectResult {
@@ -610,6 +622,15 @@ impl GcState {
             referent_ranges.insert(ptr, (start, end));
         }
 
+        if let Some(holds) = HOST_HOLDS.get() {
+            (holds.visit)(&mut |held| {
+                let held = unsafe { held.as_ref() };
+                if held.is_gc_collecting() {
+                    held.subtract_gc_ref();
+                }
+            });
+        }
+
         // Step 4: Find reachable objects (gc_refs > 0) and traverse from them
         let mut worklist: Vec<GcPtr> = Vec::new();
 
@@ -750,6 +771,11 @@ impl GcState {
                 candidates,
                 duration,
             };
+        }
+
+        if let Some(holds) = HOST_HOLDS.get() {
+            let dead: GcSet<GcPtr> = unreachable.iter().copied().collect();
+            (holds.release)(&|held| dead.contains(&GcPtr(held)));
         }
 
         // 6b: Record initial strong counts (for resurrection detection)

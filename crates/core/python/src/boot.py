@@ -522,14 +522,35 @@ def _bounded():
 _bounded()
 
 
+_warnings_base = None
+
+
 def _start(argv, first):
-    global _unfinished
+    global _unfinished, _warnings_base
     posix._reset()
     if 'matplotlib' in sys.modules:
         try:
             __import__('nanocode_matplotlib')._reset()
         except Exception:
             pass
+    try:
+        import warnings
+        if _warnings_base is None:
+            _warnings_base = warnings.filters[:], warnings.defaultaction
+        else:
+            warnings.filters[:] = _warnings_base[0]
+            warnings.defaultaction = _warnings_base[1]
+            warnings.onceregistry.clear()
+            warnings._filters_mutated()
+    except Exception:
+        pass
+    for name in ('random', 'numpy.random'):
+        random = sys.modules.get(name)
+        if random is not None:
+            try:
+                random.seed()
+            except Exception:
+                pass
     if _unfinished:
         for name, module in list(sys.modules.items()):
             spec = getattr(module, '__spec__', None)
@@ -609,5 +630,12 @@ def _finish(stopped):
     if main is not None:
         main.__dict__.clear()
     _flush()
+    for name in ('last_exc', 'last_type', 'last_value', 'last_traceback'):
+        sys.__dict__.pop(name, None)
+    linecache = sys.modules.get('linecache')
+    if linecache is not None:
+        linecache.clearcache()
+    import gc
+    gc.collect()
     global _unfinished
     _unfinished = stopped

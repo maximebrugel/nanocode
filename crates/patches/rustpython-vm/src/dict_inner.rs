@@ -311,6 +311,11 @@ impl GenIndexes {
 
 impl<T> DictInner<T> {
     fn resize(&mut self, new_size: usize) {
+        let owner: *const Self = self;
+        crate::vm::region::persistent_for(owner.cast(), || self.resize_in_place(new_size));
+    }
+
+    fn resize_in_place(&mut self, new_size: usize) {
         // Never shrink below the initial minimum table size (8). Without this
         // floor, a dict/set that repeatedly adds and removes distinct keys
         // (e.g. asyncio's per-task bookkeeping sets) settles at a tiny table
@@ -377,6 +382,10 @@ impl<T> DictInner<T> {
             index,
         };
         let entry_index = self.entries.len();
+        if self.entries.len() == self.entries.capacity() {
+            let owner: *const Self = self;
+            crate::vm::region::persistent_for(owner.cast(), || self.entries.reserve(1));
+        }
         self.entries.push(Some(entry));
         self.indices[index] = unsafe {
             // SAFETY: entry_index is self.entries.len(). it never can

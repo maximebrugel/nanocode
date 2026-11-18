@@ -39,7 +39,17 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Regions<A> {
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if run::owns(ptr) {
+        if run::retired(ptr) {
+            let moved =
+                unsafe { self.alloc(Layout::from_size_align_unchecked(size, layout.align())) };
+            if !moved.is_null() {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ptr, moved, layout.size().min(size));
+                    run::free(ptr, layout);
+                }
+            }
+            moved
+        } else if run::owns(ptr) {
             unsafe { run::realloc(ptr, layout, size) }
         } else {
             unsafe { self.0.realloc(ptr, layout, size) }
@@ -61,6 +71,18 @@ pub fn set(on: bool) -> bool {
 
 pub fn owns(ptr: *mut u8) -> bool {
     run::owns(ptr)
+}
+
+#[inline]
+pub fn persistent_for<R>(owner: *const u8, f: impl FnOnce() -> R) -> R {
+    if run::active() && !run::owns(owner.cast_mut()) {
+        run::set(false);
+        let result = f();
+        run::set(true);
+        result
+    } else {
+        f()
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -97,6 +119,7 @@ mod run {
 
     struct State {
         owner: [u8; PAGES],
+        live: [u16; PAGES],
         top: usize,
         current: u8,
         active: bool,
@@ -113,6 +136,7 @@ mod run {
 
     static STATE: Shared<State> = Shared(UnsafeCell::new(State {
         owner: [PERSISTENT; PAGES],
+        live: [0; PAGES],
         top: 0,
         current: 0,
         active: false,
@@ -164,24 +188,47 @@ mod run {
             self.owner[start / PAGE..(start + size) / PAGE].fill(FREE);
         }
 
+        fn count(&mut self, ptr: *mut u8, size: usize, add: bool) {
+            let first = ptr.addr() / PAGE;
+            let last = (ptr.addr() + size.max(1) - 1) / PAGE;
+            for page in first..=last {
+                if add {
+                    self.live[page] += 1;
+                } else {
+                    self.live[page] -= 1;
+                }
+            }
+        }
+
+        fn release_dead(&mut self, id: u8, first: usize, last: usize) {
+            for page in first..=last {
+                if self.owner[page] == id && self.live[page] == 0 {
+                    self.free_page(page);
+                }
+            }
+        }
+
+        fn free_page(&mut self, page: usize) {
+            if self.poison {
+                unsafe {
+                    ptr::write_bytes(
+                        ptr::with_exposed_provenance_mut::<u8>(page * PAGE),
+                        0xdb,
+                        PAGE,
+                    );
+                }
+            }
+            self.owner[page] = FREE;
+        }
+
         fn generation(&mut self, id: u8) -> &mut Generation {
             &mut self.generations[usize::from(id) - 1]
         }
 
         fn drop_generation(&mut self, id: u8) {
-            let poison = self.poison;
             for page in 0..self.top {
                 if self.owner[page] == id {
-                    if poison {
-                        unsafe {
-                            ptr::write_bytes(
-                                ptr::with_exposed_provenance_mut::<u8>(page * PAGE),
-                                0xdb,
-                                PAGE,
-                            );
-                        }
-                    }
-                    self.owner[page] = FREE;
+                    self.free_page(page);
                 }
             }
             *self.generation(id) = Generation::new(id);
@@ -260,6 +307,12 @@ mod run {
         owner(ptr) != PERSISTENT
     }
 
+    #[inline]
+    pub(super) fn retired(ptr: *mut u8) -> bool {
+        let id = owner(ptr);
+        id != PERSISTENT && state().generation(id).retired
+    }
+
     pub(super) unsafe fn alloc(layout: Layout, zeroed: bool) -> *mut u8 {
         let state = state();
         let generation = state.generation(state.current);
@@ -273,6 +326,7 @@ mod run {
         if !ptr.is_null() {
             generation.bytes += layout.size();
             generation.blocks += 1;
+            state.count(ptr, layout.size(), true);
         }
         ptr
     }
@@ -283,15 +337,27 @@ mod run {
         let generation = state.generation(id);
         generation.bytes -= layout.size();
         generation.blocks -= 1;
-        unsafe { generation.heap.free(ptr, layout.size(), layout.align()) }
-        if generation.blocks == 0 && generation.retired {
-            state.drop_generation(id);
+        let retired = generation.retired;
+        let empty = generation.blocks == 0;
+        if !retired {
+            unsafe { generation.heap.free(ptr, layout.size(), layout.align()) }
+        }
+        state.count(ptr, layout.size(), false);
+        if retired {
+            if empty {
+                state.drop_generation(id);
+            } else {
+                let first = ptr.addr() / PAGE;
+                let last = (ptr.addr() + layout.size().max(1) - 1) / PAGE;
+                state.release_dead(id, first, last);
+            }
         }
     }
 
     pub(super) unsafe fn realloc(ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let id = owner(ptr);
-        let generation = state().generation(id);
+        let state = state();
+        let generation = state.generation(id);
         let moved = unsafe {
             generation
                 .heap
@@ -299,6 +365,8 @@ mod run {
         };
         if !moved.is_null() {
             generation.bytes = generation.bytes - layout.size() + size;
+            state.count(ptr, layout.size(), false);
+            state.count(moved, size, true);
         }
         moved
     }
@@ -335,6 +403,8 @@ mod run {
                 state.drop_generation(id);
             } else {
                 generation.retired = true;
+                let top = state.top;
+                state.release_dead(id, 0, top.saturating_sub(1));
             }
         }
         kept.held = state.owner[..state.top]
@@ -358,6 +428,11 @@ mod run {
 
     #[inline]
     pub(super) fn owns(_: *mut u8) -> bool {
+        false
+    }
+
+    #[inline]
+    pub(super) fn retired(_: *mut u8) -> bool {
         false
     }
 

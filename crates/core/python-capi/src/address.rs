@@ -19,6 +19,10 @@ pub const fn set() -> AddressSet {
     HashSet::with_hasher(Addresses)
 }
 
+pub fn persistent<R>(f: impl FnOnce() -> R) -> R {
+    rustpython_vm::vm::region::persistent_for(core::ptr::null(), f)
+}
+
 impl BuildHasher for Addresses {
     type Hasher = AddressHasher;
 

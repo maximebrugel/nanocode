@@ -627,3 +627,42 @@ lto = "off"
 opt-level = "z"
 panic = "abort"
 strip = "symbols"
+
+[profile.dist.package.djs-core]
+opt-level = "s"
+
+[profile.dist.package.djs-embed]
+opt-level = "s"
+
+[profile.dist.package.djs-libm]
+opt-level = "s"
+
+[profile.dist.package.djs-prelude]
+opt-level = "s"
+
+[profile.dist.package.nanocode-code-mode-engine]
+opt-level = "s"
+
+[profile.dist.package.psh]
+opt-level = "s"
+
+[profile.dist.package.psh-classify]
+opt-level = "s"
+
+[profile.dist.package.psh-engine]
+opt-level = "s"
+
+[profile.dist.package.psh-os]
+opt-level = "s"
+
+[profile.dist.package.psh-pattern]
+opt-level = "s"
+
+[profile.dist.package.psh-regex]
+opt-level = "s"
+
+[profile.dist.package.psh-syntax]
+opt-level = "s"
+
+[profile.dist.package.nanocode-tui]
+opt-level = "s"

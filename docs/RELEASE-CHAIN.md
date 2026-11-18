@@ -52,21 +52,61 @@ Each step on its own:
 
 The repositories behind surfaces 3 to 6 and 9 have no CI: each AGENTS.md says to build, check and deploy by hand and push to master. Every bump is one commit, chore(deps): nanocode-ts build-<short>.
 
+## Before you deploy
+
+- Take the shared deploy lock on the machine that holds the Cloudflare and Vercel logins: ~/nc-release/deploy.lock (flock ~/nc-release/deploy.lock <command>). Other threads deploy the demos and the site too: a Cloudflare demo version landed from elsewhere between two deploys of the release on 2026-11-17, and the next deploy replaced it.
+- git pull --rebase the surface's default branch right before building, and deploy only what is on that branch plus your bump. A deploy from a stale checkout silently reverts the other thread's change.
+- Check the live version before and after (wrangler deployments list --name <worker>, vercel ls <project> --prod) and keep the previous id or URL for rollback.
+
 ## Checks after each deploy
 
-1. Same core. scripts/release-train.sh verify <surface> <short> compares the deployed wasm's sha256 with dist/nanocode_wasm.wasm in the build-<short> tarball: the Vercel demo serves it at /nanocode_wasm.wasm, the Workers bundle it (output/deploy after the dry run), the site builds it from the pinned commit. A mismatch means the surface runs another core: stop.
-2. Stock defaults. A surface runs nanocode's defaults unless an override is written down here with its reason. verify prints the Cloudflare demo's deploy vars. Known overrides to keep listed and reviewed every release: the Cloudflare demo's deploy:demo vars (CLAUDE_MODEL, OPENAI_SERVICE_TIER=priority, CHAT_PUBLIC, AI_GATEWAY_ID), the site's AI_GATEWAY_ID and request limit, and whatever the gateway's override audit lists.
-3. Smoke and performance. Run nanoeval's systems suite against the surface, this build against the last:
+1. Same core. scripts/release-train.sh verify <surface> <short> compares the deployed wasm's sha256 with dist/nanocode_wasm.wasm in the build-<short> tarball (for build-6d58e23: 2fe83d0b829f9a6f015e42c6e7cfc5246fffad8d24154464ac354faeccfe6cff). The Workers bundle it (output/deploy after the dry run); the Vercel demo installs it from the tarball. A mismatch means the surface runs another core: stop. Each surface also reports its build at a version endpoint (nanocodeTs, nanocodeRev, wasmSha256), which systems-v1's describe() records in every run.
+   - The site used to compile its own wasm from the pinned nanocode-ts commit, so its sha256 never equalled the tarball's and only the wasm fingerprint (dist/nanocode-wasm.json) matched. Its scripts/wasm.ts now takes the release tarball's wasm, and builds from source only for development.
+2. Stock defaults. A surface runs nanocode's defaults. The only differences allowed are the ones in the table below, each kept for a stated reason. Anything that changes agent behaviour beyond the model choice is removed. Re-read the table against the surface's config every release.
+3. Demo safety. On the Vercel demo, needsToken is false, and chaos is on only as the visitor-armed "Kill the next tool call" feature: a plain turn arms nothing, and measurement never calls /api/chaos.
+4. Smoke and performance. Run nanoeval's systems suite against every target, this build against the last, then read the client signals:
 
 ```sh
-node cli/nanoeval.ts systems run --suite systems-v1 --targets cf-demo,vercel-demo,site,release-worker,cli-local \
-  --build prev=build-<previous short> --build new=build-<short>
-node cli/nanoeval.ts systems compare output/systems/<previous run>/run.json output/systems/<this run>/run.json
+scripts/release-train.sh sweep <previous short> <short>            # all targets at once, each compared with the last release
+# by hand, one target:
+NANOEVAL_SUITES=~/nanoeval-suites node cli/nanoeval.ts systems run --suite systems-v1 --target vercel-demo \
+  --build build-<short>=https://nanocode-vercel-durable.vercel.app
+node cli/nanoeval.ts systems compare <last release run dir> <this run dir> --base build-<previous short> --head build-<short>
+# the CLI, both builds in one run:
+node cli/nanoeval.ts systems run --suite systems-v1 --target cli-local --build base=<old 12-char sha> --build head=<new 12-char sha>
 ```
 
-systems-v1 (versioned in nanoeval-suites, preregistered in prereg/SYSTEMS-V1.md) runs, per target and concurrently: 10+ turn conversations (per-turn TTFT, decode tok/s, turn latency, drift across turns), tens of Code Mode cells per session (compute, shell, file I/O, parallel tool calls, long cells), Python cells (interpreter start, stdlib and numpy/pandas imports where supported, compute, file I/O, state across cells), cold vs warm start and session resume, and 1/10/50 concurrent sessions (aggregate tok/s, error rate), counting errors, timeouts and stalls. Its output is a timestamped run.json and summary.md: p50/p95 per metric, pass/fail per scenario, SLO pass/fail against the suite's absolute thresholds, and new/prev ratios with 95% task-clustered bootstrap intervals read as WIN, TIE or LOSS. A release ships to the next surface only when the surface passes its SLOs and has no LOSS it can't explain. scripts/release-train.sh sweep <prev> <new> runs it for every target.
+systems-v1 (versioned in nanoeval-suites, preregistered in prereg/SYSTEMS-V1.md) runs, per target and concurrently: 10+ turn conversations (per-turn TTFT, decode tok/s, turn latency, drift across turns), tens of Code Mode cells (compute, shell, file I/O, parallel tool calls, long cells), Python cells (interpreter start, stdlib and numpy/pandas imports where supported, compute, file I/O, state across cells), cold vs warm start and session resume, and 1/10/50 concurrent sessions (aggregate tok/s, error rate), counting errors, timeouts and stalls, on a matrix of current models (presets in suite.json). Each run writes a timestamped run.json and summary.md: p50/p95 per metric, pass/fail per scenario, SLO pass/fail against the suite's absolute thresholds, and head/base ratios with 95% task-clustered bootstrap intervals read as WIN, TIE or LOSS.
+
+The release verdict is the client signals: TTFT, startup, first byte, cell latency and RSS. Turn time, model calls and tok/s are reported in a separate section, "includes model work", because they also move with how long the model thinks and how many tool calls it makes. A release moves to the next surface only when the surface passes its SLOs and has no client-signal LOSS that can't be explained.
+
+Old-vs-new on a deployed surface: the Vercel demo keeps every deployment at its own URL (behind deployment protection: send the project's automation bypass as NANOEVAL_SYSTEMS_VERCEL_DEMO_BYPASS). The Cloudflare demo and the site have no version preview URLs, so compare the new run with the last release's run dir. The public demos limit each client to 30 requests per minute; sweeps authenticate with NANOEVAL_SYSTEMS_<TARGET>_TOKEN, which the demos' bearer path exempts, and the public limits stay as they are.
 
 The comparison is always nanocode build against nanocode build on our own surfaces. Comparisons with other agents stay in the frontier evals.
+
+## Overrides, features and platform constraints
+
+Everything a surface runs differently from stock nanocode, and why. "Removed" lines are kept so nobody re-adds them.
+
+| Surface | Knob | Value | Stock | Status | Reason |
+|---------|------|-------|-------|--------|--------|
+| Cloudflare demo | CLAUDE_MODEL | claude-haiku-5-5 | claude-opus-5-5 | kept | product choice: cost of a free public demo |
+| Cloudflare demo | OPENAI_SERVICE_TIER | priority | unset | kept | latency choice: the standard tier queued 3.9-7 s before first output vs 0.65-2.0 s on priority; dropping it cost about 1 s first-turn TTFT. Codex sessions only |
+| Cloudflare demo | CHAT_PUBLIC, PUBLIC_RATE 30/60 s per client, 2000-char prompts, model allowlist | on | off | kept | feature (public demo) and abuse limit |
+| Cloudflare demo | AI_GATEWAY_ID, WORKERS_AI_ACCOUNT_ID, domain | set | | kept | wiring |
+| Cloudflare demo | wrangler.jsonc RECOVERY_*, EVENT_*, MODEL_*, PROMPT_CACHE_PRIME_MS, SESSION_POOL_* | repo config | | kept | the Worker's own stock config, not demo overrides |
+| Vercel demo | default effort | catalog (medium for haiku) | catalog | removed "low" 2026-11-17 | changed agent behaviour |
+| Vercel demo | NANOCODE_MODEL, model allowlist | claude-haiku-5-5; haiku/sonnet 5.5, gpt-6-luna, gpt-6.1-sol, glm-5.3, kimi-k3 | claude-opus-5-5 | kept | product choice: cost of a free public demo |
+| Vercel demo | drive windows | 280 s | none | kept | platform limit: function maxDuration 300 s minus margin |
+| Vercel demo | HARNESS_CHAOS | 1 | off | kept | feature: visitor-armed "Kill the next tool call" (survives a dead Function); arms nothing by default |
+| Vercel demo | charge tool, Tempo wallet MCP, visitor Hands, subagents, durability | on | | kept | features |
+| Vercel demo | allowance 0.05 / 10 calls / hour, 20 prompts, 2000 chars | set | | kept | cost limit |
+| Site | homepage chat model | gpt-6-luna | catalog | kept | product choice |
+| Site | homepage thinking | low | catalog (medium) | kept | cost cap: the free, unauthenticated proxy serves luna at low effort only |
+| Site | homepage service tier | priority | standard | kept | latency choice, measured in the site's DECISIONS.md |
+| Site | DEMO_LIMIT 30/60 s, image and search limits, 16 MiB requests | set | | kept | abuse and cost limits |
+| Site | warm-up request every 10 s | on | | kept | product decision in the site's DECISIONS.md |
+| Gateway | per its override audit (find_thread, gateway and Connectors MCP servers, context limits, restricted tools for woken turns) | | | owners | the gateway team keeps its own list; anything that changes agent behaviour should go |
 
 ## Rollback
 

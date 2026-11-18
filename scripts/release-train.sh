@@ -14,7 +14,9 @@ The release train of docs/RELEASE-CHAIN.md: one core build moved through every s
   verify <surface> <short> [url]
                                 deployed wasm sha256 == build-<short> tarball, and the surface's overrides
   sweep <prev-short> <new-short> [targets]
-                                nanoeval systems run --suite systems-v1 on every target, build vs build
+                                nanoeval systems-v1 on every target at once (cli-local, cf-demo, vercel-demo, site
+                                by default; gateway or swarms with NANOEVAL_SYSTEMS_<TARGET>_URL), then compare
+                                with the previous build: in one run for the CLI, with the last sweep's run elsewhere
   train [--rev SHA] [--cli] [--release-worker]
                                 build, then bump, deploy and verify site, cf-demo and vercel-demo in order,
                                 optionally the CLI rolling release and the nanoeval release Worker, then sweep
@@ -183,11 +185,42 @@ verify() {
 }
 
 sweep() {
-  local prev=$1 new=$2 targets=${3:-cli-local,release-worker,cf-demo,vercel-demo,site} ne=$D/nanoeval-sweep
+  local prev=$1 new=$2 targets=${3:-cli-local,cf-demo,vercel-demo,site} ne=$D/nanoeval-sweep t url build last dir pids=()
   [ -d "$ne/.git" ] || gh repo clone nanocodexyz/nanoeval "$ne" -- -q >&2
   git -C "$ne" fetch -q origin main
   git -C "$ne" checkout -q -B main origin/main
-  (cd "$ne" && npm ci --no-audit --no-fund >&2 && node cli/nanoeval.ts systems run --suite systems-v1 --targets "$targets" --build "prev=build-$prev" --build "new=build-$new")
+  (cd "$ne" && npm ci --no-audit --no-fund >&2)
+  mkdir -p "$D/sweeps" "$ne/output/systems"
+  for t in ${targets//,/ }; do
+    dir=$ne/output/systems/$(date -u +%Y%m%dT%H%M%SZ)-$t
+    case $t in
+      cli-local) build="--build build-$prev=$(cli_version "$prev") --build build-$new=$(cli_version "$new")" ;;
+      cf-demo | vercel-demo | site | release-worker) url=$(url_of "$t"); [ "$t" = site ] && url=$url/cloudflare; build="--build build-$new=$url" ;;
+      *) url=$(printenv "NANOEVAL_SYSTEMS_$(echo "$t" | tr a-z- A-Z_)_URL") || die "set NANOEVAL_SYSTEMS_$(echo "$t" | tr a-z- A-Z_)_URL for $t"; build="--build build-$new=$url" ;;
+    esac
+    # shellcheck disable=SC2086
+    (cd "$ne" && node cli/nanoeval.ts systems run --suite systems-v1 --target "$t" $build --out "$dir" --quiet > "$dir.log" 2>&1; echo "$t exit $?" >> "$dir.log") &
+    pids+=($!)
+    echo "$dir" > "$D/sweeps/$t.build-$new"
+  done
+  wait "${pids[@]}" || true
+  for t in ${targets//,/ }; do
+    dir=$(cat "$D/sweeps/$t.build-$new")
+    say "$t: $dir/summary.md ($(tail -1 "$dir.log"))"
+    if [ "$t" = cli-local ]; then
+      (cd "$ne" && node cli/nanoeval.ts systems compare "$dir" --base "build-$prev" --head "build-$new" >&2)
+    elif [ -f "$D/sweeps/$t.build-$prev" ]; then
+      last=$(cat "$D/sweeps/$t.build-$prev")
+      (cd "$ne" && node cli/nanoeval.ts systems compare "$last" "$dir" --base "build-$prev" --head "build-$new" >&2)
+    else
+      say "$t: no sweep of build-$prev recorded in $D/sweeps; compare by hand with the previous release's run dir"
+    fi
+  done
+}
+cli_version() {
+  local rev
+  rev=$(gh api "repos/$TS_REPO/contents/sdk-revision.json?ref=$(full_commit "$1")" -q .content | base64 -d | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"][:12])')
+  echo "$rev"
 }
 
 train() {

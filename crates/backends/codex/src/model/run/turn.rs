@@ -898,6 +898,7 @@ impl ModelRun {
         let mut reprompted = false;
         let mut nudged = false;
         let mut finish_checked = false;
+        let mut early_rounds = 0_u32;
         loop {
             let call_index = self.stats.model_calls + 1;
             if !first_batch {
@@ -1079,6 +1080,30 @@ impl ModelRun {
                         } else {
                             nanocode_tool_host::deadline::finish_notice(self.deadline.as_ref(), false)
                         },
+                    )?;
+                    session.conversation.clear_delta();
+                    continue;
+                }
+                if self.config.headless
+                    && self.finish_check
+                    && finish_checked
+                    && nanocode_tool_host::deadline::early_finish_round(
+                        self.deadline.as_ref(),
+                        early_rounds,
+                        self.config.early_finish_rounds,
+                    )
+                {
+                    early_rounds += 1;
+                    nanocode_trace::info!(
+                        target: "nanocode",
+                        model_call_index = call_index,
+                        early_rounds,
+                        "headless turn ended before half of its time; checking the work again"
+                    );
+                    self.append_notice(
+                        &mut session.conversation,
+                        call_index,
+                        &nanocode_tool_host::deadline::early_finish_notice(self.deadline.as_ref()),
                     )?;
                     session.conversation.clear_delta();
                     continue;

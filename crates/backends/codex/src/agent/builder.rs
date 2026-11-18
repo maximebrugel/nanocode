@@ -270,6 +270,12 @@ impl<F> CodexBuilder<F> {
     }
 
     #[must_use]
+    pub const fn early_finish_rounds(mut self, rounds: u32) -> Self {
+        self.config.early_finish_rounds = rounds;
+        self
+    }
+
+    #[must_use]
     pub const fn verification_requested(mut self, requested: bool) -> Self {
         self.config.verification_requested = requested;
         self

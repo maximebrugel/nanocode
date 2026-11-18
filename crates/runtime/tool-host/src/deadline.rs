@@ -377,6 +377,19 @@ pub const PERSISTENCE_NUDGE: &str = concat!(
     "</persistence>"
 );
 
+const EARLY_FINISH: &str = " You are finishing before half of the time for this task has passed. Use the time that is left to check the work again, as a reviewer who did not write it:\n- Read the task statement again, sentence by sentence, and list every requirement it states: each output and its exact path, format and interface, each named case, limit and target.\n- Check each requirement against the real result by running it the way the task describes, on inputs you made that differ from the given example. A test you wrote alone, or reasoning about the code, does not show that the result works.\n- Where a requirement falls short or is unverified, fix it, trying a different approach if the last one did not get there.\nWhen every requirement holds, reply with your final message.\n</system-reminder>";
+
+#[must_use]
+pub fn early_finish_round(deadline: Option<&Reminders>, used: u32, allowed: u32) -> bool {
+    used < allowed && deadline.is_some_and(|reminders| !reminders.first_passed())
+}
+
+#[must_use]
+pub fn early_finish_notice(deadline: Option<&Reminders>) -> String {
+    let time = deadline.map_or_else(String::new, |reminders| format!(" {}", reminders.remain()));
+    format!("{FINISH_OPEN}{time}{EARLY_FINISH}")
+}
+
 pub const FRESH_ATTEMPT_MARK: &str = "[fresh attempt]";
 
 #[must_use]

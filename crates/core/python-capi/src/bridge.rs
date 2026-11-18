@@ -321,6 +321,29 @@ fn forward_slots(pointer: *mut Type, class: &Py<PyType>, vm: &VirtualMachine) {
                 (*pointer).dealloc = Some(crate::extra::dealloc_free);
             }
         }
+        let sequence = [
+            types.str_type,
+            types.bytes_type,
+            types.bytearray_type,
+            types.list_type,
+            types.tuple_type,
+        ]
+        .iter()
+        .any(|builtin| class.is(*builtin));
+        if sequence && (*pointer).as_sequence.is_null() {
+            (*pointer).as_sequence = Box::leak(Box::new(SequenceMethods {
+                length: Some(crate::api::PySequence_Size),
+                concat: Some(crate::extra::PySequence_Concat),
+                repeat: Some(crate::api::PySequence_Repeat),
+                item: Some(crate::api::PySequence_GetItem),
+                was_slice: std::ptr::null(),
+                ass_item: None,
+                was_ass_slice: std::ptr::null(),
+                contains: None,
+                inplace_concat: None,
+                inplace_repeat: None,
+            }));
+        }
         if class.is(types.object_type) && (*pointer).hash.is_none() {
             (*pointer).hash = Some(crate::extra::hash_identity);
         }
@@ -629,6 +652,21 @@ fn instance(vm: &VirtualMachine, pointer: *mut Object) -> PyResult<PyObjectRef> 
             .has_feature(PyTypeFlags::HAS_DICT)
             .then(|| vm.ctx.new_dict())
     });
+    let flags = unsafe { flags(pointer) };
+    if flags & TPFLAGS_UNICODE_SUBCLASS != 0 && class.fast_issubclass(vm.ctx.types.str_type) {
+        let text = PyStr::from(units(vm, pointer)?);
+        let object: PyObjectRef = PyRef::new_ref(text, class, dict).into();
+        attach(pointer, &object);
+        return Ok(object);
+    }
+    if flags & TPFLAGS_BYTES_SUBCLASS != 0 && class.fast_issubclass(vm.ctx.types.bytes_type) {
+        let bytes = pointer.cast::<Bytes>();
+        let length = unsafe { (*bytes).base.size.unsigned_abs() };
+        let data = unsafe { slice::from_raw_parts((*bytes).data.as_ptr().cast::<u8>(), length) };
+        let object: PyObjectRef = PyRef::new_ref(PyBytes::from(data.to_vec()), class, dict).into();
+        attach(pointer, &object);
+        return Ok(object);
+    }
     let wrapper = PyRef::new_ref(
         CObject {
             pointer: AtomicPtr::new(pointer),

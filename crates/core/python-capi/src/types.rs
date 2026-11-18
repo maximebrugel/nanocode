@@ -975,8 +975,11 @@ pub fn c_type(vm: &VirtualMachine, ty: *mut Type) -> PyResult<PyTypeRef> {
         c_type(vm, base_type)?
     };
     let string = vm.ctx.types.str_type;
+    let bytes = vm.ctx.types.bytes_type;
     let base = if primary.fast_issubclass(string) || listed.iter().any(|entry| entry.is(string)) {
         string.to_owned()
+    } else if primary.fast_issubclass(bytes) || listed.iter().any(|entry| entry.is(bytes)) {
+        bytes.to_owned()
     } else if primary.fast_issubclass(CObject::class(&vm.ctx))
         || primary.fast_issubclass(vm.ctx.types.type_type)
     {

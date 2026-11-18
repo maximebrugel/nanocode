@@ -453,9 +453,73 @@ static int type_error(const char *name, const char *expected, PyObject *got) {
     return -1;
 }
 
+static int convert(PyObject *arg, const char **format, va_list *va, const char *name);
+
+static int convert_tuple(PyObject *arg, const char **format, va_list *va, const char *name) {
+    const char *start = *format;
+    Py_ssize_t count = 0;
+    int depth = 0;
+    for (const char *at = start; *at && !(depth == 0 && *at == ')'); at++) {
+        if (*at == '(') {
+            if (depth == 0)
+                count++;
+            depth++;
+        } else if (*at == ')')
+            depth--;
+        else if (depth == 0 && *at != '#' && *at != '&' && *at != '!' && *at != '*' && *at != '|')
+            count++;
+    }
+    if (!PySequence_Check(arg) || PyUnicode_Check(arg) || PyBytes_Check(arg)) {
+        PyErr_Format(PyExc_TypeError, "%s() argument must be sequence of length %zd, not %T", name, count, arg);
+        return -1;
+    }
+    Py_ssize_t length = PySequence_Size(arg);
+    if (length < 0)
+        return -1;
+    if (length != count) {
+        PyErr_Format(PyExc_TypeError, "%s() argument must be sequence of length %zd, not %zd", name, count, length);
+        return -1;
+    }
+    for (Py_ssize_t index = 0; index < count; index++) {
+        PyObject *item = PySequence_GetItem(arg, index);
+        if (!item)
+            return -1;
+        int result = convert(item, format, va, name);
+        Py_DECREF(item);
+        if (result < 0)
+            return -1;
+    }
+    if (**format != ')') {
+        PyErr_Format(PyExc_SystemError, "%s(): bad tuple format", name);
+        return -1;
+    }
+    (*format)++;
+    return 0;
+}
+
 static int convert(PyObject *arg, const char **format, va_list *va, const char *name) {
     char code = *(*format)++;
     switch (code) {
+    case '(':
+        return convert_tuple(arg, format, va, name);
+    case 'c': {
+        if (PyBytes_Check(arg) && PyBytes_GET_SIZE(arg) == 1) {
+            *va_arg(*va, char *) = PyBytes_AS_STRING(arg)[0];
+            return 0;
+        }
+        if (PyByteArray_Check(arg) && PyByteArray_Size(arg) == 1) {
+            *va_arg(*va, char *) = PyByteArray_AsString(arg)[0];
+            return 0;
+        }
+        return type_error(name, "a byte string of length 1", arg);
+    }
+    case 'D': {
+        Py_complex value = PyComplex_AsCComplex(arg);
+        if (value.real == -1.0 && PyErr_Occurred())
+            return -1;
+        *va_arg(*va, Py_complex *) = value;
+        return 0;
+    }
     case 'O': {
         if (**format == '!') {
             (*format)++;
@@ -596,6 +660,13 @@ static int convert(PyObject *arg, const char **format, va_list *va, const char *
 
 static void skip(const char **format, va_list *va) {
     char code = *(*format)++;
+    if (code == '(') {
+        while (**format && **format != ')')
+            skip(format, va);
+        if (**format == ')')
+            (*format)++;
+        return;
+    }
     if (code == 'O' && (**format == '!' || **format == '&')) {
         (*format)++;
         (void)va_arg(*va, void *);

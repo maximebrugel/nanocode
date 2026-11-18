@@ -357,11 +357,59 @@ pub extern "C" fn PyErr_CheckSignals() -> c_int {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn PyErr_WarnEx(
-    _category: *mut Object,
-    _message: *const c_char,
-    _level: isize,
+    category: *mut Object,
+    message: *const c_char,
+    level: isize,
 ) -> c_int {
-    0
+    status(|vm| {
+        let category = if category.is_null() {
+            vm.ctx.exceptions.runtime_warning.to_owned().into()
+        } else {
+            arg(vm, category)?
+        };
+        let message = vm.ctx.new_str(String::from_utf8_lossy(
+            unsafe { CStr::from_ptr(message) }.to_bytes(),
+        ));
+        vm.import("warnings", 0)?
+            .get_attr("warn", vm)?
+            .call((message, category, level.max(1)), vm)
+            .map(drop)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn PyErr_WarnExplicit(
+    category: *mut Object,
+    message: *const c_char,
+    filename: *const c_char,
+    lineno: c_int,
+    module: *const c_char,
+    registry: *mut Object,
+) -> c_int {
+    status(|vm| {
+        let category = if category.is_null() {
+            vm.ctx.exceptions.runtime_warning.to_owned().into()
+        } else {
+            arg(vm, category)?
+        };
+        let string = |pointer: *const c_char| -> PyObjectRef {
+            if pointer.is_null() {
+                vm.ctx.none()
+            } else {
+                vm.ctx
+                    .new_str(String::from_utf8_lossy(unsafe { CStr::from_ptr(pointer) }.to_bytes()))
+                    .into()
+            }
+        };
+        let registry = if registry.is_null() { vm.ctx.none() } else { arg(vm, registry)? };
+        vm.import("warnings", 0)?
+            .get_attr("warn_explicit", vm)?
+            .call(
+                (string(message), category, string(filename), lineno, string(module), registry),
+                vm,
+            )
+            .map(drop)
+    })
 }
 
 #[unsafe(no_mangle)]

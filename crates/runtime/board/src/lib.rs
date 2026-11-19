@@ -82,6 +82,11 @@ pub enum Op {
         task: TaskId,
         body: String,
     },
+    Relabel {
+        task: TaskId,
+        set: BTreeMap<String, String>,
+        unset: BTreeSet<String>,
+    },
     Grant {
         grant: access::Grant,
     },
@@ -100,7 +105,8 @@ impl Op {
             | Self::Release { task, .. }
             | Self::Finish { task, .. }
             | Self::Cancel { task, .. }
-            | Self::Reply { task, .. } => Some(task),
+            | Self::Reply { task, .. }
+            | Self::Relabel { task, .. } => Some(task),
             Self::Grant { .. } | Self::Revoke { .. } | Self::Charter {} => None,
         }
     }
@@ -187,6 +193,10 @@ pub enum Change {
     Replied {
         by: String,
         body: String,
+    },
+    Relabeled {
+        set: BTreeMap<String, String>,
+        unset: BTreeSet<String>,
     },
 }
 
@@ -394,7 +404,9 @@ impl Fold {
                 Some(task) if task.phase.terminal() => Err(Rejection::Terminal),
                 Some(_) => Ok(()),
             },
-            Op::Reply { task, .. } => self.tasks.get(task).map(drop).ok_or(Rejection::UnknownTask),
+            Op::Reply { task, .. } | Op::Relabel { task, .. } => {
+                self.tasks.get(task).map(drop).ok_or(Rejection::UnknownTask)
+            }
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => Ok(()),
         }
     }
@@ -560,6 +572,19 @@ impl Fold {
                 Change::Replied {
                     by: event.by.clone(),
                     body: body.clone(),
+                }
+            }
+            Op::Relabel { set, unset, .. } => {
+                if let Some(task) = self.tasks.get_mut(&id) {
+                    let labels = &mut task.spec.labels;
+                    if !mutated(Mutation::RelabelKeepsUnset) {
+                        labels.retain(|key, _| !unset.contains(key));
+                    }
+                    labels.extend(set.clone());
+                }
+                Change::Relabeled {
+                    set: set.clone(),
+                    unset: unset.clone(),
                 }
             }
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => return,

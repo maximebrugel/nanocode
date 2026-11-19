@@ -23,7 +23,7 @@ use crate::{
     rng::{FNV_OFFSET, Rng, fnv},
 };
 
-pub const ALL: [BoardRule; 13] = [
+pub const ALL: [BoardRule; 14] = [
     BoardRule::ConsumeIgnoresCursor,
     BoardRule::ConsumeSplits,
     BoardRule::WatchOutOfOrder,
@@ -37,6 +37,7 @@ pub const ALL: [BoardRule; 13] = [
     BoardRule::FireIgnoresStop,
     BoardRule::UnscheduleIgnored,
     BoardRule::WaitSkipsPoll,
+    BoardRule::WatchUnchecked,
 ];
 
 pub const fn name(rule: BoardRule) -> &'static str {
@@ -54,13 +55,14 @@ pub const fn name(rule: BoardRule) -> &'static str {
         BoardRule::FireIgnoresStop => "fire_ignores_stop",
         BoardRule::UnscheduleIgnored => "unschedule_ignored",
         BoardRule::WaitSkipsPoll => "wait_skips_poll",
+        BoardRule::WatchUnchecked => "watch_unchecked",
         _ => "board",
     }
 }
 
-const TALLY: &str = "tally";
-const ECHO: &str = "echo";
-const CLOCK: &str = "clock";
+pub const TALLY: &str = "agent:tally";
+pub const ECHO: &str = "agent:echo";
+pub const CLOCK: &str = "agent:clock";
 
 static TALLIED: AtomicU64 = AtomicU64::new(0);
 static ECHOED: AtomicU64 = AtomicU64::new(0);
@@ -303,7 +305,7 @@ fn quiet(world: &World, board: &Board) -> bool {
 }
 
 async fn tally(world: &World, epoch: u64, index: u64) {
-    let mut board = world.open(&format!("tally{index}.e{epoch}")).await;
+    let mut board = world.open(&format!("{TALLY}+i{index}e{epoch}")).await;
     let mut rng = Rng::derive(world.watched.shape.seed, &format!("board tally {index} {epoch}"));
     loop {
         if let Err(error) = board.refresh().await {
@@ -373,7 +375,7 @@ impl Handler for Echo<'_> {
 }
 
 async fn echo(world: &World, epoch: u64, index: u64) {
-    let mut board = world.open(&format!("echo{index}.e{epoch}")).await;
+    let mut board = world.open(&format!("{ECHO}+i{index}e{epoch}")).await;
     let timer = Timing(Arc::clone(&world.clock));
     let shape = &world.watched.shape;
     let watcher = Registered {
@@ -400,7 +402,7 @@ async fn echo(world: &World, epoch: u64, index: u64) {
 }
 
 async fn clock(world: &World, epoch: u64) {
-    let mut board = world.open(&format!("clock.e{epoch}")).await;
+    let mut board = world.open(CLOCK).await;
     let shape = &world.watched.shape;
     let mut rng = Rng::derive(shape.seed, &format!("board clock {epoch}"));
     loop {
@@ -416,7 +418,6 @@ async fn clock(world: &World, epoch: u64) {
                     None => {
                         let plan = Plan {
                             id: every.id.clone(),
-                            by: CLOCK.to_owned(),
                             send: Op::Reply {
                                 task: goal(),
                                 body: format!("tick:{}", every.id),
@@ -432,7 +433,7 @@ async fn clock(world: &World, epoch: u64) {
                         if schedule.ended.is_none()
                             && every.cancel_ms.is_some_and(|at| world.now_ms() >= at) =>
                     {
-                        board.unschedule(world.now_ms(), &every.id, CLOCK).await.map(drop)
+                        board.unschedule(world.now_ms(), &every.id).await.map(drop)
                     }
                     Some(_) => Ok(()),
                 };
@@ -476,7 +477,7 @@ fn awaited(fold: &Fold, entry: &Entry) -> bool {
 }
 
 async fn waiter(world: &World, epoch: u64) {
-    let mut board = world.open(&format!("waiter.e{epoch}")).await;
+    let mut board = world.open(&format!("agent:waiter+e{epoch}")).await;
     let timer = Timing(Arc::clone(&world.clock));
     let polling = Polling {
         timer: &timer,
@@ -800,7 +801,7 @@ fn echoes(world: &World, fold: &Fold) -> Result<(), String> {
 
 fn ticks(world: &World, fold: &Fold, cancelled: &BTreeMap<String, u64>) -> Result<(), String> {
     for every in &world.watched.shape.schedules {
-        let prefix = format!("{}#", every.id);
+        let prefix = format!("fire/{}/", every.id);
         let fires = fold
             .entries()
             .iter()

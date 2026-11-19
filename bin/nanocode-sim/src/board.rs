@@ -11,8 +11,9 @@ use std::{
 };
 
 use nanocode_board::{
-    Applied, Board, BoardError, ClaimId, NewTask, Op, Outcome, Phase, Rejection, TaskId,
+    Applied, Board, BoardError, ClaimId, EventId, NewTask, Op, Outcome, Phase, Rejection, TaskId,
     sim::{self as board_sim, Mutation as BoardRule},
+    watch::Step,
 };
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_sync::Slot;
@@ -854,6 +855,7 @@ struct Reference {
     replies: BTreeMap<String, Vec<String>>,
     gate: access::Gate,
     verdicts: BTreeMap<String, bool>,
+    schedules: BTreeMap<String, (String, Op, bool)>,
 }
 
 impl Reference {
@@ -960,6 +962,47 @@ impl Reference {
             }
             Op::Renew { .. } | Op::Release { .. } | Op::Finish { .. } | Op::Reply { .. } => false,
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => true,
+            Op::Watch(_) => false,
+        }
+    }
+
+    fn inner(&mut self, fold: &nanocode_board::Fold, id: String, by: &str, now: u64, op: Op) {
+        let accepted = self.gate.allows(by, &op, &self.tasks) && self.step(&id, now, op.clone());
+        if accepted {
+            self.gate.record(by, &id, &op);
+        }
+        if accepted || fold.outcome(&EventId(id.clone())).is_some() {
+            self.verdicts.insert(id, accepted);
+        }
+    }
+
+    fn watch(&mut self, fold: &nanocode_board::Fold, id: &str, by: &str, now: u64, step: &Step) {
+        match step {
+            Step::Consume { effects, .. } => {
+                for (index, op) in effects.iter().enumerate() {
+                    self.inner(fold, format!("{id}/{index}"), by, now, op.clone());
+                }
+            }
+            Step::Schedule { id: schedule, by: made, send, every_ms, .. } => {
+                self.schedules.insert(schedule.clone(), (made.clone(), (**send).clone(), every_ms.is_some()));
+            }
+            Step::Fire { id: schedule, n } => {
+                let Some((made, send, repeating)) = self.schedules.get(schedule).cloned() else {
+                    return;
+                };
+                let send = match send {
+                    Op::Post { mut task } if repeating => {
+                        task.id = TaskId(format!("{}/{n}", task.id));
+                        Op::Post { task }
+                    }
+                    send => send,
+                };
+                self.inner(fold, format!("fire/{schedule}/{n}"), &made, now, send);
+            }
+            Step::Unschedule { id: schedule, .. } => {
+                self.schedules.remove(schedule);
+            }
+            Step::Watch { .. } | Step::Unwatch { .. } | Step::Take { .. } | Step::Fail { .. } | Step::Bury { .. } => {}
         }
     }
 
@@ -971,7 +1014,12 @@ impl Reference {
             replies: BTreeMap::new(),
             gate: access::Gate::default(),
             verdicts: BTreeMap::new(),
+            schedules: BTreeMap::new(),
         };
+        let mut fold = nanocode_board::Fold::new();
+        for (seq, body) in rows {
+            fold.apply(*seq, body).map_err(|error| format!("reference refold: {error}"))?;
+        }
         let mut now = 0;
         for (seq, body) in rows {
             let event: nanocode_board::Event =
@@ -980,6 +1028,15 @@ impl Reference {
                 continue;
             }
             now = now.max(event.at_ms);
+            if let Op::Watch(step) = &event.op {
+                let accepted = fold.outcome(&event.id).is_some_and(Result::is_ok)
+                    && model.gate.allows(&event.by, &event.op, &model.tasks);
+                if accepted {
+                    model.watch(&fold, &event.id.0, &event.by, now, step);
+                }
+                model.verdicts.insert(event.id.0, accepted);
+                continue;
+            }
             let accepted = model.gate.allows(&event.by, &event.op, &model.tasks)
                 && model.step(&event.id.0, now, event.op.clone());
             if accepted {

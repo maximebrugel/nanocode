@@ -1,0 +1,24 @@
+/home/hand/wt/filelog/target-base/release/build/serde_core/add759fbd7c4c5a6/out/serde_core-add759fbd7c4c5a6.d: /home/hand/wt/base/crates/patches/serde_core/src/lib.rs /home/hand/wt/base/crates/patches/serde_core/src/crate_root.rs /home/hand/wt/base/crates/patches/serde_core/src/macros.rs /home/hand/wt/base/crates/patches/serde_core/src/de/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/de/value.rs /home/hand/wt/base/crates/patches/serde_core/src/de/ignored_any.rs /home/hand/wt/base/crates/patches/serde_core/src/de/impls.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/fmt.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/impls.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/impossible.rs /home/hand/wt/base/crates/patches/serde_core/src/format.rs /home/hand/wt/base/crates/patches/serde_core/src/private/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/private/content.rs /home/hand/wt/base/crates/patches/serde_core/src/private/seed.rs /home/hand/wt/base/crates/patches/serde_core/src/private/doc.rs /home/hand/wt/base/crates/patches/serde_core/src/private/size_hint.rs /home/hand/wt/base/crates/patches/serde_core/src/private/string.rs
+
+/home/hand/wt/filelog/target-base/release/build/serde_core/add759fbd7c4c5a6/out/libserde_core-add759fbd7c4c5a6.rlib: /home/hand/wt/base/crates/patches/serde_core/src/lib.rs /home/hand/wt/base/crates/patches/serde_core/src/crate_root.rs /home/hand/wt/base/crates/patches/serde_core/src/macros.rs /home/hand/wt/base/crates/patches/serde_core/src/de/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/de/value.rs /home/hand/wt/base/crates/patches/serde_core/src/de/ignored_any.rs /home/hand/wt/base/crates/patches/serde_core/src/de/impls.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/fmt.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/impls.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/impossible.rs /home/hand/wt/base/crates/patches/serde_core/src/format.rs /home/hand/wt/base/crates/patches/serde_core/src/private/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/private/content.rs /home/hand/wt/base/crates/patches/serde_core/src/private/seed.rs /home/hand/wt/base/crates/patches/serde_core/src/private/doc.rs /home/hand/wt/base/crates/patches/serde_core/src/private/size_hint.rs /home/hand/wt/base/crates/patches/serde_core/src/private/string.rs
+
+/home/hand/wt/filelog/target-base/release/build/serde_core/add759fbd7c4c5a6/out/libserde_core-add759fbd7c4c5a6.rmeta: /home/hand/wt/base/crates/patches/serde_core/src/lib.rs /home/hand/wt/base/crates/patches/serde_core/src/crate_root.rs /home/hand/wt/base/crates/patches/serde_core/src/macros.rs /home/hand/wt/base/crates/patches/serde_core/src/de/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/de/value.rs /home/hand/wt/base/crates/patches/serde_core/src/de/ignored_any.rs /home/hand/wt/base/crates/patches/serde_core/src/de/impls.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/fmt.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/impls.rs /home/hand/wt/base/crates/patches/serde_core/src/ser/impossible.rs /home/hand/wt/base/crates/patches/serde_core/src/format.rs /home/hand/wt/base/crates/patches/serde_core/src/private/mod.rs /home/hand/wt/base/crates/patches/serde_core/src/private/content.rs /home/hand/wt/base/crates/patches/serde_core/src/private/seed.rs /home/hand/wt/base/crates/patches/serde_core/src/private/doc.rs /home/hand/wt/base/crates/patches/serde_core/src/private/size_hint.rs /home/hand/wt/base/crates/patches/serde_core/src/private/string.rs
+
+/home/hand/wt/base/crates/patches/serde_core/src/lib.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/crate_root.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/macros.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/de/mod.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/de/value.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/de/ignored_any.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/de/impls.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/ser/mod.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/ser/fmt.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/ser/impls.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/ser/impossible.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/format.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/private/mod.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/private/content.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/private/seed.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/private/doc.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/private/size_hint.rs:
+/home/hand/wt/base/crates/patches/serde_core/src/private/string.rs:

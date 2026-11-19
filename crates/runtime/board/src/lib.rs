@@ -743,6 +743,27 @@ impl Board {
         Ok(board)
     }
 
+    pub async fn resume(
+        host: Arc<dyn LogHost>,
+        scope: &str,
+        identity: access::Identity,
+        fold: Fold,
+    ) -> Result<Self, BoardError> {
+        let mut board = Self {
+            host,
+            scope: scope.to_owned(),
+            writer: identity.actor().to_string(),
+            identity,
+            minted: 0,
+            fold,
+        };
+        board.refresh().await?;
+        if !mutated(Mutation::MintedRestarts) {
+            board.minted = board.fold.minted(&board.writer);
+        }
+        Ok(board)
+    }
+
     pub const fn fold(&self) -> &Fold {
         &self.fold
     }

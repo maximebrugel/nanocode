@@ -49,7 +49,7 @@ pub struct Request {
     pub method: Method,
     pub url: String,
     pub headers: HeaderMap,
-    pub body: Vec<u8>,
+    pub body: nanocode_bytes::Bytes,
 }
 
 pub struct Response {

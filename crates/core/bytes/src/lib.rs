@@ -391,6 +391,12 @@ impl BytesMut {
     }
 }
 
+impl From<BytesMut> for Vec<u8> {
+    fn from(bytes: BytesMut) -> Self {
+        bytes.0
+    }
+}
+
 impl Deref for BytesMut {
     type Target = [u8];
 

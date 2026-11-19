@@ -201,11 +201,11 @@ pub async fn intruder(world: &World, epoch: u64) {
             6 => forge(world, EVE, key(EVE), Op::Revoke { grant: keyed("grant:agents") }).await,
             7 if fold.outcome(&keyed("grant:lock")).is_some_and(Result::is_ok) => probe(world, epoch).await,
             8 => {
-                let key = Key::Cursor { actor: watching::TALLY.to_owned(), scope: None };
-                let from = fold.position(&key);
+                let cursor = Key::Cursor { actor: watching::TALLY.to_owned(), scope: None };
+                let from = fold.position(&cursor);
                 let to = raw(world).await.0.last().map_or(0, |(seq, _)| *seq);
                 if to > from {
-                    let step = Step::Consume { key, lease: None, from, to, effects: Vec::new() };
+                    let step = Step::Consume { key: cursor, lease: None, from, to, effects: Vec::new() };
                     forge(world, EVE, key(EVE), Op::Watch(step)).await;
                 }
             }

@@ -793,20 +793,37 @@ impl Board {
             seq: self.fold.next,
             detail: error.to_string(),
         })?;
+        let mut row = [(0, body)];
+        let mut fresh = false;
         loop {
-            self.refresh().await?;
             if let Some(verdict) = self.fold.outcome(&event.id) {
                 return self.settled(&event.id, verdict.clone());
             }
-            self.fold
-                .admit(&event.by, at_ms, &event.op)
-                .map_err(BoardError::Rejected)?;
+            if let Err(rejection) = self.fold.admit(&event.by, at_ms, &event.op) {
+                if fresh {
+                    return Err(BoardError::Rejected(rejection));
+                }
+                self.refresh().await?;
+                fresh = true;
+                continue;
+            }
             let seq = self.fold.next;
-            let appended = self.host.append(&self.scope, &[(seq, body.clone())]).await;
+            row[0].0 = seq;
+            let appended = self.host.append(&self.scope, &row).await;
             if let Err(error) = &appended
                 && mutated(Mutation::ErrorsLoseWrites)
             {
                 return Err(BoardError::Store(error.clone()));
+            }
+            if appended.is_ok() {
+                self.fold.apply(seq, &row[0].1)?;
+                if let Some(verdict) = self.fold.outcome(&event.id) {
+                    return self.settled(&event.id, verdict.clone());
+                }
+                return Err(BoardError::Corrupt {
+                    seq,
+                    detail: format!("the store acknowledged {} but holds another row", event.id),
+                });
             }
             match self.refresh().await {
                 Ok(()) => {}
@@ -818,26 +835,17 @@ impl Board {
                 }
                 Err(error) => return Err(error),
             }
+            fresh = true;
             if let Some(verdict) = self.fold.outcome(&event.id) {
                 return self.settled(&event.id, verdict.clone());
             }
-            match appended {
-                Ok(()) => {
-                    return Err(BoardError::Corrupt {
-                        seq,
-                        detail: format!(
-                            "the store acknowledged {} but holds another row",
-                            event.id
-                        ),
-                    });
-                }
-                Err(error) if self.fold.next <= seq => {
-                    return Err(BoardError::Unsettled {
-                        event: event.id,
-                        error,
-                    });
-                }
-                Err(_) => {}
+            if let Err(error) = appended
+                && self.fold.next <= seq
+            {
+                return Err(BoardError::Unsettled {
+                    event: event.id,
+                    error,
+                });
             }
         }
     }

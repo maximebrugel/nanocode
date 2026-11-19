@@ -59,9 +59,8 @@ impl ContextManager {
     pub(super) fn resume(items: Vec<ResponseItem>, loaded: Option<ResponseHistory>) -> Self {
         let mut context = Self::new(Vec::new());
         let len = items.len();
-        let truncated = context.record(items);
+        context.record(items, None);
         if let Some(loaded) = loaded
-            && !truncated
             && context.items.len() == len
             && loaded.len() == len
         {
@@ -95,14 +94,14 @@ impl ContextManager {
     }
 
     pub fn record_items(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
-        self.record(items);
+        self.record(items, Some(self.tool_output_token_limit));
     }
 
-    fn record(&mut self, items: impl IntoIterator<Item = ResponseItem>) -> bool {
-        let token_limit = self.tool_output_token_limit;
-        let mut truncated = false;
+    fn record(&mut self, items: impl IntoIterator<Item = ResponseItem>, token_limit: Option<usize>) {
         for mut item in items.into_iter().filter(is_api_item) {
-            truncated |= truncate_tool_output(&mut item, token_limit);
+            if let Some(token_limit) = token_limit {
+                truncate_tool_output(&mut item, token_limit);
+            }
             if let ResponseItem::CustomToolCallOutput {
                 call_id,
                 name: Some(_),
@@ -131,7 +130,6 @@ impl ContextManager {
             }
             self.items.push(item);
         }
-        truncated
     }
 
     pub fn commit_tail(&mut self) {
@@ -797,27 +795,26 @@ const fn is_api_item(item: &ResponseItem) -> bool {
     )
 }
 
-fn truncate_tool_output(item: &mut ResponseItem, token_limit: usize) -> bool {
+fn truncate_tool_output(item: &mut ResponseItem, token_limit: usize) {
     let (ResponseItem::FunctionCallOutput { output, .. }
     | ResponseItem::CustomToolCallOutput { output, .. }) = item
     else {
-        return false;
+        return;
     };
     match output {
         FunctionOutputBody::Text(text) => {
             let truncated = compaction::truncate_middle_with_token_budget(text, token_limit);
-            let changed = *truncated != **text;
-            *text = truncated.into_boxed_str();
-            changed
+            if *truncated != **text {
+                *text = truncated.into_boxed_str();
+            }
         }
         FunctionOutputBody::Content(content) => truncate_output_content(content, token_limit),
     }
 }
 
-fn truncate_output_content(items: &mut Vec<FunctionOutputContent>, token_limit: usize) -> bool {
+fn truncate_output_content(items: &mut Vec<FunctionOutputContent>, token_limit: usize) {
     let mut remaining = token_limit;
     let mut omitted_text_items = 0usize;
-    let mut truncated = false;
     let mut output = Vec::with_capacity(items.len());
     for mut item in std::mem::take(items) {
         match &mut item {
@@ -833,7 +830,6 @@ fn truncate_output_content(items: &mut Vec<FunctionOutputContent>, token_limit: 
                 } else {
                     *text = compaction::truncate_middle_with_token_budget(text, remaining)
                         .into_boxed_str();
-                    truncated = true;
                     if text.is_empty() {
                         omitted_text_items += 1;
                     } else {
@@ -845,7 +841,7 @@ fn truncate_output_content(items: &mut Vec<FunctionOutputContent>, token_limit: 
             FunctionOutputContent::InputImage { .. }
             | FunctionOutputContent::InputImageFile { .. }
             | FunctionOutputContent::EncryptedContent { .. } => output.push(item),
-            FunctionOutputContent::InputAudio { .. } => truncated = true,
+            FunctionOutputContent::InputAudio { .. } => {}
         }
     }
     if omitted_text_items > 0 {
@@ -854,5 +850,4 @@ fn truncate_output_content(items: &mut Vec<FunctionOutputContent>, token_limit: 
         });
     }
     *items = output;
-    truncated || omitted_text_items > 0
 }

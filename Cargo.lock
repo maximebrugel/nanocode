@@ -333,6 +333,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-board"
+version = "0.7.0"
+dependencies = [
+ "nanocode-durability-core",
+ "nanocode-turnlog",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nanocode-board-sync"
+version = "0.7.0"
+dependencies = [
+ "nanocode-board",
+ "nanocode-durability-core",
+ "nanocode-sync",
+ "nanocode-turnlog",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nanocode-bytes"
 version = "0.7.0"
 
@@ -837,6 +859,8 @@ dependencies = [
  "graviola",
  "nanocode",
  "nanocode-agent-core",
+ "nanocode-board",
+ "nanocode-board-sync",
  "nanocode-bytes",
  "nanocode-code-mode",
  "nanocode-code-mode-engine",

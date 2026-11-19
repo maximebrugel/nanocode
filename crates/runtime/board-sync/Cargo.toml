@@ -1,0 +1,39 @@
+[package]
+autotests = false
+autobenches = false
+name = "nanocode-board-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Two-way sync between a nanocode board and outside threads: webhooks in, platform calls out, exactly once"
+
+[dependencies]
+nanocode-board.workspace = true
+nanocode-durability-core.workspace = true
+nanocode-turnlog.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dev-dependencies]
+nanocode-sync.workspace = true
+
+[[test]]
+name = "adapters"
+path = "tests/adapters.rs"
+
+[[bench]]
+name = "sync"
+path = "benches/sync.rs"
+harness = false

@@ -13,6 +13,7 @@ use crate::rng::Rng;
 pub const OWNER: &str = "user:lead";
 pub const EVE: &str = "user:eve";
 pub const THIEF: &str = "agent:w9";
+pub const IVY: &str = "user:ivy";
 pub const SOURCE: &str = "source:github";
 pub const LOCKED: &str = "repo0";
 
@@ -47,6 +48,7 @@ pub fn grants() -> Vec<(&'static str, Grant)> {
         ("grant:eve", grant(Who::Principal(EVE.to_owned()), "*", &[Can::Read, Can::Label])),
         ("grant:lock", grant(Who::Principal(EVE.to_owned()), &format!("{LOCKED}/"), &[])),
         ("grant:temp", grant(Who::Principal(EVE.to_owned()), "goal", &[Can::Post])),
+        ("grant:ivy", grant(Who::Principal(IVY.to_owned()), "*", &[Can::Read])),
     ]
 }
 
@@ -213,6 +215,25 @@ pub async fn intruder(world: &World, epoch: u64) {
             _ => {}
         }
     }
+    relabel(world, epoch, span).await;
+}
+
+async fn relabel(world: &World, epoch: u64, span: u64) {
+    let mut rng = Rng::derive(world.shape.seed ^ epoch.rotate_left(32), "board labels");
+    for round in 0..rng.range(0, 5) {
+        world.nap(rng.range(0, span)).await;
+        let (_, fold) = raw(world).await;
+        let tasks = fold.tasks().keys().cloned().collect::<Vec<_>>();
+        if tasks.is_empty() {
+            continue;
+        }
+        let task = tasks[rng.pick(tasks.len())].clone();
+        let by = [OWNER, EVE, IVY, SOURCE][rng.pick(4)];
+        let keys = ["step", "k0", "k1"];
+        let set = BTreeMap::from([(keys[1 + rng.pick(2)].to_owned(), format!("v{epoch}.{round}"))]);
+        let unset = BTreeSet::from([keys[rng.pick(3)].to_owned()]);
+        forge(world, by, format!("{by}#labels.e{epoch}.{round}"), Op::Relabel { task, set, unset }).await;
+    }
 }
 
 fn spot(pattern: &str, target: &str) -> Option<(u8, usize)> {
@@ -343,6 +364,17 @@ impl Gate {
                 .all(|under| self.has(by, under, Can::Manage, false))
     }
 
+    fn chain(&self, by: &str, task: &TaskId, tasks: &BTreeMap<String, (Option<String>, Vec<String>, Expect)>) -> bool {
+        let mut at = Some(task.0.clone());
+        while let Some(id) = at {
+            if self.posters.get(&id).is_some_and(|poster| covers(by, poster)) {
+                return true;
+            }
+            at = tasks.get(&id).and_then(|(parent, _, _)| parent.clone());
+        }
+        false
+    }
+
     pub fn allows(&self, by: &str, op: &Op, tasks: &BTreeMap<String, (Option<String>, Vec<String>, Expect)>) -> bool {
         if !actor_ok(by) {
             return false;
@@ -373,15 +405,7 @@ impl Gate {
             Op::Cancel { task, .. }
             | Op::Tasks(
                 TaskOp::Block { task, claim: None, .. } | TaskOp::Unblock { task } | TaskOp::Reopen { task } | TaskOp::Assign { task, .. },
-            ) => {
-                let mut chain = false;
-                let mut at = Some(task.0.clone());
-                while let Some(id) = at {
-                    chain |= self.posters.get(&id).is_some_and(|poster| covers(by, poster));
-                    at = tasks.get(&id).and_then(|(parent, _, _)| parent.clone());
-                }
-                read(task) && (chain || self.can(by, &task.0, Can::Manage))
-            }
+            ) => read(task) && (self.chain(by, task, tasks) || self.can(by, &task.0, Can::Manage)),
             Op::Tasks(TaskOp::Batch { name, tasks }) => tasks.iter().all(|planned| {
                 let id = |need: &Need| match need {
                     Need::Task(task) => task.0.clone(),
@@ -393,6 +417,7 @@ impl Gate {
                     && self.can(by, &own, Can::Post)
             }),
             Op::Reply { task, .. } => read(task) && self.can(by, &task.0, Can::Post),
+            Op::Relabel { task, .. } => read(task) && (self.chain(by, task, tasks) || self.can(by, &task.0, Can::Label)),
             Op::Grant { grant } => {
                 !grant.who.is_empty()
                     && !grant.can.is_empty()
@@ -458,6 +483,12 @@ pub fn audit(fold: &Fold, model: &Reference) -> Result<(), String> {
         let applied = fold.outcome(&EventId(id.clone())).map(Result::is_ok);
         if applied != Some(*accepted) {
             return Err(format!("event {id}: the board says {applied:?}, the reference model says {accepted}"));
+        }
+    }
+    for (id, task) in fold.tasks() {
+        let labels = model.labels.get(&id.0).cloned().unwrap_or_default();
+        if task.spec.labels != labels {
+            return Err(format!("{id}: the board's labels are {:?}, the reference model's {labels:?}", task.spec.labels));
         }
     }
     views(fold, &model.gate, &model.tasks)

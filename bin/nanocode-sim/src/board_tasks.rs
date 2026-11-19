@@ -343,6 +343,7 @@ impl Reference {
     }
 
     pub(super) fn terms(&mut self, task: &NewTask) {
+        self.labels.insert(task.id.0.clone(), task.labels.clone());
         if let Some(to) = &task.terms.assignee {
             self.assignees.insert(task.id.0.clone(), to.clone());
         }
@@ -442,6 +443,7 @@ impl Reference {
             if task.terms.on_fail == OnFail::Wait {
                 self.waits.insert(id(&task.key));
             }
+            self.labels.insert(id(&task.key), task.labels.clone());
         }
         for task in tasks {
             let (parent, needs, _) = self.tasks[&id(&task.key)].clone();

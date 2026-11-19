@@ -64,10 +64,12 @@ pub enum BoardMutation {
     NextIgnoresAssignee,
     RunIgnoresLoss,
     TasksUnchecked,
+    RelabelUnchecked,
+    RelabelKeepsUnset,
 }
 
 impl BoardMutation {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 33] = [
         Self::None,
         Self::ClaimIgnoresLease,
         Self::ClaimIgnoresNeeds,
@@ -99,6 +101,8 @@ impl BoardMutation {
         Self::NextIgnoresAssignee,
         Self::RunIgnoresLoss,
         Self::TasksUnchecked,
+        Self::RelabelUnchecked,
+        Self::RelabelKeepsUnset,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -138,6 +142,8 @@ impl BoardMutation {
             Self::NextIgnoresAssignee => "next_ignores_assignee",
             Self::RunIgnoresLoss => "run_ignores_loss",
             Self::TasksUnchecked => "tasks_unchecked",
+            Self::RelabelUnchecked => "relabel_unchecked",
+            Self::RelabelKeepsUnset => "relabel_keeps_unset",
         }
     }
 
@@ -180,6 +186,8 @@ impl BoardMutation {
             Self::NextIgnoresAssignee => BoardRule::NextIgnoresAssignee,
             Self::RunIgnoresLoss => BoardRule::RunIgnoresLoss,
             Self::TasksUnchecked => BoardRule::TasksUnchecked,
+            Self::RelabelUnchecked => BoardRule::RelabelUnchecked,
+            Self::RelabelKeepsUnset => BoardRule::RelabelKeepsUnset,
             Self::None | Self::CursorBeforeEffect | Self::EffectBeforeCursor => BoardRule::None,
         }
     }
@@ -932,6 +940,7 @@ struct Reference {
     grants: BTreeMap<String, Vec<(u64, String)>>,
     finishes: BTreeMap<String, u64>,
     replies: BTreeMap<String, Vec<String>>,
+    labels: BTreeMap<String, BTreeMap<String, String>>,
     gate: access::Gate,
     verdicts: BTreeMap<String, bool>,
     assignees: BTreeMap<String, String>,
@@ -1043,7 +1052,13 @@ impl Reference {
                 true
             }
             Op::Tasks(op) => self.steer(op, now),
-            Op::Renew { .. } | Op::Release { .. } | Op::Finish { .. } | Op::Reply { .. } => false,
+            Op::Relabel { task, set, unset } if self.tasks.contains_key(&task.0) => {
+                let labels = self.labels.entry(task.0).or_default();
+                labels.retain(|key, _| !unset.contains(key));
+                labels.extend(set);
+                true
+            }
+            Op::Renew { .. } | Op::Release { .. } | Op::Finish { .. } | Op::Reply { .. } | Op::Relabel { .. } => false,
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => true,
         }
     }
@@ -1054,6 +1069,7 @@ impl Reference {
             grants: BTreeMap::new(),
             finishes: BTreeMap::new(),
             replies: BTreeMap::new(),
+            labels: BTreeMap::new(),
             gate: access::Gate::default(),
             verdicts: BTreeMap::new(),
             assignees: BTreeMap::new(),

@@ -32,6 +32,8 @@ pub enum Mutation {
     NextIgnoresAssignee,
     RunIgnoresLoss,
     TasksUnchecked,
+    RelabelUnchecked,
+    RelabelKeepsUnset,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

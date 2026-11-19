@@ -464,6 +464,13 @@ async fn race<A: Future>(
     .await
 }
 
+fn placed_as(landed: &NewTask, planned: &NewTask) -> bool {
+    landed.id == planned.id
+        && landed.spec == planned.spec
+        && landed.needs == planned.needs
+        && landed.terms == planned.terms
+}
+
 impl Board {
     pub async fn batch(
         &mut self,
@@ -477,7 +484,7 @@ impl Board {
             .await?;
         if placed
             .iter()
-            .any(|task| self.fold.task(&task.id).is_none_or(|landed| landed.spec != *task))
+            .any(|task| self.fold.task(&task.id).is_none_or(|landed| !placed_as(&landed.spec, task)))
         {
             return Err(BoardError::Rejected(Rejection::Tasks(Refusal::Duplicate)));
         }

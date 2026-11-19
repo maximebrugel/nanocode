@@ -497,6 +497,17 @@ impl Fold {
                 access.see(&actor, task)?;
                 access.need(&actor, &task.0, Can::Post)
             }
+            Op::Relabel { task, .. } => {
+                access.see(&actor, task)?;
+                if access.chain(self, &actor, task)
+                    || access.may(&actor, &task.0, Can::Label)
+                    || mutated(Mutation::RelabelUnchecked)
+                {
+                    Ok(())
+                } else {
+                    Err(Rejection::Access(Denied::Missing(Can::Label)))
+                }
+            }
             Op::Grant { grant } => {
                 if grant.who.is_empty() || grant.can.is_empty() {
                     return Err(Rejection::Access(Denied::Malformed(

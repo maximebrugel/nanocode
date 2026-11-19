@@ -53,10 +53,12 @@ pub enum BoardMutation {
     ReadLeaks,
     KeySquatting,
     MintedRestarts,
+    ReadyIndexStale,
+    FoldsUnacked,
 }
 
 impl BoardMutation {
-    const ALL: [Self; 22] = [
+    const ALL: [Self; 24] = [
         Self::None,
         Self::ClaimIgnoresLease,
         Self::ClaimIgnoresNeeds,
@@ -79,6 +81,8 @@ impl BoardMutation {
         Self::ReadLeaks,
         Self::KeySquatting,
         Self::MintedRestarts,
+        Self::ReadyIndexStale,
+        Self::FoldsUnacked,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -109,6 +113,8 @@ impl BoardMutation {
             Self::ReadLeaks => "read_leaks",
             Self::KeySquatting => "key_squatting",
             Self::MintedRestarts => "minted_restarts",
+            Self::ReadyIndexStale => "ready_index_stale",
+            Self::FoldsUnacked => "folds_unacked",
         }
     }
 
@@ -142,6 +148,8 @@ impl BoardMutation {
             Self::ReadLeaks => BoardRule::ReadLeaks,
             Self::KeySquatting => BoardRule::KeySquatting,
             Self::MintedRestarts => BoardRule::MintedRestarts,
+            Self::ReadyIndexStale => BoardRule::ReadyIndexStale,
+            Self::FoldsUnacked => BoardRule::FoldsUnacked,
             Self::None | Self::CursorBeforeEffect | Self::EffectBeforeCursor => BoardRule::None,
         }
     }
@@ -978,6 +986,56 @@ impl Reference {
     }
 }
 
+fn indexes(rows: &[(u64, String)], full: &nanocode_board::Fold) -> Result<(), String> {
+    let mut fold = nanocode_board::Fold::new();
+    let half = rows.len() / 2;
+    for (index, (seq, body)) in rows.iter().enumerate() {
+        fold.apply(*seq, body).map_err(|error| format!("refold: {error}"))?;
+        let labels = fold
+            .tasks()
+            .values()
+            .flat_map(|task| task.spec.labels.iter())
+            .collect::<BTreeSet<_>>();
+        for at in [fold.now_ms(), fold.now_ms() + 60_000] {
+            let ready = fold.ready(at).collect::<Vec<_>>();
+            let scan = fold.tasks().keys().filter(|id| fold.claimable(id, at).is_ok()).collect::<Vec<_>>();
+            if ready != scan {
+                return Err(format!("after row {seq} at {at} ms the ready index says {ready:?}, a scan says {scan:?}"));
+            }
+            for (key, value) in &labels {
+                let indexed = fold.ready_labelled(key, value, at).collect::<Vec<_>>();
+                let scan = scan
+                    .iter()
+                    .copied()
+                    .filter(|id| fold.tasks()[*id].spec.labels.get(*key) == Some(*value))
+                    .collect::<Vec<_>>();
+                if indexed != scan {
+                    return Err(format!("after row {seq} the {key}={value} index says {indexed:?}, a scan says {scan:?}"));
+                }
+            }
+        }
+        for from in [*seq, seq / 2] {
+            let after = fold.entries_after(from);
+            if after.iter().any(|entry| entry.seq < from)
+                || after.len() != fold.entries().iter().filter(|entry| entry.seq >= from).count()
+            {
+                return Err(format!("entries after row {from} miss or add entries"));
+            }
+        }
+        if index + 1 == half {
+            let log = MemoryLog::new();
+            nanocode_sync::block_on(log.append(SCOPE, rows)).map_err(|error| format!("reload: {error}"))?;
+            let host: Arc<dyn LogHost> = Arc::new(log);
+            let resumed = nanocode_sync::block_on(Board::resume(host, SCOPE, access::identity(access::SOURCE), fold.clone()))
+                .map_err(|error| format!("resume: {error}"))?;
+            if resumed.fold() != full {
+                return Err(format!("a board resumed from row {seq} folds differently from one that read every row"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn check(world: &World, rows: &[(u64, String)]) -> Result<BoardStats, String> {
     let mut fold = nanocode_board::Fold::new();
     for (seq, body) in rows {
@@ -989,6 +1047,7 @@ fn check(world: &World, rows: &[(u64, String)]) -> Result<BoardStats, String> {
     }
     let model = Reference::of(rows)?;
     access::audit(&fold, &model)?;
+    indexes(rows, &fold)?;
     let mut stats = oracle.stats;
     if fold.tasks().len() != world.expected() || model.tasks.len() != world.expected() {
         return Err(format!(

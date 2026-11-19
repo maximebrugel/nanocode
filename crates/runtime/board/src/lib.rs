@@ -553,7 +553,9 @@ impl Fold {
                         replies: Vec::new(),
                     },
                 );
-                self.reindex(&id);
+                if !mutated(Mutation::ReadyIndexStale) {
+                    self.reindex(&id);
+                }
                 self.record(seq, &event, &id, Change::Posted);
                 let spec = &self.tasks[&id].spec;
                 let doomed = spec
@@ -845,7 +847,7 @@ impl Board {
             {
                 return Err(BoardError::Store(error.clone()));
             }
-            if appended.is_ok() {
+            if appended.is_ok() || mutated(Mutation::FoldsUnacked) {
                 self.fold.apply(seq, &row[0].1)?;
                 if let Some(verdict) = self.fold.outcome(&event.id) {
                     return self.settled(&event.id, verdict.clone());

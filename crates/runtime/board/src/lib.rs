@@ -444,6 +444,10 @@ impl Fold {
 
     fn transition(&mut self, seq: u64, event: &Event) {
         let now = self.now_ms;
+        if let Op::Watch(step) = &event.op {
+            self.apply_step(seq, event, step);
+            return;
+        }
         let Some(id) = event.op.task().cloned() else {
             return;
         };
@@ -570,11 +574,7 @@ impl Fold {
                     body: body.clone(),
                 }
             }
-            Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => return,
-            Op::Watch(step) => {
-                self.apply_step(seq, event, step);
-                return;
-            }
+            Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} | Op::Watch(_) => return,
         };
         self.record(seq, event, &id, change);
     }

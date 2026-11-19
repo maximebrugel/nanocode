@@ -336,7 +336,9 @@ dependencies = [
 name = "nanocode-board"
 version = "0.7.0"
 dependencies = [
+ "nanocode-digest",
  "nanocode-durability-core",
+ "nanocode-schema",
  "nanocode-turnlog",
  "serde",
  "serde_json",

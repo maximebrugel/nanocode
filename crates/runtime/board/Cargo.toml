@@ -12,7 +12,9 @@ repository.workspace = true
 description = "A task board for agents and people: one append-only log on any turn log host, with claims, leases and read cursors"
 
 [dependencies]
+nanocode-digest.workspace = true
 nanocode-durability-core.workspace = true
+nanocode-schema.workspace = true
 nanocode-turnlog.workspace = true
 serde.workspace = true
 serde_json.workspace = true

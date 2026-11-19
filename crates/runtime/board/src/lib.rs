@@ -8,7 +8,13 @@ use nanocode_turnlog::LogHost;
 use serde::{Deserialize, Serialize};
 
 pub mod access;
+pub mod blocks;
+pub mod files;
+pub mod messages;
+pub mod middleware;
 pub mod sim;
+
+pub use messages::{MessageId, Say};
 
 use sim::{Mutation, mutated};
 
@@ -89,6 +95,9 @@ pub enum Op {
         grant: EventId,
     },
     Charter {},
+    Say {
+        say: Say,
+    },
 }
 
 impl Op {
@@ -101,7 +110,7 @@ impl Op {
             | Self::Finish { task, .. }
             | Self::Cancel { task, .. }
             | Self::Reply { task, .. } => Some(task),
-            Self::Grant { .. } | Self::Revoke { .. } | Self::Charter {} => None,
+            Self::Grant { .. } | Self::Revoke { .. } | Self::Charter {} | Self::Say { .. } => None,
         }
     }
 }
@@ -161,6 +170,7 @@ pub enum Rejection {
     NotHolder,
     Terminal,
     Access(access::Denied),
+    Said(messages::Refusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +227,7 @@ pub enum BoardError {
     Corrupt { seq: u64, detail: String },
     Rejected(Rejection),
     Unsettled { event: EventId, error: StoreError },
+    Dropped(String),
 }
 
 impl std::fmt::Display for BoardError {
@@ -230,6 +241,7 @@ impl std::fmt::Display for BoardError {
             Self::Unsettled { event, error } => {
                 write!(formatter, "board write {event} is unsettled: {error}")
             }
+            Self::Dropped(why) => write!(formatter, "board middleware dropped the write: {why}"),
         }
     }
 }
@@ -250,6 +262,7 @@ pub struct Fold {
     seen: BTreeMap<EventId, Result<u64, Rejection>>,
     entries: Vec<Entry>,
     access: access::Access,
+    said: messages::Said,
 }
 
 impl Default for Fold {
@@ -269,6 +282,7 @@ impl Fold {
             seen: BTreeMap::new(),
             entries: Vec::new(),
             access: access::Access::new(),
+            said: messages::Said::new(),
         }
     }
 
@@ -395,7 +409,7 @@ impl Fold {
                 Some(_) => Ok(()),
             },
             Op::Reply { task, .. } => self.tasks.get(task).map(drop).ok_or(Rejection::UnknownTask),
-            Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => Ok(()),
+            Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} | Op::Say { .. } => Ok(()),
         }
     }
 
@@ -415,11 +429,12 @@ impl Fold {
             return Ok(());
         }
         self.now_ms = self.now_ms.max(event.at_ms);
-        let verdict = self.admit(&event.by, event.at_ms, &event.op).map(|()| seq);
+        let verdict = self.judge(&event).map(|()| seq);
         self.seen.insert(event.id.clone(), verdict.clone());
         if verdict.is_ok() {
             self.access.record(&event.by, &event.id, &event.op);
             self.transition(seq, &event);
+            self.hear(seq, &event);
         }
         Ok(())
     }
@@ -603,6 +618,7 @@ pub struct Board {
     identity: access::Identity,
     minted: u64,
     fold: Fold,
+    chain: middleware::Chain,
 }
 
 impl Board {
@@ -619,6 +635,7 @@ impl Board {
             identity,
             minted: 0,
             fold: Fold::new(),
+            chain: middleware::Chain::default(),
         };
         board.fold_rows(rows)?;
         if !mutated(Mutation::MintedRestarts) {
@@ -667,26 +684,27 @@ impl Board {
     }
 
     async fn submit_as(&mut self, id: EventId, at_ms: u64, op: Op) -> Result<Applied, BoardError> {
-        let event = Event {
-            id,
-            by: self.writer.clone(),
-            at_ms,
-            op,
-        };
-        let body = serde_json::to_string(&event).map_err(|error| BoardError::Corrupt {
-            seq: self.fold.next,
-            detail: error.to_string(),
-        })?;
         loop {
             self.refresh().await?;
-            if let Some(verdict) = self.fold.outcome(&event.id) {
-                return self.settled(&event.id, verdict.clone());
+            if mutated(Mutation::MiddlewareRerunsLanded) {
+                self.chain.vet(&id, &self.writer, &op)?;
             }
-            self.fold
-                .admit(&event.by, at_ms, &event.op)
-                .map_err(BoardError::Rejected)?;
+            if let Some(verdict) = self.fold.outcome(&id) {
+                return self.settled(&id, verdict.clone());
+            }
+            let event = Event {
+                id: id.clone(),
+                by: self.writer.clone(),
+                at_ms,
+                op: self.chain.vet(&id, &self.writer, &op)?,
+            };
+            let body = serde_json::to_string(&event).map_err(|error| BoardError::Corrupt {
+                seq: self.fold.next,
+                detail: error.to_string(),
+            })?;
+            self.fold.judge(&event).map_err(BoardError::Rejected)?;
             let seq = self.fold.next;
-            let appended = self.host.append(&self.scope, &[(seq, body.clone())]).await;
+            let appended = self.host.append(&self.scope, &[(seq, body)]).await;
             if let Err(error) = &appended
                 && mutated(Mutation::ErrorsLoseWrites)
             {

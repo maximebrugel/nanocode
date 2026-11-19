@@ -250,6 +250,9 @@ pub struct Fold {
     seen: BTreeMap<EventId, Result<u64, Rejection>>,
     entries: Vec<Entry>,
     access: access::Access,
+    open: BTreeSet<TaskId>,
+    held: BTreeSet<TaskId>,
+    labelled: BTreeMap<String, BTreeMap<String, BTreeSet<TaskId>>>,
 }
 
 impl Default for Fold {
@@ -269,6 +272,9 @@ impl Fold {
             seen: BTreeMap::new(),
             entries: Vec::new(),
             access: access::Access::new(),
+            open: BTreeSet::new(),
+            held: BTreeSet::new(),
+            labelled: BTreeMap::new(),
         }
     }
 
@@ -294,6 +300,11 @@ impl Fold {
 
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    pub fn entries_after(&self, seq: u64) -> &[Entry] {
+        let at = self.entries.partition_point(|entry| entry.seq < seq);
+        &self.entries[at..]
     }
 
     fn minted(&self, writer: &str) -> u64 {
@@ -339,9 +350,75 @@ impl Fold {
     }
 
     pub fn ready(&self, at_ms: u64) -> impl Iterator<Item = &TaskId> + '_ {
-        self.tasks
-            .keys()
+        Merged::new(self.open.iter(), self.held.iter())
             .filter(move |id| self.claimable(id, at_ms).is_ok())
+    }
+
+    pub fn ready_labelled<'a>(
+        &'a self,
+        key: &str,
+        value: &str,
+        at_ms: u64,
+    ) -> impl Iterator<Item = &'a TaskId> + 'a {
+        let key = key.to_owned();
+        let value = value.to_owned();
+        let ids = self
+            .labelled
+            .get(&key)
+            .and_then(|values| values.get(&value))
+            .into_iter()
+            .flatten();
+        ids.filter(move |id| {
+            self.tasks
+                .get(*id)
+                .is_some_and(|task| task.spec.labels.get(&key) == Some(&value))
+                && self.claimable(id, at_ms).is_ok()
+        })
+    }
+
+    fn reindex(&mut self, id: &TaskId) {
+        let Some(task) = self.tasks.get(id) else {
+            return;
+        };
+        match &task.phase {
+            Phase::Open => {
+                self.held.remove(id);
+                self.open.insert(id.clone());
+            }
+            phase if !phase.terminal() => {
+                self.open.remove(id);
+                self.held.insert(id.clone());
+            }
+            _ => {
+                self.open.remove(id);
+                self.held.remove(id);
+                for (key, value) in &task.spec.labels {
+                    if let Some(values) = self.labelled.get_mut(key)
+                        && let Some(ids) = values.get_mut(value)
+                    {
+                        ids.remove(id);
+                        if ids.is_empty() {
+                            values.remove(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn unlabel(&mut self, id: &TaskId) {
+        let Some(task) = self.tasks.get(id) else {
+            return;
+        };
+        for (key, value) in &task.spec.labels {
+            if let Some(ids) = self
+                .labelled
+                .get_mut(key)
+                .and_then(|values| values.get_mut(value))
+            {
+                ids.remove(id);
+            }
+        }
     }
 
     pub fn settled(&self) -> bool {
@@ -416,57 +493,72 @@ impl Fold {
         }
         self.now_ms = self.now_ms.max(event.at_ms);
         let verdict = self.admit(&event.by, event.at_ms, &event.op).map(|()| seq);
-        self.seen.insert(event.id.clone(), verdict.clone());
-        if verdict.is_ok() {
+        let accepted = verdict.is_ok();
+        self.seen.insert(event.id.clone(), verdict);
+        if accepted {
             self.access.record(&event.by, &event.id, &event.op);
-            self.transition(seq, &event);
+            self.transition(seq, event);
         }
         Ok(())
     }
 
-    fn record(&mut self, seq: u64, event: &Event, task: &TaskId, change: Change) {
+    fn record(&mut self, seq: u64, event: &EventId, task: &TaskId, change: Change) {
         self.entries.push(Entry {
             seq,
-            event: event.id.clone(),
+            event: event.clone(),
             at_ms: self.now_ms,
             task: task.clone(),
             change,
         });
     }
 
-    fn transition(&mut self, seq: u64, event: &Event) {
+    fn transition(&mut self, seq: u64, event: Event) {
         let now = self.now_ms;
         let Some(id) = event.op.task().cloned() else {
             return;
         };
-        let change = match &event.op {
+        let Event {
+            id: event, by, op, ..
+        } = event;
+        let change = match op {
             Op::Post { task } => {
                 if let Some(parent) = &task.parent {
                     self.children
                         .entry(parent.clone())
                         .or_default()
-                        .insert(task.id.clone());
+                        .insert(id.clone());
                 }
                 for need in &task.needs {
                     self.dependents
                         .entry(need.clone())
                         .or_default()
-                        .insert(task.id.clone());
+                        .insert(id.clone());
+                }
+                self.unlabel(&id);
+                for (key, value) in &task.labels {
+                    self.labelled
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(value.clone())
+                        .or_default()
+                        .insert(id.clone());
                 }
                 self.tasks.insert(
-                    task.id.clone(),
+                    id.clone(),
                     Task {
-                        spec: task.clone(),
+                        spec: task,
                         phase: Phase::Open,
                         attempts: 0,
                         replies: Vec::new(),
                     },
                 );
-                self.record(seq, event, &id, Change::Posted);
-                let doomed = task
+                self.reindex(&id);
+                self.record(seq, &event, &id, Change::Posted);
+                let spec = &self.tasks[&id].spec;
+                let doomed = spec
                     .parent
                     .iter()
-                    .chain(&task.needs)
+                    .chain(&spec.needs)
                     .find(|above| {
                         matches!(
                             self.tasks.get(*above).map(|above| &above.phase),
@@ -477,13 +569,13 @@ impl Fold {
                 if let Some(above) = doomed
                     && !mutated(Mutation::PostIgnoresDoomedNeeds)
                 {
-                    self.cancel(seq, event, &id, format!("{above} did not finish"));
+                    self.cancel(seq, &event, &id, format!("{above} did not finish"));
                 }
                 return;
             }
             Op::Claim { lease_ms, .. } => {
-                let until_ms = now.saturating_add(*lease_ms);
-                let claim = ClaimId(event.id.0.clone());
+                let until_ms = now.saturating_add(lease_ms);
+                let claim = ClaimId(event.0.clone());
                 let Some(task) = self.tasks.get_mut(&id) else {
                     return;
                 };
@@ -494,12 +586,13 @@ impl Fold {
                 task.attempts += 1;
                 task.phase = Phase::Claimed {
                     claim: claim.clone(),
-                    worker: event.by.clone(),
+                    worker: by.clone(),
                     until_ms,
                 };
+                self.reindex(&id);
                 Change::Claimed {
                     claim,
-                    worker: event.by.clone(),
+                    worker: by,
                     until_ms,
                     took_over,
                 }
@@ -507,7 +600,7 @@ impl Fold {
             Op::Renew {
                 claim, lease_ms, ..
             } => {
-                let until_ms = now.saturating_add(*lease_ms);
+                let until_ms = now.saturating_add(lease_ms);
                 if let Some(Task {
                     phase:
                         Phase::Claimed {
@@ -518,23 +611,18 @@ impl Fold {
                 {
                     *until = until_ms;
                 }
-                Change::Renewed {
-                    claim: claim.clone(),
-                    until_ms,
-                }
+                Change::Renewed { claim, until_ms }
             }
             Op::Release { claim, note, .. } => {
                 if let Some(task) = self.tasks.get_mut(&id) {
                     task.phase = Phase::Open;
                 }
-                Change::Released {
-                    claim: claim.clone(),
-                    note: note.clone(),
-                }
+                self.reindex(&id);
+                Change::Released { claim, note }
             }
             Op::Finish { outcome, .. } => {
                 if let Some(task) = self.tasks.get_mut(&id) {
-                    task.phase = match outcome {
+                    task.phase = match &outcome {
                         Outcome::Done(result) => Phase::Done {
                             result: result.clone(),
                         },
@@ -543,31 +631,30 @@ impl Fold {
                         },
                     };
                 }
-                self.record(seq, event, &id, Change::Finished(outcome.clone()));
-                if matches!(outcome, Outcome::Failed(_)) {
-                    self.cascade(seq, event, &id);
+                self.reindex(&id);
+                let failed = matches!(outcome, Outcome::Failed(_));
+                self.record(seq, &event, &id, Change::Finished(outcome));
+                if failed {
+                    self.cascade(seq, &event, &id);
                 }
                 return;
             }
             Op::Cancel { reason, .. } => {
-                self.cancel(seq, event, &id, reason.clone());
+                self.cancel(seq, &event, &id, reason);
                 return;
             }
             Op::Reply { body, .. } => {
                 if let Some(task) = self.tasks.get_mut(&id) {
-                    task.replies.push((event.by.clone(), body.clone()));
+                    task.replies.push((by.clone(), body.clone()));
                 }
-                Change::Replied {
-                    by: event.by.clone(),
-                    body: body.clone(),
-                }
+                Change::Replied { by, body }
             }
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => return,
         };
-        self.record(seq, event, &id, change);
+        self.record(seq, &event, &id, change);
     }
 
-    fn cancel(&mut self, seq: u64, event: &Event, id: &TaskId, reason: String) {
+    fn cancel(&mut self, seq: u64, event: &EventId, id: &TaskId, reason: String) {
         let Some(task) = self.tasks.get_mut(id) else {
             return;
         };
@@ -577,11 +664,12 @@ impl Fold {
         task.phase = Phase::Cancelled {
             reason: reason.clone(),
         };
+        self.reindex(id);
         self.record(seq, event, id, Change::Cancelled { reason });
         self.cascade(seq, event, id);
     }
 
-    fn cascade(&mut self, seq: u64, event: &Event, id: &TaskId) {
+    fn cascade(&mut self, seq: u64, event: &EventId, id: &TaskId) {
         let below = self
             .children
             .get(id)
@@ -592,6 +680,34 @@ impl Fold {
             .collect::<BTreeSet<_>>();
         for next in below {
             self.cancel(seq, event, &next, format!("{id} did not finish"));
+        }
+    }
+}
+
+struct Merged<'a, A: Iterator<Item = &'a TaskId>, B: Iterator<Item = &'a TaskId>> {
+    a: std::iter::Peekable<A>,
+    b: std::iter::Peekable<B>,
+}
+
+impl<'a, A: Iterator<Item = &'a TaskId>, B: Iterator<Item = &'a TaskId>> Merged<'a, A, B> {
+    fn new(a: A, b: B) -> Self {
+        Self {
+            a: a.peekable(),
+            b: b.peekable(),
+        }
+    }
+}
+
+impl<'a, A: Iterator<Item = &'a TaskId>, B: Iterator<Item = &'a TaskId>> Iterator
+    for Merged<'a, A, B>
+{
+    type Item = &'a TaskId;
+
+    fn next(&mut self) -> Option<&'a TaskId> {
+        match (self.a.peek(), self.b.peek()) {
+            (Some(a), Some(b)) if b < a => self.b.next(),
+            (Some(_), _) => self.a.next(),
+            (None, _) => self.b.next(),
         }
     }
 }

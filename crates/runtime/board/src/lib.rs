@@ -14,6 +14,7 @@ use sim::{Mutation, mutated};
 
 const FIRST: u64 = 1;
 const END: u64 = i64::MAX as u64;
+const PESSIMISTIC_SUBMITS: u8 = 8;
 
 macro_rules! id {
     ($name:ident) => {
@@ -719,6 +720,7 @@ pub struct Board {
     identity: access::Identity,
     minted: u64,
     fold: Fold,
+    pessimistic: u8,
 }
 
 impl Board {
@@ -735,6 +737,7 @@ impl Board {
             identity,
             minted: 0,
             fold: Fold::new(),
+            pessimistic: 0,
         };
         board.fold_rows(rows)?;
         if !mutated(Mutation::MintedRestarts) {
@@ -756,6 +759,7 @@ impl Board {
             identity,
             minted: 0,
             fold,
+            pessimistic: 0,
         };
         board.refresh().await?;
         if !mutated(Mutation::MintedRestarts) {
@@ -816,6 +820,11 @@ impl Board {
         })?;
         let mut row = [(0, body)];
         let mut fresh = false;
+        if self.pessimistic > 0 {
+            self.pessimistic -= 1;
+            self.refresh().await?;
+            fresh = true;
+        }
         loop {
             if let Some(verdict) = self.fold.outcome(&event.id) {
                 return self.settled(&event.id, verdict.clone());
@@ -846,6 +855,7 @@ impl Board {
                     detail: format!("the store acknowledged {} but holds another row", event.id),
                 });
             }
+            self.pessimistic = PESSIMISTIC_SUBMITS;
             match self.refresh().await {
                 Ok(()) => {}
                 Err(BoardError::Store(error)) => {

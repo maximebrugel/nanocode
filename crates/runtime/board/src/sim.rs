@@ -23,6 +23,20 @@ pub enum Mutation {
     ReadLeaks,
     KeySquatting,
     MintedRestarts,
+    ConsumeIgnoresCursor,
+    ConsumeSplits,
+    WatchOutOfOrder,
+    AckIgnoresLease,
+    TakeIgnoresLease,
+    TakeIgnoresBackoff,
+    TriesUnbounded,
+    WatchSeesOwnWrites,
+    FireEarly,
+    FireReplays,
+    FireIgnoresStop,
+    UnscheduleIgnored,
+    WaitSkipsPoll,
+    WatchUnchecked,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

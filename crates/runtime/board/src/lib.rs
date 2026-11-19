@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod access;
 pub mod sim;
+pub mod wake;
+pub mod watch;
 
 use sim::{Mutation, mutated};
 
@@ -89,6 +91,7 @@ pub enum Op {
         grant: EventId,
     },
     Charter {},
+    Watch(watch::Step),
 }
 
 impl Op {
@@ -101,7 +104,7 @@ impl Op {
             | Self::Finish { task, .. }
             | Self::Cancel { task, .. }
             | Self::Reply { task, .. } => Some(task),
-            Self::Grant { .. } | Self::Revoke { .. } | Self::Charter {} => None,
+            Self::Grant { .. } | Self::Revoke { .. } | Self::Charter {} | Self::Watch(_) => None,
         }
     }
 }
@@ -161,6 +164,7 @@ pub enum Rejection {
     NotHolder,
     Terminal,
     Access(access::Denied),
+    Watch(watch::Refusal),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +254,7 @@ pub struct Fold {
     seen: BTreeMap<EventId, Result<u64, Rejection>>,
     entries: Vec<Entry>,
     access: access::Access,
+    marks: watch::Marks,
 }
 
 impl Default for Fold {
@@ -269,6 +274,7 @@ impl Fold {
             seen: BTreeMap::new(),
             entries: Vec::new(),
             access: access::Access::new(),
+            marks: watch::Marks::new(),
         }
     }
 
@@ -396,6 +402,7 @@ impl Fold {
             },
             Op::Reply { task, .. } => self.tasks.get(task).map(drop).ok_or(Rejection::UnknownTask),
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => Ok(()),
+            Op::Watch(step) => self.check_step(at_ms, step),
         }
     }
 
@@ -420,6 +427,7 @@ impl Fold {
         if verdict.is_ok() {
             self.access.record(&event.by, &event.id, &event.op);
             self.transition(seq, &event);
+            self.index_marks();
         }
         Ok(())
     }
@@ -563,6 +571,10 @@ impl Fold {
                 }
             }
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => return,
+            Op::Watch(step) => {
+                self.apply_step(seq, event, step);
+                return;
+            }
         };
         self.record(seq, event, &id, change);
     }

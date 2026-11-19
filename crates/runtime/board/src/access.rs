@@ -58,6 +58,8 @@ pub enum Denied {
     Missing(Can),
     NotPoster,
     NotHolder,
+    NotWatcher,
+    NotCreator,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -341,7 +343,7 @@ impl Access {
         }
     }
 
-    fn see(&self, actor: &Actor, task: &TaskId) -> Result<(), Rejection> {
+    pub(crate) fn see(&self, actor: &Actor, task: &TaskId) -> Result<(), Rejection> {
         if self.reads(actor, &task.0) {
             Ok(())
         } else {
@@ -495,6 +497,7 @@ impl Fold {
                 }
                 _ => Err(Rejection::Access(Denied::Missing(Can::Manage))),
             },
+            Op::Watch(step) => self.authorize_step(&actor, by, step),
         }
     }
 

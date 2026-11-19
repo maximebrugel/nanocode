@@ -29,6 +29,9 @@ mod access;
 const SCOPE: &str = "board";
 const MS: u64 = 1_000_000;
 
+#[path = "board_watch.rs"]
+mod watching;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BoardMutation {
     None,
@@ -53,6 +56,7 @@ pub enum BoardMutation {
     ReadLeaks,
     KeySquatting,
     MintedRestarts,
+    Watch(BoardRule),
 }
 
 impl BoardMutation {
@@ -82,7 +86,10 @@ impl BoardMutation {
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|mutation| mutation.name() == name)
+        Self::ALL
+            .into_iter()
+            .chain(watching::ALL.map(Self::Watch))
+            .find(|mutation| mutation.name() == name)
     }
 
     pub const fn name(self) -> &'static str {
@@ -109,6 +116,7 @@ impl BoardMutation {
             Self::ReadLeaks => "read_leaks",
             Self::KeySquatting => "key_squatting",
             Self::MintedRestarts => "minted_restarts",
+            Self::Watch(rule) => watching::name(rule),
         }
     }
 
@@ -116,6 +124,8 @@ impl BoardMutation {
         Self::ALL
             .iter()
             .skip(1)
+            .copied()
+            .chain(watching::ALL.map(Self::Watch))
             .map(|mutation| mutation.name())
             .collect::<Vec<_>>()
             .join("|")
@@ -142,6 +152,7 @@ impl BoardMutation {
             Self::ReadLeaks => BoardRule::ReadLeaks,
             Self::KeySquatting => BoardRule::KeySquatting,
             Self::MintedRestarts => BoardRule::MintedRestarts,
+            Self::Watch(rule) => rule,
             Self::None | Self::CursorBeforeEffect | Self::EffectBeforeCursor => BoardRule::None,
         }
     }
@@ -432,6 +443,7 @@ struct World {
     posted: RefCell<bool>,
     cancelled: RefCell<bool>,
     minted: RefCell<BTreeMap<String, u64>>,
+    watched: watching::Watched,
 }
 
 impl World {
@@ -445,7 +457,7 @@ impl World {
 
     async fn open(&self, writer: &str) -> Board {
         loop {
-            let host: Arc<dyn LogHost> = Arc::clone(&self.host) as Arc<dyn LogHost>;
+            let host = self.watched.wrap(Arc::clone(&self.host) as Arc<dyn LogHost>);
             match Board::open(host, SCOPE, access::identity(writer)).await {
                 Ok(board) => {
                     self.resume(board.writer()).await;
@@ -809,6 +821,7 @@ async fn epoch(world: &World, number: u64) {
     for index in 0..world.shape.workers {
         actors.push(Box::pin(worker(world, index, number)));
     }
+    watching::actors(world, number, &mut actors);
     nanocode_sync::join_in_order(actors).await;
 }
 
@@ -1077,6 +1090,7 @@ fn check(world: &World, rows: &[(u64, String)]) -> Result<BoardStats, String> {
             terminal.len()
         ));
     }
+    watching::check(world, rows, &fold)?;
     stats.consumed = watch.consumed.len() as u64;
     stats.rows = rows.len() as u64;
     Ok(stats)
@@ -1084,7 +1098,8 @@ fn check(world: &World, rows: &[(u64, String)]) -> Result<BoardStats, String> {
 
 pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
     let shape = Shape::of(seed);
-    let described = shape.describe();
+    let watched = watching::Watched::new(seed);
+    let described = format!("{} {}", shape.describe(), watched.shape.describe());
     let clock = Clock::new();
     let host = Arc::new(FaultLog {
         inner: MemoryLog::new(),
@@ -1107,6 +1122,7 @@ pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
         posted: RefCell::new(false),
         cancelled: RefCell::new(false),
         minted: RefCell::new(BTreeMap::new()),
+        watched,
         shape,
     };
     board_sim::mutate(mutation.rule());
@@ -1117,7 +1133,7 @@ pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
     loop {
         let crash_at = crashes.get(number as usize).map(|ms| ms * MS);
         let last = crash_at.is_none();
-        let deadline = clock.now_ns() + world.shape.deadline_ms * MS;
+        let deadline = clock.now_ns() + (world.shape.deadline_ms + world.watched.shape.slack_ms()) * MS;
         let mut executor = Executor::new(Arc::clone(&clock), Rng::derive(seed, &format!("board scheduler {number}")));
         let task: Task<'_> = Box::pin(epoch(&world, number));
         let ended = executor.run(vec![task], Some(crash_at.map_or(deadline, |at| at.max(clock.now_ns()))));
@@ -1139,11 +1155,12 @@ pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
                     .take(4)
                     .collect::<Vec<_>>();
                 wrong = Some(format!(
-                    "the board did not settle within {} ms of the last restart; {} rows, {}/{} tasks posted, open: {open:?}",
+                    "the board did not settle within {} ms of the last restart; {} rows, {}/{} tasks posted, open: {open:?}; {}",
                     world.shape.deadline_ms,
                     rows.len(),
                     fold.tasks().len(),
-                    world.shape.plan.len()
+                    world.shape.plan.len(),
+                    watching::stalled(&world, &fold)
                 ));
                 break;
             }
@@ -1230,6 +1247,7 @@ pub fn replay(seed: u64, mutation: BoardMutation) -> String {
 }
 
 pub fn report(seeds: &Range<u64>, passed: u64, failed: u64, twice: bool, mutation: BoardMutation, totals: &BoardStats) -> ExitCode {
+    println!("{}", watching::summary());
     println!(
         "RESULT seeds={}..{} scenario=board mutation={} passed={passed} failed={failed} twice={twice} stats={totals:?}",
         seeds.start,

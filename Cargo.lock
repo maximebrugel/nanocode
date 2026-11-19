@@ -337,6 +337,7 @@ name = "nanocode-board"
 version = "0.7.0"
 dependencies = [
  "nanocode-durability-core",
+ "nanocode-sync",
  "nanocode-turnlog",
  "serde",
  "serde_json",

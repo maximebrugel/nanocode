@@ -5,8 +5,9 @@ const DICTIONARY: &[u8] = include_bytes!("dictionary.bin");
 pub(super) const WORD_LENGTH_MIN: u32 = 4;
 pub(super) const WORD_LENGTH_MAX: u32 = 24;
 const WORD_LENGTHS: usize = WORD_LENGTH_MAX as usize + 1;
-const WORD_COUNT_BITS: [u8; WORD_LENGTHS] =
-    [0, 0, 0, 0, 10, 10, 11, 11, 10, 10, 10, 10, 10, 9, 9, 8, 7, 7, 8, 7, 7, 6, 6, 5, 5];
+const WORD_COUNT_BITS: [u8; WORD_LENGTHS] = [
+    0, 0, 0, 0, 10, 10, 11, 11, 10, 10, 10, 10, 10, 9, 9, 8, 7, 7, 8, 7, 7, 6, 6, 5, 5,
+];
 const UPPERCASE_ASCII_LIMIT: u8 = 0xc0;
 const UPPERCASE_TWO_BYTE_LIMIT: u8 = 0xe0;
 const UPPERCASE_TWO_BYTE_FLIP: u8 = 0x20;
@@ -47,7 +48,11 @@ struct Transform {
 }
 
 const fn transform(prefix: &'static [u8], kind: Kind, suffix: &'static [u8]) -> Transform {
-    Transform { prefix, kind, suffix }
+    Transform {
+        prefix,
+        kind,
+        suffix,
+    }
 }
 
 const TRANSFORMS: [Transform; 121] = [
@@ -196,7 +201,10 @@ pub(super) struct Word {
 }
 
 impl Word {
-    pub(super) const EMPTY: Self = Self { bytes: [0; WORD_BYTES_MAX], length: 0 };
+    pub(super) const EMPTY: Self = Self {
+        bytes: [0; WORD_BYTES_MAX],
+        length: 0,
+    };
 }
 
 pub(super) fn word(length: u32, word_id: u32) -> Result<Word, DecodeError> {

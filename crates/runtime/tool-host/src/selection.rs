@@ -1166,7 +1166,10 @@ impl ToolsBuilder {
     }
 
     #[must_use]
-    pub const fn tool_settings(mut self, tool_settings: nanocode_tool_contracts::ToolSettings) -> Self {
+    pub const fn tool_settings(
+        mut self,
+        tool_settings: nanocode_tool_contracts::ToolSettings,
+    ) -> Self {
         self.tools.tool_settings = tool_settings;
         self
     }

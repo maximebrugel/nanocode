@@ -114,32 +114,34 @@ pub fn wait_spec_with(after: std::time::Duration, budget: Option<usize>) -> Tool
         },
     );
     ToolDefinition::function(
-            "wait",
-            format!("Waits on a yielded `exec` cell and returns new output or completion.\n- Use `wait` only after `exec` returns `Script running with cell ID ...`.\n- `cell_id` identifies the running `exec` cell to resume.\n- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to {after} ms.\n- `max_tokens` limits how much new output this wait call returns. {budget_line}\n- `terminate: true` stops the running cell; false or omitted waits for output.\n- `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.\n- If the cell is still running, `wait` may yield again with the same `cell_id`.\n- If the cell has already finished, `wait` returns the completed result and closes the cell."),
-            json!({
-                "type": "object",
-                "properties": {
-                    "cell_id": {
-                        "type": "string",
-                        "description": "Identifier of the running exec cell."
-                    },
-                    "max_tokens": {
-                        "type": "number",
-                        "description": budget_schema
-                    },
-                    "terminate": {
-                        "type": "boolean",
-                        "description": "True stops the running exec cell; false or omitted waits for output."
-                    },
-                    "yield_time_ms": {
-                        "type": "number",
-                        "description": format!("Wait before yielding more output. Defaults to {after} ms.")
-                    }
+        "wait",
+        format!(
+            "Waits on a yielded `exec` cell and returns new output or completion.\n- Use `wait` only after `exec` returns `Script running with cell ID ...`.\n- `cell_id` identifies the running `exec` cell to resume.\n- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to {after} ms.\n- `max_tokens` limits how much new output this wait call returns. {budget_line}\n- `terminate: true` stops the running cell; false or omitted waits for output.\n- `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.\n- If the cell is still running, `wait` may yield again with the same `cell_id`.\n- If the cell has already finished, `wait` returns the completed result and closes the cell."
+        ),
+        json!({
+            "type": "object",
+            "properties": {
+                "cell_id": {
+                    "type": "string",
+                    "description": "Identifier of the running exec cell."
                 },
-                "required": ["cell_id"],
-                "additionalProperties": false
-            }),
-        )
+                "max_tokens": {
+                    "type": "number",
+                    "description": budget_schema
+                },
+                "terminate": {
+                    "type": "boolean",
+                    "description": "True stops the running exec cell; false or omitted waits for output."
+                },
+                "yield_time_ms": {
+                    "type": "number",
+                    "description": format!("Wait before yielding more output. Defaults to {after} ms.")
+                }
+            },
+            "required": ["cell_id"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 pub fn exec_spec_budgeted(spec: ToolDefinition, tokens: usize) -> ToolDefinition {
@@ -363,9 +365,7 @@ pub fn source_yielding(source: &str, after: std::time::Duration) -> std::borrow:
         ));
     };
     match serde_json::from_str(pragma) {
-        Ok(Value::Object(mut pragma))
-            if pragma.get("yield_time_ms").is_none_or(Value::is_null) =>
-        {
+        Ok(Value::Object(mut pragma)) if pragma.get("yield_time_ms").is_none_or(Value::is_null) => {
             pragma.insert("yield_time_ms".into(), yield_ms(after));
             std::borrow::Cow::Owned(format!(
                 "{EXEC_PRAGMA_PREFIX} {}\n{rest}",

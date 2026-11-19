@@ -507,7 +507,8 @@ impl Exec<'_> {
                 let proto = realm::intrinsic_obj(self.heap, Intrinsic::ArrayProto);
                 let reserve = self.heap.element_tail(o).map_or(0, |t| t.1.min(len));
                 let a = if mode == MAP {
-                    self.heap.new_array_with_length_reserved(Some(proto), len, reserve)
+                    self.heap
+                        .new_array_with_length_reserved(Some(proto), len, reserve)
                 } else {
                     self.heap.new_array(Some(proto), reserve)
                 };
@@ -1001,7 +1002,10 @@ impl Exec<'_> {
                     (i32::from(op - Op::Push0 as u8), 1)
                 }
                 _ if op == Op::PushI8 as u8 => (i32::from(self.byte(at + 1) as i8), 2),
-                _ if op == Op::PushI32 as u8 => (i32::from_le_bytes([1, 2, 3, 4].map(|i| self.byte(at + i))), 5),
+                _ if op == Op::PushI32 as u8 => (
+                    i32::from_le_bytes([1, 2, 3, 4].map(|i| self.byte(at + i))),
+                    5,
+                ),
                 _ => return None,
             };
             fixed += OPS[op as usize].cost.fuel() as i64;
@@ -1222,7 +1226,9 @@ impl Exec<'_> {
                 }
                 (MAP, _) => Some(v),
                 (FILTER, Some(t)) => t.then_some(x),
-                (SOME | FIND | FIND_INDEX, Some(t)) | (EVERY, Some(t @ false)) if t == (mode != EVERY) => {
+                (SOME | FIND | FIND_INDEX, Some(t)) | (EVERY, Some(t @ false))
+                    if t == (mode != EVERY) =>
+                {
                     found = Some(k);
                     k += 1;
                     break;
@@ -1234,7 +1240,11 @@ impl Exec<'_> {
                 if n >= room {
                     return false;
                 }
-                st(self.heap.arena_mut().hot_bytes(), ValueArray::VALUES.at(oel, n), v);
+                st(
+                    self.heap.arena_mut().hot_bytes(),
+                    ValueArray::VALUES.at(oel, n),
+                    v,
+                );
                 n += 1;
             }
             k += 1;
@@ -1247,7 +1257,9 @@ impl Exec<'_> {
             MAP | FILTER => {
                 let a = a.expect("each: a");
                 if n > 0 {
-                    self.heap.arena_mut().wrote(ValueArray::VALUES.at(oel, 0), 8 * n);
+                    self.heap
+                        .arena_mut()
+                        .wrote(ValueArray::VALUES.at(oel, 0), 8 * n);
                     self.heap.set_element_count(a, oel, n);
                 }
                 Value::object(a)

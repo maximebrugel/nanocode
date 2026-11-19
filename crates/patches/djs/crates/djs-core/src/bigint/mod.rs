@@ -17,7 +17,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-
 /// The largest magnitude in bits: `|x| < 2^MAX_BITS`. QuickJS's limit (1 Mi bits
 /// including the sign), so the same programs hit "BigInt is too large".
 pub const MAX_BITS: u64 = (1 << 20) - 1;
@@ -297,7 +296,6 @@ impl BigInt {
         }
     }
 
-
     pub fn from_u64(v: u64) -> BigInt {
         BigInt::new(false, vec![v as u32, (v >> 32) as u32])
     }
@@ -444,7 +442,6 @@ impl BigInt {
         }
         Ok(BigInt::new(neg, result.mag))
     }
-
 
     /// `!self` = `-self - 1`.
     pub fn not(&self) -> Result<BigInt> {

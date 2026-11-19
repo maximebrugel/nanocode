@@ -398,7 +398,10 @@ impl<L: Layer, F: Filter> Pair<L, F> {
         let data = self.layer.new_span(attributes, &span, &context);
         let stored: Box<dyn Any + Send + Sync> = Box::new(data);
         let previous = span.entry.data[slot].swap(Some(Arc::new(stored)));
-        assert!(previous.is_none(), "a layer's span data is set once, at new_span");
+        assert!(
+            previous.is_none(),
+            "a layer's span data is set once, at new_span"
+        );
         self.layer.on_new_span(attributes, &span, &context);
     }
 }
@@ -441,7 +444,6 @@ impl FilterMap {
     }
 }
 
-
 thread_local! {
     static FILTERING: Cell<FilterMap> = const { Cell::new(FilterMap::ENABLED) };
     static STACKS: RefCell<Vec<Stack>> = const { RefCell::new(Vec::new()) };
@@ -473,7 +475,10 @@ impl<T: Default> Paged<T> {
     }
 
     fn locate(index: u64) -> (usize, usize) {
-        assert!(index < TABLE_ENTRIES, "a table index is below the table's size");
+        assert!(
+            index < TABLE_ENTRIES,
+            "a table index is below the table's size"
+        );
         let first = PAGE_FIRST_ENTRIES as u64;
         let ordinal = index / first + 1;
         let page = (u64::BITS - 1 - ordinal.leading_zeros()) as usize;
@@ -485,7 +490,9 @@ impl<T: Default> Paged<T> {
     fn entry(&self, index: u64) -> &T {
         let (page, offset) = Self::locate(index);
         let entries = self.pages[page].get_or_init(|| {
-            (0..PAGE_FIRST_ENTRIES << page).map(|_| T::default()).collect()
+            (0..PAGE_FIRST_ENTRIES << page)
+                .map(|_| T::default())
+                .collect()
         });
         &entries[offset]
     }
@@ -752,7 +759,10 @@ impl Registry {
             let data = data.load_full()?;
             data.downcast_ref::<D>().is_some().then_some(data)
         })?;
-        Some(read(data.downcast_ref::<D>().expect("the data was found by its type")))
+        Some(read(
+            data.downcast_ref::<D>()
+                .expect("the data was found by its type"),
+        ))
     }
 
     fn with_stack<R>(&self, read: impl FnOnce(Option<&mut Vec<Entered>>) -> R) -> R {
@@ -791,8 +801,7 @@ impl Registry {
     fn pop_entered(&self, id: &Id) {
         STACKS.with(|stacks| {
             let mut stacks = stacks.borrow_mut();
-            let Some(position) = stacks.iter().position(|stack| stack.registry == self.key)
-            else {
+            let Some(position) = stacks.iter().position(|stack| stack.registry == self.key) else {
                 return;
             };
             let entered = &mut stacks[position].entered;
@@ -1246,4 +1255,3 @@ impl<'a, D> Iterator for Scope<'a, D> {
         }
     }
 }
-

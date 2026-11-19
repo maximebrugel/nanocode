@@ -992,7 +992,8 @@ impl App {
             }
             let launched = {
                 let session = session.clone();
-                nanocode_platform::spawn_blocking(move || split.launch(&session, &home, &workspace)).await
+                nanocode_platform::spawn_blocking(move || split.launch(&session, &home, &workspace))
+                    .await
             };
             match launched {
                 Ok(Ok(destination)) => notice(

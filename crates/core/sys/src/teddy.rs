@@ -66,8 +66,15 @@ impl Teddy {
         let mut low = [[0; NIBBLES]; TEDDY_PREFIX_BYTES_MAX];
         let mut high = [[0; NIBBLES]; TEDDY_PREFIX_BYTES_MAX];
         for &(bucket, prefix) in prefixes {
-            assert!(bucket < TEDDY_BUCKETS, "a Teddy bucket index is below eight");
-            assert_eq!(prefix.len(), prefix_len, "every Teddy prefix has the prefix length");
+            assert!(
+                bucket < TEDDY_BUCKETS,
+                "a Teddy bucket index is below eight"
+            );
+            assert_eq!(
+                prefix.len(),
+                prefix_len,
+                "every Teddy prefix has the prefix length"
+            );
             for (offset, &byte) in prefix.iter().enumerate() {
                 low[offset][usize::from(byte & NIBBLE_MASK)] |= 1 << bucket;
                 high[offset][usize::from(byte >> NIBBLE_BITS)] |= 1 << bucket;
@@ -233,7 +240,8 @@ mod x86 {
                         .expect("the window holds a block past every offset"),
                 );
                 let low_nibbles = _mm256_and_si256(chunk, nibble);
-                let high_nibbles = _mm256_and_si256(_mm256_srli_epi16::<NIBBLE_SHIFT>(chunk), nibble);
+                let high_nibbles =
+                    _mm256_and_si256(_mm256_srli_epi16::<NIBBLE_SHIFT>(chunk), nibble);
                 hits = _mm256_and_si256(
                     hits,
                     _mm256_and_si256(
@@ -242,7 +250,8 @@ mod x86 {
                     ),
                 );
             }
-            let empty = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hits, _mm256_setzero_si256())) as u32;
+            let empty =
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(hits, _mm256_setzero_si256())) as u32;
             let lanes = !empty;
             if lanes != 0 {
                 let lane = lanes.trailing_zeros() as usize;

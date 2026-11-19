@@ -461,13 +461,17 @@ fn referenced(stored: &[(u64, String)]) -> Vec<std::ops::Range<u64>> {
                     .cloned()
                     .collect::<Vec<_>>();
                 std::iter::once(row..row + rows)
-                    .chain(records(&root).into_iter().flat_map(|record| match record {
-                        LogRecord::Index { row, rows, .. } => std::iter::once(row..row + rows).collect(),
-                        LogRecord::Groups { groups } => groups
-                            .into_iter()
-                            .map(|(row, rows, _)| row..row + rows)
-                            .collect(),
-                        _ => Vec::new(),
+                    .chain(records(&root).into_iter().flat_map(|record| {
+                        match record {
+                            LogRecord::Index { row, rows, .. } => {
+                                std::iter::once(row..row + rows).collect()
+                            }
+                            LogRecord::Groups { groups } => groups
+                                .into_iter()
+                                .map(|(row, rows, _)| row..row + rows)
+                                .collect(),
+                            _ => Vec::new(),
+                        }
                     }))
                     .collect()
             }
@@ -684,9 +688,8 @@ impl TurnLogPolicy {
             .logs
             .remove(scope)
             .expect("a takeover follows a commit of an open log");
-        let acknowledged = ready(stale.read(|fold| {
-            (fold.last_event(), fold.events().len(), fold.recovering())
-        }));
+        let acknowledged =
+            ready(stale.read(|fold| (fold.last_event(), fold.events().len(), fold.recovering())));
         let mut lease = ready(stale.lease());
         refused(lease.push(LogRecord::Host {
             key: format!("{scope}:stale"),
@@ -1229,7 +1232,12 @@ impl TurnDurability for TurnLogPolicy {
             let last = stored
                 .iter()
                 .rposition(|(_, body)| !body.starts_with('+'))
-                .map_or(0, |start| stored[start..].iter().map(|(_, body)| body.len()).sum::<usize>());
+                .map_or(0, |start| {
+                    stored[start..]
+                        .iter()
+                        .map(|(_, body)| body.len())
+                        .sum::<usize>()
+                });
             assert!(
                 tail - last <= self.ratio * written,
                 "{scope} replays {tail} bytes after commit {seq} without a snapshot row, {last} of them in its last row, past {} times the {written} bytes a snapshot writes",

@@ -2,9 +2,9 @@ use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use nanocode_sync::FutureExt;
 use nanocode_tools::ToolOutputWire;
+use nanocode_trace::Instrument;
 use serde::Serialize;
 use serde_json::{Value, value::to_raw_value};
-use nanocode_trace::Instrument;
 
 use super::PreparedTools;
 use crate::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput};

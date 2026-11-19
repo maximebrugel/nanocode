@@ -1,9 +1,9 @@
 use std::io::Write as _;
 
-use nanocode_sys::base64::STANDARD;
-use nanocode_http::types::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 use nanocode_http::parse::Status;
+use nanocode_http::types::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version};
 use nanocode_io::{AsyncRead, AsyncReadExt as _};
+use nanocode_sys::base64::STANDARD;
 
 use crate::error::{Error, ProtocolError, Result, SubProtocolError, UrlError};
 
@@ -457,7 +457,10 @@ fn is_valid_key(key: &HeaderValue) -> bool {
             .is_ok_and(|decoded| decoded.len() == KEY_BYTES)
 }
 
-pub(crate) fn write_response<T>(output: &mut Vec<u8>, response: &nanocode_http::types::Response<T>) -> Result<()> {
+pub(crate) fn write_response<T>(
+    output: &mut Vec<u8>,
+    response: &nanocode_http::types::Response<T>,
+) -> Result<()> {
     write!(
         output,
         "{} {}\r\n",

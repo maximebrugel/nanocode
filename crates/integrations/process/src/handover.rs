@@ -57,7 +57,10 @@ fn read(descriptors: impl Iterator<Item = String>) -> ExitCode {
         .map(|output| {
             std::thread::spawn(move || {
                 if let Ok(flags) = nanocode_sys::unix::status_flags(&output) {
-                    let _ = nanocode_sys::unix::set_status_flags(&output, flags & !nanocode_sys::libc::O_NONBLOCK);
+                    let _ = nanocode_sys::unix::set_status_flags(
+                        &output,
+                        flags & !nanocode_sys::libc::O_NONBLOCK,
+                    );
                 }
                 let _ = io::copy(&mut std::fs::File::from(output), &mut io::sink());
             })

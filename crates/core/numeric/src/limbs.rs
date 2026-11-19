@@ -259,7 +259,11 @@ fn mul_karatsuba(product: &mut [Limb], long: &[Limb], short: &[Limb]) {
     let short_low = trim(short_low);
     {
         let (low_product, high_product) = product.split_at_mut(2 * split);
-        mul_any_into(&mut low_product[..long_low.len() + short_low.len()], long_low, short_low);
+        mul_any_into(
+            &mut low_product[..long_low.len() + short_low.len()],
+            long_low,
+            short_low,
+        );
         mul_any_into(high_product, long_high, short_high);
     }
     let long_sum = add(long_low, long_high);
@@ -418,7 +422,11 @@ fn square_schoolbook(product: &mut [Limb], value: &[Limb]) {
     for index in 0..length {
         let factor = value[index];
         let rest = &value[index + 1..];
-        let carry = add_mul_limb(&mut product[2 * index + 1..2 * index + 1 + rest.len()], rest, factor);
+        let carry = add_mul_limb(
+            &mut product[2 * index + 1..2 * index + 1 + rest.len()],
+            rest,
+            factor,
+        );
         product[index + length] = carry;
     }
     let mut carry: Limb = 0;
@@ -513,7 +521,9 @@ pub(crate) fn shr(value: &[Limb], bits: u64) -> Vec<Limb> {
     }
     let mut shifted = Vec::with_capacity(source.len());
     for index in 0..source.len() {
-        let high = source.get(index + 1).map_or(0, |&next| next << (LIMB_BITS - bit_shift));
+        let high = source
+            .get(index + 1)
+            .map_or(0, |&next| next << (LIMB_BITS - bit_shift));
         shifted.push((source[index] >> bit_shift) | high);
     }
     normalize(&mut shifted);
@@ -523,9 +533,7 @@ pub(crate) fn shr(value: &[Limb], bits: u64) -> Vec<Limb> {
 pub(crate) fn bits(value: &[Limb]) -> u64 {
     match value.last() {
         None => 0,
-        Some(&top) => {
-            (value.len() as u64) * LIMB_BITS_U64 - u64::from(top.leading_zeros())
-        }
+        Some(&top) => (value.len() as u64) * LIMB_BITS_U64 - u64::from(top.leading_zeros()),
     }
 }
 
@@ -624,7 +632,8 @@ pub(crate) fn div_rem(dividend: &[Limb], divisor: &[Limb]) -> (Vec<Limb>, Vec<Li
         return (quotient, remainder);
     }
     if dividend.len() == divisor.len()
-        || (dividend.len() == divisor.len() + 1 && compare(&dividend[1..], divisor) == Ordering::Less)
+        || (dividend.len() == divisor.len() + 1
+            && compare(&dividend[1..], divisor) == Ordering::Less)
     {
         return div_rem_one_limb_quotient(dividend, divisor);
     }
@@ -654,7 +663,8 @@ fn div_rem_one_limb_quotient(dividend: &[Limb], divisor: &[Limb]) -> (Vec<Limb>,
     let base = DoubleLimb::from(Limb::MAX) + 1;
     let divisor_top_wide = DoubleLimb::from(divisor_top);
     let (mut estimate, mut estimate_remainder) = if window_top >= divisor_top {
-        let numerator = (DoubleLimb::from(window_top) << LIMB_BITS) | DoubleLimb::from(window_middle);
+        let numerator =
+            (DoubleLimb::from(window_top) << LIMB_BITS) | DoubleLimb::from(window_middle);
         let estimate = DoubleLimb::from(Limb::MAX);
         (estimate, numerator - estimate * divisor_top_wide)
     } else {
@@ -662,7 +672,8 @@ fn div_rem_one_limb_quotient(dividend: &[Limb], divisor: &[Limb]) -> (Vec<Limb>,
         (DoubleLimb::from(estimate), DoubleLimb::from(remainder))
     };
     while estimate_remainder < base
-        && estimate * divisor_next > ((estimate_remainder << LIMB_BITS) | DoubleLimb::from(window_low))
+        && estimate * divisor_next
+            > ((estimate_remainder << LIMB_BITS) | DoubleLimb::from(window_low))
     {
         estimate -= 1;
         estimate_remainder += divisor_top_wide;
@@ -682,7 +693,11 @@ fn div_rem_one_limb_quotient(dividend: &[Limb], divisor: &[Limb]) -> (Vec<Limb>,
         assert_eq!(top, 0);
     }
     normalize(&mut remainder);
-    let quotient = if estimate == 0 { Vec::new() } else { vec![estimate] };
+    let quotient = if estimate == 0 {
+        Vec::new()
+    } else {
+        vec![estimate]
+    };
     (quotient, remainder)
 }
 
@@ -716,7 +731,10 @@ fn div_rem_knuth(dividend: &[Limb], divisor: &[Limb]) -> (Vec<Limb>, Vec<Limb>) 
             (estimate, numerator - estimate * divisor_top)
         } else {
             let (estimate, estimate_remainder) = top_divisor.divide_normalized(top, next);
-            (DoubleLimb::from(estimate), DoubleLimb::from(estimate_remainder))
+            (
+                DoubleLimb::from(estimate),
+                DoubleLimb::from(estimate_remainder),
+            )
         };
         while estimate_remainder < base
             && estimate * divisor_next
@@ -769,4 +787,3 @@ pub(crate) fn twos_complement_in_place(limbs: &mut [Limb]) {
         carry = overflow;
     }
 }
-

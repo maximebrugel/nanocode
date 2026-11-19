@@ -412,11 +412,7 @@ impl Proc {
 
     async fn read_back(&mut self, world: &World, state: usize, keys: Vec<String>) {
         let id = state_id(state);
-        let what = format!(
-            "p{} {} read_back {id} {keys:?}",
-            self.id,
-            self.mode_name()
-        );
+        let what = format!("p{} {} read_back {id} {keys:?}", self.id, self.mode_name());
         let ctx = world.begin(&what);
         let result = world
             .kv
@@ -428,7 +424,9 @@ impl Proc {
             Err(error) => return world.model.borrow_mut().failed(&error, &ctx, &what),
         };
         if world.mutation == Mutation::CacheKeepsBlank && matches!(self.mode, Mode::Cached(_)) {
-            values.iter_mut().for_each(|value| *value = Some(String::new()));
+            values
+                .iter_mut()
+                .for_each(|value| *value = Some(String::new()));
         }
         let mut model = world.model.borrow_mut();
         if values.len() != keys.len() {

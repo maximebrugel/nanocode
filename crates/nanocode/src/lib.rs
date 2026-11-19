@@ -1,6 +1,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub use nanocode_agent::Agent;
+pub use nanocode_agent::hedge;
 pub use nanocode_agent::input::PromptMessage;
 pub use nanocode_agent::{
     AgentEvents, AgentSessionContext, Capabilities, ClaudeModel, CostStatus, EstimatedUsdCost,
@@ -12,7 +13,6 @@ pub use nanocode_agent::{
 pub use nanocode_agent::{
     BackendId, BackendKind, BackendRegistration as Backend, BackendRequest, ModelSelection,
 };
-pub use nanocode_agent::hedge;
 pub use nanocode_agent::{ModelInfo, model_catalog};
 pub use nanocode_platform as platform;
 pub use nanocode_process_contracts as process;
@@ -46,9 +46,8 @@ pub use nanocode_code_mode::remote::{
     CodeModeExecutors, ExecutorSelection, HandAuthorizer, HandCallDecision, HandCapability,
     HandDescription, HandEnvironment, HandHostInfo, HandList, HandListener, HandPermission,
     HandProgram, HandRequestDecision, HandTailscale, HandTailscalePeer, HandToolSelection,
-    HostInfoLimits, HostInfoSource, RemoteCatalog, RemoteClient, RemoteCodeModeHost,
-    RemoteContext, RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation, RemoteTransport,
-    ResumedReply,
+    HostInfoLimits, HostInfoSource, RemoteCatalog, RemoteClient, RemoteCodeModeHost, RemoteContext,
+    RemoteDelivery, RemoteFrame, RemoteLink, RemoteOperation, RemoteTransport, ResumedReply,
 };
 pub use nanocode_code_mode::tool;
 pub use nanocode_tool_runtime::{
@@ -157,9 +156,7 @@ pub async fn turnlog_claim(
     parts(turnlog::OneLog::claim(follower, policy).await?).await
 }
 
-async fn parts(
-    log: std::sync::Arc<turnlog::OneLog>,
-) -> durability::Result<turnlog::Parts> {
+async fn parts(log: std::sync::Arc<turnlog::OneLog>) -> durability::Result<turnlog::Parts> {
     let store = session_store(log.store())?.with_logged_prompts();
     let journals = log.journals().await?;
     Ok(turnlog::Parts {
@@ -181,7 +178,10 @@ pub type ClaudeDefaults = nanocode_agent_host::Defaults<Absent<ClaudeHarness>, C
 pub type CodexDefaults = nanocode_agent_host::Defaults<CodexHarness, Absent<CodexHarness>>;
 
 pub enum Absent<F> {
-    Never(std::convert::Infallible, std::marker::PhantomData<fn() -> F>),
+    Never(
+        std::convert::Infallible,
+        std::marker::PhantomData<fn() -> F>,
+    ),
 }
 
 impl<F> Clone for Absent<F> {
@@ -216,8 +216,9 @@ impl<F: 'static> nanocode_agent_config::configuration::RuntimeBackend for Absent
     fn build(
         &self,
         _request: nanocode_agent_config::configuration::RuntimeRequest,
-    ) -> nanocode_agent_core::backend::BackendFuture<nanocode_agent_config::configuration::AgentResult>
-    {
+    ) -> nanocode_agent_core::backend::BackendFuture<
+        nanocode_agent_config::configuration::AgentResult,
+    > {
         match *self {
             Self::Never(never, _) => match never {},
         }

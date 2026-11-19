@@ -366,7 +366,6 @@ impl Error {
         self
     }
 
-
     pub fn exit_code(&self) -> i32 {
         match self.kind {
             ErrorKind::Help | ErrorKind::Version => 0,

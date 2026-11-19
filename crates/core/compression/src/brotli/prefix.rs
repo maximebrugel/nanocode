@@ -45,7 +45,9 @@ pub(super) fn decode_at(tables: &[Entry], tree: usize, word: u64) -> (u16, u32) 
     if length <= ROOT_BITS {
         return (root.value, length);
     }
-    let index = tree + usize::from(root.value) + ((word >> ROOT_BITS) & low_mask(length - ROOT_BITS)) as usize;
+    let index = tree
+        + usize::from(root.value)
+        + ((word >> ROOT_BITS) & low_mask(length - ROOT_BITS)) as usize;
     let entry = tables[index];
     (entry.value, ROOT_BITS + u32::from(entry.length))
 }
@@ -70,7 +72,13 @@ fn table_bits(remaining: &[u16; LENGTH_HISTOGRAM], length: u32) -> u32 {
 
 fn build_single(tables: &mut Vec<Entry>, symbol: u16) -> u32 {
     let start = tables.len();
-    tables.resize(start + ROOT_ENTRIES, Entry { length: 0, value: symbol });
+    tables.resize(
+        start + ROOT_ENTRIES,
+        Entry {
+            length: 0,
+            value: symbol,
+        },
+    );
     start as u32
 }
 
@@ -81,7 +89,10 @@ fn build(tables: &mut Vec<Entry>, histogram: &[u16; LENGTH_HISTOGRAM], sorted: &
     let mut next = 0;
     for length in 1..=ROOT_BITS {
         for _ in 0..histogram[length as usize] {
-            let entry = Entry { length: length as u8, value: sorted[next] };
+            let entry = Entry {
+                length: length as u8,
+                value: sorted[next],
+            };
             next += 1;
             let mut index = reverse(code, length) as usize;
             while index < ROOT_ENTRIES {
@@ -106,10 +117,15 @@ fn build(tables: &mut Vec<Entry>, histogram: &[u16; LENGTH_HISTOGRAM], sorted: &
                 sub_start = tables.len() - start;
                 sub_entries = 1 << sub_bits;
                 tables.resize(tables.len() + sub_entries, Entry::default());
-                tables[start + reverse(prefix, ROOT_BITS) as usize] =
-                    Entry { length: (ROOT_BITS + sub_bits) as u8, value: sub_start as u16 };
+                tables[start + reverse(prefix, ROOT_BITS) as usize] = Entry {
+                    length: (ROOT_BITS + sub_bits) as u8,
+                    value: sub_start as u16,
+                };
             }
-            let entry = Entry { length: low_length as u8, value: sorted[next] };
+            let entry = Entry {
+                length: low_length as u8,
+                value: sorted[next],
+            };
             next += 1;
             let mut index = reverse(code & low_mask(low_length) as u32, low_length) as usize;
             while index < sub_entries {
@@ -139,9 +155,16 @@ struct SymbolLengths {
 enum Step {
     Kind,
     SimpleCount,
-    SimpleSymbols { count: usize, read: usize },
+    SimpleSymbols {
+        count: usize,
+        read: usize,
+    },
     SimpleTreeSelect,
-    LengthCodes { index: usize, space: u32, codes: u32 },
+    LengthCodes {
+        index: usize,
+        space: u32,
+        codes: u32,
+    },
     SymbolLengths(SymbolLengths),
 }
 
@@ -184,14 +207,21 @@ impl CodeReader {
                         Step::SimpleCount
                     } else {
                         self.length_code_lengths = [0; CODE_LENGTH_CODES];
-                        Step::LengthCodes { index: kind as usize, space: CODE_LENGTH_SPACE, codes: 0 }
+                        Step::LengthCodes {
+                            index: kind as usize,
+                            space: CODE_LENGTH_SPACE,
+                            codes: 0,
+                        }
                     };
                 }
                 Step::SimpleCount => {
                     let Some(count) = bits.try_read(SIMPLE_COUNT_BITS) else {
                         return Ok(None);
                     };
-                    self.step = Step::SimpleSymbols { count: count as usize + 1, read: 0 };
+                    self.step = Step::SimpleSymbols {
+                        count: count as usize + 1,
+                        read: 0,
+                    };
                 }
                 Step::SimpleSymbols { count, read } => {
                     if read < count {
@@ -203,7 +233,10 @@ impl CodeReader {
                             return Err(DecodeError::SimpleCodeSymbolTooLarge);
                         }
                         self.symbols[read] = symbol as u16;
-                        self.step = Step::SimpleSymbols { count, read: read + 1 };
+                        self.step = Step::SimpleSymbols {
+                            count,
+                            read: read + 1,
+                        };
                         continue;
                     }
                     let symbols = &self.symbols[..count];
@@ -224,15 +257,25 @@ impl CodeReader {
                         return Ok(None);
                     };
                     self.step = Step::Kind;
-                    return Ok(Some(self.build_simple(tables, SIMPLE_SYMBOLS_MAX, select == 1)));
+                    return Ok(Some(self.build_simple(
+                        tables,
+                        SIMPLE_SYMBOLS_MAX,
+                        select == 1,
+                    )));
                 }
-                Step::LengthCodes { index, space, codes } => {
+                Step::LengthCodes {
+                    index,
+                    space,
+                    codes,
+                } => {
                     if !self.read_length_codes(bits, index, space, codes, alphabet_size)? {
                         return Ok(None);
                     }
                 }
                 Step::SymbolLengths(state) => {
-                    let Some(offset) = self.read_symbol_lengths(bits, state, alphabet_size, tables)? else {
+                    let Some(offset) =
+                        self.read_symbol_lengths(bits, state, alphabet_size, tables)?
+                    else {
                         return Ok(None);
                     };
                     self.step = Step::Kind;
@@ -277,7 +320,11 @@ impl CodeReader {
             let peek = bits.peek(CODE_LENGTH_PREFIX_BITS) as usize;
             let length = u32::from(CODE_LENGTH_PREFIX_LENGTH[peek]);
             if length > bits.available() {
-                self.step = Step::LengthCodes { index, space, codes };
+                self.step = Step::LengthCodes {
+                    index,
+                    space,
+                    codes,
+                };
                 return Ok(false);
             }
             bits.consume(length);
@@ -297,8 +344,14 @@ impl CodeReader {
         }
         self.length_table.clear();
         if codes == 1 {
-            let symbol = self.length_code_lengths.iter().position(|&length| length != 0);
-            build_single(&mut self.length_table, symbol.expect("one code length code") as u16);
+            let symbol = self
+                .length_code_lengths
+                .iter()
+                .position(|&length| length != 0);
+            build_single(
+                &mut self.length_table,
+                symbol.expect("one code length code") as u16,
+            );
         } else {
             let mut histogram = [0u16; LENGTH_HISTOGRAM];
             let count = sort_symbols(&self.length_code_lengths, &mut histogram, &mut self.sorted);
@@ -343,14 +396,22 @@ impl CodeReader {
                 state.symbol += 1;
                 continue;
             }
-            let extra_bits = if code == REPEAT_PREVIOUS { REPEAT_PREVIOUS_EXTRA_BITS } else { REPEAT_ZERO_EXTRA_BITS };
+            let extra_bits = if code == REPEAT_PREVIOUS {
+                REPEAT_PREVIOUS_EXTRA_BITS
+            } else {
+                REPEAT_ZERO_EXTRA_BITS
+            };
             if length + extra_bits > bits.available() {
                 self.step = Step::SymbolLengths(state);
                 return Ok(None);
             }
             let delta = ((word >> length) & low_mask(extra_bits)) as u32;
             bits.consume(length + extra_bits);
-            let repeat_length = if code == REPEAT_PREVIOUS { state.previous } else { 0 };
+            let repeat_length = if code == REPEAT_PREVIOUS {
+                state.previous
+            } else {
+                0
+            };
             if state.repeat_length != repeat_length {
                 state.repeat = 0;
                 state.repeat_length = repeat_length;
@@ -367,7 +428,9 @@ impl CodeReader {
             let end = (state.symbol + count) as usize;
             if repeat_length != 0 {
                 self.lengths[state.symbol as usize..end].fill(repeat_length);
-                state.space = state.space.wrapping_sub(count << (CODE_LENGTH_MAX - u32::from(repeat_length)));
+                state.space = state
+                    .space
+                    .wrapping_sub(count << (CODE_LENGTH_MAX - u32::from(repeat_length)));
             }
             state.symbol += count;
         }
@@ -375,12 +438,20 @@ impl CodeReader {
             return Err(DecodeError::InvalidPrefixCode);
         }
         let mut histogram = [0u16; LENGTH_HISTOGRAM];
-        let count = sort_symbols(&self.lengths[..alphabet_size as usize], &mut histogram, &mut self.sorted);
+        let count = sort_symbols(
+            &self.lengths[..alphabet_size as usize],
+            &mut histogram,
+            &mut self.sorted,
+        );
         Ok(Some(build(tables, &histogram, &self.sorted[..count])))
     }
 }
 
-fn sort_symbols(lengths: &[u8], histogram: &mut [u16; LENGTH_HISTOGRAM], sorted: &mut [u16]) -> usize {
+fn sort_symbols(
+    lengths: &[u8],
+    histogram: &mut [u16; LENGTH_HISTOGRAM],
+    sorted: &mut [u16],
+) -> usize {
     for &length in lengths {
         histogram[usize::from(length)] += 1;
     }

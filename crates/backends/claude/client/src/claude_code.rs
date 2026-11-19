@@ -496,7 +496,10 @@ impl ClaudeClient {
 impl ClaudeClient {
     pub fn subscription_or_key(api_key: &str) -> Result<Self, ClaudeAuthUnavailable> {
         let http = Self::http_client();
-        let login = Arc::new(crate::ClaudeAuthOrKey::new(signed_in(&http), Some(api_key))?);
+        let login = Arc::new(crate::ClaudeAuthOrKey::new(
+            signed_in(&http),
+            Some(api_key),
+        )?);
         Ok(Self::subscription(http, login))
     }
 }

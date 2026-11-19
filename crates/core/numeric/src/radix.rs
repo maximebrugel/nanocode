@@ -20,7 +20,10 @@ struct Chunking {
 
 impl Chunking {
     fn new(radix: u32) -> Self {
-        assert!((RADIX_MIN..=RADIX_MAX).contains(&radix), "base out of range");
+        assert!(
+            (RADIX_MIN..=RADIX_MAX).contains(&radix),
+            "base out of range"
+        );
         let radix = Limb::from(radix);
         let mut digits_per_limb = 1;
         let mut limb_base = radix;
@@ -43,12 +46,19 @@ pub(crate) fn digit_value(byte: u8) -> Option<u32> {
 pub(crate) fn to_string(value: &[Limb], radix: u32) -> String {
     let digits = to_digits(value, radix);
     let mut text = String::with_capacity(digits.len());
-    text.extend(digits.iter().map(|&digit| char::from(DIGITS[usize::from(digit)])));
+    text.extend(
+        digits
+            .iter()
+            .map(|&digit| char::from(DIGITS[usize::from(digit)])),
+    );
     text
 }
 
 pub(crate) fn to_digits(value: &[Limb], radix: u32) -> Vec<u8> {
-    assert!((RADIX_MIN..=RADIX_MAX).contains(&radix), "base out of range");
+    assert!(
+        (RADIX_MIN..=RADIX_MAX).contains(&radix),
+        "base out of range"
+    );
     if value.is_empty() {
         return alloc::vec![0];
     }
@@ -91,7 +101,12 @@ fn to_digits_power_of_two(value: &[Limb], bits_per_digit: u32) -> Vec<u8> {
     digits
 }
 
-fn write_digits_simple(value: &[Limb], chunking: Chunking, digits: &mut Vec<u8>, width: Option<usize>) {
+fn write_digits_simple(
+    value: &[Limb],
+    chunking: Chunking,
+    digits: &mut Vec<u8>,
+    width: Option<usize>,
+) {
     let start = digits.len();
     let divisor = limbs::LimbDivisor::new(chunking.limb_base);
     let mut rest = value.to_vec();
@@ -185,7 +200,10 @@ pub(crate) fn parse_natural(text: &str, radix: u32) -> Result<Vec<Limb>, ParseBi
 }
 
 fn parse_digits_text(text: &[u8], radix: u32) -> Option<Vec<Limb>> {
-    assert!((RADIX_MIN..=RADIX_MAX).contains(&radix), "base out of range");
+    assert!(
+        (RADIX_MIN..=RADIX_MAX).contains(&radix),
+        "base out of range"
+    );
     let mut text = text;
     if let Some((&b'+', rest)) = text.split_first() {
         if matches!(rest.first(), Some(b'+' | b'-')) {
@@ -226,7 +244,8 @@ pub(crate) fn from_digits(digits: &[u8], radix: u32) -> Vec<Limb> {
 }
 
 fn from_digits_power_of_two(digits: &[u8], bits_per_digit: u32) -> Vec<Limb> {
-    let mut limbs_out = alloc::vec![0; (digits.len() * bits_per_digit as usize).div_ceil(LIMB_BITS as usize)];
+    let mut limbs_out =
+        alloc::vec![0; (digits.len() * bits_per_digit as usize).div_ceil(LIMB_BITS as usize)];
     for (index, &digit) in digits.iter().rev().enumerate() {
         let start = index as u64 * u64::from(bits_per_digit);
         let limb_index = (start / LIMB_BITS_U64) as usize;
@@ -242,7 +261,9 @@ fn from_digits_power_of_two(digits: &[u8], bits_per_digit: u32) -> Vec<Limb> {
 }
 
 fn chunk_value(digits: &[u8], radix: Limb) -> Limb {
-    digits.iter().fold(0, |value, &digit| value * radix + Limb::from(digit))
+    digits
+        .iter()
+        .fold(0, |value, &digit| value * radix + Limb::from(digit))
 }
 
 fn from_digits_simple(digits: &[u8], chunking: Chunking) -> Vec<Limb> {
@@ -291,5 +312,3 @@ fn from_digits_recursive(digits: &[u8], chunking: Chunking, powers: &[Vec<Limb>]
     limbs::normalize(&mut value);
     value
 }
-
-

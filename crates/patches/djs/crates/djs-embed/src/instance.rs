@@ -798,10 +798,11 @@ impl HostCall<'_> {
         handled: bool,
     ) -> Result<(), Error> {
         let v = self.args.get(i).copied().unwrap_or(Raw::UNDEFINED);
-        self.instance.settle_with(target, |vm| match (fulfilled, handled) {
-            (true, _) => vm.resolve_host_call(target.0, Ok(v)),
-            (false, true) => vm.reject_host_call_handled(target.0, v),
-            (false, false) => vm.resolve_host_call(target.0, Err(v)),
-        })
+        self.instance
+            .settle_with(target, |vm| match (fulfilled, handled) {
+                (true, _) => vm.resolve_host_call(target.0, Ok(v)),
+                (false, true) => vm.reject_host_call_handled(target.0, v),
+                (false, false) => vm.resolve_host_call(target.0, Err(v)),
+            })
     }
 }

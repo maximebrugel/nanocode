@@ -6,8 +6,8 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::iter::{Product, Sum};
 use core::ops::{
-    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div,
-    DivAssign, Mul, MulAssign, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
+    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign,
+    Mul, MulAssign, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
 };
 use core::str::FromStr;
 
@@ -126,7 +126,11 @@ impl BigUint {
     pub fn from_bytes_be(bytes: &[u8]) -> Self {
         let mut limbs = Vec::with_capacity(bytes.len().div_ceil(size_of::<Limb>()));
         for chunk in bytes.rchunks(size_of::<Limb>()) {
-            limbs.push(chunk.iter().fold(0, |limb, &byte| (limb << u8::BITS) | Limb::from(byte)));
+            limbs.push(
+                chunk
+                    .iter()
+                    .fold(0, |limb, &byte| (limb << u8::BITS) | Limb::from(byte)),
+            );
         }
         Self::from_limbs(limbs)
     }
@@ -145,7 +149,11 @@ impl BigUint {
     }
 
     pub fn to_bytes_le(&self) -> Vec<u8> {
-        let mut bytes: Vec<u8> = self.limbs().iter().flat_map(|limb| limb.to_le_bytes()).collect();
+        let mut bytes: Vec<u8> = self
+            .limbs()
+            .iter()
+            .flat_map(|limb| limb.to_le_bytes())
+            .collect();
         while bytes.last() == Some(&0) {
             bytes.pop();
         }
@@ -207,7 +215,10 @@ impl BigUint {
     }
 
     pub fn count_ones(&self) -> u64 {
-        self.limbs().iter().map(|limb| u64::from(limb.count_ones())).sum()
+        self.limbs()
+            .iter()
+            .map(|limb| u64::from(limb.count_ones()))
+            .sum()
     }
 
     pub fn bit(&self, bit: u64) -> bool {
@@ -265,7 +276,10 @@ impl BigUint {
     }
 
     pub fn modpow(&self, exponent: &Self, modulus: &Self) -> Self {
-        assert!(!modulus.is_zero(), "attempt to calculate with zero modulus!");
+        assert!(
+            !modulus.is_zero(),
+            "attempt to calculate with zero modulus!"
+        );
         if modulus.is_one() {
             return Self::ZERO;
         }
@@ -318,7 +332,10 @@ impl BigUint {
     }
 
     pub fn modinv(&self, modulus: &Self) -> Option<Self> {
-        assert!(!modulus.is_zero(), "attempt to calculate with zero modulus!");
+        assert!(
+            !modulus.is_zero(),
+            "attempt to calculate with zero modulus!"
+        );
         if modulus.is_one() {
             return Some(Self::ZERO);
         }
@@ -358,7 +375,9 @@ impl BigUint {
             _ => match limbs::compare(self.limbs(), other.limbs()) {
                 Ordering::Less => None,
                 Ordering::Equal => Some(Self::ZERO),
-                Ordering::Greater => Some(Self::from_limbs(limbs::sub(self.limbs(), other.limbs()))),
+                Ordering::Greater => {
+                    Some(Self::from_limbs(limbs::sub(self.limbs(), other.limbs())))
+                }
             },
         }
     }
@@ -387,7 +406,11 @@ impl BigUint {
 
     pub(crate) fn shr_bits(&self, bits: u64) -> Self {
         if let Some(value) = self.small() {
-            return Self::from_limb(if bits >= LIMB_BITS_U64 { 0 } else { value >> bits });
+            return Self::from_limb(if bits >= LIMB_BITS_U64 {
+                0
+            } else {
+                value >> bits
+            });
         }
         Self::from_limbs(limbs::shr(self.limbs(), bits))
     }
@@ -830,7 +853,9 @@ macro_rules! forward_shift {
     };
 }
 
-pub(crate) use {forward_assign, forward_binary, forward_primitive, forward_primitive_assign, forward_shift};
+pub(crate) use {
+    forward_assign, forward_binary, forward_primitive, forward_primitive_assign, forward_shift,
+};
 
 forward_binary!(BigUint, Add, add, add_values);
 forward_binary!(BigUint, Sub, sub, sub_values);
@@ -1321,4 +1346,3 @@ impl ToBigUint for f64 {
         <BigUint as crate::FromPrimitive>::from_f64(*self)
     }
 }
-

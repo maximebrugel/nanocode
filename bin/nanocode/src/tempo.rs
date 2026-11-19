@@ -1489,20 +1489,18 @@ impl Tempo {
         subagents.update_spawn_policy(|policy| policy.providers = Some(providers.clone()));
         if !drawn {
             let (tempo, registry) = (self.clone(), Arc::downgrade(subagents.registry()));
-            subagents
-                .registry()
-                .set_providers_loader(Arc::new(move || {
-                    let (tempo, registry) = (tempo.clone(), registry.clone());
-                    Box::pin(async move {
-                        tempo.load().await;
-                        let providers = catalog(&tempo);
-                        if let Some(registry) = registry.upgrade() {
-                            registry.update_spawn_policy(|policy| {
-                                policy.providers = Some(providers.clone());
-                            });
-                        }
-                    })
-                }));
+            subagents.registry().set_providers_loader(Arc::new(move || {
+                let (tempo, registry) = (tempo.clone(), registry.clone());
+                Box::pin(async move {
+                    tempo.load().await;
+                    let providers = catalog(&tempo);
+                    if let Some(registry) = registry.upgrade() {
+                        registry.update_spawn_policy(|policy| {
+                            policy.providers = Some(providers.clone());
+                        });
+                    }
+                })
+            }));
             return;
         }
         let (tempo, subagents) = (self.clone(), subagents.clone());

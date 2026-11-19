@@ -1285,7 +1285,11 @@ impl CodeModeRuntime {
     }
 }
 
-fn finish_cell_span(span: &nanocode_trace::Span, execution: &CodeModeExecution, started_at: Instant) {
+fn finish_cell_span(
+    span: &nanocode_trace::Span,
+    execution: &CodeModeExecution,
+    started_at: Instant,
+) {
     span.record(
         "status",
         if execution.success {
@@ -2564,7 +2568,11 @@ fn observed_execution(
     let content = output::truncate_content(content, max_output_tokens);
     CodeModeExecution {
         cell: None,
-        output: with_status(status, nanocode_platform::elapsed(started_at).as_secs_f64(), content),
+        output: with_status(
+            status,
+            nanocode_platform::elapsed(started_at).as_secs_f64(),
+            content,
+        ),
         success,
         nested_calls: ordered_calls(nested_calls),
         notifications,
@@ -3540,7 +3548,8 @@ async fn execute_nested_call(
         }
         Nested::Run => caught(tools.execute_nested(&name, Value::clone(&input), context)).await,
     };
-    let duration_ns = u64::try_from(nanocode_platform::elapsed(started_at).as_nanos()).unwrap_or(u64::MAX);
+    let duration_ns =
+        u64::try_from(nanocode_platform::elapsed(started_at).as_nanos()).unwrap_or(u64::MAX);
     let encoded = execution.structured_json().map(str::to_owned);
     let value = execution.take_structured_result();
     let process_trace = execution.process_trace().copied().map(Into::into);
@@ -3580,7 +3589,11 @@ fn failed_execution(
     message: &str,
     nested_calls: Vec<NestedToolCall>,
 ) -> CodeModeExecution {
-    CodeModeExecution::failed(nanocode_platform::elapsed(started_at).as_secs_f64(), message, nested_calls)
+    CodeModeExecution::failed(
+        nanocode_platform::elapsed(started_at).as_secs_f64(),
+        message,
+        nested_calls,
+    )
 }
 
 fn with_status(

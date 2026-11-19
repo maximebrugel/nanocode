@@ -1317,7 +1317,9 @@ impl<'c, 'v> Interp<'c, 'v> {
                     }
                 }
                 Op::Line(n) => self.src_line = *n,
-                Op::Call(b, n) if !matches!(b, Builtin::System | Builtin::Close | Builtin::Fflush) => {
+                Op::Call(b, n)
+                    if !matches!(b, Builtin::System | Builtin::Close | Builtin::Fflush) =>
+                {
                     self.call_builtin(*b, *n as usize)?
                 }
                 Op::PrintFields(fields, Redir::None) => {
@@ -1341,7 +1343,11 @@ impl<'c, 'v> Interp<'c, 'v> {
                         return Ok(Step::Flush);
                     }
                 }
-                Op::Call(..) | Op::PrintFields(..) | Op::Print(..) | Op::Printf(..) | Op::Getline(..) => {
+                Op::Call(..)
+                | Op::PrintFields(..)
+                | Op::Print(..)
+                | Op::Printf(..)
+                | Op::Getline(..) => {
                     self.frames.last_mut().unwrap().ip = ip;
                     return Ok(Step::Wait);
                 }

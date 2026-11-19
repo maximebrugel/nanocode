@@ -11,7 +11,8 @@ use alloc::vec::Vec;
 use core::cell::Cell;
 
 fn body(b: &[u8], head: u32, end: u32) -> Result<(u32, i64, Option<(u32, u32)>), u8> {
-    let (mut at, mut fuel, mut site, mut prev, mut call, mut field) = (head, 0, None, head, false, false);
+    let (mut at, mut fuel, mut site, mut prev, mut call, mut field) =
+        (head, 0, None, head, false, false);
     while at < end {
         let w = word(b, at);
         let op = w as u8;
@@ -572,11 +573,22 @@ fn lower(ins: &Ins) -> Op {
 }
 
 #[inline(never)]
-fn accumulate(r: &mut [Value; 256], o: &Op, a: usize, c: usize, fuel: &mut i64, pass: i64) -> Option<u16> {
+fn accumulate(
+    r: &mut [Value; 256],
+    o: &Op,
+    a: usize,
+    c: usize,
+    fuel: &mut i64,
+    pass: i64,
+) -> Option<u16> {
     let (mut s, mut y, mut left) = (r[a], r[c].as_int().unwrap_or_default(), *fuel);
     let step = i32::from(o.lc as i8);
     let lfuel = i64::from(o.lfuel);
-    let (lo, hi, at) = (i64::from(o.n), i64::from(o.n) + i64::from(o.span), i64::from(y));
+    let (lo, hi, at) = (
+        i64::from(o.n),
+        i64::from(o.n) + i64::from(o.span),
+        i64::from(y),
+    );
     let room = match step.signum() {
         1 => (hi - at) / i64::from(step),
         -1 => (at - lo) / -i64::from(step),
@@ -1135,7 +1147,14 @@ impl Plan {
             _ => {
                 self.mark(ip)?;
                 self.stk.pop();
-                self.emit(I::JumpIf { a: top, to: 0, when }, cost)?
+                self.emit(
+                    I::JumpIf {
+                        a: top,
+                        to: 0,
+                        when,
+                    },
+                    cost,
+                )?
             }
         };
         let e = self.rollback?;
@@ -1156,42 +1175,46 @@ fn simple(p: &mut Plan, b: &[u8], f: &Frame, ip: u32) -> Option<bool> {
     let arg = |i: u32| Src::Slot(f.slot(f.bp + 2 + i));
     let int = |i: i32| Src::Value(Value::int(i));
     match op {
-            fast::GET_LOC => p.push(ip, cost, loc(imm16))?,
-        fast::GET_LOC0..=fast::GET_LOC3 => {
-            p.push(ip, cost, loc((op - fast::GET_LOC0) as u32))?
-        }
+        fast::GET_LOC => p.push(ip, cost, loc(imm16))?,
+        fast::GET_LOC0..=fast::GET_LOC3 => p.push(ip, cost, loc((op - fast::GET_LOC0) as u32))?,
         fast::GET_LOC8 | fast::ADD_LOC8 => p.push(ip, cost, loc(imm16 & 0xFF))?,
         fast::GET_ARG => p.push(ip, cost, arg(imm16))?,
-        fast::GET_ARG0..=fast::GET_ARG3 => {
-            p.push(ip, cost, arg((op - fast::GET_ARG0) as u32))?
-        }
+        fast::GET_ARG0..=fast::GET_ARG3 => p.push(ip, cost, arg((op - fast::GET_ARG0) as u32))?,
         fast::GET_ARG8 => p.push(ip, cost, arg(imm16 & 0xFF))?,
         fast::PUT_LOC => p.put(f, ip, cost, f.slot(f.lp + imm16), false)?,
-        fast::PUT_LOC0..=fast::PUT_LOC3 => {
-            p.put(f, ip, cost, f.slot(f.lp + (op - fast::PUT_LOC0) as u32), false)?
-        }
+        fast::PUT_LOC0..=fast::PUT_LOC3 => p.put(
+            f,
+            ip,
+            cost,
+            f.slot(f.lp + (op - fast::PUT_LOC0) as u32),
+            false,
+        )?,
         fast::PUT_LOC8 => p.put(f, ip, cost, f.slot(f.lp + (imm16 & 0xFF)), false)?,
         fast::SET_LOC => p.put(f, ip, cost, f.slot(f.lp + imm16), true)?,
-        fast::SET_LOC0..=fast::SET_LOC3 => {
-            p.put(f, ip, cost, f.slot(f.lp + (op - fast::SET_LOC0) as u32), true)?
-        }
+        fast::SET_LOC0..=fast::SET_LOC3 => p.put(
+            f,
+            ip,
+            cost,
+            f.slot(f.lp + (op - fast::SET_LOC0) as u32),
+            true,
+        )?,
         fast::SET_LOC8 => p.put(f, ip, cost, f.slot(f.lp + (imm16 & 0xFF)), true)?,
         fast::PUSH_I8 => p.push(ip, cost, int(imm32 as u8 as i8 as i32))?,
         fast::PUSH_I32 => p.push(ip, cost, int(imm32 as i32))?,
         fast::PUSH0..=fast::PUSH3 => p.push(ip, cost, int((op - fast::PUSH0) as i32))?,
         fast::PUSH_CONST | fast::PUSH_CONST8 => {
             if f.consts == 0 {
-            return None;
+                return None;
             }
             let i = if op == fast::PUSH_CONST {
-            imm32
+                imm32
             } else {
-            imm16 & 0xFF
+                imm16 & 0xFF
             };
             p.push(
-            ip,
-            cost,
-            Src::Value(ld(b, ValueArray::VALUES.at(f.consts, i))),
+                ip,
+                cost,
+                Src::Value(ld(b, ValueArray::VALUES.at(f.consts, i))),
             )?
         }
         fast::UNDEFINED => p.push(ip, cost, Src::Value(Value::UNDEFINED))?,
@@ -1229,16 +1252,16 @@ fn simple(p: &mut Plan, b: &[u8], f: &Frame, ip: u32) -> Option<bool> {
         fast::SAR => p.binary(f, ip, cost, |a, c, d| I::Sar { a, c, d })?,
         fast::LT | fast::LE | fast::GT | fast::GE => {
             let cmp = match op {
-            fast::LT => Cmp::Lt,
-            fast::LE => Cmp::Le,
-            fast::GT => Cmp::Gt,
-            _ => Cmp::Ge,
+                fast::LT => Cmp::Lt,
+                fast::LE => Cmp::Le,
+                fast::GT => Cmp::Gt,
+                _ => Cmp::Ge,
             };
             p.binary(f, ip, cost, |a, c, d| I::Compare {
-            a,
-            c,
-            d,
-            mask: cmp.mask(true),
+                a,
+                c,
+                d,
+                mask: cmp.mask(true),
             })?
         }
         fast::STRICT_EQ | fast::STRICT_NE => {
@@ -1474,7 +1497,9 @@ fn translate(b: &[u8], f: &Frame, fused: Option<&Gen>) -> Option<Plan> {
         return None;
     }
     if let Some(v) = p.result
-        && p.prog.iter().any(|i| i.i.reads(v.obj) || i.i.reads(v.local))
+        && p.prog
+            .iter()
+            .any(|i| i.i.reads(v.obj) || i.i.reads(v.local))
     {
         return None;
     }
@@ -1574,7 +1599,10 @@ impl Exec<'_> {
         let spare = match plan.result {
             Some(_) => {
                 let proto = realm::intrinsic_obj(self.heap, Intrinsic::ObjectProto);
-                match self.heap.new_iter_result(Some(proto), Value::UNDEFINED, false) {
+                match self
+                    .heap
+                    .new_iter_result(Some(proto), Value::UNDEFINED, false)
+                {
                     Ok(o) if !self.heap.gc_pending() => Some(o),
                     _ => return None,
                 }
@@ -1640,11 +1668,7 @@ impl Exec<'_> {
                 let q = &mut prog[s - 1];
                 (q.l, q.lc, q.lfuel, q.lx) = (true, o.c, q.fuel + p.fuel, o.a);
                 (q.aux, q.n, q.span) = (o.exit, o.n, o.span);
-                if s == 1
-                    && matches!(q.k.get(), K::Add)
-                    && q.a == q.d
-                    && q.a != q.c
-                    && q.c == q.lx
+                if s == 1 && matches!(q.k.get(), K::Add) && q.a == q.d && q.a != q.c && q.c == q.lx
                 {
                     q.k.set(K::Accumulate);
                 }
@@ -1682,10 +1706,7 @@ impl Exec<'_> {
         for s in 0..plan.prog.len() {
             let q = &prog[s];
             let (mut nx, mut f) = (s + 1 + usize::from(q.m), if q.m { q.mfuel } else { q.fuel });
-            let branch = matches!(
-                q.k.get(),
-                K::Branch | K::JumpIf | K::Latch | K::StepBranch
-            );
+            let branch = matches!(q.k.get(), K::Branch | K::JumpIf | K::Latch | K::StepBranch);
             let mut chk = false;
             if let Some(j) = prog.get(nx)
                 && matches!(j.k.get(), K::Jump)
@@ -1698,10 +1719,7 @@ impl Exec<'_> {
         }
         for s in 0..plan.prog.len() {
             let q = &prog[s];
-            if !matches!(
-                q.k.get(),
-                K::Branch | K::JumpIf | K::Latch | K::StepBranch
-            ) {
+            if !matches!(q.k.get(), K::Branch | K::JumpIf | K::Latch | K::StepBranch) {
                 continue;
             }
             let v = &prog[usize::from(q.nx)];
@@ -1762,7 +1780,9 @@ impl Exec<'_> {
                 () => {{
                     if o.l {
                         let x = o.lx as usize;
-                        let Some(i) = r[x].as_int().and_then(|i| i.checked_add(i32::from(o.lc as i8)))
+                        let Some(i) = r[x]
+                            .as_int()
+                            .and_then(|i| i.checked_add(i32::from(o.lc as i8)))
                         else {
                             fuel -= o.fuel as i64;
                             break 'run o.aux;
@@ -1832,7 +1852,8 @@ impl Exec<'_> {
             }
             match o.k.get() {
                 K::Accumulate => {
-                    if r[c].as_int().is_some() && (r[a].as_int().is_some() || r[a].tag().is_none()) {
+                    if r[c].as_int().is_some() && (r[a].as_int().is_some() || r[a].tag().is_none())
+                    {
                         match accumulate(&mut r, o, a, c, &mut fuel, pass) {
                             Some(e) => break 'run e,
                             None => k += 2,
@@ -2058,7 +2079,8 @@ impl Exec<'_> {
         };
         let made = match (plan.result, spare) {
             (Some(v), Some(o)) if r[usize::from(v.flag)] == Value::TRUE => {
-                self.heap.set_own_data_value(o, atoms::VALUE, r[v.value as usize]);
+                self.heap
+                    .set_own_data_value(o, atoms::VALUE, r[v.value as usize]);
                 Some((v, Value::object(o)))
             }
             _ => None,
@@ -2153,7 +2175,10 @@ impl Exec<'_> {
                 vals: ValueArray::VALUES.at(arr, 0),
             },
             guard,
-            resume: fuel(enter) + len / 8 + fuel(bytecode::Op::JumpIfFalse8) + fuel(bytecode::Op::Drop),
+            resume: fuel(enter)
+                + len / 8
+                + fuel(bytecode::Op::JumpIfFalse8)
+                + fuel(bytecode::Op::Drop),
             resume_pc: code + jump + size(bytecode::Op::Drop),
             yield_cost: fuel(bytecode::Op::Yield) + len / 8,
             yield_ip: code + yield_at,

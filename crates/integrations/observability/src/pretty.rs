@@ -7,8 +7,8 @@ use nanocode_trace::{
 
 use crate::{
     format::{
-        ErrorSourceList, EscapeGuard, FmtLevel, SpanFields, current_scope, event_meta,
-        level_style, write_timestamp,
+        ErrorSourceList, EscapeGuard, FmtLevel, SpanFields, current_scope, event_meta, level_style,
+        write_timestamp,
     },
     style::Style,
     subscriber::Context,
@@ -62,7 +62,11 @@ pub(crate) fn format_event(
         }
         writer.push('\n');
     }
-    let bold = if ansi { Style::new().bold() } else { Style::new() };
+    let bold = if ansi {
+        Style::new().bold()
+    } else {
+        Style::new()
+    };
     for span in current_scope(context, event).into_iter().flatten() {
         let metadata = span.metadata();
         write!(
@@ -173,11 +177,9 @@ impl Visit for PrettyVisitor<'_> {
         let bold = self.bold();
         let style = self.style;
         match field.name() {
-            "message" => self.write_padded(&format_args!(
-                "{}{:?}",
-                style.prefix(),
-                EscapeGuard(value)
-            )),
+            "message" => {
+                self.write_padded(&format_args!("{}{:?}", style.prefix(), EscapeGuard(value)))
+            }
             name if name.starts_with("r#") => self.write_padded(&format_args!(
                 "{}{}{}: {:?}",
                 bold.prefix(),
@@ -195,4 +197,3 @@ impl Visit for PrettyVisitor<'_> {
         }
     }
 }
-

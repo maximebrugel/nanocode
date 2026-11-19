@@ -186,7 +186,9 @@ fn leading_run_of(instructions: &[Instruction]) -> Option<usize> {
         .iter()
         .position(|instruction| !matches!(instruction, Instruction::BeginGroup(_)))?;
     match instructions[ip] {
-        Instruction::LoopOneCharacter { max: usize::MAX, .. } => Some(ip),
+        Instruction::LoopOneCharacter {
+            max: usize::MAX, ..
+        } => Some(ip),
         _ => None,
     }
 }
@@ -792,7 +794,9 @@ impl Emitter {
             Node::Char(c) => Instruction::Char(*c),
             Node::CharSet(set) if set.is_empty() => Instruction::Fail,
             Node::CharSet(set) => Instruction::CharSet(set.clone().into_boxed_slice()),
-            Node::Bracket { invert, set } => Instruction::Bracket(Box::new(Class::new(*invert, set))),
+            Node::Bracket { invert, set } => {
+                Instruction::Bracket(Box::new(Class::new(*invert, set)))
+            }
             Node::MatchAny => Instruction::MatchAny,
             Node::MatchAnyExceptLineTerminator => Instruction::MatchAnyExceptLineTerminator,
             Node::StartOfLine { multiline } => Instruction::StartOfLine {

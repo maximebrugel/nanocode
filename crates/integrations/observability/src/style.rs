@@ -188,4 +188,3 @@ impl fmt::Display for Infix {
         .write_prefix(formatter)
     }
 }
-

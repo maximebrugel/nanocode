@@ -13,7 +13,13 @@ pub(super) struct Window {
 
 impl Window {
     pub(super) const fn new() -> Self {
-        Self { buffer: Vec::new(), position: 0, size_max: 0, flushed: 0, wrapped: false }
+        Self {
+            buffer: Vec::new(),
+            position: 0,
+            size_max: 0,
+            flushed: 0,
+            wrapped: false,
+        }
     }
 
     pub(super) const fn is_allocated(&self) -> bool {
@@ -24,7 +30,8 @@ impl Window {
         assert!(!self.is_allocated());
         assert!(size_max.is_power_of_two());
         self.size_max = size_max;
-        self.buffer.resize(first_length.next_power_of_two().min(size_max), 0);
+        self.buffer
+            .resize(first_length.next_power_of_two().min(size_max), 0);
     }
 
     #[inline(always)]
@@ -53,7 +60,11 @@ impl Window {
     #[inline(always)]
     pub(super) fn max_distance(&self) -> usize {
         let limit = self.size_max - WINDOW_GAP_BYTES;
-        if self.wrapped { limit } else { self.position.min(limit) }
+        if self.wrapped {
+            limit
+        } else {
+            self.position.min(limit)
+        }
     }
 
     pub(super) const fn pending(&self) -> usize {
@@ -86,8 +97,13 @@ impl Window {
         let count = length.min(size - self.position);
         let target = self.position;
         let source = target.wrapping_sub(distance) & (size - 1);
-        if source < target && count <= SHORT_COPY_BYTES && distance >= SHORT_COPY_BYTES && target + SHORT_COPY_BYTES <= size {
-            self.buffer.copy_within(source..source + SHORT_COPY_BYTES, target);
+        if source < target
+            && count <= SHORT_COPY_BYTES
+            && distance >= SHORT_COPY_BYTES
+            && target + SHORT_COPY_BYTES <= size
+        {
+            self.buffer
+                .copy_within(source..source + SHORT_COPY_BYTES, target);
         } else if source < target && count <= SHORT_COPY_BYTES {
             let region = &mut self.buffer[source..target + count];
             for index in 0..count {

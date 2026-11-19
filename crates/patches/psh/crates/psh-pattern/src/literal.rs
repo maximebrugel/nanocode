@@ -98,7 +98,9 @@ impl Seq {
     }
 
     fn over_limit(&self) -> bool {
-        self.literals.as_ref().is_some_and(|l| l.len() > LIMIT_TOTAL)
+        self.literals
+            .as_ref()
+            .is_some_and(|l| l.len() > LIMIT_TOTAL)
     }
 
     fn dedup(&mut self) {

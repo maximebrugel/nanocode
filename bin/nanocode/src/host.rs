@@ -765,7 +765,9 @@ impl Host {
         let working_state = config.working_state;
         if let (Some(tokens), Some(maximum)) = (
             context_window,
-            model.as_codex().and_then(|model| model.context_window_limit()),
+            model
+                .as_codex()
+                .and_then(|model| model.context_window_limit()),
         ) && tokens > maximum
         {
             return Err(format!(

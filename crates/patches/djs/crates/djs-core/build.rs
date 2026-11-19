@@ -65,11 +65,7 @@ fn features() -> Vec<String> {
         .into_iter()
         // `default` and `unicode` only name others (D2411): a build that turns on the
         // same effective features through other names hashes the same.
-        .filter(|f| {
-            f != "default"
-                && f != "unicode"
-                && f != "unsafe-heap"
-        })
+        .filter(|f| f != "default" && f != "unicode" && f != "unsafe-heap")
         .collect()
 }
 

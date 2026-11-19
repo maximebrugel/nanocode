@@ -646,7 +646,9 @@ impl Exec<'_> {
         if site.code != self.code + self.pc + OPS[Op::GetMethod as usize].size as u32 {
             return None;
         }
-        let o = o.as_object().filter(|&o| self.is_class(o, ObjectClass::Array))?;
+        let o = o
+            .as_object()
+            .filter(|&o| self.is_class(o, ObjectClass::Array))?;
         let proto = realm::intrinsic_obj(self.heap, Intrinsic::ArrayProto);
         if !(self.heap.frozen(proto) && self.heap.bare(o, proto)) {
             return None;
@@ -1614,10 +1616,12 @@ impl Exec<'_> {
                                 == FCLOSURE =>
                         {
                             (self.pc, self.sp, self.fuel) = (ip - code, sp, fuel);
-                            let Some(fused) = heap_call!(self.each_method_hit(
-                                Atom::from_id(imm32!()),
-                                (w >> 40) as u16 as u32
-                            )) else {
+                            let Some(fused) =
+                                heap_call!(self.each_method_hit(
+                                    Atom::from_id(imm32!()),
+                                    (w >> 40) as u16 as u32
+                                ))
+                            else {
                                 break Exit::Decline(fast::GET_METHOD);
                             };
                             (ip, sp, fuel) = (code + self.pc, self.sp, self.fuel);

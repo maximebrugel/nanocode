@@ -2829,5 +2829,4 @@ impl Exec<'_> {
     }
 }
 
-impl Exec<'_> {
-}
+impl Exec<'_> {}

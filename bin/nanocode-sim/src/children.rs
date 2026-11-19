@@ -82,8 +82,7 @@ impl ChildMutation {
         }
     }
 
-    pub const NAMES: &'static str =
-        "child-acks-early|child-adopts-turn|child-forgets-notice|child-respawns-fresh|child-settles-lazily|coordinator-forgets-spawns|region-keeps-stale|region-skips-clear";
+    pub const NAMES: &'static str = "child-acks-early|child-adopts-turn|child-forgets-notice|child-respawns-fresh|child-settles-lazily|coordinator-forgets-spawns|region-keeps-stale|region-skips-clear";
 }
 
 #[derive(Clone, Debug)]

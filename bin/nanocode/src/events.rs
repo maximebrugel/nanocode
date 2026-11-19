@@ -437,7 +437,10 @@ impl EventMapper {
             }
             AgentEventKind::ModelAttemptRetrying => {
                 self.restart(payload["model_call_index"].as_u64());
-                transcript.push(CellKind::Notice(NoticeLevel::Warning, retry_notice(&payload)));
+                transcript.push(CellKind::Notice(
+                    NoticeLevel::Warning,
+                    retry_notice(&payload),
+                ));
                 true
             }
             AgentEventKind::ModelCompactionStarted => {
@@ -448,8 +451,11 @@ impl EventMapper {
                 true
             }
             AgentEventKind::ModelCompactionCompleted => {
-                let fresh =
-                    !transcript.has_notice_since(self.compaction_start, NoticeLevel::Info, COMPACTED);
+                let fresh = !transcript.has_notice_since(
+                    self.compaction_start,
+                    NoticeLevel::Info,
+                    COMPACTED,
+                );
                 if fresh {
                     transcript.push(CellKind::Notice(NoticeLevel::Info, COMPACTED.into()));
                 }

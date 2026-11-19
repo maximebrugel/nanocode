@@ -288,18 +288,19 @@ impl RemoteRunner {
         T: Stream<Item = Result<String, E>> + Sink<String, Error = E> + Unpin,
         E: fmt::Display,
     {
-        let first = match nanocode_platform::timeout(super::driver::HANDSHAKE_TIMEOUT, transport.next())
-            .await
-            .map_err(transport_error)?
-        {
-            Some(Ok(text)) => text,
-            Some(Err(error)) => return Err(transport_error(error)),
-            None => {
-                return Err(AttachmentError::Transport(
-                    "runner closed before publishing its catalog".into(),
-                ));
-            }
-        };
+        let first =
+            match nanocode_platform::timeout(super::driver::HANDSHAKE_TIMEOUT, transport.next())
+                .await
+                .map_err(transport_error)?
+            {
+                Some(Ok(text)) => text,
+                Some(Err(error)) => return Err(transport_error(error)),
+                None => {
+                    return Err(AttachmentError::Transport(
+                        "runner closed before publishing its catalog".into(),
+                    ));
+                }
+            };
         self.serve_catalog(first, transport).await
     }
 
@@ -1329,78 +1330,84 @@ impl RemoteRunner {
             .as_str()
             .into_client_request()
             .map_err(transport_error)?;
-        let mut authorization = nanocode_http::types::HeaderValue::from_str(&format!("Bearer {}", target.bearer()))
-            .map_err(transport_error)?;
+        let mut authorization =
+            nanocode_http::types::HeaderValue::from_str(&format!("Bearer {}", target.bearer()))
+                .map_err(transport_error)?;
         authorization.set_sensitive(true);
         request
             .headers_mut()
             .insert(nanocode_http::types::header::AUTHORIZATION, authorization);
         let runner = self.clone();
-        Ok(RunnerConnection(nanocode_platform::spawn_task(async move {
-            let mut backoff = super::driver::INITIAL_TRANSPORT_BACKOFF;
-            loop {
-                let connected = match initial.take() {
-                    Some((socket, first)) => Ok((socket, Some(first))),
-                    None => nanocode_platform::timeout(super::driver::HANDSHAKE_TIMEOUT, async {
-                        let connector = super::driver::tls_connector(&request).await?;
-                        nanocode_websocket::connect_async_tls_with_config(
-                            request.clone(),
-                            None,
-                            false,
-                            connector,
-                        )
-                        .await
-                    })
-                    .await
-                    .map_err(|error| {
-                        nanocode_websocket::Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            error,
-                        ))
-                    })
-                    .and_then(|result| result)
-                    .map(|(socket, _)| (socket, None)),
-                };
-                match connected {
-                    Ok((socket, first)) => {
-                        let mut frames = socket.with(|text: String| future::ready(Ok::<_, nanocode_websocket::Error>(Message::text(text)))).filter_map(|message| future::ready(match message {
+        Ok(RunnerConnection(nanocode_platform::spawn_task(
+            async move {
+                let mut backoff = super::driver::INITIAL_TRANSPORT_BACKOFF;
+                loop {
+                    let connected = match initial.take() {
+                        Some((socket, first)) => Ok((socket, Some(first))),
+                        None => {
+                            nanocode_platform::timeout(super::driver::HANDSHAKE_TIMEOUT, async {
+                                let connector = super::driver::tls_connector(&request).await?;
+                                nanocode_websocket::connect_async_tls_with_config(
+                                    request.clone(),
+                                    None,
+                                    false,
+                                    connector,
+                                )
+                                .await
+                            })
+                            .await
+                            .map_err(|error| {
+                                nanocode_websocket::Error::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    error,
+                                ))
+                            })
+                            .and_then(|result| result)
+                            .map(|(socket, _)| (socket, None))
+                        }
+                    };
+                    match connected {
+                        Ok((socket, first)) => {
+                            let mut frames = socket.with(|text: String| future::ready(Ok::<_, nanocode_websocket::Error>(Message::text(text)))).filter_map(|message| future::ready(match message {
                             Ok(Message::Text(text)) => Some(Ok(text.to_string())),
                             Ok(Message::Close(_)) => None,
                             Ok(Message::Binary(_)) => Some(Err(nanocode_websocket::Error::Protocol(nanocode_websocket::ProtocolError::ResetWithoutClosingHandshake))),
                             Ok(_) => None,
                             Err(error) => Some(Err(error)),
                         }));
-                        let served = match first {
-                            Some(first) => runner.serve_catalog(first, &mut frames).await,
-                            None => runner.serve(&mut frames).await,
-                        };
-                        if let Err(
-                            error @ (AttachmentError::Catalog(_) | AttachmentError::Fenced(_)),
-                        ) = served
+                            let served = match first {
+                                Some(first) => runner.serve_catalog(first, &mut frames).await,
+                                None => runner.serve(&mut frames).await,
+                            };
+                            if let Err(
+                                error @ (AttachmentError::Catalog(_) | AttachmentError::Fenced(_)),
+                            ) = served
+                            {
+                                runner.inner.failure.send_replace(Some(error));
+                                return;
+                            }
+                        }
+                        Err(nanocode_websocket::Error::Http(response))
+                            if matches!(response.status().as_u16(), 401 | 403) =>
                         {
-                            runner.inner.failure.send_replace(Some(error));
+                            runner.inner.failure.send_replace(Some(
+                                AttachmentError::Authentication(
+                                    "runner rejected the bearer credential".into(),
+                                ),
+                            ));
                             return;
                         }
+                        Err(error) => {
+                            nanocode_trace::warn!(target: "nanocode_code_mode::attachment", %error, "runner connection failed")
+                        }
                     }
-                    Err(nanocode_websocket::Error::Http(response))
-                        if matches!(response.status().as_u16(), 401 | 403) =>
-                    {
-                        runner
-                            .inner
-                            .failure
-                            .send_replace(Some(AttachmentError::Authentication(
-                                "runner rejected the bearer credential".into(),
-                            )));
-                        return;
-                    }
-                    Err(error) => {
-                        nanocode_trace::warn!(target: "nanocode_code_mode::attachment", %error, "runner connection failed")
-                    }
-                }
-                nanocode_platform::sleep(super::driver::Failure::Transport.delay(&mut backoff, None))
+                    nanocode_platform::sleep(
+                        super::driver::Failure::Transport.delay(&mut backoff, None),
+                    )
                     .await;
-            }
-        })))
+                }
+            },
+        )))
     }
 }
 

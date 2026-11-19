@@ -756,7 +756,10 @@ impl Filter for EnvFilter {
         if self.dynamics.has_value_filters() {
             return Some(LevelFilter::TRACE);
         }
-        Some(std::cmp::max(self.statics.max_level, self.dynamics.max_level))
+        Some(std::cmp::max(
+            self.statics.max_level,
+            self.dynamics.max_level,
+        ))
     }
 
     fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id) {
@@ -839,4 +842,3 @@ fn warn_statically_disabled(disabled: &[&Directive]) {
         bold.paint("help:")
     );
 }
-

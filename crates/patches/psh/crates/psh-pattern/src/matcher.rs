@@ -436,8 +436,7 @@ impl RegexMatcherBuilder {
         };
         let properties = hir.properties();
         let accelerated = !properties.look_set_prefix.contains(Look::Start)
-            && (literal::accelerates(&hir)
-                || properties.look_set_suffix.contains(Look::End));
+            && (literal::accelerates(&hir) || properties.look_set_suffix.contains(Look::End));
         let fast_line = if self.config.line_terminator.is_some()
             && !properties.alternation_literal
             && (!accelerated || properties.look_set.contains_word_unicode())

@@ -82,7 +82,9 @@ impl SyncMutation {
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|mutation| mutation.name() == name)
+        Self::ALL
+            .into_iter()
+            .find(|mutation| mutation.name() == name)
     }
 
     pub const fn name(self) -> &'static str {
@@ -285,7 +287,14 @@ impl Script {
     }
 }
 
-async fn notify_waiter(world: &World, notify: &Notify, done: &Cell<u64>, wakes: u64, index: usize, seed: u64) {
+async fn notify_waiter(
+    world: &World,
+    notify: &Notify,
+    done: &Cell<u64>,
+    wakes: u64,
+    index: usize,
+    seed: u64,
+) {
     let mut rng = Rng::derive(seed, &format!("notify-waiter-{index}"));
     let mut got = 0;
     while got < wakes {
@@ -531,7 +540,15 @@ impl Holding<'_> {
     }
 }
 
-async fn holder(world: &World, semaphore: &Semaphore, ledger: &Ledger, script: &Script, index: usize, acquires: u64, seed: u64) {
+async fn holder(
+    world: &World,
+    semaphore: &Semaphore,
+    ledger: &Ledger,
+    script: &Script,
+    index: usize,
+    acquires: u64,
+    seed: u64,
+) {
     let mut rng = Rng::derive(seed, &format!("holder-{index}"));
     let reverse = world.mutation == SyncMutation::ReverseQueue;
     for round in 0..acquires {
@@ -573,7 +590,9 @@ async fn holder(world: &World, semaphore: &Semaphore, ledger: &Ledger, script: &
             continue;
         };
         let Ok(permit) = acquired else {
-            world.fail(format!("semaphore: holder {index} saw the open semaphore closed"));
+            world.fail(format!(
+                "semaphore: holder {index} saw the open semaphore closed"
+            ));
             return;
         };
         if let Some((first, first_holder)) = ledger.ahead(ticket) {
@@ -601,7 +620,9 @@ async fn semaphore_scenario(world: &World, script: &Script, seed: u64) {
         .iter()
         .enumerate()
         .map(|(index, acquires)| {
-            Box::pin(holder(world, &semaphore, &ledger, script, index, *acquires, seed)) as Job<'_>
+            Box::pin(holder(
+                world, &semaphore, &ledger, script, index, *acquires, seed,
+            )) as Job<'_>
         })
         .collect();
     jobs.push(Box::pin(async {
@@ -640,7 +661,12 @@ struct Mail<'a> {
 }
 
 impl Mail<'_> {
-    async fn deliver(&self, channel: &mpsc::Sender<(usize, u64)>, message: (usize, u64), rng: &mut Rng) -> bool {
+    async fn deliver(
+        &self,
+        channel: &mpsc::Sender<(usize, u64)>,
+        message: (usize, u64),
+        rng: &mut Rng,
+    ) -> bool {
         let world = self.world;
         match rng.below(3) {
             0 => {
@@ -674,7 +700,13 @@ impl Mail<'_> {
         }
     }
 
-    async fn sender(&self, channel: mpsc::Sender<(usize, u64)>, index: usize, messages: u64, seed: u64) {
+    async fn sender(
+        &self,
+        channel: mpsc::Sender<(usize, u64)>,
+        index: usize,
+        messages: u64,
+        seed: u64,
+    ) {
         let world = self.world;
         let mut rng = Rng::derive(seed, &format!("sender-{index}"));
         let model = if world.mutation == SyncMutation::ShrinkCapacity {
@@ -764,7 +796,13 @@ async fn mpsc_scenario(world: &World, script: &Script, seed: u64) {
     }
 }
 
-async fn watcher(world: &World, mut receiver: watch::Receiver<u64>, values: u64, index: u64, seed: u64) {
+async fn watcher(
+    world: &World,
+    mut receiver: watch::Receiver<u64>,
+    values: u64,
+    index: u64,
+    seed: u64,
+) {
     let mut rng = Rng::derive(seed, &format!("watcher-{index}"));
     let mut last = 0;
     loop {

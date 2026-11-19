@@ -39,7 +39,10 @@ enum Node {
     Empty,
     Char(char),
     Any,
-    Class { ranges: Vec<(char, char)>, negated: bool },
+    Class {
+        ranges: Vec<(char, char)>,
+        negated: bool,
+    },
     Start,
     End,
     Concat(Vec<Self>),
@@ -56,7 +59,10 @@ enum Node {
 enum Instruction {
     Char(char),
     Any,
-    Class { ranges: Vec<(char, char)>, negated: bool },
+    Class {
+        ranges: Vec<(char, char)>,
+        negated: bool,
+    },
     Start,
     End,
     Split(usize, usize),
@@ -224,7 +230,10 @@ impl Parser<'_> {
 
     fn posix_class(&mut self) -> Result<&'static [(char, char)], PatternError> {
         let start = self.position;
-        while self.peek().is_some_and(|letter| letter.is_ascii_lowercase()) {
+        while self
+            .peek()
+            .is_some_and(|letter| letter.is_ascii_lowercase())
+        {
             self.position += 1;
         }
         let name: String = self.chars[start..self.position].iter().collect();
@@ -730,4 +739,3 @@ impl<'a> Run<'a> {
         .1
     }
 }
-

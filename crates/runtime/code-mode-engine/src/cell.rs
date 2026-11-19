@@ -674,7 +674,10 @@ impl ExecutionState {
                 let kind = call.arg(0).as_number().unwrap_or(0.0) as u8;
                 let live = match kind {
                     0 => wall_ms() as f64,
-                    1 => self.monotonic_base + nanocode_platform::elapsed(self.started).as_secs_f64() * 1000.0,
+                    1 => {
+                        self.monotonic_base
+                            + nanocode_platform::elapsed(self.started).as_secs_f64() * 1000.0
+                    }
                     _ => call.arg(1).as_number().unwrap_or(0.0),
                 };
                 Ok(Reply::Number(self.value(kind, live)))

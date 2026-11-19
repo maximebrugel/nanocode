@@ -25,17 +25,12 @@ pub mod ops;
 pub mod stack;
 pub mod template;
 
-
 pub use code::{Code, CodeBuf, FinishScratch, Label, Phase1, Phase1Code};
 pub use decode::Insn;
 pub use handlers::{Handler, HandlerTable};
 pub use lines::{LineTableBuilder, lookup_line};
 pub use ops::{
-      OP_NAMES, OPS, OPS_HASH, Op, build_hash, capture_desc, flags,
-    global_decls, special,
+    OP_NAMES, OPS, OPS_HASH, Op, build_hash, capture_desc, flags, global_decls, special,
 };
 pub use stack::{StackScratch, UNKNOWN_DEPTH, stack_depths};
-pub use template::{
-    TemplateError, TemplateParts, alloc_script, alloc_template_in,
-    func_flags,
-};
+pub use template::{TemplateError, TemplateParts, alloc_script, alloc_template_in, func_flags};

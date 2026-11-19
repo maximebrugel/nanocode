@@ -535,7 +535,6 @@ fn affix_literal(text: &[u8], pat: &[u8], suffix: bool, longest: bool) -> Option
     Some(out.to_vec())
 }
 
-
 fn affix(text: &[u8], p: &Pattern, suffix: bool, longest: bool, utf8: bool) -> Vec<u8> {
     let (u, offs) = units(text, utf8);
     let n = u.len();
@@ -564,7 +563,6 @@ pub(crate) enum ReplaceMode {
     Prefix,
     Suffix,
 }
-
 
 /// A piece of a replacement: text, or the matched text (`&`, `patsub_replacement`).
 #[derive(Clone, Debug, PartialEq, Eq)]

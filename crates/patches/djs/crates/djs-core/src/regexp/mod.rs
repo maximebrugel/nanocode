@@ -18,15 +18,11 @@ mod compiler;
 mod exec;
 mod parser;
 
-
 use alloc::string::String;
 use alloc::vec::Vec;
 
-pub use exec::{
-    Caps, ExecLimits, ExecState, Input, Outcome, Prog,
-    exec_in, resume_in,
-};
 pub(crate) use exec::Simple;
+pub use exec::{Caps, ExecLimits, ExecState, Input, Outcome, Prog, exec_in, resume_in};
 
 /// RegExp flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -41,7 +37,6 @@ impl Flags {
     pub const UNICODE: Flags = Flags(1 << 5);
     pub const UNICODE_SETS: Flags = Flags(1 << 6);
     pub const STICKY: Flags = Flags(1 << 7);
-
 
     pub const fn bits(self) -> u16 {
         self.0

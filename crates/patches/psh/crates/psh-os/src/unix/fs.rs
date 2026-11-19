@@ -114,7 +114,10 @@ pub fn set_times(p: &[u8], atime: Option<i64>, mtime: Option<i64>, follow: bool)
 
 #[cfg(target_os = "linux")]
 pub fn user_name(uid: u32) -> Option<Vec<u8>> {
-    nanocode_sys::unix::user_entry(uid).ok().flatten().map(|user| user.name.into_bytes())
+    nanocode_sys::unix::user_entry(uid)
+        .ok()
+        .flatten()
+        .map(|user| user.name.into_bytes())
 }
 
 #[cfg(target_os = "linux")]

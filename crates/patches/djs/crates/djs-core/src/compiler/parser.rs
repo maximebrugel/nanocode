@@ -332,7 +332,10 @@ pub struct ClassSpan {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(clippy::enum_variant_names, reason = "public API: every class span kind is a static one")]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "public API: every class span kind is a static one"
+)]
 pub enum ClassSpanKind {
     /// A static block's body, between its braces.
     StaticBlock,
@@ -564,8 +567,7 @@ impl<'a, 'h> Parser<'a, 'h> {
     pub(super) fn finish_unit(
         self,
     ) -> PResult<(Ref, Option<Erased>, Option<Vec<crate::heap::Atom>>)> {
-        self.finish_unit_with(
-        )
+        self.finish_unit_with()
     }
 
     /// [`Parser::finish_unit`], filling `maps` with the suspension maps when recorded,
@@ -1315,9 +1317,9 @@ impl<'a, 'h> Parser<'a, 'h> {
                         || (k == VarKind::Func && sc != vs)
                         || k == VarKind::Param
                         || (k == VarKind::CatchParam
-                            && f.scopes.iter().any(|b| {
-                                b.kind == ScopeKind::CatchBody && b.parent == Some(sc)
-                            }))
+                            && f.scopes
+                                .iter()
+                                .any(|b| b.kind == ScopeKind::CatchBody && b.parent == Some(sc)))
                     {
                         ok = false;
                         break;

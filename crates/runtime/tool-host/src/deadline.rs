@@ -435,7 +435,11 @@ impl FinishChecks {
         let ambiguity = if self.ambiguity { AMBIGUITY_CHECK } else { "" };
         let margin = if self.margin { MARGIN_CHECK } else { "" };
         let persist = if self.persist { PERSIST_CHECK } else { "" };
-        let tool_truth = if self.tool_truth { TOOL_TRUTH_CHECK } else { "" };
+        let tool_truth = if self.tool_truth {
+            TOOL_TRUTH_CHECK
+        } else {
+            ""
+        };
         let held_out = if self.held_out { HELD_OUT_CHECK } else { "" };
         let adversarial = if self.adversarial {
             ADVERSARIAL_CHECK
@@ -634,7 +638,10 @@ mod tests {
         assert!(!folded_finish_notice().contains(TOOL_TRUTH_CHECK));
         assert!(!persisting_finish_notice(None, false).contains(TOOL_TRUTH_CHECK));
         assert!(!persisting_folded_finish_notice().contains(TOOL_TRUTH_CHECK));
-        assert_eq!(plain.checklist(), format!("{FINISH_HEAD}{SCORE_CHECK}{FINISH_TAIL}"));
+        assert_eq!(
+            plain.checklist(),
+            format!("{FINISH_HEAD}{SCORE_CHECK}{FINISH_TAIL}")
+        );
     }
 
     #[test]
@@ -674,7 +681,12 @@ mod tests {
     #[test]
     fn tool_truth_text_names_no_task() {
         for word in ["oligotm", "primer", "dna", "protein", "terminal-bench"] {
-            assert!(!TOOL_TRUTH_CHECK.to_lowercase().contains(&word.to_lowercase()), "{word}");
+            assert!(
+                !TOOL_TRUTH_CHECK
+                    .to_lowercase()
+                    .contains(&word.to_lowercase()),
+                "{word}"
+            );
         }
     }
 }

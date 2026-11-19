@@ -80,7 +80,11 @@ fn image() -> (usize, usize) {
     (base, base + size)
 }
 
-#[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple"), not(windows)))]
+#[cfg(all(
+    not(target_family = "wasm"),
+    not(target_vendor = "apple"),
+    not(windows)
+))]
 fn image() -> (usize, usize) {
     unsafe extern "C" {
         static __executable_start: u8;

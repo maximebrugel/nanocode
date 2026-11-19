@@ -309,7 +309,11 @@ fn role(message: &Value) -> Option<&str> {
     message.get("role").and_then(Value::as_str)
 }
 
-fn of_type<'a>(blocks: &'a [Value], kind: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+fn of_type<'a>(
+    blocks: &'a [Value],
+    kind: &'a str,
+    key: &'a str,
+) -> impl Iterator<Item = &'a str> + 'a {
     blocks
         .iter()
         .filter(move |block| block.get("type").and_then(Value::as_str) == Some(kind))
@@ -557,7 +561,11 @@ impl ModelServer {
         })
     }
 
-    fn decide(&self, conversation: &Conversation, id: &str) -> (Value, Option<Value>, &'static str, Value) {
+    fn decide(
+        &self,
+        conversation: &Conversation,
+        id: &str,
+    ) -> (Value, Option<Value>, &'static str, Value) {
         let tool_id = format!("toolu_{id}");
         if let Some(cell) = &conversation.running_cell {
             self.world.count(|counts| counts.waits += 1);

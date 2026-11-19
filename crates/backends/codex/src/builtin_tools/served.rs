@@ -320,8 +320,7 @@ fn credential_forms(name: &str, url: &str, forms: &mut Vec<(String, String)>) {
         password.to_owned(),
         decoded_password.clone(),
         nanocode_sys::base64::STANDARD.encode(format!("{user}:{password}")),
-        nanocode_sys::base64::STANDARD
-            .encode(format!("{decoded_user}:{decoded_password}")),
+        nanocode_sys::base64::STANDARD.encode(format!("{decoded_user}:{decoded_password}")),
     ] {
         forms.push((form, placeholder.clone()));
     }

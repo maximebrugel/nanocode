@@ -166,7 +166,9 @@ macro_rules! from_truncated {
     )*};
 }
 
-from_truncated!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+from_truncated!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+);
 
 fn float_to_integer_value<T: FromTruncated>(value: f64, minimum: f64, bits: u32) -> Option<T> {
     if value.is_nan() {
@@ -297,7 +299,9 @@ macro_rules! primitive_integer {
     )*};
 }
 
-primitive_integer!(i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize);
+primitive_integer!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize
+);
 
 macro_rules! primitive_signed {
     ($($primitive:ty),*) => {$(
@@ -448,4 +452,3 @@ macro_rules! primitive_float {
 }
 
 primitive_float!(f32, f64);
-

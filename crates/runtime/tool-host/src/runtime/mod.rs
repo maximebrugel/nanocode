@@ -27,9 +27,9 @@ use std::{
 use nanocode_code_mode::embedded::host_owned_name;
 use nanocode_sync::FutureExt;
 use nanocode_tools::{Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput};
+use nanocode_trace::{Instrument, info, info_span};
 use serde_json::value::to_raw_value;
 use serde_json::{Value, json};
-use nanocode_trace::{Instrument, info, info_span};
 
 use crate::code_mode::{self, CodeModeExecution, CodeModeObserver};
 pub use crate::embedded::OwnedToolContext;

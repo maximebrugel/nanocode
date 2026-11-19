@@ -116,11 +116,13 @@ pub(crate) fn natural_to_f32(value: &[Limb], negative: bool) -> Option<f32> {
 fn power_of_two_f64(exponent: i64) -> f64 {
     if exponent >= 1 - F64_EXPONENT_BIAS {
         assert!(exponent <= F64_EXPONENT_BIAS);
-        let biased = u64::try_from(exponent + F64_EXPONENT_BIAS).expect("the biased exponent is positive");
+        let biased =
+            u64::try_from(exponent + F64_EXPONENT_BIAS).expect("the biased exponent is positive");
         f64::from_bits(biased << F64_STORED_MANTISSA_BITS)
     } else {
         assert!(exponent >= F64_SUBNORMAL_EXPONENT);
-        let position = u32::try_from(exponent - F64_SUBNORMAL_EXPONENT).expect("the position is small");
+        let position =
+            u32::try_from(exponent - F64_SUBNORMAL_EXPONENT).expect("the position is small");
         f64::from_bits(1 << position)
     }
 }
@@ -168,9 +170,15 @@ pub fn f64_to_ratio(value: f64) -> Option<(BigUint, BigUint)> {
     let mantissa = mantissa >> zeros;
     let exponent = exponent + i64::from(zeros);
     if exponent >= 0 {
-        Some((BigUint::from(mantissa).shl_bits(exponent as u64), BigUint::ONE))
+        Some((
+            BigUint::from(mantissa).shl_bits(exponent as u64),
+            BigUint::ONE,
+        ))
     } else {
-        Some((BigUint::from(mantissa), BigUint::ONE.shl_bits(exponent.unsigned_abs())))
+        Some((
+            BigUint::from(mantissa),
+            BigUint::ONE.shl_bits(exponent.unsigned_abs()),
+        ))
     }
 }
 
@@ -180,7 +188,8 @@ pub fn rational_to_f64(numerator: &BigInt, denominator: &BigInt) -> (f64, Orderi
         return (0.0, Ordering::Equal);
     }
     let negative = numerator.is_negative_value() != denominator.is_negative_value();
-    let (magnitude, ordering) = ratio_magnitude_to_f64(numerator.magnitude(), denominator.magnitude());
+    let (magnitude, ordering) =
+        ratio_magnitude_to_f64(numerator.magnitude(), denominator.magnitude());
     if negative {
         (-magnitude, ordering.reverse())
     } else {
@@ -223,7 +232,10 @@ fn ratio_magnitude_to_f64(numerator: &BigUint, denominator: &BigUint) -> (f64, O
     if round_up {
         mantissa += 1;
     }
-    let ordering = if round_up { Ordering::Greater } else { Ordering::Less };
+    let ordering = if round_up {
+        Ordering::Greater
+    } else {
+        Ordering::Less
+    };
     (mantissa as f64 * power_of_two_f64(unit), ordering)
 }
-

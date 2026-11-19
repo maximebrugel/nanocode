@@ -287,8 +287,12 @@ fn forward_slots(pointer: *mut Type, class: &Py<PyType>, vm: &VirtualMachine) {
         // C code reads the number slots directly (pybind11 converts to bool
         // through nb_bool, PyIndex_Check reads nb_index), so a builtin type
         // gets the ones its class defines, forwarded to the runtime.
-        let (bool_, int, float, index) =
-            (has("__bool__"), has("__int__"), has("__float__"), has("__index__"));
+        let (bool_, int, float, index) = (
+            has("__bool__"),
+            has("__int__"),
+            has("__float__"),
+            has("__index__"),
+        );
         if (*pointer).as_number.is_null() && (bool_ || int || float || index) {
             let mut number: crate::abi::NumberMethods = std::mem::zeroed();
             if bool_ {
@@ -307,9 +311,14 @@ fn forward_slots(pointer: *mut Type, class: &Py<PyType>, vm: &VirtualMachine) {
             // calls through the type (numpy's as_integer_ratio shifts through
             // PyLong_Type.tp_as_number->nb_lshift).
             let types = &vm.ctx.types;
-            if [types.int_type, types.float_type, types.complex_type, types.bool_type]
-                .iter()
-                .any(|builtin| class.is(*builtin))
+            if [
+                types.int_type,
+                types.float_type,
+                types.complex_type,
+                types.bool_type,
+            ]
+            .iter()
+            .any(|builtin| class.is(*builtin))
             {
                 use crate::api::*;
                 let binary: [(&'static str, &mut crate::abi::Binary, crate::abi::Binary); 13] = [
@@ -317,15 +326,31 @@ fn forward_slots(pointer: *mut Type, class: &Py<PyType>, vm: &VirtualMachine) {
                     ("__sub__", &mut number.subtract, Some(PyNumber_Subtract)),
                     ("__mul__", &mut number.multiply, Some(PyNumber_Multiply)),
                     ("__mod__", &mut number.remainder, Some(PyNumber_Remainder)),
-                    ("__divmod__", &mut number.divmod, Some(crate::extra::PyNumber_Divmod)),
+                    (
+                        "__divmod__",
+                        &mut number.divmod,
+                        Some(crate::extra::PyNumber_Divmod),
+                    ),
                     ("__lshift__", &mut number.lshift, Some(PyNumber_Lshift)),
                     ("__rshift__", &mut number.rshift, Some(PyNumber_Rshift)),
                     ("__and__", &mut number.and, Some(PyNumber_And)),
                     ("__xor__", &mut number.xor, Some(PyNumber_Xor)),
                     ("__or__", &mut number.or, Some(PyNumber_Or)),
-                    ("__floordiv__", &mut number.floor_divide, Some(PyNumber_FloorDivide)),
-                    ("__truediv__", &mut number.true_divide, Some(PyNumber_TrueDivide)),
-                    ("__matmul__", &mut number.matrix_multiply, Some(PyNumber_MatrixMultiply)),
+                    (
+                        "__floordiv__",
+                        &mut number.floor_divide,
+                        Some(PyNumber_FloorDivide),
+                    ),
+                    (
+                        "__truediv__",
+                        &mut number.true_divide,
+                        Some(PyNumber_TrueDivide),
+                    ),
+                    (
+                        "__matmul__",
+                        &mut number.matrix_multiply,
+                        Some(PyNumber_MatrixMultiply),
+                    ),
                 ];
                 for (name, slot, forward) in binary {
                     if has(name) {
@@ -333,10 +358,26 @@ fn forward_slots(pointer: *mut Type, class: &Py<PyType>, vm: &VirtualMachine) {
                     }
                 }
                 let unary: [(&'static str, &mut crate::abi::Unary, crate::abi::Unary); 4] = [
-                    ("__neg__", &mut number.negative, Some(crate::extra::PyNumber_Negative)),
-                    ("__pos__", &mut number.positive, Some(crate::extra::PyNumber_Positive)),
-                    ("__abs__", &mut number.absolute, Some(crate::extra::PyNumber_Absolute)),
-                    ("__invert__", &mut number.invert, Some(crate::extra::PyNumber_Invert)),
+                    (
+                        "__neg__",
+                        &mut number.negative,
+                        Some(crate::extra::PyNumber_Negative),
+                    ),
+                    (
+                        "__pos__",
+                        &mut number.positive,
+                        Some(crate::extra::PyNumber_Positive),
+                    ),
+                    (
+                        "__abs__",
+                        &mut number.absolute,
+                        Some(crate::extra::PyNumber_Absolute),
+                    ),
+                    (
+                        "__invert__",
+                        &mut number.invert,
+                        Some(crate::extra::PyNumber_Invert),
+                    ),
                 ];
                 for (name, slot, forward) in unary {
                     if has(name) {
@@ -535,7 +576,8 @@ pub fn with_machine<R>(f: impl FnOnce() -> R) -> R {
     if !MACHINE.get().is_null() {
         return f();
     }
-    let Some(vm) = rustpython_vm::vm::thread::try_with_current_vm(|vm| vm as *const VirtualMachine) else {
+    let Some(vm) = rustpython_vm::vm::thread::try_with_current_vm(|vm| vm as *const VirtualMachine)
+    else {
         return f();
     };
     MACHINE.set(vm);
@@ -758,9 +800,16 @@ fn instance(vm: &VirtualMachine, pointer: *mut Object) -> PyResult<PyObjectRef> 
     }
     // The same for complex (numpy.complex128: a header, then real and imag).
     if class.fast_issubclass(vm.ctx.types.complex_type)
-        && unsafe { (*(*pointer).ty).basicsize } == (size_of::<Object>() + 2 * size_of::<f64>()) as isize
+        && unsafe { (*(*pointer).ty).basicsize }
+            == (size_of::<Object>() + 2 * size_of::<f64>()) as isize
     {
-        let parts = unsafe { pointer.cast::<u8>().add(size_of::<Object>()).cast::<[f64; 2]>().read() };
+        let parts = unsafe {
+            pointer
+                .cast::<u8>()
+                .add(size_of::<Object>())
+                .cast::<[f64; 2]>()
+                .read()
+        };
         let value = nanocode_numeric::Complex64::new(parts[0], parts[1]);
         let object: PyObjectRef =
             PyRef::new_ref(rustpython_vm::builtins::PyComplex::from(value), class, dict).into();
@@ -1593,7 +1642,12 @@ pub fn type_pointer(vm: &VirtualMachine, class: &Py<PyType>) -> *mut Type {
     C_TYPES.with_borrow_mut(|types| types.insert(key, pointer as usize));
     PROXY_TYPES.with_borrow_mut(|types| types.insert(pointer as usize));
     let mro: Vec<PyObjectRef> = class.mro_map_collect(|cls| cls.to_owned().into());
-    let bases: Vec<PyObjectRef> = class.bases.read().iter().map(|base| base.clone().into()).collect();
+    let bases: Vec<PyObjectRef> = class
+        .bases
+        .read()
+        .iter()
+        .map(|base| base.clone().into())
+        .collect();
     unsafe {
         (*pointer).mro = new_ref(vm, vm.ctx.new_tuple(mro).as_object());
         (*pointer).bases = new_ref(vm, vm.ctx.new_tuple(bases).as_object());

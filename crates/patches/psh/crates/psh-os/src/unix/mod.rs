@@ -617,8 +617,9 @@ impl Host for UnixHost {
     }
 
     fn prepare_fork(&self) -> Option<Box<dyn psh_engine::host::PreparedFork>> {
-        self.fork_jobs
-            .then(|| Box::new(spawn::prepare(&self.shared)) as Box<dyn psh_engine::host::PreparedFork>)
+        self.fork_jobs.then(|| {
+            Box::new(spawn::prepare(&self.shared)) as Box<dyn psh_engine::host::PreparedFork>
+        })
     }
 
     fn forks(&self) -> bool {

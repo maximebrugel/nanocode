@@ -99,7 +99,6 @@ pub(crate) fn stops(n: Signal) -> bool {
     )
 }
 
-
 /// Which pending signals end a wait of the shell's own vproc (D1903).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Gives {

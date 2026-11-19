@@ -161,7 +161,6 @@ impl Exec<'_> {
         })
     }
 
-
     /// `fast_iter_next`'s step on explicit operands (the tier-0 loop, D1930): advances
     /// the Array Iterator `it` and returns the element, or `None` with nothing changed.
     pub(super) fn iter_next_hit(&mut self, it: Value, f: Value) -> Option<Value> {

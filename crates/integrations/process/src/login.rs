@@ -167,9 +167,7 @@ async fn in_process(
     report: &str,
 ) -> Option<Vec<u8>> {
     let psh = |name: &OsStr| name.as_encoded_bytes().starts_with(b"PSH_");
-    if shell.file_name() != Some(OsStr::new("bash"))
-        || launched.iter().any(|(name, _)| psh(name))
-    {
+    if shell.file_name() != Some(OsStr::new("bash")) || launched.iter().any(|(name, _)| psh(name)) {
         return None;
     }
     let mut environment = launched.to_vec();

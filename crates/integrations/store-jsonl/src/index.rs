@@ -284,7 +284,9 @@ impl Journal {
                 self.index = index;
             }
             Ok(None) => {}
-            Err(error) => nanocode_trace::warn!(%error, "rebuilding invalid JSONL index from journal"),
+            Err(error) => {
+                nanocode_trace::warn!(%error, "rebuilding invalid JSONL index from journal")
+            }
         }
     }
 

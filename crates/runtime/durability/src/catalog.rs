@@ -680,7 +680,9 @@ mod store {
 
         #[must_use]
         pub fn sharing_payloads(mut self, other: &Self) -> Self {
-            self.store.payload_memo.clone_from(&other.store.payload_memo);
+            self.store
+                .payload_memo
+                .clone_from(&other.store.payload_memo);
             self
         }
 

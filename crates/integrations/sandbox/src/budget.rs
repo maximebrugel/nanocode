@@ -524,10 +524,7 @@ fn holding(tree: &[u32], own: Option<&Path>, adjusted: &mut BTreeSet<u32>) -> u6
 
 fn kill(tree: &[u32]) {
     for process in tree {
-        if let Some(process) = i32::try_from(*process)
-            .ok()
-            .filter(|process| *process != 0)
-        {
+        if let Some(process) = i32::try_from(*process).ok().filter(|process| *process != 0) {
             nanocode_platform::unix::signal_process(process, nanocode_sys::libc::SIGKILL).ok();
         }
     }

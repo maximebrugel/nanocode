@@ -353,11 +353,11 @@ impl Heap {
         self.set_old_region(end, minors);
         self.arena.reset_cards(from, end);
         let stack = self.arena.get::<Ref>(0, Roots::STACK).get();
-        let segment = self
-            .arena
-            .get::<Ref>(0, Roots::INTERP)
-            .get()
-            .and_then(|i| self.arena.get(i, super::cells::Interp::SEGMENT).as_internal());
+        let segment = self.arena.get::<Ref>(0, Roots::INTERP).get().and_then(|i| {
+            self.arena
+                .get(i, super::cells::Interp::SEGMENT)
+                .as_internal()
+        });
         for c in [stack, segment].into_iter().flatten() {
             let size = self.arena.get(c, Header::SIZE);
             self.arena.card(c, size);

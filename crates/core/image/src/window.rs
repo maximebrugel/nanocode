@@ -47,7 +47,10 @@ impl ImageWindow {
         let mut bytes = 0;
         for (index, size) in sizes.iter().enumerate() {
             bytes += size;
-            let budget = self.bytes.filter(|budget| bytes > *budget).map(|budget| budget / 2);
+            let budget = self
+                .bytes
+                .filter(|budget| bytes > *budget)
+                .map(|budget| budget / 2);
             while evicted < self.evicted(index + 1) || budget.is_some_and(|budget| bytes > budget) {
                 bytes -= sizes[evicted];
                 evicted += 1;

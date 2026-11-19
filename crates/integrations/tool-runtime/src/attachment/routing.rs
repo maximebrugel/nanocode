@@ -515,8 +515,7 @@ impl Tool for RoutedTool {
             }
         }
         let cua_tool = cua(definition_name(&self.local).as_str());
-        let workdir =
-            !keeps_own_paths(self.routing) && (cua_tool || !self.snapshot().is_empty());
+        let workdir = !keeps_own_paths(self.routing) && (cua_tool || !self.snapshot().is_empty());
         if let ToolDefinition::Function { parameters, .. } = &mut definition
             && (workdir || cua_tool)
         {
@@ -530,9 +529,7 @@ impl Tool for RoutedTool {
             {
                 properties.insert("workdir".into(), serde_json::json!({"type":"string","description":"Logical workspace root selecting the local host or a remote runner."}));
             }
-            if cua_tool
-                && let Some(object) = schema.as_object_mut()
-            {
+            if cua_tool && let Some(object) = schema.as_object_mut() {
                 let required = object
                     .entry("required")
                     .or_insert_with(|| serde_json::json!([]));

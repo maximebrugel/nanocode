@@ -224,7 +224,9 @@ pub enum ChildFd {
     /// A new pipe: the child gets one end, the engine the other (in
     /// [`Spawned::pipes`]), which it pumps to or from an engine object. `input` is a
     /// pipe the child reads from.
-    Pipe { input: bool },
+    Pipe {
+        input: bool,
+    },
     /// The same as an earlier descriptor of the list (`|&`, `2>&1` into a pipe: one
     /// pipe, so the order of the writes survives).
     Dup(u32),

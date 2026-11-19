@@ -377,7 +377,8 @@ impl EmbeddedToolRuntime {
                     None => exec,
                 },
                 crate::code_mode_spec::wait_spec_with(
-                    self.cell_yield.unwrap_or(crate::code_mode_spec::DEFAULT_YIELD),
+                    self.cell_yield
+                        .unwrap_or(crate::code_mode_spec::DEFAULT_YIELD),
                     self.output_budget,
                 ),
             ];
@@ -550,7 +551,12 @@ impl EmbeddedToolRuntime {
         let Some(host) = self.host() else {
             return Ok(code_mode_unavailable("exec"));
         };
-        let source = self.yielding(host, self.exec_yield, source, crate::code_mode_spec::source_yielding);
+        let source = self.yielding(
+            host,
+            self.exec_yield,
+            source,
+            crate::code_mode_spec::source_yielding,
+        );
         let source = &*self.budgeted(host, source, crate::code_mode_spec::source_budgeted);
         if host.tool_mode() == EmbeddedToolMode::CodeOnly {
             host.adopt(context, self.cell_tools()).await;
@@ -597,7 +603,12 @@ impl EmbeddedToolRuntime {
         let Some(host) = self.host() else {
             return Ok(code_mode_unavailable("exec"));
         };
-        let source = self.yielding(host, self.exec_yield, source, crate::code_mode_spec::source_yielding);
+        let source = self.yielding(
+            host,
+            self.exec_yield,
+            source,
+            crate::code_mode_spec::source_yielding,
+        );
         let source = &*self.budgeted(host, source, crate::code_mode_spec::source_budgeted);
         if host.tool_mode() == EmbeddedToolMode::CodeOnly {
             host.adopt(context.as_context(), self.cell_tools()).await;
@@ -691,7 +702,12 @@ impl EmbeddedToolRuntime {
         let Some(host) = self.host() else {
             return Ok(code_mode_unavailable("wait"));
         };
-        let input = self.yielding(host, self.cell_yield, input, crate::code_mode_spec::wait_yielding);
+        let input = self.yielding(
+            host,
+            self.cell_yield,
+            input,
+            crate::code_mode_spec::wait_yielding,
+        );
         let input = &*self.budgeted(host, input, crate::code_mode_spec::wait_budgeted);
         if host.tool_mode() == EmbeddedToolMode::CodeOnly {
             host.adopt(context, self.cell_tools()).await;

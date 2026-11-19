@@ -1,8 +1,8 @@
 use crate::{
     SYSTEM,
     landlock::{
-        Abi, Created, FS_IOCTL_DEV, FS_READ_DIR, FS_READ_FILE, FS_WRITE_FILE, Kind,
-        NET_BIND_TCP, NET_CONNECT_TCP, Ruleset, SCOPE_ABSTRACT_UNIX_SOCKET, SCOPE_SIGNAL,
+        Abi, Created, FS_IOCTL_DEV, FS_READ_DIR, FS_READ_FILE, FS_WRITE_FILE, Kind, NET_BIND_TCP,
+        NET_CONNECT_TCP, Ruleset, SCOPE_ABSTRACT_UNIX_SOCKET, SCOPE_SIGNAL,
     },
     seccomp,
 };

@@ -4,7 +4,10 @@ use std::io;
 fn missing() -> Vec<&'static str> {
     [
         ("aes", std::arch::is_x86_feature_detected!("aes")),
-        ("pclmulqdq", std::arch::is_x86_feature_detected!("pclmulqdq")),
+        (
+            "pclmulqdq",
+            std::arch::is_x86_feature_detected!("pclmulqdq"),
+        ),
         ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
         ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
         ("adx", std::arch::is_x86_feature_detected!("adx")),

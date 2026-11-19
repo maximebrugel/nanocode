@@ -235,7 +235,11 @@ fn method(
     .into()
 }
 
-fn member(vm: &VirtualMachine, class: &'static Py<PyType>, def: &MemberDef) -> PyResult<PyObjectRef> {
+fn member(
+    vm: &VirtualMachine,
+    class: &'static Py<PyType>,
+    def: &MemberDef,
+) -> PyResult<PyObjectRef> {
     let name = text(def.name).unwrap_or("?");
     let kind = def.kind;
     let offset = def.offset as usize;
@@ -244,10 +248,12 @@ fn member(vm: &VirtualMachine, class: &'static Py<PyType>, def: &MemberDef) -> P
         read_member(vm, kind, at, name)
     });
     let set: Option<Setter> = (def.flags & READONLY == 0).then(|| {
-        Box::new(move |vm: &VirtualMachine, zelf: PyObjectRef, value: PyObjectRef| {
-            let at = unsafe { pointer_of(vm, &zelf)?.cast::<u8>().add(offset) };
-            write_member(vm, kind, at, &value)
-        }) as Setter
+        Box::new(
+            move |vm: &VirtualMachine, zelf: PyObjectRef, value: PyObjectRef| {
+                let at = unsafe { pointer_of(vm, &zelf)?.cast::<u8>().add(offset) };
+                write_member(vm, kind, at, &value)
+            },
+        ) as Setter
     });
     Ok(descriptor(vm, class, name, Some(get), set, text(def.doc)))
 }
@@ -265,7 +271,8 @@ fn descriptor(
 ) -> PyObjectRef {
     let mut descriptor = rustpython_vm::builtins::PyGetSet::new(name, class, &vm.ctx);
     if let Some(get) = get {
-        descriptor = descriptor.with_get(move |zelf: PyObjectRef, vm: &VirtualMachine| get(vm, zelf));
+        descriptor =
+            descriptor.with_get(move |zelf: PyObjectRef, vm: &VirtualMachine| get(vm, zelf));
     }
     if let Some(set) = set {
         descriptor = descriptor.with_set(
@@ -369,7 +376,11 @@ fn write_member(
     Ok(())
 }
 
-fn getset(vm: &VirtualMachine, class: &'static Py<PyType>, def: &GetSetDef) -> PyResult<PyObjectRef> {
+fn getset(
+    vm: &VirtualMachine,
+    class: &'static Py<PyType>,
+    def: &GetSetDef,
+) -> PyResult<PyObjectRef> {
     let name = text(def.name).unwrap_or("?");
     let closure = def.closure as usize;
     let get = def.get.map(|get| {
@@ -381,19 +392,21 @@ fn getset(vm: &VirtualMachine, class: &'static Py<PyType>, def: &GetSetDef) -> P
         }) as Getter
     });
     let set = def.set.map(|set| {
-        Box::new(move |vm: &VirtualMachine, zelf: PyObjectRef, value: PyObjectRef| {
-            enter(vm, || {
-                let result = unsafe {
-                    call3(
-                        set,
-                        borrowed(vm, &zelf),
-                        borrowed(vm, &value),
-                        closure as *mut c_void,
-                    )
-                };
-                check(vm, result as isize).map(drop)
-            })
-        }) as Setter
+        Box::new(
+            move |vm: &VirtualMachine, zelf: PyObjectRef, value: PyObjectRef| {
+                enter(vm, || {
+                    let result = unsafe {
+                        call3(
+                            set,
+                            borrowed(vm, &zelf),
+                            borrowed(vm, &value),
+                            closure as *mut c_void,
+                        )
+                    };
+                    check(vm, result as isize).map(drop)
+                })
+            },
+        ) as Setter
     });
     Ok(descriptor(vm, class, name, get, set, text(def.doc)))
 }

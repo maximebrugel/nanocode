@@ -237,11 +237,17 @@ impl fmt::Display for LandlockError {
             Self::MissingHandledAccess => f.write_str("missing access"),
             Self::CreateRuleset(source) => write!(f, "failed to create a ruleset: {source}"),
             Self::UnhandledAccess(incompatible) => {
-                write!(f, "access-rights not handled by the ruleset: {incompatible}")
+                write!(
+                    f,
+                    "access-rights not handled by the ruleset: {incompatible}"
+                )
             }
             Self::Stat(source) => write!(f, "failed to check file descriptor type: {source}"),
             Self::DirectoryAccess(incompatible) => {
-                write!(f, "incompatible directory-only access-rights: {incompatible}")
+                write!(
+                    f,
+                    "incompatible directory-only access-rights: {incompatible}"
+                )
             }
             Self::AddRule(source) => write!(f, "failed to add a rule: {source}"),
             Self::SetNoNewPrivileges(source) => write!(f, "failed to set no_new_privs: {source}"),
@@ -260,7 +266,10 @@ const fn required(kind: Kind, access: u64, abi: Abi) -> Result<u64, LandlockErro
     }
     let unknown = access & !kind.known();
     if unknown != 0 {
-        return Err(LandlockError::Unknown(Flags { kind, bits: unknown }));
+        return Err(LandlockError::Unknown(Flags {
+            kind,
+            bits: unknown,
+        }));
     }
     let compatible = access & kind.all(abi);
     if compatible == 0 {
@@ -308,8 +317,9 @@ impl Ruleset {
         if self.fs == 0 && self.net == 0 && self.scoped == 0 {
             return Err(LandlockError::MissingHandledAccess);
         }
-        let fd = nanocode_sys::unix::confine::landlock_create_ruleset(self.fs, self.net, self.scoped)
-            .map_err(LandlockError::CreateRuleset)?;
+        let fd =
+            nanocode_sys::unix::confine::landlock_create_ruleset(self.fs, self.net, self.scoped)
+                .map_err(LandlockError::CreateRuleset)?;
         Ok(Created {
             fd,
             abi: self.abi,

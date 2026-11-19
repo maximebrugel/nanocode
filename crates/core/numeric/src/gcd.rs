@@ -130,10 +130,9 @@ fn apply_cofactors(larger: &mut Vec<Limb>, smaller: &mut Vec<Limb>, cofactors: &
 
 fn to_double_limb(value: &[Limb]) -> DoubleLimb {
     assert!(value.len() <= 2);
-    value
-        .iter()
-        .rev()
-        .fold(0, |wide, &limb| (wide << LIMB_BITS) | DoubleLimb::from(limb))
+    value.iter().rev().fold(0, |wide, &limb| {
+        (wide << LIMB_BITS) | DoubleLimb::from(limb)
+    })
 }
 
 pub(crate) const fn gcd_limb(mut a: Limb, mut b: Limb) -> Limb {
@@ -180,4 +179,3 @@ fn gcd_double_limb(mut a: DoubleLimb, mut b: DoubleLimb) -> DoubleLimb {
         }
     }
 }
-

@@ -22,10 +22,10 @@ pub use decode::{
     DEFAULT_ALLOC_BYTES_MAX, DecodeError, Decoded, Decoder, Format, Header, Limits, dimensions,
     guess_format,
 };
-pub use window::ImageWindow;
 pub use pixels::{Image, Pixels, RgbLayout};
 pub use resample::lanczos3;
 pub use thumbnail::thumbnail;
+pub use window::ImageWindow;
 
 use nanocode_digest::Sha1;
 pub use nanocode_types_core::ImageDetail;
@@ -91,7 +91,8 @@ fn encode_data_url(mime: &str, bytes: &[u8]) -> String {
 }
 
 const fn encoded_length(bytes: usize) -> usize {
-    nanocode_sys::base64::encoded_length(bytes, true).expect("base64 length of an in-memory buffer fits in usize")
+    nanocode_sys::base64::encoded_length(bytes, true)
+        .expect("base64 length of an in-memory buffer fits in usize")
 }
 
 struct ImageMetadata {
@@ -618,8 +619,8 @@ fn bound_bytes(bytes: Vec<u8>, max_bytes: usize) -> Result<EncodedImage, ImagePr
         .image;
     let (mut width, mut height) = (source.width(), source.height());
     loop {
-        let resized =
-            ((width, height) != (source.width(), source.height())).then(|| thumbnail(&source, width, height));
+        let resized = ((width, height) != (source.width(), source.height()))
+            .then(|| thumbnail(&source, width, height));
         let image = encode_image(
             resized.as_ref().unwrap_or(&source),
             Format::Jpeg,

@@ -25,7 +25,6 @@ mod writer;
 
 use std::{borrow::Cow, fs::OpenOptions, io, path::PathBuf, sync::Arc, time::Duration};
 
-
 pub use batch::{BatchConfig, BatchSpanProcessor, SpanExporter};
 pub use cli::ObservabilityOutputArgs;
 pub use layer::{OtelLayer, OtelSpan, add_link, span_context};

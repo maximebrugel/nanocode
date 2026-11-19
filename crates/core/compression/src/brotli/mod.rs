@@ -111,7 +111,10 @@ struct Group {
 
 impl Group {
     const fn new() -> Self {
-        Self { tables: Vec::new(), offsets: Vec::new() }
+        Self {
+            tables: Vec::new(),
+            offsets: Vec::new(),
+        }
     }
 
     fn clear(&mut self) {
@@ -203,7 +206,11 @@ impl Decoder {
         match self.run(&mut bits, output, &mut written) {
             Ok(status) => {
                 self.bits = bits.finish();
-                Ok(Progress { consumed: bits.position(), written, status })
+                Ok(Progress {
+                    consumed: bits.position(),
+                    written,
+                    status,
+                })
             }
             Err(error) => {
                 self.phase = Phase::Failed(error);
@@ -212,7 +219,12 @@ impl Decoder {
         }
     }
 
-    fn run(&mut self, bits: &mut Bits<'_>, output: &mut [u8], written: &mut usize) -> Result<Status, DecodeError> {
+    fn run(
+        &mut self,
+        bits: &mut Bits<'_>,
+        output: &mut [u8],
+        written: &mut usize,
+    ) -> Result<Status, DecodeError> {
         loop {
             match self.step(bits, output, written)? {
                 Flow::Continue => {}
@@ -231,7 +243,12 @@ impl Decoder {
         }
     }
 
-    fn step(&mut self, bits: &mut Bits<'_>, output: &mut [u8], written: &mut usize) -> Result<Flow, DecodeError> {
+    fn step(
+        &mut self,
+        bits: &mut Bits<'_>,
+        output: &mut [u8],
+        written: &mut usize,
+    ) -> Result<Flow, DecodeError> {
         if self.window.is_full() {
             self.check_length()?;
             *written += self.window.flush(&mut output[*written..]);

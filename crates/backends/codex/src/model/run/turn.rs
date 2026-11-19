@@ -1105,7 +1105,10 @@ impl ModelRun {
                                 false,
                             )
                         } else {
-                            nanocode_tool_host::deadline::finish_notice(self.deadline.as_ref(), false)
+                            nanocode_tool_host::deadline::finish_notice(
+                                self.deadline.as_ref(),
+                                false,
+                            )
                         },
                     )?;
                     session.conversation.clear_delta();

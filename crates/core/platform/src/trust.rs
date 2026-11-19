@@ -117,7 +117,10 @@ pub fn mozilla_roots() -> Vec<CertificateDer<'static>> {
 }
 
 fn der_length(der: &[u8]) -> usize {
-    assert_eq!(der[0], DER_SEQUENCE, "a generated Mozilla root is a DER sequence");
+    assert_eq!(
+        der[0], DER_SEQUENCE,
+        "a generated Mozilla root is a DER sequence"
+    );
     let first = der[1];
     if first < DER_LONG_LENGTH {
         return DER_HEADER_BYTES + usize::from(first);
@@ -163,7 +166,11 @@ fn load_paths(file: Option<&Path>, directories: &[PathBuf]) -> NativeCertificate
     loaded
 }
 
-fn load_directory(directory: &Path, read: &mut BTreeSet<FileIdentity>, loaded: &mut NativeCertificates) {
+fn load_directory(
+    directory: &Path,
+    read: &mut BTreeSet<FileIdentity>,
+    loaded: &mut NativeCertificates,
+) {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {

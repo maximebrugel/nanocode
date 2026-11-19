@@ -21,7 +21,6 @@ mod regex;
 mod resolve;
 mod value;
 
-
 use std::rc::Rc;
 
 use psh_engine::host::{OpenOptions, error_text};
@@ -254,8 +253,7 @@ const GAWK_ONLY: &[&[u8]] = &[
 /// too: the real program runs those as well).
 fn names_gawk_only(src: &[u8]) -> bool {
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    src.split(|&b| !word(b))
-        .any(|w| GAWK_ONLY.contains(&w))
+    src.split(|&b| !word(b)).any(|w| GAWK_ONLY.contains(&w))
 }
 
 /// Source to a runnable program.

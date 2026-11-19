@@ -119,8 +119,7 @@ impl WireMutation {
         }
     }
 
-    pub const NAMES: &'static str =
-        "http-reuse-dirty|http-no-read-timeout|tool-result-twice|drop-cancelled-prompt|hedge-unmarked|http-real-elapsed|drop-acked-answer|drop-tool-result|rewrite-assistant|acks-unflushed";
+    pub const NAMES: &'static str = "http-reuse-dirty|http-no-read-timeout|tool-result-twice|drop-cancelled-prompt|hedge-unmarked|http-real-elapsed|drop-acked-answer|drop-tool-result|rewrite-assistant|acks-unflushed";
 }
 
 #[derive(Clone, Copy, Debug)]

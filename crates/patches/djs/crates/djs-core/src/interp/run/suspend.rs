@@ -32,8 +32,8 @@
 //! frame's own continuation: a tail call.
 
 use super::hot::{self, ld, ld32, st};
-use crate::heap::cells::Object;
 use super::*;
+use crate::heap::cells::Object;
 
 pub(crate) const START: i32 = 0;
 pub(crate) const SUSPENDED: i32 = 1;
@@ -161,7 +161,11 @@ pub(super) fn suspended_frame(heap: &Heap, it: Value, f: Value) -> Option<(u32, 
     if state.as_int() != Some(SUSPENDED) {
         return None;
     }
-    Some((saved.as_internal()?, pc.as_int()? as u32, hp_off.as_int()? as u32))
+    Some((
+        saved.as_internal()?,
+        pc.as_int()? as u32,
+        hp_off.as_int()? as u32,
+    ))
 }
 
 impl Exec<'_> {
@@ -454,7 +458,13 @@ impl Exec<'_> {
         fuel: i64,
     ) -> Option<(u32, i64)> {
         let cost = OPS[Op::IterNextLoc as usize].cost.fuel() as i64;
-        self.gen_enter_hot((sp, cap, Value::UNDEFINED), g, f, (at, Continuation::GenStep), (cost, fuel))
+        self.gen_enter_hot(
+            (sp, cap, Value::UNDEFINED),
+            g,
+            f,
+            (at, Continuation::GenStep),
+            (cost, fuel),
+        )
     }
 
     #[inline(always)]

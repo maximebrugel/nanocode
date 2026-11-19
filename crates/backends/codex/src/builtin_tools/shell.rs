@@ -176,7 +176,10 @@ impl Tool for WriteStdinHandler {
     }
 }
 
-pub(crate) fn output_limit(requested: Option<usize>, context: ToolContext<'_>) -> (usize, OutputUnit) {
+pub(crate) fn output_limit(
+    requested: Option<usize>,
+    context: ToolContext<'_>,
+) -> (usize, OutputUnit) {
     let requested = requested.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     let budget = context.output_token_budget();
     let bytes = context

@@ -68,8 +68,6 @@ struct Tracked {
     kept: u64,
 }
 
-
-
 /// The card table (D3200): a byte per 512-byte card of the old region `[0, end)`, set by
 /// every write below `end` through the arena's write methods or [`Arena::wrote`], so a
 /// minor collection traces only the dirty cards instead of the whole old region. `end` 0:
@@ -309,7 +307,9 @@ impl Arena {
         c.end = 0;
         c.dirty.clear();
         if c.dirty.try_reserve_exact(n).is_ok()
-            && c.starts.try_reserve_exact(n.saturating_sub(c.starts.len())).is_ok()
+            && c.starts
+                .try_reserve_exact(n.saturating_sub(c.starts.len()))
+                .is_ok()
         {
             c.dirty.resize(n, 0);
             c.starts.resize(n, 0);

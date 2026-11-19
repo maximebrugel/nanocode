@@ -1,11 +1,6 @@
 #![cfg(unix)]
 
-use std::{
-    ffi::OsString,
-    io,
-    os::unix::ffi::OsStringExt,
-    sync::Arc,
-};
+use std::{ffi::OsString, io, os::unix::ffi::OsStringExt, sync::Arc};
 
 use nanocode_process::{Contained, Embedded, Running};
 

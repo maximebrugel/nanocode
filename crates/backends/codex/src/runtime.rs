@@ -306,8 +306,8 @@ impl RuntimeBackend for CodexHarness {
                         .clone()
                         .session_id(session_id)
                         .deferred_durability(&state, record, text.clone());
-                    let built =
-                        nanocode_trace::info_span!("codex.session.build").in_scope(|| deferred.build());
+                    let built = nanocode_trace::info_span!("codex.session.build")
+                        .in_scope(|| deferred.build());
                     match nanocode_agent_core::Agent::persist_created(built).await {
                         Ok((agent, events)) => {
                             host.initial_notice_committed(&agent, text);

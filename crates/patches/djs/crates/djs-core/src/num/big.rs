@@ -204,7 +204,6 @@ impl Big {
         self.trim();
         sticky
     }
-
 }
 
 impl PartialEq for Big {

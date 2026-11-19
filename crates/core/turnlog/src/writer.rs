@@ -933,13 +933,13 @@ impl Follower {
 
     async fn finish(mut self) -> Result<TurnLog, StoreError> {
         let held = std::mem::take(&mut self.held);
-        let extensible = held
-            .last()
-            .filter(|(_, body)| codec::extensible(body))
-            .map(|(seq, body)| TailRow {
-                bytes: body.len(),
-                seq: *seq,
-            });
+        let extensible =
+            held.last()
+                .filter(|(_, body)| codec::extensible(body))
+                .map(|(seq, body)| TailRow {
+                    bytes: body.len(),
+                    seq: *seq,
+                });
         let tail_row = self.fold_rows(held, extensible)?;
         let next = self.next;
         let tail_rows = usize::try_from(match (self.snapshot_row, self.first) {
@@ -1315,9 +1315,11 @@ impl Lease<'_> {
                 owner,
             )
             .await?;
-            writer
-                .fold
-                .touch(owner.split_once('\n').map_or(owner.as_str(), |(state, _)| state));
+            writer.fold.touch(
+                owner
+                    .split_once('\n')
+                    .map_or(owner.as_str(), |(state, _)| state),
+            );
         }
         Ok(())
     }
@@ -1506,13 +1508,7 @@ impl Lease<'_> {
                 )
                 .await?;
             }
-            root(
-                self.host,
-                self.scope,
-                &mut writer.fold,
-                &mut writer.stats,
-            )
-            .await?;
+            root(self.host, self.scope, &mut writer.fold, &mut writer.stats).await?;
             for (first, section) in writer.fold.unlisted() {
                 let records = section_records(self.host, self.scope, &first, section).await?;
                 writer.fold.paged(&first, records)?;
@@ -1532,19 +1528,19 @@ impl Lease<'_> {
                 self.limit,
                 self.ratio,
             )?;
-            let index = index(&mut writer.spare, &writer.fold, &sections, level, self.limit)?;
+            let index = index(
+                &mut writer.spare,
+                &writer.fold,
+                &sections,
+                level,
+                self.limit,
+            )?;
             let head = index.next;
             for turn in &recovered {
                 writer.fold.recovered_at(turn, head);
             }
             writer.fold.committed(head);
-            let packed = packed(
-                &mut writer.spare,
-                &writer.fold,
-                keep,
-                level,
-                index.root,
-            );
+            let packed = packed(&mut writer.spare, &writer.fold, keep, level, index.root);
             writer.fold.committed(previous);
             let packed = packed?;
             writer.state = packed.plain;
@@ -1783,14 +1779,12 @@ impl Lease<'_> {
             Some(part) => {
                 let packed = part.head;
                 let rewritten = part.sections.bytes + part.index.bytes;
-                writer
-                    .fold
-                    .sectioned(
-                        part.sections.entries,
-                        part.index.pages,
-                        part.index.groups,
-                        part.index.root,
-                    );
+                writer.fold.sectioned(
+                    part.sections.entries,
+                    part.index.pages,
+                    part.index.groups,
+                    part.index.root,
+                );
                 writer.fold.evict();
                 writer.stats.sections += sectioned_rows;
                 writer.stats.snapshot_bytes += rewritten as u64;

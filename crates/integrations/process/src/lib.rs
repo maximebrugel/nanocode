@@ -427,8 +427,7 @@ impl ShellSessions {
                 MAX_EXEC_YIELD_MS,
             );
             #[cfg(unix)]
-            if login
-                && let Some(login_shell) = self.login_shell.get_or_init(selection::login_shell)
+            if login && let Some(login_shell) = self.login_shell.get_or_init(selection::login_shell)
             {
                 let reported = timeout(
                     yield_time,

@@ -160,7 +160,9 @@ pub(crate) async fn job_is_program(vp: &Vp, name: &[u8]) -> bool {
     match lookup(vp, name).await {
         None => true,
         Some(e) if std::ptr::eq(e, &nested::ENTRY) => false,
-        Some(_) => crate::builtins::hash::search(vp, name, None).await.is_some(),
+        Some(_) => crate::builtins::hash::search(vp, name, None)
+            .await
+            .is_some(),
     }
 }
 

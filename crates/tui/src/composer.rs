@@ -453,8 +453,9 @@ impl Composer {
 
     #[must_use]
     pub fn height(&self, width: u16) -> u16 {
-        let _span = nanocode_trace::info_span!("tui.composer.layout", width, text.bytes = self.text.len())
-            .entered();
+        let _span =
+            nanocode_trace::info_span!("tui.composer.layout", width, text.bytes = self.text.len())
+                .entered();
         u16::try_from(self.rows(usize::from(width)).len()).unwrap_or(u16::MAX)
     }
 

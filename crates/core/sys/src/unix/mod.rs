@@ -41,7 +41,10 @@ pub fn read(fd: impl AsFd, buffer: &mut [u8]) -> io::Result<usize> {
         return Err(io::Error::last_os_error());
     }
     let read = usize::try_from(read).expect("a successful read returns a count");
-    assert!(read <= buffer.len(), "a read returns at most the buffer's length");
+    assert!(
+        read <= buffer.len(),
+        "a read returns at most the buffer's length"
+    );
     Ok(read)
 }
 
@@ -166,13 +169,14 @@ pub fn set_window_size(fd: impl AsFd, size: WindowSize) -> io::Result<()> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn open_pseudoterminal() -> io::Result<(OwnedFd, OwnedFd)> {
     let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
-    let controller = match checked(unsafe { libc::open(PSEUDOTERMINAL_MULTIPLEXER.as_ptr(), flags) }) {
-        Ok(controller) => unsafe { OwnedFd::from_raw_fd(controller) },
-        Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
-            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
-        }
-        Err(error) => return Err(error),
-    };
+    let controller =
+        match checked(unsafe { libc::open(PSEUDOTERMINAL_MULTIPLEXER.as_ptr(), flags) }) {
+            Ok(controller) => unsafe { OwnedFd::from_raw_fd(controller) },
+            Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => {
+                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
+            }
+            Err(error) => return Err(error),
+        };
     let mut unlock: libc::c_int = 0;
     checked(unsafe { libc::ioctl(raw(&controller), libc::TIOCSPTLCK, &raw mut unlock) })?;
     let mut number: libc::c_uint = 0;
@@ -191,10 +195,19 @@ pub fn open_pseudoterminal() -> io::Result<(OwnedFd, OwnedFd)> {
     checked(unsafe { libc::grantpt(raw(&controller)) })?;
     checked(unsafe { libc::unlockpt(raw(&controller)) })?;
     let mut name = [0_u8; PSEUDOTERMINAL_NAME_BYTES];
-    checked(unsafe { libc::ioctl(raw(&controller), libc::TIOCPTYGNAME.into(), name.as_mut_ptr()) })?;
+    checked(unsafe {
+        libc::ioctl(
+            raw(&controller),
+            libc::TIOCPTYGNAME.into(),
+            name.as_mut_ptr(),
+        )
+    })?;
     let path = std::ffi::CStr::from_bytes_until_nul(&name).map_err(io::Error::other)?;
     let terminal = checked(unsafe {
-        libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC)
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
     })?;
     Ok((controller, unsafe { OwnedFd::from_raw_fd(terminal) }))
 }
@@ -277,7 +290,9 @@ pub fn send_descriptor(socket: impl AsFd, descriptor: BorrowedFd<'_>) -> io::Res
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
         (*header).cmsg_len = fitted(libc::CMSG_LEN(descriptor_bytes));
-        libc::CMSG_DATA(header).cast::<RawFd>().write_unaligned(descriptor.as_raw_fd());
+        libc::CMSG_DATA(header)
+            .cast::<RawFd>()
+            .write_unaligned(descriptor.as_raw_fd());
     }
     let sent = unsafe { libc::sendmsg(raw(&socket), &raw const message, 0) };
     if sent < 0 {
@@ -307,7 +322,13 @@ pub fn receive_descriptor(socket: impl AsFd) -> io::Result<Option<OwnedFd>> {
     let mut found = None;
     let mut header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
     while !header.is_null() {
-        let (level, kind, length) = unsafe { ((*header).cmsg_level, (*header).cmsg_type, (*header).cmsg_len) };
+        let (level, kind, length) = unsafe {
+            (
+                (*header).cmsg_level,
+                (*header).cmsg_type,
+                (*header).cmsg_len,
+            )
+        };
         let data_offset = unsafe { libc::CMSG_DATA(header).offset_from(header.cast::<u8>()) };
         let data_bytes = fitted::<usize, _>(length)
             .checked_sub(usize::try_from(data_offset).expect("data follows its header"))
@@ -315,7 +336,12 @@ pub fn receive_descriptor(socket: impl AsFd) -> io::Result<Option<OwnedFd>> {
         if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
             let count = data_bytes / size_of::<RawFd>();
             for index in 0..count {
-                let received = unsafe { libc::CMSG_DATA(header).cast::<RawFd>().add(index).read_unaligned() };
+                let received = unsafe {
+                    libc::CMSG_DATA(header)
+                        .cast::<RawFd>()
+                        .add(index)
+                        .read_unaligned()
+                };
                 let owned = unsafe { OwnedFd::from_raw_fd(received) };
                 if found.is_none() {
                     found = Some(owned);

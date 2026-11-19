@@ -244,7 +244,10 @@ impl Shape {
             self.roots,
             self.turns,
             self.store.name(),
-            self.crashes.iter().map(|at| at / 1_000_000).collect::<Vec<_>>(),
+            self.crashes
+                .iter()
+                .map(|at| at / 1_000_000)
+                .collect::<Vec<_>>(),
             match self.wire {
                 WireKind::Transport => self.faults.calm(),
                 WireKind::Http => self.http_faults.calm(),
@@ -254,7 +257,11 @@ impl Shape {
                 ChildMode::Local => String::new(),
                 ChildMode::Remote => format!(
                     " child_crashes_ms={:?} kill_after_ms={} calm_children={} queued_spawns={}",
-                    self.child_faults.crashes.iter().map(|at| at / 1_000_000).collect::<Vec<_>>(),
+                    self.child_faults
+                        .crashes
+                        .iter()
+                        .map(|at| at / 1_000_000)
+                        .collect::<Vec<_>>(),
                     self.child_faults.kill_after.as_millis(),
                     self.child_faults.calm(),
                     self.child_faults.queued_spawns
@@ -366,7 +373,8 @@ struct SimRegion {
 
 impl nanocode::claude::RootRegion for SimRegion {
     fn adopted(&self, fresh: bool) {
-        self.world.trace(&format!("adopted the mapped root request fresh={fresh}"));
+        self.world
+            .trace(&format!("adopted the mapped root request fresh={fresh}"));
         self.pending.set(false);
     }
 
@@ -382,20 +390,25 @@ impl nanocode::claude::RootRegion for SimRegion {
 }
 
 impl Durable {
-    async fn session_store(&self) -> Result<(SessionStore, Option<nanocode::turnlog::Parts>), String> {
+    async fn session_store(
+        &self,
+    ) -> Result<(SessionStore, Option<nanocode::turnlog::Parts>), String> {
         let store = match self.kind {
             StoreKind::Memory => MemoryStore::new()
                 .map_err(|error| format!("MemoryStore::new failed: {error}"))
                 .and_then(|store| {
-                    nanocode::session_store(store).map_err(|error| format!("session store: {error}"))
+                    nanocode::session_store(store)
+                        .map_err(|error| format!("session store: {error}"))
                 }),
             StoreKind::Kv => nanocode::session_store(KeyValueStore::new(
                 self.kv.clone().expect("a kv seed has a kv"),
             ))
             .map_err(|error| format!("session store: {error}")),
             StoreKind::Log => {
-                let host: Arc<dyn nanocode::turnlog::LogHost> =
-                    Arc::new(TracedHost(SimHost::new(Arc::clone(&self.disk)), Arc::clone(&self.world)));
+                let host: Arc<dyn nanocode::turnlog::LogHost> = Arc::new(TracedHost(
+                    SimHost::new(Arc::clone(&self.disk)),
+                    Arc::clone(&self.world),
+                ));
                 let policy = nanocode::turnlog::Policy {
                     effects: nanocode::turnlog::Effects::default(),
                     max_row_bytes: None,
@@ -433,14 +446,20 @@ impl nanocode::turnlog::LogHost for TracedHost {
         scope: &'a str,
         from: u64,
         to: u64,
-    ) -> nanocode_durability_core::StoreFuture<'a, Result<Vec<(u64, String)>, nanocode_durability_core::StoreError>> {
+    ) -> nanocode_durability_core::StoreFuture<
+        'a,
+        Result<Vec<(u64, String)>, nanocode_durability_core::StoreError>,
+    > {
         self.0.scan(scope, from, to)
     }
 
     fn load<'a>(
         &'a self,
         scope: &'a str,
-    ) -> nanocode_durability_core::StoreFuture<'a, Result<Vec<(u64, String)>, nanocode_durability_core::StoreError>> {
+    ) -> nanocode_durability_core::StoreFuture<
+        'a,
+        Result<Vec<(u64, String)>, nanocode_durability_core::StoreError>,
+    > {
         self.0.load(scope)
     }
 
@@ -448,11 +467,15 @@ impl nanocode::turnlog::LogHost for TracedHost {
         &'a self,
         scope: &'a str,
         rows: &'a [(u64, String)],
-    ) -> nanocode_durability_core::StoreFuture<'a, Result<(), nanocode_durability_core::StoreError>> {
+    ) -> nanocode_durability_core::StoreFuture<'a, Result<(), nanocode_durability_core::StoreError>>
+    {
         self.1.trace(&format!(
             "log append {} rows {}",
             rows.len(),
-            rows.iter().map(|(_, body)| body.chars().take(60).collect::<String>()).collect::<Vec<_>>().join(" | ")
+            rows.iter()
+                .map(|(_, body)| body.chars().take(60).collect::<String>())
+                .collect::<Vec<_>>()
+                .join(" | ")
         ));
         self.0.append(scope, rows)
     }
@@ -484,20 +507,28 @@ type Listing = Vec<(String, Vec<String>)>;
 
 fn claude(wire: &Wire) -> Result<ClaudeClient, String> {
     match wire {
-        Wire::Transport(network) => Ok(ClaudeClient::messages_api(ENDPOINT, "sk-sim", CONNECT_TIMEOUT, IDLE_TIMEOUT)
-            .map_err(|error| format!("claude client: {error}"))?
-            .with_transport(Transport(Arc::clone(network)))),
+        Wire::Transport(network) => {
+            Ok(
+                ClaudeClient::messages_api(ENDPOINT, "sk-sim", CONNECT_TIMEOUT, IDLE_TIMEOUT)
+                    .map_err(|error| format!("claude client: {error}"))?
+                    .with_transport(Transport(Arc::clone(network))),
+            )
+        }
         Wire::Http(server) => {
             let builder = nanocode_http::Client::builder()
                 .no_proxy()
                 .connect_timeout(CONNECT_TIMEOUT)
-                .default_headers(nanocode_http::accept_encoding(nanocode_http::header::HeaderMap::new()))
+                .default_headers(nanocode_http::accept_encoding(
+                    nanocode_http::header::HeaderMap::new(),
+                ))
                 .connector(Connector(Arc::clone(server)));
             let builder = match server.mutation() {
                 WireMutation::NoReadTimeout => builder,
                 _ => builder.read_timeout(IDLE_TIMEOUT),
             };
-            let http = builder.build().map_err(|error| format!("http client: {error}"))?;
+            let http = builder
+                .build()
+                .map_err(|error| format!("http client: {error}"))?;
             Ok(ClaudeClient::new(http, MESSAGES_URL, "sk-sim"))
         }
     }
@@ -510,7 +541,9 @@ fn runtime(
     world: &Arc<World>,
     children: Option<&Arc<SimChildren>>,
 ) -> Result<Nanocode, String> {
-    let hedging = Arc::new(nanocode::hedge::Hedging::new(nanocode::hedge::HedgePolicy::DEFAULT));
+    let hedging = Arc::new(nanocode::hedge::Hedging::new(
+        nanocode::hedge::HedgePolicy::DEFAULT,
+    ));
     let claude = nanocode::ClaudeHarness::new(claude)
         .configure(move |builder| Ok(builder.hedging(Arc::clone(&hedging))));
     let builder = Nanocode::builder()
@@ -688,7 +721,11 @@ async fn submit(
     }
 }
 
-async fn stored_status(store: &SessionStore, session: &str, request_id: &str) -> Option<TurnStatus> {
+async fn stored_status(
+    store: &SessionStore,
+    session: &str,
+    request_id: &str,
+) -> Option<TurnStatus> {
     store
         .turn(session, request_id)
         .await
@@ -711,7 +748,17 @@ async fn run_turn(
     let mut attempt = 0;
     loop {
         world.trace(&format!("submit {label} {request_id} attempt {attempt}"));
-        let error = match submit(agent, store, flushes, label, turn, cancel && attempt == 0, world).await {
+        let error = match submit(
+            agent,
+            store,
+            flushes,
+            label,
+            turn,
+            cancel && attempt == 0,
+            world,
+        )
+        .await
+        {
             Ok(text) => return Ok(text),
             Err(error) => error,
         };
@@ -897,8 +944,9 @@ async fn listing(runtime: &Nanocode, shape: &Shape) -> Result<(Listing, BTreeSet
                 completed.insert(label.to_owned());
             }
             lines.push(
-                serde_json::to_string(entry)
-                    .map_err(|error| format!("agent {} does not encode: {error}", entry.agent_id))?,
+                serde_json::to_string(entry).map_err(|error| {
+                    format!("agent {} does not encode: {error}", entry.agent_id)
+                })?,
             );
         }
         listing.push((session, lines));
@@ -908,7 +956,9 @@ async fn listing(runtime: &Nanocode, shape: &Shape) -> Result<(Listing, BTreeSet
 
 fn difference(before: &Listing, after: &Listing) -> Option<String> {
     for ((session, lines), (_, restored)) in before.iter().zip(after) {
-        if let Some(at) = (0..lines.len().max(restored.len())).find(|at| lines.get(*at) != restored.get(*at)) {
+        if let Some(at) =
+            (0..lines.len().max(restored.len())).find(|at| lines.get(*at) != restored.get(*at))
+        {
             return Some(format!(
                 "{session} entry {at}: {:?} before the restart, {:?} after",
                 lines.get(at),
@@ -916,7 +966,13 @@ fn difference(before: &Listing, after: &Listing) -> Option<String> {
             ));
         }
     }
-    (before.len() != after.len()).then(|| format!("{} roots before the restart, {} after", before.len(), after.len()))
+    (before.len() != after.len()).then(|| {
+        format!(
+            "{} roots before the restart, {} after",
+            before.len(),
+            after.len()
+        )
+    })
 }
 
 async fn verify(
@@ -932,7 +988,13 @@ async fn verify(
     nanocode::claude::durability::forget_templates();
     let (store, parts) = durable.session_store().await?;
     let children = remote.map(|remote| remote.children(number, world));
-    let runtime = runtime(store.clone(), parts.as_ref(), claude(wire)?, world, children.as_ref())?;
+    let runtime = runtime(
+        store.clone(),
+        parts.as_ref(),
+        claude(wire)?,
+        world,
+        children.as_ref(),
+    )?;
     let mut agents = Vec::new();
     for root in 0..shape.roots {
         agents.push(open_root(&runtime, &store, root, number, world).await?);
@@ -1007,7 +1069,13 @@ async fn epoch(
         pending.set(true);
         world.trace("prefetched the mapped root request");
     }
-    let runtime = runtime(store.clone(), parts.as_ref(), model, world, children.as_ref())?;
+    let runtime = runtime(
+        store.clone(),
+        parts.as_ref(),
+        model,
+        world,
+        children.as_ref(),
+    )?;
     if let (Some(control), Some(resident_max)) = (runtime.subagents(), shape.hibernation) {
         control.set_hibernation(true);
         control.set_max_resident(resident_max);
@@ -1066,8 +1134,19 @@ pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
         world.hold_receipts();
     }
     let wire = match shape.wire {
-        WireKind::Transport => Wire::Transport(Arc::new(Network::new(seed, Arc::clone(&world), shape.faults, options.mutation))),
-        WireKind::Http => Wire::Http(Arc::new(HttpServer::new(seed, Arc::clone(&world), shape.http_faults, options.mutation, IDLE_TIMEOUT))),
+        WireKind::Transport => Wire::Transport(Arc::new(Network::new(
+            seed,
+            Arc::clone(&world),
+            shape.faults,
+            options.mutation,
+        ))),
+        WireKind::Http => Wire::Http(Arc::new(HttpServer::new(
+            seed,
+            Arc::clone(&world),
+            shape.http_faults,
+            options.mutation,
+            IDLE_TIMEOUT,
+        ))),
     };
     let remote = (shape.children == ChildMode::Remote).then(|| Remote {
         seed,
@@ -1121,7 +1200,16 @@ pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
             Rng::derive(seed, &format!("scheduler {number}")),
         );
         let task: Task<'_> = Box::pin(async {
-            let outcome = epoch(&durable, &shape, number, &wire, &world, &client, remote.as_ref()).await;
+            let outcome = epoch(
+                &durable,
+                &shape,
+                number,
+                &wire,
+                &world,
+                &client,
+                remote.as_ref(),
+            )
+            .await;
             result.replace(Some(outcome));
         });
         let crash_at = crashes.pop_front();
@@ -1164,17 +1252,29 @@ pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
                 kv.with(crate::store::Kv::power_loss);
             }
             let result = RefCell::new(None);
-            let mut executor = Executor::new(Arc::clone(&clock), Rng::derive(seed, "scheduler verify"));
+            let mut executor =
+                Executor::new(Arc::clone(&clock), Rng::derive(seed, "scheduler verify"));
             let task: Task<'_> = Box::pin(async {
-                let outcome = verify(&durable, &shape, EPOCHS_MAX, &wire, &world, remote.as_ref(), before).await;
+                let outcome = verify(
+                    &durable,
+                    &shape,
+                    EPOCHS_MAX,
+                    &wire,
+                    &world,
+                    remote.as_ref(),
+                    before,
+                )
+                .await;
                 result.replace(Some(outcome));
             });
             let ended = executor.run(vec![task], None);
             drop(executor);
             drop_spawned();
-            result
-                .into_inner()
-                .unwrap_or_else(|| Err(format!("the verification epoch ended {ended:?} without a verdict")))
+            result.into_inner().unwrap_or_else(|| {
+                Err(format!(
+                    "the verification epoch ended {ended:?} without a verdict"
+                ))
+            })
         }
         Some(outcome) => outcome.map(drop),
         None => Err("the run never ended".to_owned()),

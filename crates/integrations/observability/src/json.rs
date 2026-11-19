@@ -1,16 +1,12 @@
-use std::{
-    collections::BTreeMap,
-    fmt,
-    io,
-};
+use std::{collections::BTreeMap, fmt, io};
 
-use serde::ser::{SerializeMap, SerializeSeq, Serializer as _};
-use serde_json::{Serializer, Value};
 use nanocode_trace::{
     Event, Level,
     field::{Field, Visit},
     span::Record,
 };
+use serde::ser::{SerializeMap, SerializeSeq, Serializer as _};
+use serde_json::{Serializer, Value};
 
 use crate::{
     format::{Fields, SpanFields, current_scope, event_meta, write_timestamp},
@@ -73,10 +69,7 @@ struct EventFields<'a, 'b>(&'a Event<'b>);
 impl serde::Serialize for EventFields<'_, '_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let map = serializer.serialize_map(Some(self.0.fields().count()))?;
-        let mut visitor = MapVisitor {
-            map,
-            state: Ok(()),
-        };
+        let mut visitor = MapVisitor { map, state: Ok(()) };
         self.0.record(&mut visitor);
         visitor.state?;
         visitor.map.end()
@@ -243,5 +236,3 @@ impl Visit for JsonVisitor<'_> {
         }
     }
 }
-
-

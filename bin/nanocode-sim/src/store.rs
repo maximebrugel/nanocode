@@ -622,7 +622,10 @@ impl KeyValue for SimKv {
         entries: &'a [(String, String)],
     ) -> StoreFuture<'a, Result<(), StoreError>> {
         if std::env::var_os("NANOCODE_SIM_POLLS").is_some() {
-            eprintln!("kv put_values {:?}", entries.iter().map(|(key, _)| key).collect::<Vec<_>>());
+            eprintln!(
+                "kv put_values {:?}",
+                entries.iter().map(|(key, _)| key).collect::<Vec<_>>()
+            );
         }
         self.call(move |kv, op| kv.put_values(op, entries))
     }

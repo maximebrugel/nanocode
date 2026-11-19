@@ -222,10 +222,12 @@ impl TerminalSession {
         span.record("frame.changed_cells", changed_cells);
         drop(diff_encode);
         span.record("frame.bytes", self.bytes.len());
-        nanocode_trace::info_span!("tui.terminal.write", bytes = self.bytes.len()).in_scope(|| {
-            self.output.write_all(&self.bytes)?;
-            self.output.flush()
-        })?;
+        nanocode_trace::info_span!("tui.terminal.write", bytes = self.bytes.len()).in_scope(
+            || {
+                self.output.write_all(&self.bytes)?;
+                self.output.flush()
+            },
+        )?;
         self.stats.frames += 1;
         self.stats.bytes += self.bytes.len() as u64;
         if self.stale {

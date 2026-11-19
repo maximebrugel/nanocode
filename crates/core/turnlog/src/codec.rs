@@ -115,7 +115,11 @@ pub(crate) struct Packed {
 }
 
 impl Packer {
-    pub(crate) fn new(spare: &mut Spare, level: i32, dictionary: &[u8]) -> Result<Self, StoreError> {
+    pub(crate) fn new(
+        spare: &mut Spare,
+        level: i32,
+        dictionary: &[u8],
+    ) -> Result<Self, StoreError> {
         let deflate = match spare.deflate.take() {
             Some(deflate) => reused(deflate, level, dictionary)?,
             None => compressor(level, dictionary)?,

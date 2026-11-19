@@ -148,7 +148,9 @@ pub(crate) fn spawn(
         ended: Box::new(move |status| drop(exit.send(status))),
     });
     let running = started
-        .inspect_err(|error| nanocode_trace::warn!(%error, "the shell did not start in this process"))
+        .inspect_err(
+            |error| nanocode_trace::warn!(%error, "the shell did not start in this process"),
+        )
         .ok()?;
     let child =
         process::ProcessChild::served(process::ProcessGroupGuard::embedded(running), exited);
@@ -195,7 +197,9 @@ pub(crate) async fn output(
             login: false,
             ended: Box::new(move |status| drop(exit.send(status))),
         })
-        .inspect_err(|error| nanocode_trace::warn!(%error, "the shell did not start in this process"))
+        .inspect_err(
+            |error| nanocode_trace::warn!(%error, "the shell did not start in this process"),
+        )
         .ok()?;
     let status = exited.await.ok()?;
     let mut stdout = Vec::new();

@@ -16,7 +16,10 @@ pub fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
             return Err(error);
         }
         let read = usize::try_from(read).expect("a successful getrandom returns a count");
-        assert!(read > 0, "getrandom fills at least one byte of a nonempty buffer");
+        assert!(
+            read > 0,
+            "getrandom fills at least one byte of a nonempty buffer"
+        );
         assert!(read <= rest.len(), "getrandom fills at most the buffer");
         filled += read;
     }
@@ -58,9 +61,16 @@ pub fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
 #[cfg(windows)]
 #[cfg_attr(
     target_arch = "x86",
-    link(name = "bcryptprimitives", kind = "raw-dylib", import_name_type = "undecorated")
+    link(
+        name = "bcryptprimitives",
+        kind = "raw-dylib",
+        import_name_type = "undecorated"
+    )
 )]
-#[cfg_attr(not(target_arch = "x86"), link(name = "bcryptprimitives", kind = "raw-dylib"))]
+#[cfg_attr(
+    not(target_arch = "x86"),
+    link(name = "bcryptprimitives", kind = "raw-dylib")
+)]
 unsafe extern "system" {
     fn ProcessPrng(data: *mut u8, length: usize) -> i32;
 }

@@ -38,7 +38,8 @@ use std::{
 };
 
 use nanocode::{
-    ModelSelection, ServiceTier, Thinking, agent::events::SharedTextDelta, durability::TranscriptItem,
+    ModelSelection, ServiceTier, Thinking, agent::events::SharedTextDelta,
+    durability::TranscriptItem,
 };
 use nanocode_sync::{FutureExt, StreamExt};
 
@@ -54,7 +55,18 @@ const PIPED_PROMPT_LIMIT: usize = 10 * 1024 * 1024;
 const ESCALATION_PROMPT: &str = "Continue.";
 const EDIT_TOOLS: [&str; 5] = ["Edit", "MultiEdit", "NotebookEdit", "Write", "apply_patch"];
 const WRITE_MARKS: [&str; 12] = [
-    "> ", ">>", "<<", "tee ", "sed -i", "apply_patch", "write", "mv ", "cp ", "rm ", "mkdir ", "touch ",
+    "> ",
+    ">>",
+    "<<",
+    "tee ",
+    "sed -i",
+    "apply_patch",
+    "write",
+    "mv ",
+    "cp ",
+    "rm ",
+    "mkdir ",
+    "touch ",
 ];
 const TELEMETRY_SHUTDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -448,7 +460,11 @@ async fn latest_session(host: &Host) -> Result<String> {
         .as_ref()
         .ok_or("--continue requires durability")?;
     store
-        .brief_page(Some(host.config.workspace.as_path()), 1, sessions::user_facing)
+        .brief_page(
+            Some(host.config.workspace.as_path()),
+            1,
+            sessions::user_facing,
+        )
         .await?
         .into_iter()
         .next()
@@ -569,11 +585,20 @@ impl Stall {
             AgentEventKind::ToolCall => {
                 let call = serde_json::from_str::<serde_json::Value>(event.payload.get())
                     .unwrap_or_default();
-                if call.get("parent_call_id").is_some_and(|parent| !parent.is_null()) {
+                if call
+                    .get("parent_call_id")
+                    .is_some_and(|parent| !parent.is_null())
+                {
                     return false;
                 }
-                let tool = call.get("tool").and_then(serde_json::Value::as_str).unwrap_or_default();
-                let arguments = call.get("arguments").map(ToString::to_string).unwrap_or_default();
+                let tool = call
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let arguments = call
+                    .get("arguments")
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
                 self.idle = match EDIT_TOOLS.contains(&tool)
                     || WRITE_MARKS.iter().any(|mark| arguments.contains(mark))
                 {
@@ -610,7 +635,8 @@ fn tool_call_started(event: &nanocode::agent::events::AgentEvent) {
     struct Call {
         parent_call_id: Option<serde::de::IgnoredAny>,
     }
-    if serde_json::from_str::<Call>(event.payload.get()).is_ok_and(|call| call.parent_call_id.is_some())
+    if serde_json::from_str::<Call>(event.payload.get())
+        .is_ok_and(|call| call.parent_call_id.is_some())
         && (NESTED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_power_of_two()
     {
         nanocode_sys::entry::release_file_pages();
@@ -647,8 +673,14 @@ async fn stream_turn(
             nanocode::agent::events::AgentEventKind::ToolCall => tool_call_started(&event.event),
             _ => {}
         }
-        printer.event(&event.event, event.delta.as_ref().map(SharedTextDelta::borrowed))?;
-        if stall.as_mut().is_some_and(|stall| stall.cancels(&event.event)) {
+        printer.event(
+            &event.event,
+            event.delta.as_ref().map(SharedTextDelta::borrowed),
+        )?;
+        if stall
+            .as_mut()
+            .is_some_and(|stall| stall.cancels(&event.event))
+        {
             control.cancel().await?;
         }
     }

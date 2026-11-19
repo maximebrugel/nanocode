@@ -2,8 +2,8 @@ use super::bits::{Bits, low_mask};
 use super::commands::CommandStep;
 use super::prefix::{ALPHABET_SIZE_MAX, decode};
 use super::tables::{
-    BLOCK_LENGTH_BASE, BLOCK_LENGTH_CODES, BLOCK_LENGTH_EXTRA_BITS, COMMAND_CODES, DISTANCE_CONTEXTS,
-    LITERAL_CONTEXTS,
+    BLOCK_LENGTH_BASE, BLOCK_LENGTH_CODES, BLOCK_LENGTH_EXTRA_BITS, COMMAND_CODES,
+    DISTANCE_CONTEXTS, LITERAL_CONTEXTS,
 };
 use super::{DecodeError, Decoder, Flow, Phase};
 
@@ -39,7 +39,13 @@ pub(super) struct BlockState {
 
 impl BlockState {
     pub(super) const fn new() -> Self {
-        Self { types: 1, ring: [1, 0], length: META_BLOCK_LENGTH_MAX, type_table: 0, length_table: 0 }
+        Self {
+            types: 1,
+            ring: [1, 0],
+            length: META_BLOCK_LENGTH_MAX,
+            type_table: 0,
+            length_table: 0,
+        }
     }
 }
 
@@ -91,7 +97,10 @@ fn block_length(word: u64, table: &[super::prefix::Entry]) -> (u32, u32) {
     let (code, length) = decode(table, word);
     let extra_bits = u32::from(BLOCK_LENGTH_EXTRA_BITS[usize::from(code)]);
     let extra = ((word >> length) & low_mask(extra_bits)) as u32;
-    (BLOCK_LENGTH_BASE[usize::from(code)] + extra, length + extra_bits)
+    (
+        BLOCK_LENGTH_BASE[usize::from(code)] + extra,
+        length + extra_bits,
+    )
 }
 
 impl Decoder {
@@ -123,14 +132,20 @@ impl Decoder {
             }
             BlockStep::TypeCode => {
                 let alphabet_size = self.blocks[category].types + BLOCK_TYPE_EXTRA_CODES;
-                let Some(offset) = self.code.read(bits, alphabet_size, &mut self.block_tables)? else {
+                let Some(offset) = self
+                    .code
+                    .read(bits, alphabet_size, &mut self.block_tables)?
+                else {
                     return Ok(Flow::NeedsInput);
                 };
                 self.blocks[category].type_table = offset as usize;
                 BlockStep::LengthCode
             }
             BlockStep::LengthCode => {
-                let Some(offset) = self.code.read(bits, BLOCK_LENGTH_CODES, &mut self.block_tables)? else {
+                let Some(offset) =
+                    self.code
+                        .read(bits, BLOCK_LENGTH_CODES, &mut self.block_tables)?
+                else {
                     return Ok(Flow::NeedsInput);
                 };
                 self.blocks[category].length_table = offset as usize;
@@ -149,13 +164,19 @@ impl Decoder {
                 return Ok(Flow::Continue);
             }
         };
-        self.phase = Phase::BlockTypes { category, step: next };
+        self.phase = Phase::BlockTypes {
+            category,
+            step: next,
+        };
         Ok(Flow::Continue)
     }
 
     const fn next_category(&mut self, category: usize) {
         self.phase = if category + 1 < CATEGORIES {
-            Phase::BlockTypes { category: category + 1, step: BlockStep::Count }
+            Phase::BlockTypes {
+                category: category + 1,
+                step: BlockStep::Count,
+            }
         } else {
             Phase::DistanceParameters
         };
@@ -168,7 +189,8 @@ impl Decoder {
         self.postfix_bits = parameters & low_mask(POSTFIX_BITS) as u32;
         self.direct_codes = (parameters >> POSTFIX_BITS) << self.postfix_bits;
         self.context_modes.clear();
-        self.context_modes.resize(self.blocks[LITERAL].types as usize, 0);
+        self.context_modes
+            .resize(self.blocks[LITERAL].types as usize, 0);
         self.phase = Phase::ContextModes { next: 0 };
         Flow::Continue
     }
@@ -183,11 +205,19 @@ impl Decoder {
             self.context_modes[next] = mode as u8;
             next += 1;
         }
-        self.phase = Phase::ContextMap { distance: false, step: MapStep::Trees };
+        self.phase = Phase::ContextMap {
+            distance: false,
+            step: MapStep::Trees,
+        };
         Flow::Continue
     }
 
-    pub(super) fn context_map(&mut self, bits: &mut Bits<'_>, distance: bool, step: MapStep) -> Result<Flow, DecodeError> {
+    pub(super) fn context_map(
+        &mut self,
+        bits: &mut Bits<'_>,
+        distance: bool,
+        step: MapStep,
+    ) -> Result<Flow, DecodeError> {
         let next = match step {
             MapStep::Trees => {
                 let Some(count) = read_count(bits) else {
@@ -196,10 +226,16 @@ impl Decoder {
                 let trees = count + 1;
                 let (map, size) = if distance {
                     self.distance_tree_count = trees;
-                    (&mut self.distance_map, self.blocks[DISTANCE].types as usize * DISTANCE_CONTEXTS as usize)
+                    (
+                        &mut self.distance_map,
+                        self.blocks[DISTANCE].types as usize * DISTANCE_CONTEXTS as usize,
+                    )
                 } else {
                     self.literal_tree_count = trees;
-                    (&mut self.literal_map, self.blocks[LITERAL].types as usize * LITERAL_CONTEXTS)
+                    (
+                        &mut self.literal_map,
+                        self.blocks[LITERAL].types as usize * LITERAL_CONTEXTS,
+                    )
                 };
                 map.clear();
                 map.resize(size, 0);
@@ -223,17 +259,33 @@ impl Decoder {
                     (peek >> RUN_LENGTH_FLAG_BITS) + 1
                 };
                 self.map_table.clear();
-                MapStep::Code { trees, run_length_max }
+                MapStep::Code {
+                    trees,
+                    run_length_max,
+                }
             }
-            MapStep::Code { trees, run_length_max } => {
+            MapStep::Code {
+                trees,
+                run_length_max,
+            } => {
                 let alphabet_size = trees + run_length_max;
                 assert!(alphabet_size as usize <= ALPHABET_SIZE_MAX);
-                if self.code.read(bits, alphabet_size, &mut self.map_table)?.is_none() {
+                if self
+                    .code
+                    .read(bits, alphabet_size, &mut self.map_table)?
+                    .is_none()
+                {
                     return Ok(Flow::NeedsInput);
                 }
-                MapStep::Values { run_length_max, index: 0 }
+                MapStep::Values {
+                    run_length_max,
+                    index: 0,
+                }
             }
-            MapStep::Values { run_length_max, index } => {
+            MapStep::Values {
+                run_length_max,
+                index,
+            } => {
                 if !self.map_values(bits, distance, run_length_max, index)? {
                     return Ok(Flow::NeedsInput);
                 }
@@ -244,13 +296,20 @@ impl Decoder {
                     return Ok(Flow::NeedsInput);
                 };
                 if transform == 1 {
-                    inverse_move_to_front(if distance { &mut self.distance_map } else { &mut self.literal_map });
+                    inverse_move_to_front(if distance {
+                        &mut self.distance_map
+                    } else {
+                        &mut self.literal_map
+                    });
                 }
                 self.finish_map(distance);
                 return Ok(Flow::Continue);
             }
         };
-        self.phase = Phase::ContextMap { distance, step: next };
+        self.phase = Phase::ContextMap {
+            distance,
+            step: next,
+        };
         Ok(Flow::Continue)
     }
 
@@ -261,7 +320,11 @@ impl Decoder {
         run_length_max: u32,
         index: usize,
     ) -> Result<bool, DecodeError> {
-        let map = if distance { &mut self.distance_map } else { &mut self.literal_map };
+        let map = if distance {
+            &mut self.distance_map
+        } else {
+            &mut self.literal_map
+        };
         let mut index = index;
         while index < map.len() {
             bits.refill();
@@ -270,7 +333,13 @@ impl Decoder {
             let symbol = u32::from(symbol);
             if symbol == 0 || symbol > run_length_max {
                 if length > bits.available() {
-                    self.phase = Phase::ContextMap { distance, step: MapStep::Values { run_length_max, index } };
+                    self.phase = Phase::ContextMap {
+                        distance,
+                        step: MapStep::Values {
+                            run_length_max,
+                            index,
+                        },
+                    };
                     return Ok(false);
                 }
                 bits.consume(length);
@@ -281,7 +350,13 @@ impl Decoder {
                 continue;
             }
             if length + symbol > bits.available() {
-                self.phase = Phase::ContextMap { distance, step: MapStep::Values { run_length_max, index } };
+                self.phase = Phase::ContextMap {
+                    distance,
+                    step: MapStep::Values {
+                        run_length_max,
+                        index,
+                    },
+                };
                 return Ok(false);
             }
             let repeat = (1 << symbol) + ((word >> length) & low_mask(symbol)) as usize;
@@ -298,18 +373,35 @@ impl Decoder {
         self.phase = if distance {
             Phase::TreeGroup { group: 0 }
         } else {
-            Phase::ContextMap { distance: true, step: MapStep::Trees }
+            Phase::ContextMap {
+                distance: true,
+                step: MapStep::Trees,
+            }
         };
     }
 
-    pub(super) fn tree_group(&mut self, bits: &mut Bits<'_>, group: usize) -> Result<Flow, DecodeError> {
+    pub(super) fn tree_group(
+        &mut self,
+        bits: &mut Bits<'_>,
+        group: usize,
+    ) -> Result<Flow, DecodeError> {
         let (trees, count, alphabet_size) = match group {
-            LITERAL => (&mut self.literal_trees, self.literal_tree_count, LITERAL_CODES),
-            COMMAND => (&mut self.command_trees, self.blocks[COMMAND].types, COMMAND_CODES),
+            LITERAL => (
+                &mut self.literal_trees,
+                self.literal_tree_count,
+                LITERAL_CODES,
+            ),
+            COMMAND => (
+                &mut self.command_trees,
+                self.blocks[COMMAND].types,
+                COMMAND_CODES,
+            ),
             _ => (
                 &mut self.distance_trees,
                 self.distance_tree_count,
-                DISTANCE_SHORT_CODES + self.direct_codes + (DISTANCE_EXTRA_CODES << self.postfix_bits),
+                DISTANCE_SHORT_CODES
+                    + self.direct_codes
+                    + (DISTANCE_EXTRA_CODES << self.postfix_bits),
             ),
         };
         while trees.offsets.len() < count as usize {
@@ -352,7 +444,10 @@ impl Decoder {
         bits.refill();
         let word = bits.word();
         let (code, type_length) = decode(&self.block_tables[block.type_table..], word);
-        let (length, length_bits) = block_length(word >> type_length, &self.block_tables[block.length_table..]);
+        let (length, length_bits) = block_length(
+            word >> type_length,
+            &self.block_tables[block.length_table..],
+        );
         if type_length + length_bits > bits.available() {
             return false;
         }

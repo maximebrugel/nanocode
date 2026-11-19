@@ -1040,7 +1040,12 @@ pub unsafe extern "C" fn PyOS_double_to_string(
     guard(null_mut(), |vm| {
         let code = code as u8;
         let mut text = if code == b'r' {
-            vm.ctx.new_float(value).as_object().repr(vm)?.to_string_lossy().into_owned()
+            vm.ctx
+                .new_float(value)
+                .as_object()
+                .repr(vm)?
+                .to_string_lossy()
+                .into_owned()
         } else {
             let mut spec = String::new();
             if flags & 0x01 != 0 {
@@ -1061,7 +1066,9 @@ pub unsafe extern "C" fn PyOS_double_to_string(
         }
         if flags & 0x02 != 0
             && value.is_finite()
-            && text.bytes().all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'+')
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'+')
         {
             text.push_str(".0");
         }

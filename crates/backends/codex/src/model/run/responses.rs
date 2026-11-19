@@ -382,7 +382,11 @@ pub(super) fn record_tool_span_terminal(
     span.record("duration_ns", duration_ns);
 }
 
-pub(super) fn model_tool_span(session_id: &str, call: &CodeCall, call_index: u32) -> nanocode_trace::Span {
+pub(super) fn model_tool_span(
+    session_id: &str,
+    call: &CodeCall,
+    call_index: u32,
+) -> nanocode_trace::Span {
     let qualified_name = qualified_tool_name(call);
     info_span!(
         target: "nanocode",
@@ -733,7 +737,10 @@ const HEADLESS_EXEC_GLOBALS: [&str; 4] = [
 ];
 const HEADLESS_EXEC_MCP_TEXT: [(&str, &str); 3] = [
     (" or `await tools.mcp__ologs__get_profile(...)`", ""),
-    (", `{ file_id }` or an MCP `ImageContent` block", " or `{ file_id }`"),
+    (
+        ", `{ file_id }` or an MCP `ImageContent` block",
+        " or `{ file_id }`",
+    ),
     (
         " Exports of a `WebAssembly` instance, when the host provides one, return their results synchronously.",
         "",
@@ -801,7 +808,10 @@ fn headless_exec_description(description: &str) -> String {
                     .iter()
                     .any(|name| field.starts_with(&format!("{name}?:"))))
         {
-            if kept.last().is_some_and(|last| last.trim_start().starts_with("//")) {
+            if kept
+                .last()
+                .is_some_and(|last| last.trim_start().starts_with("//"))
+            {
                 kept.pop();
             }
             continue;

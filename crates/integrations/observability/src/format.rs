@@ -108,7 +108,10 @@ impl<O: Output> FmtLayer<O> {
                 let message = names.next().expect("the span event has a message field");
                 let values = [(&message, Some(&SPAN_NEW as &dyn Value))];
                 let value_set = fields.value_set(&values);
-                self.on_event(&Event::new_child_of(span.id(), metadata, &value_set), context);
+                self.on_event(
+                    &Event::new_child_of(span.id(), metadata, &value_set),
+                    context,
+                );
             }
             Some((busy, idle)) => {
                 let fields = FieldSet::new(MESSAGE_AND_TIMES, callsite);
@@ -124,7 +127,10 @@ impl<O: Output> FmtLayer<O> {
                     (&idle_field, Some(&idle as &dyn Value)),
                 ];
                 let value_set = fields.value_set(&values);
-                self.on_event(&Event::new_child_of(span.id(), metadata, &value_set), context);
+                self.on_event(
+                    &Event::new_child_of(span.id(), metadata, &value_set),
+                    context,
+                );
             }
         }
     }
@@ -195,19 +201,23 @@ impl Timings {
         if self.entered_count.fetch_add(1, Ordering::AcqRel) == 0 {
             let now = self.now();
             let last = self.last.swap(now, Ordering::AcqRel);
-            self.idle.fetch_add(now.saturating_sub(last), Ordering::AcqRel);
+            self.idle
+                .fetch_add(now.saturating_sub(last), Ordering::AcqRel);
         }
     }
 
     fn exit(&self) {
         let previous = self
             .entered_count
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
             .expect("a span exits after it entered");
         if previous == 1 {
             let now = self.now();
             let last = self.last.swap(now, Ordering::AcqRel);
-            self.busy.fetch_add(now.saturating_sub(last), Ordering::AcqRel);
+            self.busy
+                .fetch_add(now.saturating_sub(last), Ordering::AcqRel);
         }
     }
 
@@ -329,7 +339,11 @@ pub(crate) const fn event_meta<'a>(event: &'a Event<'a>) -> EventMeta<'a> {
 }
 
 pub(crate) fn write_timestamp(writer: &mut String) -> fmt::Result {
-    write!(writer, "{}", DateTime::from(nanocode_platform::system_time()))
+    write!(
+        writer,
+        "{}",
+        DateTime::from(nanocode_platform::system_time())
+    )
 }
 
 pub(crate) fn current_scope<'a>(
@@ -434,7 +448,10 @@ impl Visit for DefaultVisitor<'_> {
                 ),
             );
         } else {
-            self.record_debug(field, &format_args!("{}", EscapeGuard(format_args!("{value}"))));
+            self.record_debug(
+                field,
+                &format_args!("{}", EscapeGuard(format_args!("{value}"))),
+            );
         }
     }
 
@@ -657,4 +674,3 @@ impl From<SystemTime> for DateTime {
         }
     }
 }
-

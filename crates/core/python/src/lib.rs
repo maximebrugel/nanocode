@@ -92,7 +92,9 @@ pub trait Files {
 
     fn read_at(&self, path: &[u8], offset: u64, len: usize, limit: u64) -> io::Result<Vec<u8>> {
         let data = self.read(path, limit)?;
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
         let end = start.saturating_add(len).min(data.len());
         Ok(data[start..end].to_vec())
     }

@@ -25,8 +25,7 @@ use std::rc::Rc;
 
 use psh_syntax::{
     AndOrOp, ArithExpr, ArithKind, BinOp, BinaryTest, CmdId, Command, CommandKind, CondKind,
-    ListId, ParamName, ParamOp, ParamPrefix, Part, Span, UnaryOp, Word, WordPart,
-    plain_decimal,
+    ListId, ParamName, ParamOp, ParamPrefix, Part, Span, UnaryOp, Word, WordPart, plain_decimal,
 };
 
 use crate::exec;
@@ -108,7 +107,9 @@ enum Ins {
     /// The loop ends with the status in its register.
     LoopExit(u16),
     /// The next word of for name in words into name, or the end of the loop.
-    ForItem { cmd: CmdId },
+    ForItem {
+        cmd: CmdId,
+    },
     /// A clause of for ((init; cond; step)).
     ForClause {
         lp: u16,
@@ -131,12 +132,28 @@ enum Op {
     Arith(u32),
     Assign(Box<[(u16, Val)]>),
     /// [ a OP b ] or test a OP b: the operands must be integers.
-    Test { op: Cmp, a: Opnd, b: Opnd, under: Under },
+    Test {
+        op: Cmp,
+        a: Opnd,
+        b: Opnd,
+        under: Under,
+    },
     /// [[ a OP b ]].
-    Cond { op: Cmp, a: Opnd, b: Opnd },
-    Const { status: i32, under: Span },
+    Cond {
+        op: Cmp,
+        a: Opnd,
+        b: Opnd,
+    },
+    Const {
+        status: i32,
+        under: Span,
+    },
     /// echo with literal words and integer variables.
-    Echo { args: Box<[EArg]>, newline: bool, under: Under },
+    Echo {
+        args: Box<[EArg]>,
+        newline: bool,
+        under: Under,
+    },
     Break(u32, Span),
     Continue(u32, Span),
     Slow,
@@ -184,10 +201,18 @@ enum AExpr {
     Num(i64),
     Load(u16),
     Unary(UnaryOp, u32),
-    IncDec { slot: u16, inc: bool, post: bool },
+    IncDec {
+        slot: u16,
+        inc: bool,
+        post: bool,
+    },
     Binary(BinOp, u32, u32),
     Cond(u32, u32, u32),
-    Assign { slot: u16, op: Option<BinOp>, value: u32 },
+    Assign {
+        slot: u16,
+        op: Option<BinOp>,
+        value: u32,
+    },
 }
 
 /// The compiled loop of cmd, compiled on first use (None: not worth it).
@@ -313,7 +338,8 @@ impl<'c> Compiler<'c> {
                 self.ins.push(Ins::NoErrRestore(r));
                 self.in_cond = false;
                 exits.push(self.pc());
-                self.ins.push(if w.until { Ins::Jz(0) } else { Ins::Jnz(0) });
+                self.ins
+                    .push(if w.until { Ins::Jz(0) } else { Ins::Jnz(0) });
                 self.list(w.body)?;
                 self.ins.push(Ins::BodyDone(lp));
                 self.ins.push(Ins::Jmp(head));
@@ -425,9 +451,8 @@ impl<'c> Compiler<'c> {
                 idx: idx as u32,
             };
             let p = &item.first;
-            let plain = |p: &psh_syntax::Pipeline| {
-                p.stages.len() == 1 && !p.negated() && p.time.is_none()
-            };
+            let plain =
+                |p: &psh_syntax::Pipeline| p.stages.len() == 1 && !p.negated() && p.time.is_none();
             if item.background {
                 self.slow(src, None);
             } else if item.rest.is_empty() && plain(p) {
@@ -532,7 +557,12 @@ impl<'c> Compiler<'c> {
         match &cmd.kind {
             CommandKind::While(_) | CommandKind::ArithFor(_) => {
                 let start = self.ins.len();
-                let saved = (self.slots.len(), self.exprs.len(), self.loops.len(), self.nregs);
+                let saved = (
+                    self.slots.len(),
+                    self.exprs.len(),
+                    self.loops.len(),
+                    self.nregs,
+                );
                 let (lp, in_cond, natives) = (self.lp, self.in_cond, self.natives);
                 if self.compile_loop(cmd, false).is_none() {
                     self.ins.truncate(start);
@@ -833,7 +863,9 @@ impl<'c> Compiler<'c> {
             if lv.index.is_some() {
                 return None;
             }
-            std::str::from_utf8(&text[lv.name.range()]).ok().map(str::to_string)
+            std::str::from_utf8(&text[lv.name.range()])
+                .ok()
+                .map(str::to_string)
         };
         let node = match &e.kind {
             ArithKind::Num(n) => AExpr::Num(*n),
@@ -1138,9 +1170,7 @@ impl Ex<'_> {
     #[inline]
     fn quick(&mut self, e: u32) -> Option<i64> {
         match self.prog.exprs[e as usize] {
-            AExpr::Binary(op, a, b)
-                if !matches!(op, BinOp::And | BinOp::Or | BinOp::Comma) =>
-            {
+            AExpr::Binary(op, a, b) if !matches!(op, BinOp::And | BinOp::Or | BinOp::Comma) => {
                 let (x, y) = (self.leaf(a)?, self.leaf(b)?);
                 binary(op, x, y)
             }
@@ -1148,7 +1178,11 @@ impl Ex<'_> {
                 let SV::Int(old) = self.slots[slot as usize].0 else {
                     return None;
                 };
-                let new = if inc { old.wrapping_add(1) } else { old.wrapping_sub(1) };
+                let new = if inc {
+                    old.wrapping_add(1)
+                } else {
+                    old.wrapping_sub(1)
+                };
                 self.slots[slot as usize] = (SV::Int(new), true);
                 Some(if post { old } else { new })
             }
@@ -1340,8 +1374,7 @@ fn native_ok(vp: &Vp, prog: &Prog) -> bool {
         return false;
     }
     // An unquoted $i of digits is one field unless IFS splits digits or '-'.
-    !vp
-        .vars
+    !vp.vars
         .value("IFS")
         .is_some_and(|ifs| ifs.iter().any(|b| b.is_ascii_digit() || *b == b'-'))
 }
@@ -1762,7 +1795,10 @@ fn spin(vp: &mut Vp, ex: &mut Ex<'_>, mut pc: u32, st: &mut i32) -> u32 {
     loop {
         match &prog.code[pc as usize] {
             Ins::Stmt { op, line, .. } => {
-                if matches!(op, Op::Break(..) | Op::Continue(..) | Op::Echo { .. } | Op::Slow) {
+                if matches!(
+                    op,
+                    Op::Break(..) | Op::Continue(..) | Op::Echo { .. } | Op::Slow
+                ) {
                     return pc;
                 }
                 if !vp.core.sched.pass() {

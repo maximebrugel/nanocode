@@ -25,7 +25,6 @@ mod regex;
 mod string;
 mod token;
 
-
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -85,9 +84,6 @@ impl<'a> Lexer<'a> {
         }
         Ok(lexer)
     }
-
-
-
 
     pub(crate) fn rest(&self) -> &'a [u8] {
         &self.src[self.pos as usize..]

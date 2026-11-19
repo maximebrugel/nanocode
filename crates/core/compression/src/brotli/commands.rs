@@ -31,7 +31,11 @@ pub(super) enum CommandStep {
 }
 
 impl Decoder {
-    pub(super) fn commands(&mut self, bits: &mut Bits<'_>, step: CommandStep) -> Result<Flow, DecodeError> {
+    pub(super) fn commands(
+        &mut self,
+        bits: &mut Bits<'_>,
+        step: CommandStep,
+    ) -> Result<Flow, DecodeError> {
         let mut step = step;
         loop {
             step = match step {
@@ -46,7 +50,10 @@ impl Decoder {
                         CommandStep::Distance { copy }
                     } else {
                         self.remaining -= insert as i32;
-                        CommandStep::Literals { count: insert, copy }
+                        CommandStep::Literals {
+                            count: insert,
+                            copy,
+                        }
                     }
                 }
                 CommandStep::Literals { count, copy } => {
@@ -74,7 +81,13 @@ impl Decoder {
                     }
                     let copied = self.window.copy(distance as usize, count as usize) as u32;
                     if copied < count {
-                        return Ok(self.pause(CommandStep::Copy { distance, count: count - copied }, Flow::Continue));
+                        return Ok(self.pause(
+                            CommandStep::Copy {
+                                distance,
+                                count: count - copied,
+                            },
+                            Flow::Continue,
+                        ));
                     }
                     if self.remaining <= 0 {
                         return Ok(self.end_meta_block());
@@ -88,7 +101,9 @@ impl Decoder {
                     if !self.window.reserve() {
                         return Ok(self.pause(step, Flow::Continue));
                     }
-                    let copied = self.window.write(&self.word.bytes[usize::from(written)..usize::from(self.word.length)]);
+                    let copied = self.window.write(
+                        &self.word.bytes[usize::from(written)..usize::from(self.word.length)],
+                    );
                     let written = written + copied as u8;
                     if written < self.word.length {
                         return Ok(self.pause(CommandStep::Word { written }, Flow::Continue));
@@ -152,7 +167,9 @@ impl Decoder {
                     return Ok((count, Flow::NeedsInput));
                 }
             }
-            let run = count.min(self.blocks[LITERAL].length).min(self.window.space() as u32);
+            let run = count
+                .min(self.blocks[LITERAL].length)
+                .min(self.window.space() as u32);
             let decoded = self.literal_run(bits, run);
             count -= decoded;
             self.blocks[LITERAL].length -= decoded;
@@ -181,7 +198,8 @@ impl Decoder {
                 let mut decoded = target.len();
                 for (index, slot) in target.iter_mut().enumerate() {
                     bits.ensure(CODE_LENGTH_MAX);
-                    let context = lookup[usize::from(last)] | lookup[CONTEXT_SECOND_BYTE_OFFSET + usize::from(before_last)];
+                    let context = lookup[usize::from(last)]
+                        | lookup[CONTEXT_SECOND_BYTE_OFFSET + usize::from(before_last)];
                     let tree = trees[usize::from(context) & CONTEXT_MASK] as usize;
                     let (symbol, length) = decode_at(tables, tree, bits.word());
                     if length > bits.available() {
@@ -201,9 +219,16 @@ impl Decoder {
     }
 
     #[inline(always)]
-    fn distance(&mut self, bits: &mut Bits<'_>, copy: PendingCopy) -> Result<Option<CommandStep>, DecodeError> {
+    fn distance(
+        &mut self,
+        bits: &mut Bits<'_>,
+        copy: PendingCopy,
+    ) -> Result<Option<CommandStep>, DecodeError> {
         let (distance, push) = if copy.implicit_distance {
-            (self.distances[(self.distance_index + DISTANCE_RING_SIZE - 1) % DISTANCE_RING_SIZE], false)
+            (
+                self.distances[(self.distance_index + DISTANCE_RING_SIZE - 1) % DISTANCE_RING_SIZE],
+                false,
+            )
         } else {
             if self.blocks[DISTANCE].length == 0 && !self.switch_block(bits, DISTANCE) {
                 return Ok(None);
@@ -228,15 +253,26 @@ impl Decoder {
             self.distance_index = (self.distance_index + 1) % DISTANCE_RING_SIZE;
         }
         self.remaining -= copy.length as i32;
-        Ok(Some(CommandStep::Copy { distance, count: copy.length }))
+        Ok(Some(CommandStep::Copy {
+            distance,
+            count: copy.length,
+        }))
     }
 
     #[inline(always)]
-    fn read_distance(&mut self, bits: &mut Bits<'_>, context: u8) -> Result<Option<(u32, bool)>, DecodeError> {
+    fn read_distance(
+        &mut self,
+        bits: &mut Bits<'_>,
+        context: u8,
+    ) -> Result<Option<(u32, bool)>, DecodeError> {
         bits.refill();
         let word = bits.word();
         let tree = usize::from(self.distance_map[self.distance_map_offset + usize::from(context)]);
-        let (symbol, length) = decode_at(&self.distance_trees.tables, self.distance_trees.offsets[tree] as usize, word);
+        let (symbol, length) = decode_at(
+            &self.distance_trees.tables,
+            self.distance_trees.offsets[tree] as usize,
+            word,
+        );
         let symbol = u32::from(symbol);
         if symbol < DISTANCE_SHORT_CODES + self.direct_codes {
             if length > bits.available() {
@@ -258,12 +294,17 @@ impl Decoder {
         let extra = ((word >> length) & low_mask(extra_bits)) as u32;
         bits.consume(length + extra_bits);
         let offset = ((DISTANCE_OFFSET_BASE + (high & 1)) << extra_bits) - DISTANCE_OFFSET_BIAS;
-        Ok(Some((((offset + extra) << self.postfix_bits) + postfix + self.direct_codes + 1, true)))
+        Ok(Some((
+            ((offset + extra) << self.postfix_bits) + postfix + self.direct_codes + 1,
+            true,
+        )))
     }
 
     #[inline(always)]
     fn short_distance(&self, code: u32) -> Result<u32, DecodeError> {
-        let back = |count: usize| self.distances[(self.distance_index + DISTANCE_RING_SIZE - count) % DISTANCE_RING_SIZE];
+        let back = |count: usize| {
+            self.distances[(self.distance_index + DISTANCE_RING_SIZE - count) % DISTANCE_RING_SIZE]
+        };
         if code < DISTANCE_LAST_CODES {
             return Ok(back(code as usize + 1));
         }
@@ -284,7 +325,12 @@ impl Decoder {
 }
 
 #[inline(always)]
-fn single_tree_literals(bits: &mut Bits<'_>, tables: &[Entry], tree: usize, target: &mut [u8]) -> usize {
+fn single_tree_literals(
+    bits: &mut Bits<'_>,
+    tables: &[Entry],
+    tree: usize,
+    target: &mut [u8],
+) -> usize {
     for (index, slot) in target.iter_mut().enumerate() {
         bits.ensure(CODE_LENGTH_MAX);
         let (symbol, length) = decode_at(tables, tree, bits.word());

@@ -234,8 +234,6 @@ pub fn shared() -> io::Result<&'static Reactor> {
         .map_err(|message| io::Error::other(message.clone()))
 }
 
-
-
 fn start() -> Result<Reactor, String> {
     let poller = Poller::new().map_err(|error| format!("the reactor's poller failed: {error}"))?;
     let driver = Driver {

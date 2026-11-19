@@ -347,7 +347,6 @@ impl<A: Filter, B: Filter> Filter for And<A, B> {
     }
 }
 
-
 pub fn scope(directives: &str) -> Result<Box<dyn Filter>, ParseError> {
     let filter = EnvFilter::try_new(directives)?;
     let targets = directives

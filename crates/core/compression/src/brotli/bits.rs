@@ -64,7 +64,8 @@ impl<'a> Bits<'a> {
     #[inline(always)]
     pub(super) const fn has(&self, needed: u32) -> bool {
         let remaining = self.input.len() - self.position;
-        remaining >= WORD_BYTES || self.count as usize + remaining * BYTE_BITS as usize >= needed as usize
+        remaining >= WORD_BYTES
+            || self.count as usize + remaining * BYTE_BITS as usize >= needed as usize
     }
 
     #[inline(always)]
@@ -172,7 +173,8 @@ impl<'a> Bits<'a> {
             taken += 1;
         }
         let direct = (target.len() - taken).min(self.input_remaining());
-        target[taken..taken + direct].copy_from_slice(&self.input[self.position..self.position + direct]);
+        target[taken..taken + direct]
+            .copy_from_slice(&self.input[self.position..self.position + direct]);
         self.position += direct;
         if self.count == 0 {
             self.value = 0;

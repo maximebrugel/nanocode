@@ -4,9 +4,8 @@ use core::cmp::Ordering;
 use core::fmt;
 use core::iter::{Product, Sum};
 use core::ops::{
-    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div,
-    DivAssign, Mul, MulAssign, Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub,
-    SubAssign,
+    Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Div, DivAssign,
+    Mul, MulAssign, Neg, Not, Rem, RemAssign, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
 };
 use core::str::FromStr;
 
@@ -188,7 +187,9 @@ impl BigInt {
         let mut bytes = self.magnitude.to_bytes_be();
         let first = bytes.first().copied().unwrap_or(0);
         let negative = self.is_negative_value();
-        if first > 0x7f && !(first == 0x80 && bytes.iter().skip(1).all(|&byte| byte == 0) && negative) {
+        if first > 0x7f
+            && !(first == 0x80 && bytes.iter().skip(1).all(|&byte| byte == 0) && negative)
+        {
             bytes.insert(0, 0);
         }
         if negative {
@@ -282,11 +283,17 @@ impl BigInt {
             !modulus.is_zero_value(),
             "attempt to calculate with zero modulus!"
         );
-        let mut magnitude = self.magnitude.modpow(&exponent.magnitude, &modulus.magnitude);
+        let mut magnitude = self
+            .magnitude
+            .modpow(&exponent.magnitude, &modulus.magnitude);
         if magnitude.is_zero() {
             return Self::ZERO;
         }
-        let exponent_odd = exponent.magnitude.limbs().first().is_some_and(|limb| limb & 1 == 1);
+        let exponent_odd = exponent
+            .magnitude
+            .limbs()
+            .first()
+            .is_some_and(|limb| limb & 1 == 1);
         if (self.is_negative_value() && exponent_odd) != modulus.is_negative_value() {
             magnitude = &modulus.magnitude - &magnitude;
         }
@@ -357,7 +364,10 @@ impl BigInt {
         if !self.is_negative_value() {
             return self.magnitude.bit(bit);
         }
-        let zeros = self.magnitude.trailing_zeros().expect("a negative value is nonzero");
+        let zeros = self
+            .magnitude
+            .trailing_zeros()
+            .expect("a negative value is nonzero");
         match bit.cmp(&zeros) {
             Ordering::Less => false,
             Ordering::Equal => true,
@@ -406,14 +416,18 @@ impl BigInt {
         assert!(!other.is_zero_value(), "division by zero");
         let (quotient, remainder) = self.magnitude.div_rem_value(&other.magnitude);
         (
-            Self::from_parts(self.is_negative_value() != other.is_negative_value(), quotient),
+            Self::from_parts(
+                self.is_negative_value() != other.is_negative_value(),
+                quotient,
+            ),
             Self::from_parts(self.is_negative_value(), remainder),
         )
     }
 
     pub(crate) fn div_mod_floor_values(&self, other: &Self) -> (Self, Self) {
         let (quotient, remainder) = self.div_rem_truncate(other);
-        if !remainder.is_zero_value() && remainder.is_negative_value() != other.is_negative_value() {
+        if !remainder.is_zero_value() && remainder.is_negative_value() != other.is_negative_value()
+        {
             (quotient - 1u32, remainder + other)
         } else {
             (quotient, remainder)
@@ -421,7 +435,12 @@ impl BigInt {
     }
 
     fn bitwise(&self, other: &Self, operation: fn(Limb, Limb) -> Limb) -> Self {
-        let length = self.magnitude.limbs().len().max(other.magnitude.limbs().len()) + 1;
+        let length = self
+            .magnitude
+            .limbs()
+            .len()
+            .max(other.magnitude.limbs().len())
+            + 1;
         let left = twos_complement_limbs(self, length);
         let right = twos_complement_limbs(other, length);
         let mut combined: Vec<Limb> = left
@@ -491,7 +510,11 @@ fn sub_values(left: &BigInt, right: &BigInt) -> BigInt {
     if let (Some(a), Some(b)) = (left.small_value(), right.small_value()) {
         return BigInt::from_i128(a - b);
     }
-    add_with_sign(left, right, !right.is_negative_value() && !right.is_zero_value())
+    add_with_sign(
+        left,
+        right,
+        !right.is_negative_value() && !right.is_zero_value(),
+    )
 }
 
 fn add_with_sign(left: &BigInt, right: &BigInt, right_negative: bool) -> BigInt {
@@ -1061,7 +1084,8 @@ impl crate::FromPrimitive for BigInt {
     }
 
     fn from_f64(value: f64) -> Option<Self> {
-        crate::float::f64_to_natural(value).map(|(negative, magnitude)| Self::from_parts(negative, magnitude))
+        crate::float::f64_to_natural(value)
+            .map(|(negative, magnitude)| Self::from_parts(negative, magnitude))
     }
 }
 
@@ -1079,7 +1103,10 @@ impl crate::Integer for BigInt {
     }
 
     fn lcm(&self, other: &Self) -> Self {
-        Self::from_parts(false, crate::Integer::lcm(&self.magnitude, &other.magnitude))
+        Self::from_parts(
+            false,
+            crate::Integer::lcm(&self.magnitude, &other.magnitude),
+        )
     }
 
     fn is_multiple_of(&self, other: &Self) -> bool {
@@ -1110,7 +1137,6 @@ impl crate::Integer for BigInt {
             quotient
         }
     }
-
 }
 
 pub trait ToBigInt {
@@ -1139,7 +1165,9 @@ macro_rules! to_bigint_primitive {
     )*};
 }
 
-to_bigint_primitive!(i8, i16, i32, i64, isize, i128, u8, u16, u32, u64, usize, u128);
+to_bigint_primitive!(
+    i8, i16, i32, i64, isize, i128, u8, u16, u32, u64, usize, u128
+);
 
 impl ToBigInt for f32 {
     fn to_bigint(&self) -> Option<BigInt> {
@@ -1152,4 +1180,3 @@ impl ToBigInt for f64 {
         <BigInt as crate::FromPrimitive>::from_f64(*self)
     }
 }
-

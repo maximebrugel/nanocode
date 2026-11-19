@@ -178,10 +178,7 @@ impl Vm {
         IMAGE_DEPS.write(&mut heap);
         state::init(&mut heap)?;
         realm::init(&mut heap)?;
-        let mut vm = Vm {
-            heap,
-            opts,
-        };
+        let mut vm = Vm { heap, opts };
         crate::builtins::number::set_seed(&mut vm.heap, opts.random_seed);
         if opts.prelude {
             #[cfg(djs_prelude)]
@@ -477,10 +474,7 @@ impl Vm {
             return Err(LoadError::BadHeader);
         }
         heap.force_prefix_barrier(opts.prefix_barrier);
-        Ok(Vm {
-            heap,
-            opts,
-        })
+        Ok(Vm { heap, opts })
     }
 
     /// The arena as it is: the complete VM state, including dead value-stack slots above
@@ -864,7 +858,12 @@ impl Vm {
 
     pub fn reject_host_call_handled(&mut self, call_id: u32, reason: Value) -> Result<(), VmError> {
         let c = run::host_call_cell(&self.heap, call_id).ok_or(VmError::UnknownHostCall)?;
-        if let Some(p) = self.heap.arena().get::<Value>(c, HostCall::PROMISE).as_object() {
+        if let Some(p) = self
+            .heap
+            .arena()
+            .get::<Value>(c, HostCall::PROMISE)
+            .as_object()
+        {
             let f = run::promise::flags(&self.heap, p);
             run::promise::set_flags(&mut self.heap, p, f | run::promise::FLAG_HANDLED);
         }
@@ -1227,5 +1226,4 @@ fn tidy_stack(heap: &mut Heap, shrink: bool) {
     let _ = state::move_stack(heap, sp, cap);
 }
 
-impl Vm {
-}
+impl Vm {}

@@ -1,6 +1,7 @@
 mod agents;
 #[cfg(unix)]
 mod alloc;
+mod board;
 #[cfg(unix)]
 mod capture;
 mod cellcalls;
@@ -9,9 +10,9 @@ mod children;
 mod disk;
 #[cfg(target_os = "linux")]
 mod dns;
+mod drive;
 #[cfg(unix)]
 mod egress;
-mod drive;
 mod executor;
 mod faults;
 mod hands;
@@ -22,9 +23,11 @@ mod log;
 mod longthread;
 mod model;
 mod mpp;
+mod network;
 mod onelog;
 mod rng;
 mod scripted;
+mod server;
 mod simulate;
 mod socket;
 mod store;
@@ -34,34 +37,33 @@ mod tasks;
 mod tidy;
 mod turnlog;
 mod turns;
+mod websocket;
 mod whole;
 mod workload;
 mod world;
-mod network;
-mod server;
-mod websocket;
 
 use std::{collections::BTreeMap, ops::Range, process::ExitCode};
 
 use crate::{
     agents::{AgentStats, AgentsMutation},
+    board::{BoardMutation, BoardStats},
+    cellcalls::{CellCallsMutation, CellCallsStats},
+    children::ChildMutation,
+    hands::{HandsMutation, HandsStats},
+    httpd::WireMutation,
+    httpserver::{HttpServerMutation, HttpServerStats},
+    longthread::{LongThreadMutation, LongThreadStats},
     model::Stats,
+    mpp::{MppMutation, MppStats},
     onelog::{LiveSeqs, Protections},
     simulate::{Options, run_seed},
     store::Mutation,
-    turns::{Invariant, PolicyKind, TurnMutation, TurnOptions, TurnStats},
-    httpd::WireMutation,
-    httpserver::{HttpServerMutation, HttpServerStats},
-    mpp::{MppMutation, MppStats},
     streams::{StreamsMutation, StreamsStats},
-    hands::{HandsMutation, HandsStats},
-    cellcalls::{CellCallsMutation, CellCallsStats},
-    longthread::{LongThreadMutation, LongThreadStats},
     sync::{SyncMutation, SyncStats},
     tasks::{TasksMutation, TasksStats},
+    turns::{Invariant, PolicyKind, TurnMutation, TurnOptions, TurnStats},
     websocket::{WebSocketMutation, WebSocketStats},
     whole::{ChildMode, StoreKind, WholeOptions, WholeStats, WireKind},
-    children::ChildMutation,
 };
 
 const DEFAULT_OPS: u64 = 1000;
@@ -86,6 +88,7 @@ enum Scenario {
     Capture,
     Executor,
     Dns,
+    Board,
 }
 
 struct Args {
@@ -105,6 +108,7 @@ struct Args {
     cell_calls: CellCallsMutation,
     long_thread: LongThreadMutation,
     tasks: TasksMutation,
+    board: BoardMutation,
     #[cfg(unix)]
     alloc: alloc::AllocMutation,
     #[cfg(unix)]
@@ -119,7 +123,7 @@ type Caught = BTreeMap<Invariant, (u64, u64, (u64, u64))>;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|capture|executor|dns] [--ops N] [--twice] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
+        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|capture|executor|dns|board] [--ops N] [--twice] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
        websocket: [--mutation {}]
        http_server: [--mutation {}]
        alloc: [--mutation overstate_size|forget_free|scribble]
@@ -132,7 +136,8 @@ fn usage() -> ExitCode {
        long_thread: [--mutation {}]
        capture: [--mutation skip_trim|drop_chunk|skip_redact|redact_then_trim]
        executor: [--mutation {}]
-       dns: [--mutation cut_answer|drop_search]",
+       dns: [--mutation cut_answer|drop_search]
+       board: [--mutation {}]",
         Mutation::names(),
         TurnMutation::names(),
         onelog::PROTECTIONS.join("|"),
@@ -147,7 +152,8 @@ fn usage() -> ExitCode {
         HandsMutation::names(),
         CellCallsMutation::names(),
         LongThreadMutation::names(),
-        TasksMutation::names()
+        TasksMutation::names(),
+        BoardMutation::names()
     );
     ExitCode::from(2)
 }
@@ -199,6 +205,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut cell_calls = CellCallsMutation::None;
     let mut long_thread = LongThreadMutation::None;
     let mut tasks = TasksMutation::None;
+    let mut board = BoardMutation::None;
     #[cfg(unix)]
     let mut capture = capture::CaptureMutation::None;
     #[cfg(target_os = "linux")]
@@ -247,6 +254,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "cell_calls" => Scenario::CellCalls,
                     "long_thread" => Scenario::LongThread,
                     "executor" => Scenario::Executor,
+                    "board" => Scenario::Board,
                     #[cfg(unix)]
                     "capture" => Scenario::Capture,
                     #[cfg(target_os = "linux")]
@@ -289,6 +297,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::CellCalls, Some(name)) => cell_calls = CellCallsMutation::parse(name)?,
         (Scenario::LongThread, Some(name)) => long_thread = LongThreadMutation::parse(name)?,
         (Scenario::Executor, Some(name)) => tasks = TasksMutation::parse(name)?,
+        (Scenario::Board, Some(name)) => board = BoardMutation::parse(name)?,
         #[cfg(unix)]
         (Scenario::Capture, Some(name)) => capture = capture::CaptureMutation::parse(name)?,
         #[cfg(not(unix))]
@@ -330,6 +339,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         cell_calls,
         long_thread,
         tasks,
+        board,
         #[cfg(unix)]
         alloc,
         #[cfg(unix)]
@@ -377,6 +387,9 @@ fn replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::Executor {
         return tasks::replay(seed, args.tasks);
+    }
+    if args.scenario == Scenario::Board {
+        return board::replay(seed, args.board);
     }
     #[cfg(unix)]
     if args.scenario == Scenario::Capture {
@@ -667,7 +680,10 @@ const fn mutation_name(whole: &WholeOptions) -> &'static str {
 fn mutations() -> ExitCode {
     let mut lines = Vec::new();
     let mut add = |scenario: &str, names: String| {
-        for name in names.split('|').filter(|name| !name.is_empty() && *name != "none") {
+        for name in names
+            .split('|')
+            .filter(|name| !name.is_empty() && *name != "none")
+        {
             lines.push(format!("MUTATION scenario={scenario} mutation={name}"));
         }
     };
@@ -686,6 +702,7 @@ fn mutations() -> ExitCode {
     add("cell_calls", CellCallsMutation::names());
     add("long_thread", LongThreadMutation::names());
     add("executor", TasksMutation::names());
+    add("board", BoardMutation::names());
     #[cfg(unix)]
     {
         add("alloc", alloc::AllocMutation::names());
@@ -753,6 +770,7 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::CellCalls && args.cell_calls != CellCallsMutation::None)
         || (args.scenario == Scenario::LongThread && args.long_thread != LongThreadMutation::None)
         || (args.scenario == Scenario::Executor && args.tasks != TasksMutation::None)
+        || (args.scenario == Scenario::Board && args.board != BoardMutation::None)
         || alloc_experiment(&args);
     let (mut passed, mut failed) = (0_u64, 0_u64);
     let mut totals = Stats::default();
@@ -768,6 +786,7 @@ fn main() -> ExitCode {
     let mut cell_calls_totals = CellCallsStats::default();
     let mut long_thread_totals = LongThreadStats::default();
     let mut tasks_totals = TasksStats::default();
+    let mut board_totals = BoardStats::default();
     #[cfg(unix)]
     let mut capture_totals = capture::CaptureStats::default();
     #[cfg(target_os = "linux")]
@@ -845,6 +864,13 @@ fn main() -> ExitCode {
                 args.twice,
                 args.options.verbose,
                 &mut tasks_totals,
+            ),
+            Scenario::Board => board::judge(
+                seed,
+                args.board,
+                args.twice,
+                args.options.verbose,
+                &mut board_totals,
             ),
             #[cfg(unix)]
             Scenario::Capture => capture::judge(
@@ -924,30 +950,96 @@ fn main() -> ExitCode {
         );
     }
     if args.scenario == Scenario::Hands {
-        return hands::report(&args.seeds, passed, failed, args.twice, args.hands, &hands_totals);
+        return hands::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.hands,
+            &hands_totals,
+        );
     }
     if args.scenario == Scenario::CellCalls {
-        return cellcalls::report(&args.seeds, passed, failed, args.twice, args.cell_calls, &cell_calls_totals);
+        return cellcalls::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.cell_calls,
+            &cell_calls_totals,
+        );
     }
     if args.scenario == Scenario::LongThread {
-        return longthread::report(&args.seeds, passed, failed, args.twice, args.long_thread, &long_thread_totals);
+        return longthread::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.long_thread,
+            &long_thread_totals,
+        );
+    }
+    if args.scenario == Scenario::Board {
+        return board::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.board,
+            &board_totals,
+        );
     }
     if args.scenario == Scenario::Executor {
-        return tasks::report(&args.seeds, passed, failed, args.twice, args.tasks, &tasks_totals);
+        return tasks::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.tasks,
+            &tasks_totals,
+        );
     }
     #[cfg(target_os = "linux")]
     if args.scenario == Scenario::Dns {
-        return dns::report(&args.seeds, passed, failed, args.twice, args.dns, &dns_totals);
+        return dns::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.dns,
+            &dns_totals,
+        );
     }
     #[cfg(unix)]
     if args.scenario == Scenario::Capture {
-        return capture::report(&args.seeds, passed, failed, args.twice, args.capture, &capture_totals);
+        return capture::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.capture,
+            &capture_totals,
+        );
     }
     if args.scenario == Scenario::Sync {
-        return sync::report(&args.seeds, passed, failed, args.twice, args.sync, &sync_totals);
+        return sync::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.sync,
+            &sync_totals,
+        );
     }
     if args.scenario == Scenario::Mpp {
-        return mpp::report(&args.seeds, passed, failed, args.twice, args.mpp, &mpp_totals);
+        return mpp::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.mpp,
+            &mpp_totals,
+        );
     }
     if args.scenario == Scenario::HttpServer {
         return httpserver::report(
@@ -961,11 +1053,25 @@ fn main() -> ExitCode {
     }
     #[cfg(unix)]
     if args.scenario == Scenario::Alloc {
-        return alloc::report(&args.seeds, passed, failed, args.twice, args.alloc, &alloc_totals);
+        return alloc::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.alloc,
+            &alloc_totals,
+        );
     }
     #[cfg(unix)]
     if args.scenario == Scenario::Egress {
-        return egress::report(&args.seeds, passed, failed, args.twice, args.egress, &egress_totals);
+        return egress::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.egress,
+            &egress_totals,
+        );
     }
     if args.scenario == Scenario::Turns {
         return report_turns(&args, passed, failed, &turn_totals, &caught);
@@ -985,7 +1091,10 @@ fn main() -> ExitCode {
             || args.whole.store_mutation != Mutation::None
         {
             if failed > 0 {
-                println!("MUTATION {} caught by {failed} seeds", mutation_name(&args.whole));
+                println!(
+                    "MUTATION {} caught by {failed} seeds",
+                    mutation_name(&args.whole)
+                );
                 return ExitCode::SUCCESS;
             }
             println!("MUTATION {} NOT caught", mutation_name(&args.whole));

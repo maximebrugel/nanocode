@@ -59,7 +59,11 @@ impl Decoder {
                     return Err(DecodeError::InvalidWindowBits);
                 }
                 bits.consume(MEDIUM_WINDOW_FIELD_END + WINDOW_FIELD_BITS);
-                if long == 0 { LONG_WINDOW_DEFAULT_BITS } else { LONG_WINDOW_BITS_BASE + long }
+                if long == 0 {
+                    LONG_WINDOW_DEFAULT_BITS
+                } else {
+                    LONG_WINDOW_BITS_BASE + long
+                }
             }
         };
         self.window_size = 1 << window_bits;
@@ -67,7 +71,11 @@ impl Decoder {
         Ok(Flow::Continue)
     }
 
-    pub(super) fn header(&mut self, bits: &mut Bits<'_>, step: HeaderStep) -> Result<Flow, DecodeError> {
+    pub(super) fn header(
+        &mut self,
+        bits: &mut Bits<'_>,
+        step: HeaderStep,
+    ) -> Result<Flow, DecodeError> {
         let next = match step {
             HeaderStep::Last => {
                 let Some(last) = bits.try_read(1) else {
@@ -75,7 +83,11 @@ impl Decoder {
                 };
                 self.is_last = last == 1;
                 self.remaining = 0;
-                if self.is_last { HeaderStep::LastEmpty } else { HeaderStep::Nibbles }
+                if self.is_last {
+                    HeaderStep::LastEmpty
+                } else {
+                    HeaderStep::Nibbles
+                }
             }
             HeaderStep::LastEmpty => {
                 let Some(empty) = bits.try_read(1) else {
@@ -94,10 +106,18 @@ impl Decoder {
                 if count == METADATA_NIBBLE_COUNT {
                     HeaderStep::Reserved
                 } else {
-                    HeaderStep::Size { nibbles: count + NIBBLE_COUNT_BASE, read: 0, value: 0 }
+                    HeaderStep::Size {
+                        nibbles: count + NIBBLE_COUNT_BASE,
+                        read: 0,
+                        value: 0,
+                    }
                 }
             }
-            HeaderStep::Size { nibbles, read, value } => {
+            HeaderStep::Size {
+                nibbles,
+                read,
+                value,
+            } => {
                 if read == nibbles {
                     HeaderStep::Uncompressed { value }
                 } else {
@@ -107,7 +127,11 @@ impl Decoder {
                     if read + 1 == nibbles && nibbles > NIBBLE_COUNT_BASE && nibble == 0 {
                         return Err(DecodeError::ExuberantNibble);
                     }
-                    HeaderStep::Size { nibbles, read: read + 1, value: value | nibble << (NIBBLE_BITS * read) }
+                    HeaderStep::Size {
+                        nibbles,
+                        read: read + 1,
+                        value: value | nibble << (NIBBLE_BITS * read),
+                    }
                 }
             }
             HeaderStep::Uncompressed { value } => {
@@ -129,7 +153,11 @@ impl Decoder {
         Ok(Flow::Continue)
     }
 
-    fn metadata_header(&mut self, bits: &mut Bits<'_>, step: HeaderStep) -> Result<Flow, DecodeError> {
+    fn metadata_header(
+        &mut self,
+        bits: &mut Bits<'_>,
+        step: HeaderStep,
+    ) -> Result<Flow, DecodeError> {
         let next = match step {
             HeaderStep::Reserved => {
                 let Some(reserved) = bits.try_read(1) else {
@@ -147,7 +175,11 @@ impl Decoder {
                 if bytes == 0 {
                     return self.start_metadata(bits, 0);
                 }
-                HeaderStep::SkipSize { bytes, read: 0, value: 0 }
+                HeaderStep::SkipSize {
+                    bytes,
+                    read: 0,
+                    value: 0,
+                }
             }
             HeaderStep::SkipSize { bytes, read, value } => {
                 if read == bytes {
@@ -159,7 +191,11 @@ impl Decoder {
                 if read + 1 == bytes && bytes > 1 && byte == 0 {
                     return Err(DecodeError::ExuberantMetadataByte);
                 }
-                HeaderStep::SkipSize { bytes, read: read + 1, value: value | byte << (BYTE_BITS * read) }
+                HeaderStep::SkipSize {
+                    bytes,
+                    read: read + 1,
+                    value: value | byte << (BYTE_BITS * read),
+                }
             }
             HeaderStep::Last
             | HeaderStep::LastEmpty
@@ -180,7 +216,12 @@ impl Decoder {
         Ok(Flow::Continue)
     }
 
-    fn start_data(&mut self, bits: &mut Bits<'_>, length: u32, uncompressed: bool) -> Result<Flow, DecodeError> {
+    fn start_data(
+        &mut self,
+        bits: &mut Bits<'_>,
+        length: u32,
+        uncompressed: bool,
+    ) -> Result<Flow, DecodeError> {
         if uncompressed && bits.align() != 0 {
             return Err(DecodeError::PaddingBitsNotZero);
         }
@@ -192,7 +233,10 @@ impl Decoder {
             self.phase = Phase::Uncompressed;
         } else {
             self.begin_compressed();
-            self.phase = Phase::BlockTypes { category: 0, step: BlockStep::Count };
+            self.phase = Phase::BlockTypes {
+                category: 0,
+                step: BlockStep::Count,
+            };
         }
         Ok(Flow::Continue)
     }

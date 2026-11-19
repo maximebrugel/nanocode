@@ -125,7 +125,8 @@ impl<O: Write> Printer<O> {
             AgentEventKind::AssistantDelta => {
                 let key = payload.key();
                 if !self.calls.contains_key(&*key) {
-                    self.calls.insert(key.clone().into_owned(), payload.model_call_index);
+                    self.calls
+                        .insert(key.clone().into_owned(), payload.model_call_index);
                 }
                 self.answer(&key, payload.model_call_index, text)
             }
@@ -192,7 +193,9 @@ impl<O: Write> Printer<O> {
             return self.notice(&format!("nanocode: {notice}"));
         }
         if shown {
-            self.notice(&format!("nanocode: {notice}; the partial reply above is discarded"))
+            self.notice(&format!(
+                "nanocode: {notice}; the partial reply above is discarded"
+            ))
         } else {
             self.notice(&format!("nanocode: {notice}"))
         }
@@ -256,11 +259,16 @@ impl<O: Write> Printer<O> {
         let Some(pipe) = &mut self.pipe else {
             return Ok(());
         };
-        if pipe.replay.take().is_some_and(|replay| !replay.shown.ends_with(b"\n")) {
+        if pipe
+            .replay
+            .take()
+            .is_some_and(|replay| !replay.shown.ends_with(b"\n"))
+        {
             self.answers.write_all(b"\n")?;
         }
-        self.answers
-            .write_all(b"--- nanocode: retried reply; the partial reply above is discarded ---\n")?;
+        self.answers.write_all(
+            b"--- nanocode: retried reply; the partial reply above is discarded ---\n",
+        )?;
         self.answers.write_all(&pipe.written)?;
         writeln!(
             self.notices,

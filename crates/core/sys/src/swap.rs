@@ -191,7 +191,10 @@ const fn is_debt_paid(seen: usize) -> bool {
 }
 
 fn release_paid_debt(seen: usize, raw: *mut ()) {
-    assert!(is_debt_paid(seen), "only a writer's payment replaces a debt");
+    assert!(
+        is_debt_paid(seen),
+        "only a writer's payment replaces a debt"
+    );
     let release: &'static Release =
         unsafe { &*ptr::with_exposed_provenance::<Release>(seen & !TAG_MASK) };
     (release.0)(raw);
@@ -209,7 +212,11 @@ struct Storage<T> {
 
 impl<T> Storage<T> {
     fn new(raw: *mut T) -> Self {
-        assert_eq!(raw.addr() & TAG_MASK, 0, "an Arc's value is aligned past the tag bits");
+        assert_eq!(
+            raw.addr() & TAG_MASK,
+            0,
+            "an Arc's value is aligned past the tag bits"
+        );
         Self {
             pointer: AtomicPtr::new(raw),
             owns: PhantomData,
@@ -253,7 +260,11 @@ impl<T> Storage<T> {
             Ok(_) if current.is_null() => Protected::Owned(current),
             Ok(_) => Protected::Debt(current),
             Err(seen) => {
-                assert_eq!(seen & TAG_MASK, PENDING_PAID_TAG, "only a writer helps a pending load");
+                assert_eq!(
+                    seen & TAG_MASK,
+                    PENDING_PAID_TAG,
+                    "only a writer helps a pending load"
+                );
                 slot.store(FREE, Ordering::SeqCst);
                 Protected::Owned(ptr::with_exposed_provenance_mut(seen & !TAG_MASK))
             }
@@ -294,14 +305,22 @@ impl<T> Storage<T> {
     }
 
     fn swap(&self, new: *mut T) -> *mut T {
-        assert_eq!(new.addr() & TAG_MASK, 0, "an Arc's value is aligned past the tag bits");
+        assert_eq!(
+            new.addr() & TAG_MASK,
+            0,
+            "an Arc's value is aligned past the tag bits"
+        );
         let old = self.pointer.swap(new, Ordering::SeqCst);
         self.settle(old);
         old
     }
 
     fn compare_exchange(&self, current: *mut T, new: *mut T) -> bool {
-        assert_eq!(new.addr() & TAG_MASK, 0, "an Arc's value is aligned past the tag bits");
+        assert_eq!(
+            new.addr() & TAG_MASK,
+            0,
+            "an Arc's value is aligned past the tag bits"
+        );
         let exchanged = self
             .pointer
             .compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
@@ -404,7 +423,10 @@ impl<P: Pointer> Drop for Guard<P> {
             if seen == raw.addr() {
                 return;
             }
-            assert!(is_debt_paid(seen), "only a writer's payment replaces a debt");
+            assert!(
+                is_debt_paid(seen),
+                "only a writer's payment replaces a debt"
+            );
         }
         unsafe { ManuallyDrop::drop(&mut self.value) };
     }
@@ -605,7 +627,10 @@ impl<P: Pointer> From<P> for Swapped<P> {
 
 impl<P: Pointer + fmt::Debug> fmt::Debug for Swapped<P> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("ArcSwapAny").field(&*self.load()).finish()
+        formatter
+            .debug_tuple("ArcSwapAny")
+            .field(&*self.load())
+            .finish()
     }
 }
 

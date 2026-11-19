@@ -872,7 +872,8 @@ fn emit_function(
                             out.place_label(Label(l.imm(0)));
                         }
                         let at = i + 2 + k;
-                        let (get, bound, lt, jump) = (all[at], all[at + 1], all[at + 2], all[at + 3]);
+                        let (get, bound, lt, jump) =
+                            (all[at], all[at + 1], all[at + 2], all[at + 3]);
                         flush(&out, &mut li, &mut lines, get.pc);
                         out.exact(Op::GetLoc8, s as u32);
                         flush(&out, &mut li, &mut lines, bound.pc);

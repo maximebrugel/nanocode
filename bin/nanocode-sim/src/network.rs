@@ -10,8 +10,8 @@ use nanocode::claude::transport::{
 use nanocode_sync::Slot;
 
 use crate::{
-    rng::{FNV_OFFSET, PPM, Rng, fnv},
     httpd::WireMutation,
+    rng::{FNV_OFFSET, PPM, Rng, fnv},
     server::ModelServer,
     world::World,
 };
@@ -139,7 +139,12 @@ fn transport(detail: &str, unsent: bool) -> HttpError {
 }
 
 impl Network {
-    pub fn new(seed: u64, world: Arc<World>, faults: NetworkFaults, mutation: WireMutation) -> Self {
+    pub fn new(
+        seed: u64,
+        world: Arc<World>,
+        faults: NetworkFaults,
+        mutation: WireMutation,
+    ) -> Self {
         Self {
             server: ModelServer::new(seed, Arc::clone(&world), mutation),
             world,
@@ -186,9 +191,7 @@ impl Network {
                 .into_iter()
                 .map(|cut| (rng.range(0, CHUNK_GAP_MS_MAX), cut))
                 .collect();
-            let truncated = rng
-                .chance(faults.truncate_ppm)
-                .then(|| rng.chance(PPM / 2));
+            let truncated = rng.chance(faults.truncate_ppm).then(|| rng.chance(PPM / 2));
             Fate::Delivered {
                 duplicate: rng.chance(faults.duplicate_ppm),
                 headers_ms,
@@ -258,7 +261,8 @@ impl Network {
                     "{{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"sim status {status}\"}}}}"
                 );
                 return Ok(HttpResponse::new(
-                    nanocode_http::types::StatusCode::from_u16(status).expect("a simulated status is valid"),
+                    nanocode_http::types::StatusCode::from_u16(status)
+                        .expect("a simulated status is valid"),
                     headers,
                     Box::pin(nanocode_sync::stream::once(
                         async move { Ok(body.into_bytes()) },
@@ -307,7 +311,8 @@ impl Network {
                 Some(_) if cut_ppm == PPM => PPM / 2,
                 _ => cut_ppm,
             };
-            let cut = usize::try_from(length * cut_ppm / PPM).expect("a cut inside a reply fits in usize");
+            let cut = usize::try_from(length * cut_ppm / PPM)
+                .expect("a cut inside a reply fits in usize");
             if cut > from {
                 parts.push_back((gap_ms, Ok(bytes[from..cut].to_vec())));
                 from = cut;
@@ -315,7 +320,11 @@ impl Network {
         }
         if let Some(with_error) = truncated {
             self.world.count(|counts| counts.faults += 1);
-            self.world.trace(&format!("net truncated {} at {from} of {}", reply.label, bytes.len()));
+            self.world.trace(&format!(
+                "net truncated {} at {from} of {}",
+                reply.label,
+                bytes.len()
+            ));
             if with_error {
                 parts.push_back((0, Err(transport("sim: stream reset", false))));
             }
@@ -325,13 +334,20 @@ impl Network {
             nanocode_http::types::header::CONTENT_TYPE,
             nanocode_http::types::HeaderValue::from_static("text/event-stream"),
         );
-        headers.insert("request-id", nanocode_http::types::HeaderValue::from_static("req_sim"));
+        headers.insert(
+            "request-id",
+            nanocode_http::types::HeaderValue::from_static("req_sim"),
+        );
         let body = nanocode_sync::stream::unfold((parts, open), |(mut parts, open)| async move {
             let (gap_ms, part) = parts.pop_front()?;
             nanocode_platform::sleep(Duration::from_millis(gap_ms)).await;
             Some((part, (parts, open)))
         });
-        Ok(HttpResponse::new(nanocode_http::types::StatusCode::OK, headers, Box::pin(body)))
+        Ok(HttpResponse::new(
+            nanocode_http::types::StatusCode::OK,
+            headers,
+            Box::pin(body),
+        ))
     }
 }
 

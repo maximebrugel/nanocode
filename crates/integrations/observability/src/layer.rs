@@ -14,8 +14,8 @@ use nanocode_trace::{
 };
 
 use crate::{
-    subscriber::{Context, Layer, Registry, SpanRef},
     model::{Event as SpanEvent, KeyValue, SpanContext, SpanKind, Status, Text, Value},
+    subscriber::{Context, Layer, Registry, SpanRef},
     trace::{Builder, Parent, Started, Tracer},
 };
 
@@ -666,4 +666,3 @@ pub fn add_link(span: &nanocode_trace::Span, link: SpanContext) {
         State::Started(started) => started.add_link(link),
     });
 }
-

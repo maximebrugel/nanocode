@@ -4,9 +4,9 @@ use crate::client::{
     OpenAiAuthSnapshot, monotonic_now_ns,
     transport::host::{HostConnectRequest, HostError, HostHttpBody, HostTransport},
 };
-use nanocode_http::types::header;
 #[cfg(not(target_family = "wasm"))]
 use nanocode_http::layer::{self, retry};
+use nanocode_http::types::header;
 
 #[cfg(not(target_family = "wasm"))]
 use crate::client::RetryAfter;
@@ -574,7 +574,10 @@ pub(super) fn map_http_error(error: nanocode_http::Error) -> ResponsesError {
 
 #[cfg(target_family = "wasm")]
 impl ResponsesHttp {
-    #[expect(clippy::unused_async, reason = "a WebAssembly host opens its own connections")]
+    #[expect(
+        clippy::unused_async,
+        reason = "a WebAssembly host opens its own connections"
+    )]
     pub(crate) async fn preconnect(&self, _api_base_url: &str) -> Result<(), ResponsesError> {
         Ok(())
     }

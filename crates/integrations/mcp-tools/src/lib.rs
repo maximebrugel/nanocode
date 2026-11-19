@@ -40,9 +40,9 @@ use nanocode_mcp::{
     protocol::JsonObject,
 };
 use nanocode_tools::ToolDefinition;
+use nanocode_trace::{Instrument, info_span};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use nanocode_trace::{Instrument, info_span};
 
 pub use config::{
     McpPaymentManagement, McpPaymentProvider, McpPendingPayment, McpServer, McpToolExposure,

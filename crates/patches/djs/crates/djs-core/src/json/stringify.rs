@@ -47,16 +47,13 @@ pub enum StringifyError {
     BigInt,
 }
 
-impl StringifyError {
-}
+impl StringifyError {}
 
 impl From<HeapError> for StringifyError {
     fn from(e: HeapError) -> Self {
         StringifyError::Heap(e)
     }
 }
-
-
 
 /// `JSON.stringify(value, undefined, space)` for plain data, with `gap` already computed
 /// from `space` (see [`gap_from_number`] / [`gap_from_units`]). `Ok(None)` is the
@@ -322,7 +319,6 @@ impl Out {
     }
 }
 
-
 /// Writes `n` in decimal.
 fn write_int(out: &mut Out, n: i64) {
     let mut buf = [0u8; 20];
@@ -424,7 +420,6 @@ struct Ser<'h, 'g> {
 }
 
 const KEY_CACHE: usize = 128;
-
 
 const CLEAN_PROTOS: usize = 8;
 

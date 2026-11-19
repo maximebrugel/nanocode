@@ -853,7 +853,8 @@ impl NativeToolRuntime {
                 }
             },
             code_mode::wait_spec_with(
-                self.cell_yield.unwrap_or(crate::code_mode_spec::DEFAULT_YIELD),
+                self.cell_yield
+                    .unwrap_or(crate::code_mode_spec::DEFAULT_YIELD),
                 self.output_budget,
             ),
         ];
@@ -1433,7 +1434,8 @@ impl Drop for OpenToolSpan {
         self.span.record("otel.status_code", "ERROR");
         self.span.record(
             "duration_ns",
-            u64::try_from(nanocode_platform::elapsed(self.opened_at).as_nanos()).unwrap_or(u64::MAX),
+            u64::try_from(nanocode_platform::elapsed(self.opened_at).as_nanos())
+                .unwrap_or(u64::MAX),
         );
     }
 }

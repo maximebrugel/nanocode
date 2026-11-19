@@ -139,7 +139,8 @@ pub(super) fn harness_turn_finished<'a>(
                     session.usage.record(usage);
                 }
                 let follow_up_output = session.follow_up_output.take();
-                let kept = result.is_ok() && submitted_output.is_none() && follow_up_output.is_some();
+                let kept =
+                    result.is_ok() && submitted_output.is_none() && follow_up_output.is_some();
 
                 if let Some(output) = &submitted_output {
                     session.last_output = Some(output.clone());

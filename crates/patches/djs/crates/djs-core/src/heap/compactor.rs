@@ -52,8 +52,6 @@ const STACK_CAP: usize = 16 * 1024;
 /// dlmalloc segment, where a bigger block becomes a page run at memory's end (D3143).
 const STACK_RESERVE: usize = 4 * 1024;
 
-
-
 /// The largest mark stack (entries) for an arena of `len` bytes.
 fn stack_cap(len: u32) -> usize {
     (len as usize / 64).max(STACK_CAP)
@@ -468,20 +466,26 @@ impl Marker<'_> {
             let h: u64 = a.read(c);
             let (kb, size) = (h as u8, (h >> 32) as u32);
             if kb != CellKind::EphemeronArray as u8 && !is_leaf(kb) && !frames.contains(&c) {
-                let kind = CellKind::from_u8(kb).unwrap_or_else(|| super::fail::bad_cell_kind(kb, c));
+                let kind =
+                    CellKind::from_u8(kb).unwrap_or_else(|| super::fail::bad_cell_kind(kb, c));
                 walk::for_each_slot(kind, c, size, |slot| {
                     let (s, t) = match slot {
                         Slot::Value(s) => (s, a.read::<Value>(s).ref_offset()),
                         Slot::Ref(s) => (s, a.read::<Ref>(s).get()),
                     };
                     if t.is_some_and(|t| t >= old) && !dirty(s) {
-                        panic!("young reference at {s} (cell {c}, {kind:?}) outside a dirty card (D3200)");
+                        panic!(
+                            "young reference at {s} (cell {c}, {kind:?}) outside a dirty card (D3200)"
+                        );
                     }
                 });
                 if kind == CellKind::Object
                     && is_collection(a, c)
                     && super::collection::has_young_keys(a, c, old)
-                    && !(c..c + size).step_by(1 << super::arena::Cards::SHIFT).chain([c + size - 1]).any(dirty)
+                    && !(c..c + size)
+                        .step_by(1 << super::arena::Cards::SHIFT)
+                        .chain([c + size - 1])
+                        .any(dirty)
                 {
                     panic!("collection {c} with young keys over clean cards (D3200)");
                 }

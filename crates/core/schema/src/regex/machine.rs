@@ -745,7 +745,8 @@ impl Machine<'_> {
                     let mut shorter = self
                         .step_back(max, forward)
                         .expect("a longer one-character run can give back a character");
-                    while shorter != min && self.continuation_fails(continuation, shorter, forward) {
+                    while shorter != min && self.continuation_fails(continuation, shorter, forward)
+                    {
                         shorter = self
                             .step_back(shorter, forward)
                             .expect("a longer one-character run can give back a character");

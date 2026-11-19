@@ -1,10 +1,10 @@
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
+use nanocode_http::layer::{Body, Request, Sender};
 use nanocode_http::types::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE},
 };
-use nanocode_http::layer::{Body, Request, Sender};
 use nanocode_mcp::{
     Error as SessionError, Inbound, Message, Outgoing, RequestId, TransportError,
     protocol::{CANCELLED, INITIALIZE, INITIALIZED},
@@ -1027,7 +1027,9 @@ impl Shared {
             }
             match self.get(cursor.last_event_id.as_deref()).await {
                 Ok(Some(response)) => return Some(response),
-                Ok(None) => nanocode_trace::debug!("retry sse stream error: server does not support SSE"),
+                Ok(None) => {
+                    nanocode_trace::debug!("retry sse stream error: server does not support SSE")
+                }
                 Err(error) => nanocode_trace::debug!("retry sse stream error: {error}"),
             }
             attempt = attempt.saturating_add(1);

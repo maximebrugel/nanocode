@@ -307,13 +307,20 @@ impl crate::One for Complex<f64> {
     }
 }
 
-
 impl fmt::Display for Complex<f64> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let real_negative = self.re < 0.0;
         let imaginary_negative = self.im < 0.0;
-        let real = if real_negative { 0.0 - self.re } else { self.re };
-        let imaginary = if imaginary_negative { 0.0 - self.im } else { self.im };
+        let real = if real_negative {
+            0.0 - self.re
+        } else {
+            self.re
+        };
+        let imaginary = if imaginary_negative {
+            0.0 - self.im
+        } else {
+            self.im
+        };
         let sign = if real_negative {
             "-"
         } else if formatter.sign_plus() {
@@ -323,7 +330,9 @@ impl fmt::Display for Complex<f64> {
         };
         let between = if imaginary_negative { "-" } else { "+" };
         let text = match formatter.precision() {
-            Some(precision) => alloc::format!("{sign}{real:.precision$}{between}{imaginary:.precision$}i"),
+            Some(precision) => {
+                alloc::format!("{sign}{real:.precision$}{between}{imaginary:.precision$}i")
+            }
             None => alloc::format!("{sign}{real}{between}{imaginary}i"),
         };
         match formatter.width() {

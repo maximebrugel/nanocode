@@ -22,9 +22,9 @@ mod reentry;
 #[doc(hidden)]
 pub mod select;
 mod semaphore;
-mod set_once;
 #[cfg(not(target_family = "wasm"))]
 mod session;
+mod set_once;
 mod shared;
 pub mod sink;
 mod spine;
@@ -56,7 +56,6 @@ pub use map::{Kept, Throttle};
 pub use nanocode_sys::AtomicWaker;
 pub use notify::{Notified, Notify};
 pub use once_cell::{OnceCell, SetError};
-pub use set_once::{SetOnce, SetOnceError};
 pub use ordered::{OrdMap, OrdSet};
 #[cfg(not(target_family = "wasm"))]
 pub use reentry::{Claim, Reentry};
@@ -65,6 +64,7 @@ pub use semaphore::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use session::{Locker, SessionLock, SessionLockError, SessionLocks};
+pub use set_once::{SetOnce, SetOnceError};
 pub use shared::{Map, Set};
 pub use sink::{Sink, SinkExt};
 #[cfg(not(target_family = "wasm"))]
@@ -1397,7 +1397,9 @@ impl<T: Clone + Send + Sync + 'static> Refreshed<T> {
         let (stale, held) = self.entries.read(|entries| match entries.held(key) {
             None => (true, None),
             Some(entry) => (
-                entry.at.is_none_or(|at| nanocode_platform::elapsed(at) >= fresh)
+                entry
+                    .at
+                    .is_none_or(|at| nanocode_platform::elapsed(at) >= fresh)
                     || entry.value.as_ref().is_some_and(outdated),
                 Some((entry.refreshing, entry.value.clone())),
             ),

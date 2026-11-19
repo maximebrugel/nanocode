@@ -120,7 +120,12 @@ impl<'a> Gif<'a> {
             .enumerate()
         {
             let frame_y = (row as u32).wrapping_sub(top);
-            for (column, pixel) in target.as_chunks_mut::<RGBA_BYTES>().0.iter_mut().enumerate() {
+            for (column, pixel) in target
+                .as_chunks_mut::<RGBA_BYTES>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
                 let frame_x = (column as u32).wrapping_sub(left);
                 if frame_x < frame_width && frame_y < frame_height {
                     let at =
@@ -177,7 +182,12 @@ impl<'a> Gif<'a> {
             };
             let (done, rest) = target.split_at_mut(decoded * RGBA_BYTES);
             target = rest;
-            for (pixel, &index) in done.as_chunks_mut::<RGBA_BYTES>().0.iter_mut().zip(&indices[..decoded]) {
+            for (pixel, &index) in done
+                .as_chunks_mut::<RGBA_BYTES>()
+                .0
+                .iter_mut()
+                .zip(&indices[..decoded])
+            {
                 let offset = PALETTE_CHANNELS * usize::from(index);
                 if let Some(color) = palette.get(offset..offset + PALETTE_CHANNELS) {
                     pixel[..PALETTE_CHANNELS].copy_from_slice(color);

@@ -412,7 +412,6 @@ pub(crate) fn sort_numbers(heap: &mut Heap, list: Obj) -> Result<(), Fault> {
     Ok(())
 }
 
-
 pub(crate) fn join_active(heap: &Heap, o: Obj) -> bool {
     let list = realm::intrinsic(heap, Intrinsic::JoinStack)
         .as_internal()

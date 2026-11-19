@@ -1335,7 +1335,10 @@ impl App {
 
     fn generated_event(&mut self, generation: u64, event: &TimedAgentEvent) -> Redraw {
         if generation == self.generation {
-            self.agent_event(&event.event, event.delta.as_ref().map(SharedTextDelta::borrowed))
+            self.agent_event(
+                &event.event,
+                event.delta.as_ref().map(SharedTextDelta::borrowed),
+            )
         } else {
             Redraw::None
         }

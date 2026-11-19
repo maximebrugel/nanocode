@@ -475,7 +475,9 @@ impl<'a> Simple<'a> {
             return None;
         }
         let end = if self.plus {
-            (at + 1..len).find(|&i| !self.matches(unit(i))).unwrap_or(len)
+            (at + 1..len)
+                .find(|&i| !self.matches(unit(i)))
+                .unwrap_or(len)
         } else {
             at + 1
         };
@@ -828,7 +830,10 @@ impl Machine<'_, '_> {
         let code = self.code;
         let word = code.at(pc);
         let body = code.at(pc + 6);
-        let follow = code.sub(pc + 6 + code.at(pc + 4) as usize, 2 * code.at(pc + 5) as usize);
+        let follow = code.sub(
+            pc + 6 + code.at(pc + 4) as usize,
+            2 * code.at(pc + 5) as usize,
+        );
         let mut pos = self.s.pos as usize;
         loop {
             let Some(&c) = b.get(pos) else {

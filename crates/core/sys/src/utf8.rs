@@ -5,8 +5,15 @@ const CONTINUATION_TAG: u8 = 0x80;
 
 pub fn valid_up_to(bytes: &[u8]) -> usize {
     let checked = valid_blocks(bytes);
-    assert!(checked <= bytes.len(), "the block validator stays inside the input");
-    assert_eq!(checked % BLOCK_BYTES, 0, "the block validator checks whole blocks");
+    assert!(
+        checked <= bytes.len(),
+        "the block validator stays inside the input"
+    );
+    assert_eq!(
+        checked % BLOCK_BYTES,
+        0,
+        "the block validator checks whole blocks"
+    );
     let start = last_character_start(bytes, checked);
     match std::str::from_utf8(&bytes[start..]) {
         Ok(_) => bytes.len(),
@@ -95,7 +102,22 @@ mod lookup {
     ];
 
     pub(super) const INCOMPLETE_MAX: [u8; 16] = [
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0 - 1, 0xe0 - 1, 0xc0 - 1,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xf0 - 1,
+        0xe0 - 1,
+        0xc0 - 1,
     ];
 }
 
@@ -130,7 +152,8 @@ mod x86 {
 
     use super::BLOCK_BYTES;
     use super::lookup::{
-        FIRST_HIGH, FIRST_LOW, FOURTH_BYTE_BIAS, HIGH_BIT, INCOMPLETE_MAX, SECOND_HIGH, THIRD_BYTE_BIAS,
+        FIRST_HIGH, FIRST_LOW, FOURTH_BYTE_BIAS, HIGH_BIT, INCOMPLETE_MAX, SECOND_HIGH,
+        THIRD_BYTE_BIAS,
     };
 
     const VECTOR_BYTES: usize = 32;
@@ -155,7 +178,10 @@ mod x86 {
 
     #[target_feature(enable = "avx2")]
     fn previous<const SHIFT: i32>(input: __m256i, previous_input: __m256i) -> __m256i {
-        _mm256_alignr_epi8::<SHIFT>(input, _mm256_permute2x128_si256::<0x21>(previous_input, input))
+        _mm256_alignr_epi8::<SHIFT>(
+            input,
+            _mm256_permute2x128_si256::<0x21>(previous_input, input),
+        )
     }
 
     #[target_feature(enable = "avx2")]
@@ -167,14 +193,20 @@ mod x86 {
     fn errors(input: __m256i, previous_input: __m256i, tables: &[__m256i; 3]) -> __m256i {
         let previous1 = previous::<15>(input, previous_input);
         let first_high = _mm256_shuffle_epi8(tables[0], high_nibbles(previous1));
-        let first_low = _mm256_shuffle_epi8(tables[1], _mm256_and_si256(previous1, _mm256_set1_epi8(NIBBLE)));
+        let first_low = _mm256_shuffle_epi8(
+            tables[1],
+            _mm256_and_si256(previous1, _mm256_set1_epi8(NIBBLE)),
+        );
         let second_high = _mm256_shuffle_epi8(tables[2], high_nibbles(input));
         let special = _mm256_and_si256(_mm256_and_si256(first_high, first_low), second_high);
         let previous2 = previous::<14>(input, previous_input);
         let previous3 = previous::<13>(input, previous_input);
         let third = _mm256_subs_epu8(previous2, _mm256_set1_epi8(THIRD_BYTE_BIAS as i8));
         let fourth = _mm256_subs_epu8(previous3, _mm256_set1_epi8(FOURTH_BYTE_BIAS as i8));
-        let continuation = _mm256_and_si256(_mm256_or_si256(third, fourth), _mm256_set1_epi8(HIGH_BIT as i8));
+        let continuation = _mm256_and_si256(
+            _mm256_or_si256(third, fourth),
+            _mm256_set1_epi8(HIGH_BIT as i8),
+        );
         _mm256_xor_si256(continuation, special)
     }
 
@@ -195,7 +227,10 @@ mod x86 {
             let error = if _mm256_movemask_epi8(_mm256_or_si256(first, second)) == 0 {
                 incomplete
             } else {
-                _mm256_or_si256(errors(first, previous_input, &tables), errors(second, first, &tables))
+                _mm256_or_si256(
+                    errors(first, previous_input, &tables),
+                    errors(second, first, &tables),
+                )
             };
             if _mm256_testz_si256(error, error) == 0 {
                 return block;
@@ -213,7 +248,8 @@ mod arm {
 
     use super::BLOCK_BYTES;
     use super::lookup::{
-        FIRST_HIGH, FIRST_LOW, FOURTH_BYTE_BIAS, HIGH_BIT, INCOMPLETE_MAX, SECOND_HIGH, THIRD_BYTE_BIAS,
+        FIRST_HIGH, FIRST_LOW, FOURTH_BYTE_BIAS, HIGH_BIT, INCOMPLETE_MAX, SECOND_HIGH,
+        THIRD_BYTE_BIAS,
     };
 
     const NIBBLE: u8 = 0x0f;
@@ -230,7 +266,11 @@ mod arm {
     }
 
     #[target_feature(enable = "neon")]
-    fn errors(input: uint8x16_t, previous_input: uint8x16_t, tables: &[uint8x16_t; 3]) -> uint8x16_t {
+    fn errors(
+        input: uint8x16_t,
+        previous_input: uint8x16_t,
+        tables: &[uint8x16_t; 3],
+    ) -> uint8x16_t {
         let previous1 = vextq_u8::<15>(previous_input, input);
         let first_high = vqtbl1q_u8(tables[0], vshrq_n_u8::<4>(previous1));
         let first_low = vqtbl1q_u8(tables[1], vandq_u8(previous1, vdupq_n_u8(NIBBLE)));
@@ -247,20 +287,33 @@ mod arm {
     #[target_feature(enable = "neon")]
     unsafe fn valid_blocks_neon(input: *const u8, blocks: usize) -> usize {
         let tables = unsafe {
-            [vld1q_u8(FIRST_HIGH.as_ptr()), vld1q_u8(FIRST_LOW.as_ptr()), vld1q_u8(SECOND_HIGH.as_ptr())]
+            [
+                vld1q_u8(FIRST_HIGH.as_ptr()),
+                vld1q_u8(FIRST_LOW.as_ptr()),
+                vld1q_u8(SECOND_HIGH.as_ptr()),
+            ]
         };
         let incomplete_max = unsafe { vld1q_u8(INCOMPLETE_MAX.as_ptr()) };
         let mut previous_input = vdupq_n_u8(0);
         let mut incomplete = vdupq_n_u8(0);
         for block in 0..blocks {
             let vectors = unsafe { vld1q_u8_x4(input.add(block * BLOCK_BYTES)) };
-            let any = vorrq_u8(vorrq_u8(vectors.0, vectors.1), vorrq_u8(vectors.2, vectors.3));
+            let any = vorrq_u8(
+                vorrq_u8(vectors.0, vectors.1),
+                vorrq_u8(vectors.2, vectors.3),
+            );
             let error = if vmaxvq_u8(any) < HIGH_BIT {
                 incomplete
             } else {
                 vorrq_u8(
-                    vorrq_u8(errors(vectors.0, previous_input, &tables), errors(vectors.1, vectors.0, &tables)),
-                    vorrq_u8(errors(vectors.2, vectors.1, &tables), errors(vectors.3, vectors.2, &tables)),
+                    vorrq_u8(
+                        errors(vectors.0, previous_input, &tables),
+                        errors(vectors.1, vectors.0, &tables),
+                    ),
+                    vorrq_u8(
+                        errors(vectors.2, vectors.1, &tables),
+                        errors(vectors.3, vectors.2, &tables),
+                    ),
                 )
             };
             if vmaxvq_u8(error) != 0 {

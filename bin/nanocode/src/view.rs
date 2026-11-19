@@ -450,8 +450,8 @@ fn transcripts(
     app.panes.main_area = Rect::default();
     app.panes.side_area = Rect::default();
     if app.panes.side.is_none() {
-        let _pane =
-            nanocode_trace::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "main").entered();
+        let _pane = nanocode_trace::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "main")
+            .entered();
         app.panes.main_area = area;
         let transcript = app.visible_transcript();
         transcript.render(area, buffer, theme, spinner);
@@ -486,16 +486,20 @@ fn transcripts(
         ..body
     };
     let (main, side) = (app.panes.main_area, app.panes.side_area);
-    nanocode_trace::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "main").in_scope(|| {
-        let transcript = app.pane_transcript(false);
-        transcript.render(main, buffer, theme, spinner);
-        animation.transcript(transcript);
-    });
-    nanocode_trace::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "side").in_scope(|| {
-        let transcript = app.pane_transcript(true);
-        transcript.render(side, buffer, theme, spinner);
-        animation.transcript(transcript);
-    });
+    nanocode_trace::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "main").in_scope(
+        || {
+            let transcript = app.pane_transcript(false);
+            transcript.render(main, buffer, theme, spinner);
+            animation.transcript(transcript);
+        },
+    );
+    nanocode_trace::info_span!(target: TUI_TARGET, "nc.pane.render", pane = "side").in_scope(
+        || {
+            let transcript = app.pane_transcript(true);
+            transcript.render(side, buffer, theme, spinner);
+            animation.transcript(transcript);
+        },
+    );
     Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(theme.border()))

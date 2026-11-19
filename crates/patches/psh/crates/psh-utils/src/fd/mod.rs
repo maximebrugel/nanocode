@@ -28,7 +28,6 @@ mod patterns;
 mod sanitize;
 mod walk;
 
-
 use std::sync::{Arc, Mutex};
 
 use psh_engine::host::{FileKind, OpenOptions};

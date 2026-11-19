@@ -31,10 +31,14 @@ fn stack_bounds() -> Option<(usize, usize)> {
     }
     let mut address = std::ptr::null_mut();
     let mut size = 0;
-    let read =
-        unsafe { libc::pthread_attr_getstack(attributes.as_ptr(), &raw mut address, &raw mut size) };
+    let read = unsafe {
+        libc::pthread_attr_getstack(attributes.as_ptr(), &raw mut address, &raw mut size)
+    };
     let destroyed = unsafe { libc::pthread_attr_destroy(attributes.as_mut_ptr()) };
-    assert_eq!(destroyed, 0, "pthread_attr_destroy accepts attributes pthread_getattr_np filled");
+    assert_eq!(
+        destroyed, 0,
+        "pthread_attr_destroy accepts attributes pthread_getattr_np filled"
+    );
     if read != 0 {
         return None;
     }

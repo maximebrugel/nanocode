@@ -146,13 +146,22 @@ impl World {
     }
 
     pub fn saw(&self, label: &str, turn: u64) -> bool {
-        self.with(|state| state.seen.get(label).is_some_and(|seen| seen.contains(&turn)))
+        self.with(|state| {
+            state
+                .seen
+                .get(label)
+                .is_some_and(|seen| seen.contains(&turn))
+        })
     }
 
     pub fn cancelled(&self, label: &str, turn: u64) {
         self.trace(&format!("cancelled {label} turn {turn}"));
         self.with(|state| {
-            state.cancelled.entry(label.to_owned()).or_default().insert(turn);
+            state
+                .cancelled
+                .entry(label.to_owned())
+                .or_default()
+                .insert(turn);
         });
     }
 

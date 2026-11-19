@@ -193,8 +193,8 @@ pub fn install_seccomp_filter(program: &[SocketFilter]) -> Result<(), SeccompErr
     if program.is_empty() {
         return Err(SeccompError::EmptyFilter);
     }
-    let length =
-        libc::c_ushort::try_from(program.len()).map_err(|_| SeccompError::TooLong(program.len()))?;
+    let length = libc::c_ushort::try_from(program.len())
+        .map_err(|_| SeccompError::TooLong(program.len()))?;
     set_no_new_privileges().map_err(SeccompError::NoNewPrivileges)?;
     let filter = SocketFilterProgram {
         length,

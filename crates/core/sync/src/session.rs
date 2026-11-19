@@ -116,7 +116,10 @@ impl<L: Locker> SessionLocks<L> {
         let waiting = Gauge::new(&self.locker, kind, "waiting");
         let keys = sorted(keys);
         let late = || {
-            self.locker.late(kind, nanocode_platform::now().saturating_duration_since(asked));
+            self.locker.late(
+                kind,
+                nanocode_platform::now().saturating_duration_since(asked),
+            );
             SessionLockError::Late { kind, deadline }
         };
         let mut queued = Vec::with_capacity(keys.len());
@@ -134,7 +137,10 @@ impl<L: Locker> SessionLocks<L> {
                 .map_err(SessionLockError::Backend)?;
             if let Some(lock) = self.taken(connection, kind, &keys, &mut queued).await? {
                 drop(waiting);
-                self.locker.waited(kind, nanocode_platform::now().saturating_duration_since(asked));
+                self.locker.waited(
+                    kind,
+                    nanocode_platform::now().saturating_duration_since(asked),
+                );
                 return Ok(lock);
             }
             let now = nanocode_platform::now();

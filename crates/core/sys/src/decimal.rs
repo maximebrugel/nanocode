@@ -30,7 +30,9 @@ impl<const BYTES: usize> DecimalText<BYTES> {
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
-        Self { bytes: [b'0'; BYTES] }
+        Self {
+            bytes: [b'0'; BYTES],
+        }
     }
 
     #[inline]

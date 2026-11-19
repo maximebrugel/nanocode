@@ -185,7 +185,8 @@ impl<T: 'static> AtomicStatic<T> {
     }
 
     pub fn store(&self, value: Option<&'static T>) {
-        self.pointer.store(static_into_raw(value), Ordering::Release);
+        self.pointer
+            .store(static_into_raw(value), Ordering::Release);
     }
 
     pub fn compare_exchange(

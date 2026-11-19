@@ -1456,8 +1456,7 @@ pub(crate) fn run_item<'a>(
         let p = &item.first;
         if item.background {
             background(vp, code, id, i).await
-        } else if item.rest.is_empty() && p.stages.len() == 1 && !p.negated() && p.time.is_none()
-        {
+        } else if item.rest.is_empty() && p.stages.len() == 1 && !p.negated() && p.time.is_none() {
             let cmd = p.stages[0].cmd;
             if let Some(now) = crate::now::command(vp, code, cmd, true) {
                 match now {

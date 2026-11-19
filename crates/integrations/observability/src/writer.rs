@@ -2,7 +2,6 @@ use std::io::{self, Write};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
-
 const CLOSE_SEND_WAIT: Duration = Duration::from_millis(100);
 const CLOSE_SEND_POLL: Duration = Duration::from_millis(1);
 const CLOSE_FLUSH_WAIT: Duration = Duration::from_millis(1_000);

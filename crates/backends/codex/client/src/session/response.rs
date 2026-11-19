@@ -822,12 +822,19 @@ fn record_response_usage_and_cost(
     }
     span.record("cost.status", cost_status.as_str());
     if let Some(estimated_cost) = estimated_cost {
-        span.record("cost.usd", nanocode_trace::field::display(estimated_cost.amount()));
+        span.record(
+            "cost.usd",
+            nanocode_trace::field::display(estimated_cost.amount()),
+        );
         span.record("cost.service_tier", estimated_cost.service_tier().as_str());
     }
 }
 
-fn finish_response_span(span: &nanocode_trace::Span, started_at: Instant, error: Option<&ResponseError>) {
+fn finish_response_span(
+    span: &nanocode_trace::Span,
+    started_at: Instant,
+    error: Option<&ResponseError>,
+) {
     span.record(
         "duration_ns",
         u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),

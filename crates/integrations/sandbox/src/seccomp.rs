@@ -60,7 +60,9 @@ impl fmt::Display for SeccompError {
                 f,
                 "The seccomp filter contains too many BPF instructions: {length}. Max length is {PROGRAM_INSTRUCTIONS_MAX}."
             ),
-            Self::IdenticalActions => f.write_str("`match_action` and `mismatch_action` are equal."),
+            Self::IdenticalActions => {
+                f.write_str("`match_action` and `mismatch_action` are equal.")
+            }
             Self::InvalidArgumentNumber => write!(
                 f,
                 "The seccomp rule contains an invalid argument index. Maximum index value: {ARGUMENT_INDEX_MAX}"
@@ -129,7 +131,8 @@ impl Condition {
     }
 
     fn program(self, offset: u8) -> Vec<SocketFilter> {
-        let low_offset = u32::from(SECCOMP_DATA_ARGUMENTS_OFFSET + self.index * SECCOMP_DATA_ARGUMENT_BYTES);
+        let low_offset =
+            u32::from(SECCOMP_DATA_ARGUMENTS_OFFSET + self.index * SECCOMP_DATA_ARGUMENT_BYTES);
         let load = statement(BPF_LD | BPF_W | BPF_ABS, low_offset);
         let program = match self.operation {
             Operation::NotEqual => vec![
@@ -139,7 +142,12 @@ impl Condition {
             Operation::MaskedEqual(mask) => vec![
                 load,
                 statement(BPF_ALU | BPF_AND | BPF_K, mask as u32),
-                jump(BPF_JMP | BPF_JEQ | BPF_K, (self.value & mask) as u32, 0, offset),
+                jump(
+                    BPF_JMP | BPF_JEQ | BPF_K,
+                    (self.value & mask) as u32,
+                    0,
+                    offset,
+                ),
             ],
         };
         assert!(program.len() <= usize::from(CONDITION_INSTRUCTIONS_MAX));
@@ -228,7 +236,10 @@ pub(crate) fn compile(
         program.push(statement(BPF_RET | BPF_K, mismatch.value()));
         return Ok(program);
     }
-    program.push(statement(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NUMBER_OFFSET));
+    program.push(statement(
+        BPF_LD | BPF_W | BPF_ABS,
+        SECCOMP_DATA_NUMBER_OFFSET,
+    ));
     for (number, chain) in rules {
         let number = u32::try_from(*number).expect("a system call number fits in 32 bits");
         program.push(jump(BPF_JMP | BPF_JEQ | BPF_K, number, 0, 1));
@@ -280,7 +291,11 @@ pub(crate) const NATIVE: Syscalls = Syscalls {
     setpgid: nanocode_sys::libc::SYS_setpgid,
 };
 
-fn argument(index: u8, operation: Operation, value: i32) -> Result<Condition, Box<dyn std::error::Error + Send + Sync>> {
+fn argument(
+    index: u8,
+    operation: Operation,
+    value: i32,
+) -> Result<Condition, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Condition::new(index, operation, u64::try_from(value)?)?)
 }
 
@@ -290,22 +305,46 @@ pub(crate) fn tool_filter(
 ) -> Result<Vec<SocketFilter>, Box<dyn std::error::Error + Send + Sync>> {
     let mut socket = vec![
         Rule::new(vec![
-            argument(SOCKET_DOMAIN_ARGUMENT, Operation::NotEqual, nanocode_sys::libc::AF_INET)?,
-            argument(SOCKET_DOMAIN_ARGUMENT, Operation::NotEqual, nanocode_sys::libc::AF_INET6)?,
+            argument(
+                SOCKET_DOMAIN_ARGUMENT,
+                Operation::NotEqual,
+                nanocode_sys::libc::AF_INET,
+            )?,
+            argument(
+                SOCKET_DOMAIN_ARGUMENT,
+                Operation::NotEqual,
+                nanocode_sys::libc::AF_INET6,
+            )?,
         ])?,
         Rule::new(vec![
-            argument(SOCKET_PROTOCOL_ARGUMENT, Operation::NotEqual, SOCKET_DEFAULT_PROTOCOL)?,
-            argument(SOCKET_PROTOCOL_ARGUMENT, Operation::NotEqual, nanocode_sys::libc::IPPROTO_TCP)?,
+            argument(
+                SOCKET_PROTOCOL_ARGUMENT,
+                Operation::NotEqual,
+                SOCKET_DEFAULT_PROTOCOL,
+            )?,
+            argument(
+                SOCKET_PROTOCOL_ARGUMENT,
+                Operation::NotEqual,
+                nanocode_sys::libc::IPPROTO_TCP,
+            )?,
         ])?,
     ];
     for kind in (0..SOCKET_TYPES).filter(|kind| *kind != nanocode_sys::libc::SOCK_STREAM) {
         let masked = Operation::MaskedEqual(SOCKET_TYPE_MASK);
-        socket.push(Rule::new(vec![argument(SOCKET_TYPE_ARGUMENT, masked, kind)?])?);
+        socket.push(Rule::new(vec![argument(
+            SOCKET_TYPE_ARGUMENT,
+            masked,
+            kind,
+        )?])?);
     }
     let fast_open_mask = u64::try_from(nanocode_sys::libc::MSG_FASTOPEN)?;
     let fast_open = |index| -> Result<Vec<Rule>, Box<dyn std::error::Error + Send + Sync>> {
         let masked = Operation::MaskedEqual(fast_open_mask);
-        Ok(vec![Rule::new(vec![argument(index, masked, nanocode_sys::libc::MSG_FASTOPEN)?])?])
+        Ok(vec![Rule::new(vec![argument(
+            index,
+            masked,
+            nanocode_sys::libc::MSG_FASTOPEN,
+        )?])?])
     };
     let rules = BTreeMap::from([
         (syscalls.socket, socket),

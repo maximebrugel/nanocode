@@ -1,8 +1,8 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use nanocode_process_contracts::{
-    ExecCommand, ExecCommandResult, JOB_TOOLS, MAX_POLL_YIELD_MS, MIN_POLL_YIELD_MS,
-    ShellExecutor, WriteStdin, effective_token_limit,
+    ExecCommand, ExecCommandResult, JOB_TOOLS, MAX_POLL_YIELD_MS, MIN_POLL_YIELD_MS, ShellExecutor,
+    WriteStdin, effective_token_limit,
 };
 use nanocode_sync::Atom;
 use nanocode_tools::{RunningTask, ToolDefinition};
@@ -160,7 +160,12 @@ impl JobHandler {
                 .with_output_token_budget(context.output_token_budget())
                 .from_caller(context.session_id());
                 let result = self.sessions.execute(command, &self.workspace).await;
-                Ok(self.report(&result, max_output_tokens, None, Started::Now(&arguments.cmd)))
+                Ok(self.report(
+                    &result,
+                    max_output_tokens,
+                    None,
+                    Started::Now(&arguments.cmd),
+                ))
             }
             JobTool::Wait => {
                 let arguments = input.decode_json::<WaitArguments>()?;

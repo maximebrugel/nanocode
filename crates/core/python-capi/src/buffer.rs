@@ -103,7 +103,11 @@ fn describe(view: *mut Buffer, length: usize, readonly: bool) -> BufferDescripto
         stride *= shape[i];
     }
     for i in 0..ndim {
-        let step = if view.strides.is_null() { contiguous[i] } else { unsafe { *view.strides.add(i) } };
+        let step = if view.strides.is_null() {
+            contiguous[i]
+        } else {
+            unsafe { *view.strides.add(i) }
+        };
         if step < 0 {
             return BufferDescriptor::simple(length, readonly);
         }
@@ -112,9 +116,20 @@ fn describe(view: *mut Buffer, length: usize, readonly: bool) -> BufferDescripto
     let format = if view.format.is_null() {
         std::borrow::Cow::Borrowed("B")
     } else {
-        std::borrow::Cow::Owned(unsafe { std::ffi::CStr::from_ptr(view.format) }.to_string_lossy().into_owned())
+        std::borrow::Cow::Owned(
+            unsafe { std::ffi::CStr::from_ptr(view.format) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     };
-    BufferDescriptor { len: length, offset: 0, readonly, itemsize, format, dim_desc }
+    BufferDescriptor {
+        len: length,
+        offset: 0,
+        readonly,
+        itemsize,
+        format,
+        dim_desc,
+    }
 }
 
 pub fn export(object: &PyObject, flags: BufferFlags, vm: &VirtualMachine) -> PyResult<PyBuffer> {
@@ -137,7 +152,11 @@ pub fn export(object: &PyObject, flags: BufferFlags, vm: &VirtualMachine) -> PyR
         view: AtomicPtr::new(view),
     }
     .into_pyobject(vm);
-    Ok(PyBuffer::new(holder, describe(view, length, readonly), &METHODS))
+    Ok(PyBuffer::new(
+        holder,
+        describe(view, length, readonly),
+        &METHODS,
+    ))
 }
 
 /// A C view of a memoryview the runtime made, kept as long as the memoryview.
@@ -160,7 +179,8 @@ static BUILT: std::sync::Mutex<Vec<(usize, Box<BuiltView>)>> = std::sync::Mutex:
 pub extern "C" fn _PyMemoryView_GetBuffer(pointer: *mut Object) -> *mut Buffer {
     crate::bridge::guard(null_mut(), |vm| {
         let object = crate::bridge::arg(vm, pointer)?;
-        let Some(memoryview) = object.downcast_ref::<rustpython_vm::builtins::PyMemoryView>() else {
+        let Some(memoryview) = object.downcast_ref::<rustpython_vm::builtins::PyMemoryView>()
+        else {
             return Err(vm.new_type_error("expected a memoryview".to_owned()));
         };
         let buffer = memoryview.exporter_buffer();

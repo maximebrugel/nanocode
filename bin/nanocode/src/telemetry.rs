@@ -2,9 +2,9 @@ use std::{collections::HashMap, time::Instant};
 
 use nanocode::agent::events::{AgentEvent, AgentEventKind};
 use nanocode_observability::{METRICS_TARGET, SpanContext, TUI_TARGET};
+use nanocode_trace::{Level, Span, field::Empty};
 use nanocode_tui::input::{Event, KeyCode, KeyModifiers, MouseEventKind};
 use serde_json::Value;
-use nanocode_trace::{Level, Span, field::Empty};
 
 pub fn input_span(event: &Event) -> Span {
     let action = match event {

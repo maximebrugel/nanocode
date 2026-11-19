@@ -4,46 +4,49 @@ pub mod adler32;
 pub mod alloc;
 #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
 pub mod apple;
-pub mod blake3;
-#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
-pub mod security;
 mod atomic;
-mod bilock;
-pub mod queue;
 pub mod base64;
+mod bilock;
+pub mod blake3;
+#[cfg(windows)]
+pub mod certificate_store;
+#[cfg(windows)]
+pub mod console;
+#[cfg(target_os = "macos")]
+pub mod core_foundation;
 pub mod crc32;
 mod decimal;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod entry;
 mod exclusive;
+mod inline;
+pub mod jpeg;
+#[cfg(windows)]
+pub mod junction;
 pub mod libc;
 pub mod lz4;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 mod math;
 pub mod memchr;
-#[cfg(target_os = "macos")]
-pub mod core_foundation;
-mod inline;
 mod pin;
-pub mod jpeg;
+pub mod queue;
 #[cfg(any(unix, windows))]
 mod random;
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+pub mod security;
 pub mod sha1;
 pub mod sha256;
 pub mod sha512;
 mod stack;
 mod swap;
 pub mod teddy;
-pub mod utf8;
-mod waker;
+#[cfg(target_os = "macos")]
+pub mod trust_settings;
 #[cfg(unix)]
 pub mod unix;
-#[cfg(windows)]
-pub mod certificate_store;
-#[cfg(windows)]
-pub mod console;
-#[cfg(windows)]
-pub mod junction;
+pub mod utf8;
+mod waker;
+pub mod webp;
 #[cfg(windows)]
 #[allow(
     non_snake_case,
@@ -55,9 +58,6 @@ pub mod junction;
     clippy::use_self
 )]
 pub mod windows_sys;
-#[cfg(target_os = "macos")]
-pub mod trust_settings;
-pub mod webp;
 mod zero;
 
 pub use atomic::{AtomicArc, AtomicBox, AtomicPinBox, AtomicStatic};

@@ -613,6 +613,4 @@ impl Exec<'_> {
         let p = proto.map_or(0, |p| p.offset());
         self.ic_write(ic, [w0, old, new, p, epoch]);
     }
-
-
 }

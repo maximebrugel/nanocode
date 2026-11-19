@@ -152,9 +152,13 @@ impl State {
             (false, 0) => {}
             (false, 1) => {
                 self.importing = (0, 0);
-                let kept = u64::try_from(now.saturating_sub(from)).unwrap_or(0).min(self.credit);
+                let kept = u64::try_from(now.saturating_sub(from))
+                    .unwrap_or(0)
+                    .min(self.credit);
                 self.credit -= kept;
-                self.held = self.held.map(|held| held.saturating_add(i64::try_from(kept).unwrap_or(0)));
+                self.held = self
+                    .held
+                    .map(|held| held.saturating_add(i64::try_from(kept).unwrap_or(0)));
                 let kept = isize::try_from(kept).unwrap_or(isize::MAX);
                 rustpython_vm::vm::limit::raise_memory_ceiling(kept.saturating_sub(room));
             }
@@ -510,7 +514,9 @@ mod _host {
         files(vm, &path, |state| match crate::sitedata::read(&path) {
             Some(data) => {
                 let data = data?;
-                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(data.len());
                 let end = start.saturating_add(len).min(data.len());
                 Ok(data[start..end].to_vec())
             }

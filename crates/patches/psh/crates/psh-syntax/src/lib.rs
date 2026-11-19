@@ -29,7 +29,6 @@ mod source;
 mod span;
 mod words;
 
-
 pub use alias::{AliasUse, Aliases};
 pub use arith::{
     ArithError, ArithErrorKind, ArithExpr, ArithKind, BinOp, LValue, UnaryOp, arith_dump,

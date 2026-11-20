@@ -103,7 +103,7 @@ type Dialects = [&'static str; 2];
 
 /// Serializes schema preparation across processes on Postgres: two loads that create nanocode_log at once otherwise
 /// race in CREATE TABLE IF NOT EXISTS (duplicate key in pg_type for the table's row type). SQLite has one writer.
-const PREPARE_LOCK: Dialects = ["SELECT 1", "SELECT pg_advisory_xact_lock(7_061_636_193)"];
+const PREPARE_LOCK: Dialects = ["SELECT NULL", "SELECT pg_advisory_xact_lock(7_061_636_193)"];
 const CREATE: Dialects = [
     "CREATE TABLE IF NOT EXISTS nanocode_log (scope TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (scope, seq)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS nanocode_log (scope TEXT NOT NULL, seq BIGINT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (scope, seq))",

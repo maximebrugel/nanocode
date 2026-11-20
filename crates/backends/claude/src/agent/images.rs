@@ -64,7 +64,14 @@ fn reference(source: &Value) -> String {
     }
 }
 
-fn image_sources(message: &HistoryMessage) -> impl Iterator<Item = &Value> {
+fn image_total(message: &HistoryMessage) -> usize {
+    if !message.mentions("image") {
+        return 0;
+    }
+    image_sources(&message.view()).count()
+}
+
+fn image_sources(message: &crate::Message) -> impl Iterator<Item = &Value> {
     message.content.iter().flat_map(|block| match block {
         ContentBlock::Image { source, .. } => vec![source],
         ContentBlock::ToolResult {
@@ -85,7 +92,9 @@ enum Rewrite {
 }
 
 fn rewrite(message: &mut HistoryMessage, mut replace: impl FnMut(&Value) -> Option<Rewrite>) {
-    let replacements: Vec<_> = image_sources(message).map(&mut replace).collect();
+    let view = message.view();
+    let replacements: Vec<_> = image_sources(&view).map(&mut replace).collect();
+    drop(view);
     if replacements.iter().all(Option::is_none) {
         return;
     }
@@ -141,7 +150,7 @@ pub(super) fn omit_images(messages: &mut [HistoryMessage]) -> bool {
 pub(super) fn omit_documents(messages: &mut [HistoryMessage]) -> bool {
     let mut omitted = false;
     for message in messages {
-        let has_document = message.content.iter().any(|block| match block {
+        let has_document = message.mentions("document") && message.any_block(|block| match block {
             ContentBlock::Document { .. } => true,
             ContentBlock::ToolResult {
                 content: ToolResultContent::Blocks(blocks),
@@ -191,7 +200,7 @@ pub(super) fn evict_images(
 ) -> (Vec<HistoryMessage>, [Option<usize>; 2]) {
     let counts: Vec<usize> = messages
         .iter()
-        .map(|message| message.image_count(|message| image_sources(message).count()))
+        .map(|message| message.image_count(image_total))
         .collect();
     let total: usize = counts.iter().sum();
     let evicted = window.evicted(total);
@@ -233,11 +242,18 @@ pub(super) async fn inline_images(
     messages: &[HistoryMessage],
 ) -> Result<Option<Vec<HistoryMessage>>, NanocodeError> {
     let mut loaded = HashMap::new();
-    for source in messages
+    let views = messages
         .iter()
-        .filter(|message| message.image_count(|message| image_sources(message).count()) > 0)
-        .flat_map(image_sources)
-    {
+        .filter(|message| message.image_count(image_total) > 0)
+        .map(HistoryMessage::view)
+        .collect::<Vec<_>>();
+    let sources = views
+        .iter()
+        .flat_map(|message| image_sources(message))
+        .cloned()
+        .collect::<Vec<_>>();
+    drop(views);
+    for source in &sources {
         let Some(url) = source["url"].as_str().filter(|_| is_blob(source)) else {
             continue;
         };

@@ -1065,26 +1065,66 @@ impl MessageLayout {
 
     #[must_use]
     pub fn of<M: WireMessage>(messages: &[M]) -> Self {
-        messages.iter().fold(Self::default(), |layout, message| {
-            layout.then(Self::message(message.message()))
-        })
+        messages
+            .iter()
+            .fold(Self::default(), |layout, message| layout.then(message.layout()))
+    }
+}
+
+#[doc(hidden)]
+pub enum Encoded<'a> {
+    Borrowed(&'a str),
+    Shared(Arc<str>),
+    Owned(String),
+}
+
+impl std::ops::Deref for Encoded<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Borrowed(json) => json,
+            Self::Shared(json) => json,
+            Self::Owned(json) => json,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub enum MessageView<'a> {
+    Borrowed(&'a Message),
+    Shared(Arc<Message>),
+}
+
+impl std::ops::Deref for MessageView<'_> {
+    type Target = Message;
+
+    fn deref(&self) -> &Message {
+        match self {
+            Self::Borrowed(message) => message,
+            Self::Shared(message) => message,
+        }
     }
 }
 
 #[doc(hidden)]
 pub trait WireMessage {
-    fn message(&self) -> &Message;
+    fn message(&self) -> MessageView<'_>;
 
     fn wire_id(&self) -> Option<u64> {
         None
+    }
+
+    fn layout(&self) -> MessageLayout {
+        MessageLayout::message(&self.message())
     }
 
     fn encoded<'a>(
         &'a self,
         _subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<std::borrow::Cow<'a, str>, ClaudeError> {
-        encode(self.message()).map(std::borrow::Cow::Owned)
+    ) -> Result<Encoded<'a>, ClaudeError> {
+        encode(&self.message()).map(Encoded::Owned)
     }
 
     fn digests(
@@ -1129,13 +1169,13 @@ impl MessageDigests {
 }
 
 impl WireMessage for Message {
-    fn message(&self) -> &Message {
-        self
+    fn message(&self) -> MessageView<'_> {
+        MessageView::Borrowed(self)
     }
 }
 
 impl<T: WireMessage + ?Sized> WireMessage for &T {
-    fn message(&self) -> &Message {
+    fn message(&self) -> MessageView<'_> {
         (**self).message()
     }
 
@@ -1143,11 +1183,15 @@ impl<T: WireMessage + ?Sized> WireMessage for &T {
         (**self).wire_id()
     }
 
+    fn layout(&self) -> MessageLayout {
+        (**self).layout()
+    }
+
     fn encoded<'a>(
         &'a self,
         subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<std::borrow::Cow<'a, str>, ClaudeError> {
+    ) -> Result<Encoded<'a>, ClaudeError> {
         (**self).encoded(subscription, encode)
     }
 
@@ -1160,8 +1204,8 @@ impl<T: WireMessage + ?Sized> WireMessage for &T {
 }
 
 impl WireMessage for std::borrow::Cow<'_, Message> {
-    fn message(&self) -> &Message {
-        self
+    fn message(&self) -> MessageView<'_> {
+        MessageView::Borrowed(self)
     }
 }
 
@@ -1452,6 +1496,20 @@ impl MessagesRequest {
         subscription: bool,
         owned: impl Fn(&mut M) -> &mut Message,
     ) -> Result<(), ClaudeError> {
+        self.cache_floors_editing(layout, messages, floors, subscription, |message, edit| {
+            edit(owned(message))
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn cache_floors_editing<M: WireMessage>(
+        &mut self,
+        layout: MessageLayout,
+        messages: &mut [M],
+        floors: [Option<usize>; 2],
+        subscription: bool,
+        edit: impl Fn(&mut M, &mut dyn FnMut(&mut Message) -> Result<(), ClaudeError>) -> Result<(), ClaudeError>,
+    ) -> Result<(), ClaudeError> {
         let Some(control) = self.cache_control.clone() else {
             return Ok(());
         };
@@ -1483,7 +1541,9 @@ impl MessagesRequest {
             }
         }
         for (message, block) in blocks.into_iter().take(spare) {
-            owned(&mut messages[message]).content[block].set_cache_control(&control)?;
+            edit(&mut messages[message], &mut |message| {
+                message.content[block].set_cache_control(&control)
+            })?;
         }
         Ok(())
     }
@@ -2441,6 +2501,15 @@ impl ClaudeClient {
                 .subscription_identity
                 .api_metadata(&self.subscription_session)?;
             api_body(head, messages, streaming, None, cache, &metadata)
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn encode_record(&self, record: &str) -> Result<String, ClaudeError> {
+        if self.subscription_compatibility {
+            subscription_wire::encode_record(record)
+        } else {
+            Ok(record.to_owned())
         }
     }
 
@@ -3571,13 +3640,18 @@ fn api_body<M: WireMessage>(
     let reused = kept.as_ref().map_or(0, |(_, ends)| shared.min(ends.len()));
     let encoded = messages[reused..]
         .iter()
-        .map(|message| message.encoded(false, &encode))
+        .map(|message| {
+            message.encoded(false, &encode).map(|json| match json {
+                Encoded::Owned(json) => Err(json.len()),
+                kept => Ok(kept),
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let added = tail.iter().map(|part| part.len()).sum::<usize>()
         + "],".len()
         + encoded
             .iter()
-            .map(|message| message.len() + 1)
+            .map(|json| json.as_ref().map_or_else(|len| *len, |json| json.len()) + 1)
             .sum::<usize>();
     let (mut body, mut ends) = match kept {
         Some((mut body, mut ends)) => {
@@ -3599,11 +3673,14 @@ fn api_body<M: WireMessage>(
         messages[known..].iter().map(WireMessage::wire_id),
         fresh,
     );
-    for message in &encoded {
+    for (message, json) in messages[reused..].iter().zip(&encoded) {
         if !ends.is_empty() {
             body.push(',');
         }
-        body.push_str(message);
+        match json {
+            Ok(json) => body.push_str(json),
+            Err(_) => body.push_str(&message.encoded(false, &encode)?),
+        }
         ends.push(body.len());
     }
     let end = body.len();

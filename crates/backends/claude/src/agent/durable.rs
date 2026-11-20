@@ -103,7 +103,7 @@ impl Snapshot {
                 .filter(|message| !message.is_effort_update())
                 .map(|message| {
                     ResponseItem::message(
-                        match message.role {
+                        match message.role() {
                             Role::User => MessageRole::User,
                             Role::Assistant => MessageRole::Assistant,
                             Role::System => MessageRole::Developer,
@@ -1214,11 +1214,19 @@ impl ToolIds {
         }
     }
 
-    fn tool_uses(message: &HistoryMessage) -> impl Iterator<Item = &str> {
-        message.content.iter().filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
+    fn tool_uses(message: &HistoryMessage) -> Vec<String> {
+        if message.role() != Role::Assistant || !message.mentions("tool_use") {
+            return Vec::new();
+        }
+        message
+            .view()
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn unlisted(&mut self, id: &str, admitted: &history::AdmittedIds) {
@@ -1237,7 +1245,8 @@ impl ToolIds {
     }
 
     fn list_message(&mut self, message: &HistoryMessage, admitted: &history::AdmittedIds) {
-        for id in Self::tool_uses(message) {
+        for id in &Self::tool_uses(message) {
+            let id = id.as_str();
             let count = self.listed.entry(id.into()).or_insert(0);
             *count += 1;
             if *count > 1 {
@@ -1255,7 +1264,8 @@ impl ToolIds {
     }
 
     fn unlist_message(&mut self, message: &HistoryMessage, admitted: &history::AdmittedIds) {
-        for id in Self::tool_uses(message) {
+        for id in &Self::tool_uses(message) {
+            let id = id.as_str();
             let Some(count) = self.listed.get_mut(id) else {
                 continue;
             };
@@ -1311,6 +1321,7 @@ struct TemplatePrompt<'a> {
 pub(super) trait Paged: Clone {
     fn same(&self, other: &Self) -> bool;
     fn record(&self) -> serde_json::Result<EncodedPayload>;
+    fn committed(&self) {}
 }
 
 impl Paged for HistoryMessage {
@@ -1320,6 +1331,10 @@ impl Paged for HistoryMessage {
 
     fn record(&self) -> serde_json::Result<EncodedPayload> {
         Self::record(self)
+    }
+
+    fn committed(&self) {
+        Self::committed(self);
     }
 }
 
@@ -1336,6 +1351,7 @@ impl Paged for history::CodeRound {
 pub(super) struct Pages<T> {
     items: Vec<T>,
     log: SequenceLog,
+    released: usize,
 }
 
 impl<T> Default for Pages<T> {
@@ -1343,6 +1359,7 @@ impl<T> Default for Pages<T> {
         Self {
             items: Vec::new(),
             log: SequenceLog::default(),
+            released: 0,
         }
     }
 }
@@ -1379,9 +1396,16 @@ impl<T: Paged> Pages<T> {
             )
             .map_err(provider_error)?;
         self.items.truncate(unchanged);
+        self.released = self.released.min(unchanged);
         self.items.extend_from_slice(&items[unchanged..]);
         records.extend(self.log.frontier().cloned());
         Ok(self.log.sequence())
+    }
+
+    fn committed(&mut self) {
+        self.items[self.released..].iter().for_each(T::committed);
+        self.released = self.items.len();
+        self.log.release();
     }
 }
 
@@ -1406,10 +1430,10 @@ impl Paging {
 
     fn committed(&mut self) {
         self.stored = None;
-        self.messages.log.release();
-        self.code_calls.log.release();
-        self.compacted.log.release();
-        self.pending.log.release();
+        self.messages.committed();
+        self.code_calls.committed();
+        self.compacted.committed();
+        self.pending.committed();
     }
 }
 
@@ -1597,9 +1621,9 @@ fn turn_output(result: &TurnResult, last: Option<&HistoryMessage>) -> Result<Box
     let final_message = result.final_message();
     let record = last
         .filter(|message| {
-            message.role == Role::Assistant
+            message.role() == Role::Assistant
                 && !final_message.is_empty()
-                && text_of(message) == final_message
+                && text_of(&message.view()) == final_message
         })
         .map(HistoryMessage::record)
         .transpose()
@@ -1869,9 +1893,10 @@ impl Snapshot {
             )));
         }
         for message in &self.conversation.messages {
-            for block in &message.content {
+            let view = message.view();
+            for block in &view.content {
                 match block {
-                    ContentBlock::Text { text, .. } => items.push(match message.role {
+                    ContentBlock::Text { text, .. } => items.push(match message.role() {
                         Role::Assistant => TranscriptItem::Assistant(text.clone()),
                         Role::User => TranscriptItem::User(text.clone()),
                         Role::System => continue,

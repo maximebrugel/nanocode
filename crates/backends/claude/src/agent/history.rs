@@ -1,9 +1,13 @@
-use crate::{ClaudeError, ContentBlock, Message, MessageDigests, WireMessage};
+use crate::{
+    ClaudeError, ContentBlock, Encoded, Message, MessageDigests, MessageLayout, MessageView,
+    OutputConfig, Role, WireMessage,
+};
 use nanocode_durability::EncodedPayload;
+use nanocode_sync::{Atom, SwapOption};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::value::RawValue;
 use std::{
-    borrow::Cow,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -19,9 +23,32 @@ fn wire_id() -> u64 {
     WIRE_IDS.fetch_add(1, Ordering::Relaxed)
 }
 
+#[derive(Clone)]
+struct Kept {
+    json: Arc<str>,
+    record: EncodedPayload,
+}
+
+impl Kept {
+    fn of(json: Arc<str>) -> Self {
+        Self {
+            record: EncodedPayload::from_json(Arc::clone(&json)),
+            json,
+        }
+    }
+
+    fn encode(message: &Message) -> serde_json::Result<Self> {
+        Ok(Self::of(serde_json::to_string(message)?.into()))
+    }
+}
+
 struct Entry {
-    message: Message,
-    wire: OnceLock<Box<str>>,
+    typed: SwapOption<Message>,
+    kept: Atom<Option<Kept>>,
+    role: Role,
+    output: Option<OutputConfig>,
+    same_wire: OnceLock<bool>,
+    layout: OnceLock<MessageLayout>,
     digests: OnceLock<MessageDigests>,
     images: OnceLock<usize>,
     companions: OnceLock<bool>,
@@ -29,11 +56,15 @@ struct Entry {
     cleared: OnceLock<HistoryMessage>,
 }
 
-impl Clone for Entry {
-    fn clone(&self) -> Self {
+impl Entry {
+    fn new(message: &Message, typed: Option<Arc<Message>>, kept: Option<Kept>) -> Self {
         Self {
-            message: self.message.clone(),
-            wire: OnceLock::new(),
+            typed: SwapOption::new(typed),
+            kept: Atom::new(kept),
+            role: message.role,
+            output: message.output_config.clone(),
+            same_wire: OnceLock::new(),
+            layout: OnceLock::new(),
             digests: OnceLock::new(),
             images: OnceLock::new(),
             companions: OnceLock::new(),
@@ -41,28 +72,111 @@ impl Clone for Entry {
             cleared: OnceLock::new(),
         }
     }
+
+    fn typed(&self) -> Arc<Message> {
+        if let Some(message) = self.typed.load_full() {
+            return message;
+        }
+        let kept = self.kept.get();
+        let json = &Option::as_ref(&kept).expect("a message keeps its typed form or its bytes").json;
+        Arc::new(serde_json::from_str(json).expect("a recorded message parses"))
+    }
+}
+
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        let typed = self.typed();
+        Self::new(&typed, Some(Arc::clone(&typed)), Option::clone(&*self.kept.get()))
+    }
+}
+
+pub(super) struct MessageMut<'a> {
+    entry: &'a mut Entry,
+    message: Option<Message>,
+}
+
+impl Deref for MessageMut<'_> {
+    type Target = Message;
+
+    fn deref(&self) -> &Message {
+        self.message.as_ref().expect("a message being changed")
+    }
+}
+
+impl DerefMut for MessageMut<'_> {
+    fn deref_mut(&mut self) -> &mut Message {
+        self.message.as_mut().expect("a message being changed")
+    }
+}
+
+impl Drop for MessageMut<'_> {
+    fn drop(&mut self) {
+        if let Some(message) = self.message.take() {
+            *self.entry = Entry::new(&message, None, None);
+            self.entry.typed = SwapOption::new(Some(Arc::new(message)));
+        }
+    }
 }
 
 impl HistoryMessage {
-    pub(super) fn make_mut(&mut self) -> &mut Message {
+    pub(super) fn make_mut(&mut self) -> MessageMut<'_> {
         self.1 = wire_id();
         let entry = Arc::make_mut(&mut self.0);
-        entry.wire = OnceLock::new();
-        entry.digests = OnceLock::new();
-        entry.images = OnceLock::new();
-        entry.companions = OnceLock::new();
-        entry.results = OnceLock::new();
-        entry.cleared = OnceLock::new();
-        &mut entry.message
+        let message = Arc::unwrap_or_clone(entry.typed());
+        *entry = Entry::new(&message, None, None);
+        MessageMut {
+            entry,
+            message: Some(message),
+        }
+    }
+
+    pub(super) fn role(&self) -> Role {
+        self.0.role
+    }
+
+    pub(super) fn view(&self) -> MessageView<'static> {
+        MessageView::Shared(self.0.typed())
+    }
+
+    pub(super) fn any_block(&self, check: impl FnMut(&ContentBlock) -> bool) -> bool {
+        self.0.typed().content.iter().any(check)
+    }
+
+    pub(super) fn is_effort_update(&self) -> bool {
+        self.0.role == Role::System && self.0.output.is_some()
+    }
+
+    pub(super) fn output_config(&self) -> Option<&OutputConfig> {
+        self.0.output.as_ref()
+    }
+
+    pub(super) fn mentions(&self, text: &str) -> bool {
+        if self.0.typed.load().is_some() {
+            return true;
+        }
+        let Some(kept) = &*self.0.kept.get() else {
+            return true;
+        };
+        match serde_json::to_string(text) {
+            Ok(escaped) => kept.json.contains(&escaped[1..escaped.len() - 1]),
+            Err(_) => true,
+        }
+    }
+
+    fn settled(message: Message) -> Self {
+        match Kept::encode(&message) {
+            Ok(kept) => Self(Arc::new(Entry::new(&message, None, Some(kept))), wire_id()),
+            Err(_) => Self::from(message),
+        }
     }
 
     pub(super) fn cleared(&self, clear: impl FnOnce(&mut Message)) -> Self {
         self.0
             .cleared
             .get_or_init(|| {
-                let mut message = self.0.message.clone();
+                let mut message = Message::clone(&self.0.typed());
                 clear(&mut message);
-                Self::from(message)
+                Self::settled(message)
             })
             .clone()
     }
@@ -81,7 +195,7 @@ impl HistoryMessage {
     ) -> &[(usize, u64)] {
         self.0.results.get_or_init(|| {
             self.0
-                .message
+                .typed()
                 .content
                 .iter()
                 .enumerate()
@@ -91,7 +205,7 @@ impl HistoryMessage {
     }
 
     pub(super) fn has_companions(&self, check: impl FnOnce(&Message) -> bool) -> bool {
-        *self.0.companions.get_or_init(|| check(&self.0.message))
+        *self.0.companions.get_or_init(|| check(&self.0.typed()))
     }
 
     pub(super) fn ptr_eq(&self, other: &Self) -> bool {
@@ -99,108 +213,128 @@ impl HistoryMessage {
     }
 
     pub(super) fn into_message(self) -> Message {
-        Arc::try_unwrap(self.0).map_or_else(|entry| entry.message.clone(), |entry| entry.message)
+        match Arc::try_unwrap(self.0) {
+            Ok(entry) => Arc::unwrap_or_clone(entry.typed()),
+            Err(entry) => Message::clone(&entry.typed()),
+        }
     }
 
-    pub(super) fn json(&self) -> serde_json::Result<Arc<str>> {
-        serde_json::to_string(&self.0.message).map(Arc::from)
+    pub(super) fn recorded(message: Message, json: Arc<str>, record: EncodedPayload) -> Self {
+        let typed = Arc::new(message);
+        Self(
+            Arc::new(Entry::new(
+                &typed,
+                Some(Arc::clone(&typed)),
+                Some(Kept { json, record }),
+            )),
+            wire_id(),
+        )
+    }
+
+    fn kept(&self) -> serde_json::Result<Kept> {
+        if let Some(kept) = &*self.0.kept.get() {
+            return Ok(kept.clone());
+        }
+        let encoded = Kept::encode(&self.0.typed())?;
+        Ok(self
+            .0
+            .kept
+            .update(|kept| kept.get_or_insert_with(|| encoded.clone()).clone()))
+    }
+
+    pub(super) fn with_json<R>(&self, read: impl FnOnce(&str) -> R) -> serde_json::Result<R> {
+        Ok(read(&self.kept()?.json))
     }
 
     pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
-        let record = EncodedPayload::from_json(self.json()?);
-        Ok(record)
+        Ok(self.kept()?.record)
     }
 
-    pub(super) fn json_utf16_len(&self) -> serde_json::Result<u64> {
-        struct Utf16(u64);
-        impl std::io::Write for Utf16 {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                for &byte in bytes {
-                    if byte & 0xC0 != 0x80 {
-                        self.0 += if byte >= 0xF0 { 2 } else { 1 };
-                    }
-                }
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+    pub(super) fn committed(&self) {
+        if self.0.kept.read(Option::is_some) {
+            self.0.typed.store(None);
         }
-        let mut units = Utf16(0);
-        serde_json::to_writer(&mut units, &self.0.message)?;
-        Ok(units.0)
     }
 }
 
 impl From<Message> for HistoryMessage {
     fn from(message: Message) -> Self {
+        let typed = Arc::new(message);
         Self(
-            Arc::new(Entry {
-                message,
-                wire: OnceLock::new(),
-                digests: OnceLock::new(),
-                images: OnceLock::new(),
-                companions: OnceLock::new(),
-                results: OnceLock::new(),
-                cleared: OnceLock::new(),
-            }),
+            Arc::new(Entry::new(&typed, Some(Arc::clone(&typed)), None)),
             wire_id(),
         )
     }
 }
 
-impl Deref for HistoryMessage {
-    type Target = Message;
-
-    fn deref(&self) -> &Message {
-        &self.0.message
-    }
-}
-
 impl PartialEq for HistoryMessage {
     fn eq(&self, other: &Self) -> bool {
-        self.ptr_eq(other) || self.0.message == other.0.message
+        if self.ptr_eq(other) {
+            return true;
+        }
+        if let (Some(left), Some(right)) = (&*self.0.kept.get(), &*other.0.kept.get()) {
+            return left.json == right.json;
+        }
+        *self.0.typed() == *other.0.typed()
     }
 }
 
 impl Serialize for HistoryMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.message.serialize(serializer)
+        match &*self.0.kept.get() {
+            Some(kept) => serde_json::from_str::<&RawValue>(&kept.json)
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
+            None => self.0.typed().serialize(serializer),
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for HistoryMessage {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Message::deserialize(deserializer).map(Self::from)
+        Message::deserialize(deserializer).map(Self::settled)
     }
 }
 
 impl WireMessage for HistoryMessage {
-    fn message(&self) -> &Message {
-        &self.0.message
+    fn message(&self) -> MessageView<'_> {
+        self.view()
     }
 
     fn wire_id(&self) -> Option<u64> {
         Some(self.1)
     }
 
+    fn layout(&self) -> MessageLayout {
+        *self
+            .0
+            .layout
+            .get_or_init(|| <Message as WireMessage>::layout(&self.0.typed()))
+    }
+
     fn encoded<'a>(
         &'a self,
         subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<Cow<'a, str>, ClaudeError> {
-        if subscription {
-            let wire = match self.0.wire.get() {
-                Some(wire) => wire,
-                None => {
-                    let encoded = encode(&self.0.message)?.into_boxed_str();
-                    self.0.wire.get_or_init(|| encoded)
-                }
-            };
-            return Ok(Cow::Borrowed(wire));
+    ) -> Result<Encoded<'a>, ClaudeError> {
+        let kept = self.kept()?;
+        if !subscription {
+            return Ok(Encoded::Shared(kept.json));
         }
-        encode(&self.0.message).map(Cow::Owned)
+        if let Some(same) = self.0.same_wire.get() {
+            return Ok(if *same {
+                Encoded::Shared(kept.json)
+            } else {
+                Encoded::Owned(crate::subscription_wire::encode_record(&kept.json)?)
+            });
+        }
+        let wire = encode(&self.0.typed())?;
+        let same = *self.0.same_wire.get_or_init(|| wire == *kept.json);
+        Ok(if same {
+            Encoded::Shared(kept.json)
+        } else {
+            Encoded::Owned(wire)
+        })
     }
 
     fn digests(
@@ -220,6 +354,7 @@ pub(super) struct CodeRound(Arc<Round>);
 
 struct Round {
     value: serde_json::Value,
+    record: OnceLock<EncodedPayload>,
     bytes: OnceLock<usize>,
 }
 
@@ -229,7 +364,11 @@ impl CodeRound {
     }
 
     pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
-        serde_json::to_string(&self.0.value).map(|json| EncodedPayload::from_json(json.into()))
+        if let Some(record) = self.0.record.get() {
+            return Ok(record.clone());
+        }
+        let record = EncodedPayload::from_json(serde_json::to_string(&self.0.value)?.into());
+        Ok(self.0.record.get_or_init(|| record).clone())
     }
 
     pub(super) fn bytes(&self) -> usize {
@@ -244,6 +383,7 @@ impl From<serde_json::Value> for CodeRound {
     fn from(value: serde_json::Value) -> Self {
         Self(Arc::new(Round {
             value,
+            record: OnceLock::new(),
             bytes: OnceLock::new(),
         }))
     }
@@ -400,7 +540,7 @@ pub(super) fn media_placeholders(messages: &mut [HistoryMessage]) {
         _ => false,
     };
     for message in messages {
-        if !message.content.iter().any(media) {
+        if !(message.mentions("image") || message.mentions("document")) || !message.any_block(&media) {
             continue;
         }
         for block in &mut message.make_mut().content {
@@ -425,7 +565,7 @@ pub(super) fn media_placeholders(messages: &mut [HistoryMessage]) {
 
 pub(super) fn strip_thinking(messages: &mut Vec<HistoryMessage>) {
     messages.retain_mut(|message| {
-        if message.content.iter().any(|block| {
+        if message.mentions("thinking") && message.any_block(|block| {
             matches!(
                 block,
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
@@ -438,6 +578,6 @@ pub(super) fn strip_thinking(messages: &mut Vec<HistoryMessage>) {
                 )
             });
         }
-        !message.content.is_empty() || message.is_effort_update()
+        !message.view().content.is_empty() || message.is_effort_update()
     });
 }

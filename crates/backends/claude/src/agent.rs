@@ -2742,9 +2742,16 @@ fn stopped_background_notices(
         .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_');
     let texts = messages
         .iter()
-        .flat_map(|message| message.content.iter())
-        .filter(|block| !plain || serializes_str_containing(block, &local))
-        .filter_map(|block| serde_json::to_string(block).ok())
+        .filter(|message| !plain || message.mentions(&local))
+        .flat_map(|message| {
+            message
+                .view()
+                .content
+                .iter()
+                .filter(|block| !plain || serializes_str_containing(block, &local))
+                .filter_map(|block| serde_json::to_string(block).ok())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     let mut started = Vec::new();
     for text in &texts {
@@ -2789,8 +2796,9 @@ fn stopped_background_notices(
 }
 
 fn summary_message(message: &HistoryMessage) -> bool {
-    message.role == Role::User
-        && message.content.iter().any(|block| match block {
+    message.role() == Role::User
+        && (message.mentions("compaction") || message.mentions(COMPACT_CONTINUED))
+        && message.view().content.iter().any(|block| match block {
             ContentBlock::Compaction { .. } => true,
             ContentBlock::Text { text, .. } => text.starts_with(COMPACT_CONTINUED),
             _ => false,
@@ -2832,6 +2840,7 @@ fn refused_summary(error: &NanocodeError) -> bool {
 fn plain_summaries(messages: &mut [HistoryMessage]) {
     for message in messages {
         if message
+            .view()
             .content
             .iter()
             .any(|block| matches!(block, ContentBlock::Compaction { .. }))
@@ -2846,7 +2855,8 @@ fn plain_summaries(messages: &mut [HistoryMessage]) {
 }
 
 fn tools_used(messages: &[HistoryMessage]) -> String {
-    messages
+    let views = messages.iter().map(HistoryMessage::view).collect::<Vec<_>>();
+    views
         .iter()
         .flat_map(|message| message.content.iter())
         .flat_map(|block| match block {
@@ -3042,6 +3052,7 @@ impl Conversation {
         for notice in &self.recovery_notices {
             if !messages.iter().any(|message| {
                 message
+                    .view()
                     .content
                     .iter()
                     .any(|block| matches!(block, ContentBlock::Text { text, .. } if text == notice))
@@ -3078,10 +3089,16 @@ impl Conversation {
 fn unfinished_server_turn_start(messages: &[HistoryMessage]) -> Option<usize> {
     let mut unresolved = HashMap::new();
     for (index, message) in messages.iter().enumerate() {
-        for block in &message.content {
+        if !message.mentions("server_tool_use")
+            && !message.mentions("mcp_tool_")
+            && !message.mentions("_tool_result")
+        {
+            continue;
+        }
+        for block in &message.view().content {
             match block {
                 ContentBlock::ServerToolUse { id, .. } | ContentBlock::McpToolUse { id, .. } => {
-                    unresolved.insert(id.as_str(), index);
+                    unresolved.insert(id.clone(), index);
                 }
                 ContentBlock::WebSearchToolResult { tool_use_id, .. }
                 | ContentBlock::WebFetchToolResult { tool_use_id, .. }
@@ -3100,7 +3117,7 @@ fn unfinished_server_turn_start(messages: &[HistoryMessage]) -> Option<usize> {
     Some(
         messages[..first]
             .iter()
-            .rposition(|message| crate::is_user_turn_start(message))
+            .rposition(|message| crate::is_user_turn_start(&message.view()))
             .map_or(0, |index| index + 1),
     )
 }
@@ -3108,16 +3125,17 @@ fn unfinished_server_turn_start(messages: &[HistoryMessage]) -> Option<usize> {
 fn current_server_turn_start(messages: &[HistoryMessage]) -> Option<usize> {
     let start = messages
         .iter()
-        .rposition(|message| crate::is_user_turn_start(message))
+        .rposition(|message| crate::is_user_turn_start(&message.view()))
         .map_or(0, |index| index + 1);
     messages[start..]
         .iter()
-        .flat_map(|message| &message.content)
-        .any(|block| {
-            matches!(
-                block,
-                ContentBlock::ServerToolUse { .. } | ContentBlock::McpToolUse { .. }
-            )
+        .any(|message| {
+            message.view().content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ServerToolUse { .. } | ContentBlock::McpToolUse { .. }
+                )
+            })
         })
         .then_some(start)
 }
@@ -3150,10 +3168,10 @@ fn wire_messages(
         .map(separated_result_companions)
         .collect::<Vec<_>>();
     let changes =
-        |message: &HistoryMessage| message.role == Role::System && !message.is_effort_update();
+        |message: &HistoryMessage| message.role() == Role::System && !message.is_effort_update();
     for index in (0..sent.len().saturating_sub(1)).rev() {
         let mut at = index;
-        while at + 1 < sent.len() && changes(&sent[at]) && sent[at + 1].role == Role::User {
+        while at + 1 < sent.len() && changes(&sent[at]) && sent[at + 1].role() == Role::User {
             sent.swap(at, at + 1);
             at += 1;
         }
@@ -3177,7 +3195,7 @@ fn separated_result_companions(message: &HistoryMessage) -> HistoryMessage {
             )
         })
     }) {
-        separate_result_companions(std::slice::from_mut(message.make_mut()));
+        separate_result_companions(std::slice::from_mut(&mut *message.make_mut()));
     }
     message
 }
@@ -3233,8 +3251,13 @@ fn separate_result_companions(messages: &mut [Message]) {
     }
 }
 
-fn client_discovered_tools(messages: &[HistoryMessage]) -> HashSet<&str> {
-    let search_ids = messages
+fn client_discovered_tools(messages: &[HistoryMessage]) -> HashSet<String> {
+    let views = messages
+        .iter()
+        .filter(|message| message.mentions("ToolSearch") || message.mentions("tool_reference"))
+        .map(HistoryMessage::view)
+        .collect::<Vec<_>>();
+    let search_ids = views
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
@@ -3242,7 +3265,7 @@ fn client_discovered_tools(messages: &[HistoryMessage]) -> HashSet<&str> {
             _ => None,
         })
         .collect::<HashSet<_>>();
-    messages
+    views
         .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
@@ -3257,6 +3280,7 @@ fn client_discovered_tools(messages: &[HistoryMessage]) -> HashSet<&str> {
         .flatten()
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_reference"))
         .filter_map(|block| block.get("tool_name").and_then(Value::as_str))
+        .map(str::to_owned)
         .collect()
 }
 
@@ -4544,27 +4568,27 @@ fn is_output_limit_continuation(message: &Message) -> bool {
 fn drop_cut_thinking(pending: &mut Vec<HistoryMessage>) {
     let mut end = pending.len();
     while end >= 2
-        && pending[end - 2].role == Role::Assistant
-        && is_output_limit_continuation(&pending[end - 1])
+        && pending[end - 2].role() == Role::Assistant
+        && is_output_limit_continuation(&pending[end - 1].view())
     {
         let cut = end - 2;
-        if pending[cut].content.iter().any(is_thinking) {
+        if pending[cut].view().content.iter().any(is_thinking) {
             pending[cut]
                 .make_mut()
                 .content
                 .retain(|block| !is_thinking(block));
-            if pending[cut].content.is_empty() {
+            if pending[cut].view().content.is_empty() {
                 pending.remove(cut);
                 if let Some(previous) = pending[..cut]
                     .iter()
-                    .rposition(|message| message.role != Role::System)
-                    .filter(|previous| pending[*previous].role == Role::User)
+                    .rposition(|message| message.role() != Role::System)
+                    .filter(|previous| pending[*previous].role() == Role::User)
                 {
                     let continuation = pending.remove(cut);
                     pending[previous]
                         .make_mut()
                         .content
-                        .extend(continuation.content.iter().cloned());
+                        .extend(continuation.view().content.iter().cloned());
                 }
             }
         }
@@ -4581,12 +4605,12 @@ const fn tool_change(block: &ContentBlock) -> bool {
 
 fn strip_tool_changes(messages: &mut Vec<HistoryMessage>) {
     messages.retain_mut(|message| {
-        if message.role == Role::System && message.content.iter().any(tool_change) {
+        if message.role() == Role::System && message.view().content.iter().any(tool_change) {
             message
                 .make_mut()
                 .content
                 .retain(|block| !tool_change(block));
-            return !message.content.is_empty();
+            return !message.view().content.is_empty();
         }
         true
     });
@@ -4619,43 +4643,49 @@ fn refused_tool_changes(error: &NanocodeError) -> bool {
         .any(|name| text.contains(name))
 }
 
-fn delivered_notice<'a>(conversation: &'a Conversation, prefix: &str) -> Option<&'a str> {
+fn delivered_notice(conversation: &Conversation, prefix: &str) -> Option<String> {
     conversation
         .messages
         .iter()
         .rev()
-        .filter(|message| message.role == Role::User)
-        .flat_map(|message| message.content.iter().rev())
-        .find_map(|block| match block {
-            ContentBlock::Text { text, .. } => text
-                .strip_prefix(DEVELOPER_NOTICE_OPEN)?
-                .strip_suffix(DEVELOPER_NOTICE_CLOSE)?
-                .strip_prefix(prefix),
-            _ => None,
+        .filter(|message| message.role() == Role::User && message.mentions(DEVELOPER_NOTICE_OPEN))
+        .find_map(|message| {
+            message.view().content.iter().rev().find_map(|block| match block {
+                ContentBlock::Text { text, .. } => text
+                    .strip_prefix(DEVELOPER_NOTICE_OPEN)?
+                    .strip_suffix(DEVELOPER_NOTICE_CLOSE)?
+                    .strip_prefix(prefix)
+                    .map(str::to_owned),
+                _ => None,
+            })
         })
 }
 
-fn latest_developer_notice<'a>(snapshot: &'a Snapshot, prefix: &str) -> Option<&'a str> {
-    let delivered = snapshot
+fn latest_developer_notice(snapshot: &Snapshot, prefix: &str) -> Option<String> {
+    if let Some((_, text)) = snapshot
+        .developer_notices
+        .iter()
+        .rev()
+        .find(|(_, text)| text.starts_with(prefix))
+    {
+        return Some(text.clone());
+    }
+    snapshot
         .conversation
         .messages
         .iter()
         .rev()
-        .filter(|message| message.role == Role::User)
-        .flat_map(|message| message.content.iter().rev())
-        .filter_map(|block| match block {
-            ContentBlock::Text { text, .. } => text
-                .strip_prefix(DEVELOPER_NOTICE_OPEN)?
-                .strip_suffix(DEVELOPER_NOTICE_CLOSE),
-            _ => None,
-        });
-    snapshot
-        .developer_notices
-        .iter()
-        .rev()
-        .map(|(_, text)| text.as_str())
-        .chain(delivered)
-        .find(|text| text.starts_with(prefix))
+        .filter(|message| message.role() == Role::User && message.mentions(DEVELOPER_NOTICE_OPEN))
+        .find_map(|message| {
+            message.view().content.iter().rev().find_map(|block| match block {
+                ContentBlock::Text { text, .. } => text
+                    .strip_prefix(DEVELOPER_NOTICE_OPEN)?
+                    .strip_suffix(DEVELOPER_NOTICE_CLOSE)
+                    .filter(|text| text.starts_with(prefix))
+                    .map(str::to_owned),
+                _ => None,
+            })
+        })
 }
 
 impl State {
@@ -4784,7 +4814,9 @@ impl State {
         let shown = context.date.as_str();
         if !self.fixed_date && !shown.is_empty() {
             let today = crate::environment::current_date();
-            let told = delivered_notice(conversation, DATE_CHANGED)
+            let delivered = delivered_notice(conversation, DATE_CHANGED);
+            let told = delivered
+                .as_deref()
                 .and_then(|rest| rest.strip_suffix(DATE_CHANGED_END))
                 .unwrap_or(shown);
             if told != today {
@@ -4816,7 +4848,7 @@ impl State {
                 .map(|section| format!("```\n{section}\n```"))
                 .collect::<Vec<_>>()
                 .join(INSTRUCTIONS_SECTION);
-            if told != Some(now.as_str()) {
+            if told.as_deref() != Some(now.as_str()) {
                 notices.push(format!("{INSTRUCTIONS_CHANGED}{now}"));
             }
         }
@@ -4876,11 +4908,12 @@ impl State {
             .offered
             .get_or_init(|| offered_tools(&self.fresh_tools()));
         let mut offered = offered_tools(&kept.tools);
-        for block in messages
+        let views = messages
             .iter()
-            .filter(|message| message.role == Role::System)
-            .flat_map(|message| &message.content)
-        {
+            .filter(|message| message.role() == Role::System)
+            .map(HistoryMessage::view)
+            .collect::<Vec<_>>();
+        for block in views.iter().flat_map(|message| &message.content) {
             match block {
                 ContentBlock::ToolAddition { tool, .. } => {
                     if let Some(name) = tool["definition"]["name"].as_str() {

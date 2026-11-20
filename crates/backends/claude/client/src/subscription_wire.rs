@@ -166,7 +166,9 @@ fn fingerprint<M: WireMessage>(messages: &[M], version: &str) -> String {
     let first = messages
         .iter()
         .map(WireMessage::message)
-        .find(|m| m.role == Role::User)
+        .find(|m| m.role == Role::User);
+    let first = first
+        .as_deref()
         .and_then(|m| {
             m.content.iter().find_map(|b| match b {
                 ContentBlock::Text { text, .. } => Some(text.as_str()),
@@ -328,6 +330,100 @@ fn stringify_object(
     Ok(())
 }
 
+fn sorted_maps() -> bool {
+    static SORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SORTED.get_or_init(|| {
+        let mut map = serde_json::Map::new();
+        map.insert("b".to_owned(), Value::Null);
+        map.insert("a".to_owned(), Value::Null);
+        map.keys().next().is_some_and(|key| key == "a")
+    })
+}
+
+struct RawEntries<'a>(Vec<(String, &'a serde_json::value::RawValue)>);
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for RawEntries<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entries<'a>(std::marker::PhantomData<&'a ()>);
+
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Entries<'a> {
+            type Value = RawEntries<'a>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                let mut entries: Vec<(String, &'a serde_json::value::RawValue)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, &'de serde_json::value::RawValue>()? {
+                    match entries.iter_mut().find(|(seen, _)| *seen == key) {
+                        Some(entry) => entry.1 = value,
+                        None => entries.push((key, value)),
+                    }
+                }
+                Ok(RawEntries(entries))
+            }
+        }
+
+        deserializer.deserialize_map(Entries(std::marker::PhantomData))
+    }
+}
+
+fn restringify(raw: &str, out: &mut Vec<u8>) -> Result<(), ClaudeError> {
+    match raw.as_bytes().first() {
+        Some(b'[') => {
+            let items: Vec<&serde_json::value::RawValue> = serde_json::from_str(raw)?;
+            out.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                restringify(item.get(), out)?;
+            }
+            out.push(b']');
+        }
+        Some(b'{') => {
+            let RawEntries(mut entries) = serde_json::from_str(raw)?;
+            if sorted_maps() {
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+            }
+            out.push(b'{');
+            let mut first = true;
+            for key in ["type", "text"]
+                .into_iter()
+                .filter(|key| entries.iter().any(|(seen, _)| seen == key))
+                .chain(
+                    entries
+                        .iter()
+                        .map(|(key, _)| key.as_str())
+                        .filter(|key| !matches!(*key, "type" | "text")),
+                )
+            {
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                serde_json::to_writer(&mut *out, key)?;
+                out.push(b':');
+                if let Some((_, value)) = entries.iter().find(|(seen, _)| seen == key) {
+                    restringify(value.get(), out)?;
+                }
+            }
+            out.push(b'}');
+        }
+        _ => out.extend_from_slice(raw.as_bytes()),
+    }
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn encode_record(record: &str) -> Result<String, ClaudeError> {
+    let mut bytes = Vec::with_capacity(record.len());
+    restringify(record, &mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| ClaudeError::Protocol("invalid subscription wire bytes".into()))
+}
+
 pub(crate) fn encode_message(message: &Message) -> Result<String, ClaudeError> {
     let mut bytes = Vec::new();
     stringify(&serde_json::to_value(message)?, &mut bytes)?;
@@ -393,7 +489,7 @@ pub(crate) fn wire<M: WireMessage>(
         .enumerate()
         .map(|(index, message)| match &patched {
             Some((at, patched)) if *at == index => {
-                encode_message(patched).map(std::borrow::Cow::Owned)
+                encode_message(patched).map(crate::Encoded::Owned)
             }
             _ => message.encoded(true, &encode_message),
         })

@@ -120,12 +120,12 @@ pub(super) fn request_response<'a>(
             floors
         };
         request
-            .cache_floors_with(
+            .cache_floors_editing(
                 state.wire_cache.layout(&sent),
                 &mut sent,
                 kept,
                 client.uses_subscription(),
-                HistoryMessage::make_mut,
+                |message: &mut HistoryMessage, edit| edit(&mut message.make_mut()),
             )
             .map_err(provider_error)?;
         request
@@ -245,12 +245,12 @@ pub(super) fn request_response<'a>(
                 floors
             };
             request
-                .cache_floors_with(
+                .cache_floors_editing(
                     state.wire_cache.layout(&sent),
                     &mut sent,
                     kept,
                     client.uses_subscription(),
-                    HistoryMessage::make_mut,
+                    |message: &mut HistoryMessage, edit| edit(&mut message.make_mut()),
                 )
                 .map_err(provider_error)?;
             wire = client
@@ -787,8 +787,7 @@ pub(super) fn request_response<'a>(
                     || (refused_tool_changes(&error)
                         && sent
                             .iter()
-                            .flat_map(|message| &message.content)
-                            .any(tool_change)))
+                            .any(|message| message.mentions("tool_") && message.any_block(tool_change))))
                     && let Some(effect) = active_effect
                 {
                     effect.refuse(&error).await?;

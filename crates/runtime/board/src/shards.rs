@@ -24,7 +24,7 @@ use nanocode_sync::{mpsc, oneshot};
 use nanocode_turnlog::LogHost;
 
 use crate::{
-    Applied, Board, BoardError, Fold, NewTask, Op, Resolution, Task, TaskId, Write, access,
+    Applied, Board, BoardError, Event, Fold, NewTask, Op, Resolution, Task, TaskId, Write, access,
     deliver::{Delivery, Key, Outbox},
     sim::{Mutation, mutated},
     tasks::TaskOp,
@@ -509,9 +509,25 @@ impl ReadyIndex {
 type Reply = oneshot::Sender<Result<Applied, BoardError>>;
 type Verdicts = Vec<Result<Applied, BoardError>>;
 
+/// What a planned group holds: writes the board mints ids for, or events whose ids the caller
+/// already minted (a store that derives its rows itself, such as pyramid2's engine).
+enum Planning {
+    Writes(Vec<Write>),
+    Events(Vec<Event>),
+}
+
+impl Planning {
+    fn len(&self) -> usize {
+        match self {
+            Self::Writes(writes) => writes.len(),
+            Self::Events(events) => events.len(),
+        }
+    }
+}
+
 enum Job {
     Write(Write, Reply),
-    Plan(Vec<Write>, oneshot::Sender<Result<Ticket, BoardError>>),
+    Plan(Planning, oneshot::Sender<Result<Ticket, BoardError>>),
 }
 
 /// A handle that queues writes for one partition's committer.
@@ -592,11 +608,11 @@ impl Committer {
                 let mut drained = taken.drain(..).peekable();
                 while let Some(job) = drained.next() {
                     match job {
-                        Job::Plan(writes, reply) => {
+                        Job::Plan(planning, reply) => {
                             stats.planned += 1;
-                            stats.writes += writes.len() as u64;
-                            stats.largest = stats.largest.max(writes.len() as u64);
-                            plan(&mut board, &mut stats, writes, reply).await;
+                            stats.writes += planning.len() as u64;
+                            stats.largest = stats.largest.max(planning.len() as u64);
+                            plan(&mut board, &mut stats, planning, reply).await;
                         }
                         Job::Write(write, reply) => {
                             let mut group = vec![write];
@@ -654,9 +670,20 @@ impl Committer {
     /// caller to write in its own transaction (a log append that must hold the board rows it
     /// derives). Settle the returned ticket with how that transaction ended.
     pub async fn plan(&self, writes: Vec<Write>) -> Result<Ticket, BoardError> {
+        self.planning(Planning::Writes(writes)).await
+    }
+
+    /// [`Committer::plan`] for events whose ids the caller already minted: the ticket's rows are
+    /// these events at the seqs the partition gives them, so a caller that numbered them itself
+    /// checks its seqs against the ticket's before it writes.
+    pub async fn plan_events(&self, events: Vec<Event>) -> Result<Ticket, BoardError> {
+        self.planning(Planning::Events(events)).await
+    }
+
+    async fn planning(&self, planning: Planning) -> Result<Ticket, BoardError> {
         let (reply, ticket) = oneshot::channel();
         self.queue
-            .send(Job::Plan(writes, reply))
+            .send(Job::Plan(planning, reply))
             .map_err(|_| BoardError::Dropped("the partition's committer stopped".into()))?;
         ticket.await.unwrap_or_else(|_| {
             Err(BoardError::Dropped(
@@ -669,10 +696,19 @@ impl Committer {
 async fn plan(
     board: &mut Board,
     stats: &mut Stats,
-    writes: Vec<Write>,
+    planning: Planning,
     reply: oneshot::Sender<Result<Ticket, BoardError>>,
 ) {
-    let group = board.plan_group(writes).await;
+    let group = match planning {
+        Planning::Writes(writes) => board.plan_group(writes).await,
+        Planning::Events(events) => {
+            let events = events
+                .into_iter()
+                .map(|event| (event.id, event.by, event.at_ms, event.op))
+                .collect();
+            board.plan_events(events).await
+        }
+    };
     let (resolve, resolution) = oneshot::channel();
     let (verdict, verdicts) = oneshot::channel();
     let ticket = Ticket {

@@ -283,6 +283,32 @@ impl<L: Link> LinkedList<L> {
 
     // === rustpython additions ===
 
+    /// Moves every node of `other` to the front of `self`, keeping their
+    /// order, and calls `f` on each node moved. `other` is left empty.
+    ///
+    /// Walks `other` once (to find its last node), and does not touch the
+    /// nodes already in `self`.
+    pub fn prepend_all(&mut self, other: &mut Self, mut f: impl FnMut(&L::Target)) {
+        let Some(first) = other.head.take() else {
+            return;
+        };
+        let mut last = first;
+        unsafe {
+            loop {
+                f(last.as_ref());
+                match L::pointers(last).as_ref().get_next() {
+                    Some(next) => last = next,
+                    None => break,
+                }
+            }
+            L::pointers(last).as_mut().set_next(self.head);
+            if let Some(head) = self.head {
+                L::pointers(head).as_mut().set_prev(Some(last));
+            }
+        }
+        self.head = Some(first);
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &L::Target> {
         core::iter::successors(self.head, |node| unsafe {
             L::pointers(*node).as_ref().get_next()

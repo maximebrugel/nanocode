@@ -344,9 +344,9 @@ pub(crate) type GcOwner = u16;
 /// current. Every interpreter collects these.
 pub(crate) const GC_NO_OWNER: GcOwner = 0;
 
-/// `gc_refs` of an object a running collection has proved reachable. One past
-/// the largest count [`PyObject::start_gc_refs`] stores, so no real count can
-/// be taken for it.
+/// `gc_refs` of a candidate whose strong count is too large to hold: one past
+/// the largest count [`PyObject::start_gc_refs`] stores, which no subtraction
+/// takes down, so the candidate is a root.
 pub(crate) const GC_REACHABLE: u32 = u32::MAX;
 
 /// Link implementation for GC intrusive linked list tracking
@@ -472,9 +472,10 @@ pub struct Py<T> {
     /// Sits in what would otherwise be padding, so it costs no space.
     pub(super) gc_owner: PyAtomic<GcOwner>,
     /// The count a running collection is working with: the strong count with
-    /// the references held from inside the candidate set taken off, or
-    /// [`GC_REACHABLE`] once the object has been proved reachable. Only
-    /// meaningful while `gc_bits` has [`GcBits::COLLECTING`].
+    /// the references held from inside the candidate set taken off (or
+    /// [`GC_REACHABLE`] when it did not fit), and then, once the roots are
+    /// known, the object's index among the candidates. Only meaningful while
+    /// `gc_bits` has [`GcBits::COLLECTING`].
     pub(super) gc_refs: PyAtomic<u32>,
     /// Intrusive linked list pointers for GC generational tracking
     pub(super) gc_pointers: Pointers<PyObject>,
@@ -2031,15 +2032,12 @@ impl PyObject {
             .store(refs.saturating_sub(1), Ordering::Relaxed);
     }
 
-    /// Mark the object reachable, answering whether this call was the one that
-    /// did it.
+    /// Replace the count, once the running collection has read off whether
+    /// this candidate is a root, with its index among the candidates, which
+    /// the reachability walk looks its referents and its mark up by.
     #[inline]
-    pub(crate) fn mark_gc_reachable(&self) -> bool {
-        if self.0.gc_refs.load(Ordering::Relaxed) == GC_REACHABLE {
-            return false;
-        }
-        self.0.gc_refs.store(GC_REACHABLE, Ordering::Relaxed);
-        true
+    pub(crate) fn set_gc_candidate_index(&self, idx: u32) {
+        self.0.gc_refs.store(idx, Ordering::Relaxed);
     }
 
     /// Leave the candidate set, whatever the collection concluded.

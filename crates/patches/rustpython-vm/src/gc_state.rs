@@ -537,8 +537,13 @@ impl GcState {
         // keeps the candidates in a walkable order, and the bit is what keeps
         // an object that appears in two generation lists out of it twice.
         let mut candidate_ptrs: Vec<GcPtr> = Vec::new();
+        // Every node the scan walks; equal to the candidate count when each one
+        // became a candidate, which is what lets an all-reachable collection
+        // promote whole lists at once below.
+        let mut scanned = 0usize;
         for gen_list in &gen_locks {
             for obj in gen_list.iter() {
+                scanned += 1;
                 if retired.binary_search(&obj.gc_owner()).is_ok() {
                     obj.set_gc_owner(GC_NO_OWNER);
                 }
@@ -601,14 +606,15 @@ impl GcState {
         // the range that is its own: a vector each would be an allocation per
         // tracked object, and the collection wants them all at once anyway.
         let mut referent_ptrs: Vec<NonNull<PyObject>> = Vec::new();
-        // Sized for every candidate up front: grown from empty, the table
-        // rehashed itself several times in every gen0 collection.
-        let mut referent_ranges: GcMap<GcPtr, (usize, usize)> =
-            GcMap::with_capacity_and_hasher(candidate_ptrs.len(), GcBuildHasher::default());
+        // One range per candidate, in `candidate_ptrs` order. `NO_RANGE` marks
+        // a candidate step 3 skipped (its strong count was 0).
+        const NO_RANGE: (usize, usize) = (usize::MAX, usize::MAX);
+        let mut referent_ranges: Vec<(usize, usize)> = Vec::with_capacity(candidates);
 
         for &ptr in &candidate_ptrs {
             let obj = unsafe { ptr.0.as_ref() };
             if obj.strong_count() == 0 {
+                referent_ranges.push(NO_RANGE);
                 continue;
             }
             let start = referent_ptrs.len();
@@ -622,7 +628,7 @@ impl GcState {
                     child.subtract_gc_ref();
                 }
             }
-            referent_ranges.insert(ptr, (start, end));
+            referent_ranges.push((start, end));
         }
 
         if let Some(holds) = HOST_HOLDS.get() {
@@ -634,18 +640,30 @@ impl GcState {
             });
         }
 
-        // Step 4: Find reachable objects (gc_refs > 0) and traverse from them
-        let mut worklist: Vec<GcPtr> = Vec::new();
+        // Step 4: Find reachable objects (gc_refs > 0) and traverse from them.
+        //
+        // The counts have done their job once each candidate's root status is
+        // read off, so `gc_refs` is reused to hold the candidate's index into
+        // `candidate_ptrs`: a child reached through an edge then finds its
+        // referent range and its mark by index, with no table keyed by address.
+        let mut reached: Vec<bool> = Vec::with_capacity(candidates);
+        let mut worklist: Vec<usize> = Vec::new();
 
-        for &ptr in &candidate_ptrs {
+        for (idx, &ptr) in candidate_ptrs.iter().enumerate() {
             let obj = unsafe { ptr.0.as_ref() };
-            if obj.gc_refs() > 0 {
-                obj.mark_gc_reachable();
-                worklist.push(ptr);
+            let root = obj.gc_refs() > 0;
+            reached.push(root);
+            if root {
+                worklist.push(idx);
             }
+            // Candidates number far fewer than `GC_REACHABLE`; see the
+            // assertion below.
+            obj.set_gc_candidate_index(idx as u32);
         }
+        debug_assert!(candidates < GC_REACHABLE as usize);
 
-        while let Some(ptr) = worklist.pop() {
+        while let Some(idx) = worklist.pop() {
+            let ptr = candidate_ptrs[idx];
             let obj = unsafe { ptr.0.as_ref() };
             if obj.is_gc_tracked() {
                 // Reuse the pre-computed referent pointers from step 3, in
@@ -653,18 +671,22 @@ impl GcState {
                 // edge in the heap. Objects skipped in step 3 (strong_count was
                 // 0) have none stored and are traversed here instead.
                 let computed;
-                let children: &[NonNull<PyObject>] = match referent_ranges.get(&ptr) {
-                    Some(&(start, end)) => &referent_ptrs[start..end],
-                    None => {
+                let children: &[NonNull<PyObject>] = match referent_ranges[idx] {
+                    NO_RANGE => {
                         computed = unsafe { obj.gc_get_referent_ptrs() };
                         &computed
                     }
+                    (start, end) => &referent_ptrs[start..end],
                 };
                 for &child_ptr in children {
                     // SAFETY: as in step 3, the referents are live.
                     let child = unsafe { child_ptr.as_ref() };
-                    if child.is_gc_collecting() && child.mark_gc_reachable() {
-                        worklist.push(GcPtr(child_ptr));
+                    if child.is_gc_collecting() {
+                        let child_idx = child.gc_refs() as usize;
+                        if !reached[child_idx] {
+                            reached[child_idx] = true;
+                            worklist.push(child_idx);
+                        }
                     }
                 }
             }
@@ -675,9 +697,9 @@ impl GcState {
         // kept the bit would be passed over by every later collection.
         let mut reachable: Vec<GcPtr> = Vec::new();
         let mut unreachable: Vec<GcPtr> = Vec::new();
-        for &ptr in &candidate_ptrs {
+        for (&ptr, &is_reached) in candidate_ptrs.iter().zip(&reached) {
             let obj = unsafe { ptr.0.as_ref() };
-            if obj.gc_refs() == GC_REACHABLE {
+            if is_reached {
                 reachable.push(ptr);
             } else {
                 unreachable.push(ptr);
@@ -701,6 +723,27 @@ impl GcState {
                 reachable.len(),
                 unreachable.len()
             );
+        }
+
+        // Everything in the scanned lists was a candidate and every candidate is
+        // reachable: the survivors are exactly those lists, so they move to the
+        // next generation whole, without pinning each one or unlinking it.
+        if unreachable.is_empty() && scanned == candidates && generation < 2 {
+            drop(gen_locks);
+            self.promote_all(generation);
+            for count in self.counts.iter().take(generation + 1) {
+                count.store(0, Ordering::Relaxed);
+            }
+
+            let duration = elapsed_secs(start_time);
+
+            gc.generations[generation].update_stats(0, 0, candidates, duration);
+            return CollectResult {
+                collected: 0,
+                uncollectable: 0,
+                candidates,
+                duration,
+            };
         }
 
         // Create strong references while read locks are still held.
@@ -1008,6 +1051,35 @@ impl GcState {
             uncollectable: 0,
             candidates,
             duration,
+        }
+    }
+
+    /// Move every object in generations `0..=from_gen` to the next one.
+    ///
+    /// The fast path of [`Self::promote_survivors`] for a collection that found
+    /// every object in those generations reachable.
+    fn promote_all(&self, from_gen: usize) {
+        let next_gen = from_gen + 1;
+        debug_assert!(next_gen <= 2);
+        for src_gen in 0..next_gen {
+            // Ascending order, as in `promote_survivors`.
+            let mut src = self.generation_lists[src_gen].write();
+            let mut dst = self.generation_lists[next_gen].write();
+            let mut promoted = 0usize;
+            // Whatever is in the list now moves, including anything tracked
+            // since the scan: it lands in the list its generation names.
+            dst.prepend_all(&mut src, |obj| {
+                obj.set_gc_generation(next_gen as u8);
+                promoted += 1;
+            });
+            if promoted != 0 {
+                let _ = self.counts[src_gen].try_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |count| Some(count.saturating_sub(promoted)),
+                );
+                self.counts[next_gen].fetch_add(promoted, Ordering::Relaxed);
+            }
         }
     }
 

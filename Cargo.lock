@@ -976,6 +976,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanocode-s3"
+version = "0.7.0"
+dependencies = [
+ "nanocode-digest",
+ "nanocode-http",
+ "nanocode-platform",
+]
+
+[[package]]
 name = "nanocode-sandbox"
 version = "0.7.0"
 dependencies = [

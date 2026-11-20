@@ -92,6 +92,7 @@ members = [
     "crates/integrations/store-sql",
     "crates/integrations/store-jsonl",
     "crates/integrations/mpp",
+    "crates/integrations/s3",
     "crates/tui",
     "bin/nanocode",
     "bin/cua-driver",

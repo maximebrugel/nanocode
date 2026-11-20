@@ -1,4 +1,11 @@
 # Backend/mode combos nc-build check runs under nanocode-sim --memory --memory-gate (docs/memory-invariant.md).
-# Add a combo here once it holds the invariant on master.
+# Add a combo here once it holds the invariant on master. A combo=retained line gates retained and prefix only,
+# for a combo whose load transient is still open.
 codex/paged
 codex/reload
+claude/paged
+claude/reload
+claude/memo=retained
+claude/replay=retained
+codex/memo=retained
+codex/replay=retained

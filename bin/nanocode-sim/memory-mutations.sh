@@ -7,7 +7,7 @@ git clone --quiet --shared "$root" "$work/core"
 cd "$work/core"
 export SHIPPY_REMOTE_BUILD=0
 export CARGO_TARGET_DIR=${MEMORY_MUTATIONS_TARGET:-$work/target}
-check=(--memory --memory-gate --only claude/paged --turns 30 --retained-k 2.0)
+check=(--memory --memory-gate-retained --only claude/paged --turns 30)
 prefix=(--memory --only codex/reload --turns 10)
 cargo run --release --offline --locked -p nanocode-sim -- "${check[@]}" > "$work/baseline.log" 2>&1
 printf 'baseline_exit=0\n' > "$work/exits.txt"

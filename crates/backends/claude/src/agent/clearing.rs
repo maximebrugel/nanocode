@@ -2,7 +2,7 @@ use crate::{ContentBlock, ToolResultContent};
 
 use super::history::HistoryMessage;
 
-const CLEARED: &str = "[Old tool result content cleared]";
+pub(super) const CLEARED: &str = "[Old tool result content cleared]";
 const CLEAR_AT_LEAST_TOKENS: u64 = 20_000;
 const KEEP_TOOL_RESULTS: usize = 12;
 const MIN_CLEARABLE_CHARS: usize = 64;
@@ -66,8 +66,7 @@ pub(super) fn clear_tool_results(
                 .count();
         let blocks = &results[at..end];
         if end - at == messages[message].result_tokens(result_tokens).len() {
-            messages[message] =
-                messages[message].cleared(|message| clear(&mut message.content, blocks));
+            messages[message] = messages[message].cleared();
         } else {
             clear(&mut messages[message].make_mut().content, blocks);
         }

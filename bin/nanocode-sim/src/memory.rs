@@ -26,7 +26,8 @@ use crate::{
 
 pub type Heap = nanocode_sys::alloc::Counted<std::alloc::System>;
 
-pub const RETAINED_PER_HISTORY_BYTE: f64 = 1.2;
+pub const RETAINED_PER_HISTORY_BYTE: f64 = 1.05;
+pub const RETAINED_PER_MESSAGE_BYTES: usize = 1 << 10;
 pub const RETAINED_CONSTANT_BYTES: usize = 2 << 20;
 pub const TRANSIENT_PER_LARGEST_MESSAGE: usize = 4;
 pub const TRANSIENT_PER_REQUEST_BODY: usize = 1;
@@ -40,6 +41,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MIB: f64 = 1_048_576.0;
 const RATIO_FLOOR_BYTES: usize = 1 << 20;
+const SIZE_PROFILES: &[(&str, usize, usize)] = &[
+    ("mixed", 200, 64 << 10),
+    ("tools", 1 << 10, 64 << 10),
+    ("chat", 64, 2 << 10),
+];
 const CACHE_MARKS: &[&[u8]] = &[
     b",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}",
     b",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"5m\"}",
@@ -128,8 +134,10 @@ struct Options {
     seed: u64,
     only: Vec<String>,
     gate: bool,
+    gate_transient: bool,
     verbose: bool,
     retained_k: f64,
+    retained_m: usize,
 }
 
 impl Options {
@@ -142,13 +150,19 @@ impl Options {
             seed: 1,
             only: Vec::new(),
             gate: false,
+            gate_transient: true,
             verbose: false,
             retained_k: RETAINED_PER_HISTORY_BYTE,
+            retained_m: RETAINED_PER_MESSAGE_BYTES,
         };
         let mut rest = args.iter();
         while let Some(flag) = rest.next() {
             match flag.as_str() {
                 "--memory-gate" => options.gate = true,
+                "--memory-gate-retained" => {
+                    options.gate = true;
+                    options.gate_transient = false;
+                }
                 "--verbose" => options.verbose = true,
                 "--turns" => options.turns = rest.next()?.parse().ok()?,
                 "--rounds" => options.rounds = rest.next()?.parse().ok()?,
@@ -156,6 +170,15 @@ impl Options {
                 "--max-bytes" => options.max = rest.next()?.parse().ok()?,
                 "--seed" => options.seed = rest.next()?.parse().ok()?,
                 "--retained-k" => options.retained_k = rest.next()?.parse().ok()?,
+                "--retained-m" => options.retained_m = rest.next()?.parse().ok()?,
+                "--size-profile" => {
+                    let name = rest.next()?;
+                    let &(_, min, max) = SIZE_PROFILES
+                        .iter()
+                        .find(|(profile, _, _)| profile == name)?;
+                    options.min = min;
+                    options.max = max;
+                }
                 "--only" => options
                     .only
                     .extend(rest.next()?.split(',').map(str::to_owned)),
@@ -166,27 +189,44 @@ impl Options {
     }
 
     fn wants(&self, combo: &str) -> bool {
-        self.only.is_empty() || self.only.iter().any(|only| combo.contains(only.as_str()))
+        self.only.is_empty()
+            || self
+                .only
+                .iter()
+                .any(|only| combo.contains(only.split('=').next().unwrap_or(only)))
+    }
+
+    fn gates_transient(&self, combo: &str) -> bool {
+        self.gate_transient
+            && !self.only.iter().any(|only| {
+                only.split_once('=')
+                    .is_some_and(|(name, gate)| gate == "retained" && combo.contains(name))
+            })
     }
 }
 
 pub fn main(args: &[String]) -> ExitCode {
     let Some(options) = Options::parse(args) else {
         eprintln!(
-            "usage: nanocode-sim --memory [--memory-gate] [--only BACKEND/MODE,...] [--turns N] [--rounds N] [--min-bytes N] [--max-bytes N] [--seed S] [--retained-k K] [--verbose]"
+            "usage: nanocode-sim --memory [--memory-gate | --memory-gate-retained] [--only BACKEND/MODE[=retained],...] [--turns N] [--rounds N] [--size-profile mixed|tools|chat] [--min-bytes N] [--max-bytes N] [--seed S] [--retained-k K] [--retained-m M] [--verbose]"
         );
         return ExitCode::FAILURE;
     };
     Heap::start();
     println!(
-        "memory invariant: retained <= {} x history + {} MiB, step transient <= {TRANSIENT_PER_REQUEST_BODY} x request body + {TRANSIENT_PER_LARGEST_MESSAGE} x largest message + {} MiB, wire prefix byte-stable",
+        "memory invariant: retained <= {} x history + {} B x messages + {} MiB, step transient <= {TRANSIENT_PER_REQUEST_BODY} x request body + {TRANSIENT_PER_LARGEST_MESSAGE} x largest message + {} MiB, wire prefix byte-stable",
         options.retained_k,
+        options.retained_m,
         RETAINED_CONSTANT_BYTES >> 20,
         TRANSIENT_CONSTANT_BYTES >> 20
     );
     println!(
-        "{:<14} {:>9} {:>9} {:>7} {:>7} {:>9} {:>8} {:>7}  verdict",
-        "combo", "history", "retained", "max", "final", "transient", "xbody", "prefix"
+        "tool results {}..{} bytes, log-uniform",
+        options.min, options.max
+    );
+    println!(
+        "{:<14} {:>9} {:>6} {:>9} {:>7} {:>7} {:>7} {:>9} {:>8} {:>7}  verdict",
+        "combo", "history", "msgs", "retained", "max", "final", "B/msg", "transient", "xbody", "prefix"
     );
     let mut breached = 0_usize;
     let mut broken = 0_usize;
@@ -201,11 +241,15 @@ pub fn main(args: &[String]) -> ExitCode {
                 Ok(report) => {
                     let line = report.line(&combo);
                     broken += usize::from(report.unstable > 0);
-                    if report.breaches().is_empty() {
+                    let breaches = report.breaches();
+                    if breaches.is_empty() {
                         println!("{line}  PASS");
                     } else {
-                        breached += 1;
-                        println!("{line}  MEMORY {} VIOLATION", report.breaches().join("+"));
+                        breached += usize::from(
+                            options.gates_transient(&combo)
+                                || breaches.iter().any(|breach| *breach != "TRANSIENT"),
+                        );
+                        println!("{line}  MEMORY {} VIOLATION", breaches.join("+"));
                     }
                 }
                 Err(error) => {
@@ -225,6 +269,7 @@ pub fn main(args: &[String]) -> ExitCode {
 struct Report {
     turns: u64,
     history: usize,
+    messages: usize,
     largest: usize,
     retained: usize,
     ratio_max: f64,
@@ -241,11 +286,13 @@ struct Report {
 impl Report {
     fn line(&self, combo: &str) -> String {
         format!(
-            "{combo:<14} {:>8.1}M {:>8.1}M {:>7.2} {:>7.2} {:>8.1}M {:>8.2} {:>7}",
+            "{combo:<14} {:>8.1}M {:>6} {:>8.1}M {:>7.2} {:>7.2} {:>7.0} {:>8.1}M {:>8.2} {:>7}",
             self.history as f64 / MIB,
+            self.messages,
             self.retained as f64 / MIB,
             self.ratio_max,
             self.ratio_final,
+            self.retained.saturating_sub(self.history) as f64 / self.messages.max(1) as f64,
             self.transient as f64 / MIB,
             self.transient as f64 / self.body.max(1) as f64,
             if self.unstable == 0 {
@@ -273,16 +320,11 @@ impl Report {
         breaches
     }
 
-    fn sample(
-        &mut self,
-        retained_k: f64,
-        retained: usize,
-        transient: usize,
-        history: usize,
-        largest: usize,
-        body: usize,
-    ) {
+    fn sample(&mut self, options: &Options, retained: usize, transient: usize, model: &Model) {
+        let (history, messages, largest, body) =
+            (model.history(), model.messages(), model.largest(), model.body());
         self.history = history;
+        self.messages = messages;
         self.largest = largest;
         self.retained = retained;
         self.transient = self.transient.max(transient);
@@ -291,7 +333,9 @@ impl Report {
             self.ratio_max = self.ratio_max.max(ratio);
         }
         self.ratio_final = ratio;
-        let allowed = retained_k * history as f64 + RETAINED_CONSTANT_BYTES as f64;
+        let allowed = options.retained_k * history as f64
+            + (options.retained_m * messages) as f64
+            + RETAINED_CONSTANT_BYTES as f64;
         self.retained_over |= retained as f64 > allowed;
         self.transient_over |= transient
             > TRANSIENT_PER_REQUEST_BODY * body
@@ -382,14 +426,7 @@ async fn run(
         let end = Heap::count();
         let retained = end.live.saturating_sub(baseline);
         let transient = end.peak.saturating_sub(start.max(end.live));
-        report.sample(
-            options.retained_k,
-            retained,
-            transient,
-            model.history(),
-            model.largest(),
-            model.body(),
-        );
+        report.sample(options, retained, transient, &model);
         report.turns = turn + 1;
         if options.verbose {
             println!(
@@ -556,6 +593,10 @@ impl Model {
 
     fn history(&self) -> usize {
         self.history.load(Ordering::Acquire)
+    }
+
+    fn messages(&self) -> usize {
+        self.lengths.read(Vec::len)
     }
 
     fn largest(&self) -> usize {

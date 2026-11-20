@@ -1,16 +1,16 @@
 use crate::{
-    ClaudeError, ContentBlock, Encoded, Message, MessageDigests, MessageLayout, MessageView,
+    ClaudeError, ContentBlock, Encoded, Message, MessageLayout, MessageView,
     OutputConfig, Role, WireMessage,
 };
 use nanocode_durability::EncodedPayload;
-use nanocode_sync::{Atom, SwapOption};
+use nanocode_sync::SwapOption;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -19,57 +19,38 @@ pub(super) struct HistoryMessage(Arc<Entry>, u64);
 
 static WIRE_IDS: AtomicU64 = AtomicU64::new(0);
 
+const CLEARED_WIRE: u64 = 1 << 63;
+
 fn wire_id() -> u64 {
     WIRE_IDS.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Clone)]
-struct Kept {
-    json: Arc<str>,
-    record: EncodedPayload,
-}
-
-impl Kept {
-    fn of(json: Arc<str>) -> Self {
-        Self {
-            record: EncodedPayload::from_json(Arc::clone(&json)),
-            json,
-        }
-    }
-
-    fn encode(message: &Message) -> serde_json::Result<Self> {
-        Ok(Self::of(serde_json::to_string(message)?.into()))
-    }
-}
+const SAME_WIRE_KNOWN: u8 = 1;
+const SAME_WIRE: u8 = 2;
+const COMPANIONS_KNOWN: u8 = 4;
+const COMPANIONS: u8 = 8;
+const IMAGES_UNKNOWN: u32 = u32::MAX;
 
 struct Entry {
     typed: SwapOption<Message>,
-    kept: Atom<Option<Kept>>,
+    record: OnceLock<EncodedPayload>,
+    results: OnceLock<Box<[(usize, u64)]>>,
+    images: AtomicU32,
     role: Role,
     output: Option<OutputConfig>,
-    same_wire: OnceLock<bool>,
-    layout: OnceLock<MessageLayout>,
-    digests: OnceLock<MessageDigests>,
-    images: OnceLock<usize>,
-    companions: OnceLock<bool>,
-    results: OnceLock<Box<[(usize, u64)]>>,
-    cleared: OnceLock<HistoryMessage>,
+    flags: AtomicU8,
 }
 
 impl Entry {
-    fn new(message: &Message, typed: Option<Arc<Message>>, kept: Option<Kept>) -> Self {
+    fn new(message: &Message, typed: Option<Arc<Message>>, record: Option<EncodedPayload>) -> Self {
         Self {
             typed: SwapOption::new(typed),
-            kept: Atom::new(kept),
+            record: record.map_or_else(OnceLock::new, OnceLock::from),
+            results: OnceLock::new(),
+            images: AtomicU32::new(IMAGES_UNKNOWN),
             role: message.role,
             output: message.output_config.clone(),
-            same_wire: OnceLock::new(),
-            layout: OnceLock::new(),
-            digests: OnceLock::new(),
-            images: OnceLock::new(),
-            companions: OnceLock::new(),
-            results: OnceLock::new(),
-            cleared: OnceLock::new(),
+            flags: AtomicU8::new(0),
         }
     }
 
@@ -77,16 +58,34 @@ impl Entry {
         if let Some(message) = self.typed.load_full() {
             return message;
         }
-        let kept = self.kept.get();
-        let json = &Option::as_ref(&kept).expect("a message keeps its typed form or its bytes").json;
+        let json = self
+            .record
+            .get()
+            .and_then(|record| record.json().ok())
+            .expect("a message keeps its typed form or its bytes");
         Arc::new(serde_json::from_str(json).expect("a recorded message parses"))
+    }
+
+    fn json(&self) -> Option<&str> {
+        self.record.get().and_then(|record| record.json().ok())
+    }
+
+    fn flag(&self, known: u8, set: u8, check: impl FnOnce() -> bool) -> bool {
+        let flags = self.flags.load(Ordering::Acquire);
+        if flags & known != 0 {
+            return flags & set != 0;
+        }
+        let value = check();
+        self.flags
+            .fetch_or(known | if value { set } else { 0 }, Ordering::AcqRel);
+        value
     }
 }
 
 impl Clone for Entry {
     fn clone(&self) -> Self {
         let typed = self.typed();
-        Self::new(&typed, Some(Arc::clone(&typed)), Option::clone(&*self.kept.get()))
+        Self::new(&typed, Some(Arc::clone(&typed)), self.record.get().cloned())
     }
 }
 
@@ -120,9 +119,9 @@ impl Drop for MessageMut<'_> {
 
 impl HistoryMessage {
     pub(super) fn make_mut(&mut self) -> MessageMut<'_> {
+        let message = Arc::unwrap_or_clone(self.typed());
         self.1 = wire_id();
         let entry = Arc::make_mut(&mut self.0);
-        let message = Arc::unwrap_or_clone(entry.typed());
         *entry = Entry::new(&message, None, None);
         MessageMut {
             entry,
@@ -134,12 +133,30 @@ impl HistoryMessage {
         self.0.role
     }
 
+    const fn is_cleared(&self) -> bool {
+        self.1 & CLEARED_WIRE != 0
+    }
+
+    fn typed(&self) -> Arc<Message> {
+        let typed = self.0.typed();
+        if !self.is_cleared() {
+            return typed;
+        }
+        let mut message = Message::clone(&typed);
+        for &(block, _) in self.0.results.get().map_or(&[][..], |results| &results[..]) {
+            if let Some(ContentBlock::ToolResult { content, .. }) = message.content.get_mut(block) {
+                *content = crate::ToolResultContent::Text(super::clearing::CLEARED.to_owned());
+            }
+        }
+        Arc::new(message)
+    }
+
     pub(super) fn view(&self) -> MessageView<'static> {
-        MessageView::Shared(self.0.typed())
+        MessageView::Shared(self.typed())
     }
 
     pub(super) fn any_block(&self, check: impl FnMut(&ContentBlock) -> bool) -> bool {
-        self.0.typed().content.iter().any(check)
+        self.typed().content.iter().any(check)
     }
 
     pub(super) fn is_effort_update(&self) -> bool {
@@ -151,42 +168,51 @@ impl HistoryMessage {
     }
 
     pub(super) fn mentions(&self, text: &str) -> bool {
-        if self.0.typed.load().is_some() {
+        if self.is_cleared() || self.0.typed.load().is_some() {
             return true;
         }
-        let Some(kept) = &*self.0.kept.get() else {
+        let Some(json) = self.0.json() else {
             return true;
         };
         match serde_json::to_string(text) {
-            Ok(escaped) => kept.json.contains(&escaped[1..escaped.len() - 1]),
+            Ok(escaped) => json.contains(&escaped[1..escaped.len() - 1]),
             Err(_) => true,
         }
     }
 
     fn settled(message: Message) -> Self {
-        match Kept::encode(&message) {
-            Ok(kept) => Self(Arc::new(Entry::new(&message, None, Some(kept))), wire_id()),
+        match serde_json::to_string(&message) {
+            Ok(json) => Self(
+                Arc::new(Entry::new(
+                    &message,
+                    None,
+                    Some(EncodedPayload::from_json(json.into())),
+                )),
+                wire_id(),
+            ),
             Err(_) => Self::from(message),
         }
     }
 
-    pub(super) fn cleared(&self, clear: impl FnOnce(&mut Message)) -> Self {
-        self.0
-            .cleared
-            .get_or_init(|| {
-                let mut message = Message::clone(&self.0.typed());
-                clear(&mut message);
-                Self::settled(message)
-            })
-            .clone()
+    pub(super) fn cleared(&self) -> Self {
+        Self(Arc::clone(&self.0), self.1 | CLEARED_WIRE)
     }
 
     pub(super) fn image_count(&self, count: impl FnOnce(&Self) -> usize) -> usize {
-        if let Some(images) = self.0.images.get() {
-            return *images;
+        if self.is_cleared() {
+            return count(self);
+        }
+        let images = self.0.images.load(Ordering::Acquire);
+        if images != IMAGES_UNKNOWN {
+            return images as usize;
         }
         let images = count(self);
-        *self.0.images.get_or_init(|| images)
+        if let Ok(known) = u32::try_from(images)
+            && known != IMAGES_UNKNOWN
+        {
+            self.0.images.store(known, Ordering::Release);
+        }
+        images
     }
 
     pub(super) fn result_tokens(
@@ -205,53 +231,56 @@ impl HistoryMessage {
     }
 
     pub(super) fn has_companions(&self, check: impl FnOnce(&Message) -> bool) -> bool {
-        *self.0.companions.get_or_init(|| check(&self.0.typed()))
+        if self.is_cleared() {
+            return check(&self.typed());
+        }
+        self.0
+            .flag(COMPANIONS_KNOWN, COMPANIONS, || check(&self.0.typed()))
     }
 
     pub(super) fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0) && self.is_cleared() == other.is_cleared()
     }
 
     pub(super) fn into_message(self) -> Message {
+        if self.is_cleared() {
+            return Arc::unwrap_or_clone(self.typed());
+        }
         match Arc::try_unwrap(self.0) {
             Ok(entry) => Arc::unwrap_or_clone(entry.typed()),
             Err(entry) => Message::clone(&entry.typed()),
         }
     }
 
-    pub(super) fn recorded(message: Message, json: Arc<str>, record: EncodedPayload) -> Self {
-        let typed = Arc::new(message);
-        Self(
-            Arc::new(Entry::new(
-                &typed,
-                Some(Arc::clone(&typed)),
-                Some(Kept { json, record }),
-            )),
-            wire_id(),
-        )
+    pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
+        if self.is_cleared() {
+            return Ok(EncodedPayload::from_json(
+                serde_json::to_string(&*self.typed())?.into(),
+            ));
+        }
+        if let Some(record) = self.0.record.get() {
+            return Ok(record.clone());
+        }
+        let record = EncodedPayload::from_json(serde_json::to_string(&*self.0.typed())?.into());
+        Ok(self.0.record.get_or_init(|| record).clone())
     }
 
-    fn kept(&self) -> serde_json::Result<Kept> {
-        if let Some(kept) = &*self.0.kept.get() {
-            return Ok(kept.clone());
+    fn json(&self) -> serde_json::Result<&str> {
+        if self.0.json().is_none() {
+            self.record()?;
         }
-        let encoded = Kept::encode(&self.0.typed())?;
-        Ok(self
-            .0
-            .kept
-            .update(|kept| kept.get_or_insert_with(|| encoded.clone()).clone()))
+        Ok(self.0.json().expect("a recorded message keeps its bytes"))
     }
 
     pub(super) fn with_json<R>(&self, read: impl FnOnce(&str) -> R) -> serde_json::Result<R> {
-        Ok(read(&self.kept()?.json))
-    }
-
-    pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
-        Ok(self.kept()?.record)
+        if self.is_cleared() {
+            return Ok(read(&serde_json::to_string(&*self.typed())?));
+        }
+        Ok(read(self.json()?))
     }
 
     pub(super) fn committed(&self) {
-        if self.0.kept.read(Option::is_some) {
+        if !self.is_cleared() && self.0.record.get().is_some() {
             self.0.typed.store(None);
         }
     }
@@ -272,20 +301,23 @@ impl PartialEq for HistoryMessage {
         if self.ptr_eq(other) {
             return true;
         }
-        if let (Some(left), Some(right)) = (&*self.0.kept.get(), &*other.0.kept.get()) {
-            return left.json == right.json;
+        if !self.is_cleared()
+            && !other.is_cleared()
+            && let (Some(left), Some(right)) = (self.0.json(), other.0.json())
+        {
+            return left == right;
         }
-        *self.0.typed() == *other.0.typed()
+        *self.typed() == *other.typed()
     }
 }
 
 impl Serialize for HistoryMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match &*self.0.kept.get() {
-            Some(kept) => serde_json::from_str::<&RawValue>(&kept.json)
+        match self.0.json().filter(|_| !self.is_cleared()) {
+            Some(json) => serde_json::from_str::<&RawValue>(json)
                 .map_err(serde::ser::Error::custom)?
                 .serialize(serializer),
-            None => self.0.typed().serialize(serializer),
+            None => self.typed().serialize(serializer),
         }
     }
 }
@@ -306,10 +338,7 @@ impl WireMessage for HistoryMessage {
     }
 
     fn layout(&self) -> MessageLayout {
-        *self
-            .0
-            .layout
-            .get_or_init(|| <Message as WireMessage>::layout(&self.0.typed()))
+        <Message as WireMessage>::layout(&self.typed())
     }
 
     fn encoded<'a>(
@@ -317,35 +346,31 @@ impl WireMessage for HistoryMessage {
         subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
     ) -> Result<Encoded<'a>, ClaudeError> {
-        let kept = self.kept()?;
+        if self.is_cleared() {
+            let typed = self.typed();
+            return match subscription {
+                true => encode(&typed).map(Encoded::Owned),
+                false => Ok(Encoded::Owned(serde_json::to_string(&*typed)?)),
+            };
+        }
+        let json = self.json()?;
         if !subscription {
-            return Ok(Encoded::Shared(kept.json));
+            return Ok(Encoded::Borrowed(json));
         }
-        if let Some(same) = self.0.same_wire.get() {
-            return Ok(if *same {
-                Encoded::Shared(kept.json)
-            } else {
-                Encoded::Owned(crate::subscription_wire::encode_record(&kept.json)?)
-            });
+        let mut wire = None;
+        let same = self.0.flag(SAME_WIRE_KNOWN, SAME_WIRE, || {
+            let encoded = encode(&self.0.typed());
+            let same = encoded.as_deref().is_ok_and(|encoded| encoded == json);
+            wire = Some(encoded);
+            same
+        });
+        if same {
+            return Ok(Encoded::Borrowed(json));
         }
-        let wire = encode(&self.0.typed())?;
-        let same = *self.0.same_wire.get_or_init(|| wire == *kept.json);
-        Ok(if same {
-            Encoded::Shared(kept.json)
-        } else {
-            Encoded::Owned(wire)
-        })
-    }
-
-    fn digests(
-        &self,
-        encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<MessageDigests, ClaudeError> {
-        if let Some(digests) = self.0.digests.get() {
-            return Ok(*digests);
+        match wire {
+            Some(wire) => wire.map(Encoded::Owned),
+            None => crate::subscription_wire::encode_record(json).map(Encoded::Owned),
         }
-        let digests = MessageDigests::of(&self.encoded(false, encode)?);
-        Ok(*self.0.digests.get_or_init(|| digests))
     }
 }
 

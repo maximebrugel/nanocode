@@ -1,28 +1,29 @@
 # Memory invariant: one owner per byte
 
-Status: adopted as a report-only check (`nanocode-sim --memory`), 2026-11-19. Measured at d3b5744f8.
-
 ## Why
 
-A busy multi-tenant server (one process, ~190 concurrent turns, 32 GiB limit) grows its heap by ~150 MiB per running turn. Its heap profile at a 24 GiB peak shows the same committed message bytes held three to five times per session: a parsed `Message` tree, a cached JSON string, a durable record, a payload memo copy and a wire cache. Each copy is reasonable alone; together they make retained heap a multiple of history.
+A busy multi-tenant server (one process, ~190 concurrent turns, 32 GiB limit) grew its heap by ~150 MiB per running turn. Its heap profile showed the same committed message bytes held three to five times per session: a parsed `Message` tree, a cached JSON string, a durable record, a payload memo copy and a wire cache. Each copy is reasonable alone; together they made retained heap a multiple of history.
 
 ## The invariant
 
-1. **One owner per byte.** A live session holds each committed message's canonical serialized bytes exactly once. Every other view (request body, durable record, log entry, cache, parsed value tree) borrows those bytes (a shared `Arc<str>` or a slice of it) or is derived on demand and dropped. Retained heap per session is at most `K x history bytes + C`.
+1. **One owner per byte.** A live session holds each committed message's canonical serialized bytes exactly once. Every other view (request body, durable record, log entry, cache, parsed value tree) borrows those bytes (a shared `Arc<str>` or a slice of it) or is derived on demand and dropped. Retained heap per session is at most `K x history bytes + M x messages + C`.
 2. **Bounded transients.** Building a request, loading or replaying a session, or committing a record allocates at most `T_BODY x request body + T_MSG x largest message + C_T` beyond what it retains: never O(history) more per step, except the one pass that writes the request body.
 3. **Prefix-stable wire bytes.** Rebuilding the request from the single owner yields byte-identical message prefixes across rounds and across a durable reload, so prompt caching is unaffected. Deliberate context edits (Claude's tool-result clearing) are the only allowed breaks.
 
 | Constant | Value | Code |
 | --- | --- | --- |
-| `K` | 1.2 | `RETAINED_PER_HISTORY_BYTE` |
+| `K` | 1.05 | `RETAINED_PER_HISTORY_BYTE` |
+| `M` | 1 KiB | `RETAINED_PER_MESSAGE_BYTES` |
 | `C` | 2 MiB | `RETAINED_CONSTANT_BYTES` |
 | `T_BODY` | 1 | `TRANSIENT_PER_REQUEST_BODY` |
 | `T_MSG` | 4 | `TRANSIENT_PER_LARGEST_MESSAGE` |
 | `C_T` | 4 MiB | `TRANSIENT_CONSTANT_BYTES` |
 
-All five live in `bin/nanocode-sim/src/memory.rs`. `K = 1.2` leaves 0.2 for per-message structure (offsets, ids, small parsed headers); a session that keeps a parsed tree of every message beside its JSON cannot meet it.
+All six live in `bin/nanocode-sim/src/memory.rs`.
 
-**History bytes** are measured on the wire: for each position in the request's message array (`messages` for Claude, `input` for Codex), the largest serialized size it has had. Positions Claude later clears keep their original size.
+The retained bound has two slopes because a session keeps two kinds of memory. Bytes: the owner JSON of each message is about 1.03x its wire size, so `K = 1.05`. Bookkeeping: every message has a fixed cost whatever its size: the history entry and its `Arc`, the durable record and its key, the paged sequence log's reference, the wire cache's id, digest and layout prefix, and allocator rounding. That cost is O(messages), not O(bytes), so it has its own term instead of hiding in `K`, where the bound would depend on the average message size. `M = 1 KiB` is the measured per-message cost rounded up. A parsed tree kept beside every message's JSON costs several KiB per message and fails `M`; a second serialized copy of every message fails `K`.
+
+**History bytes** are measured on the wire: for each position in the request's message array (`messages` for Claude, `input` for Codex), the largest serialized size it has had. Positions Claude later clears keep their original size. **Messages** is the number of positions.
 
 ## Who owns the bytes
 
@@ -30,9 +31,10 @@ The owner is the committed message's canonical serialized JSON, one `Arc<str>` p
 
 | Layer | Rule |
 | --- | --- |
-| Backend history (Claude `HistoryMessage`, Codex `ResponseItem` list) | Holds the owner `Arc<str>`. A parsed form is either not kept or kept only for small fields; large strings (tool results, text) are not held twice. |
-| Wire / request builder | Writes the body by copying borrowed message bytes into one buffer per request; keeps no per-message serialized copy (a "wire" `Box<str>` is a second owner). The kept request body for cache reuse counts as a borrower only if it is the only copy of its bytes beyond the owner. |
-| Durable records, `SequenceLog`, staged writes | Build records from the owner `Arc` (`EncodedPayload::from_json(Arc::clone(..))`); after a durable commit, a record may become a reference and drop its bytes. |
+| Backend history (Claude `HistoryMessage`, Codex `ResponseItem` list) | Holds the owner. Claude keeps one entry per message: the record (the owner bytes) and, until its durable commit, the typed message it was built from; after the commit, typed views are parsed from the bytes on demand and dropped. Facts read every request (image count, tool-result token sizes, wire flags) are small fields, not copies. |
+| Cleared copies (Claude tool-result clearing) | Derived per request from the owner and encoded straight into the body; never cached. The edit is deterministic, so the bytes are the same every round. |
+| Wire / request builder | Writes the body by copying borrowed message bytes into one buffer per request; keeps no per-message serialized copy. The kept request body for cache reuse counts as a borrower only if it is the only copy of its bytes beyond the owner. |
+| Durable records, `SequenceLog`, staged writes | Build records from the owner `Arc` (`EncodedPayload::from_json(Arc::clone(..))`); after a durable commit, a record may become a reference and drop its bytes. Rarely set record fields (a staged closure's pending records and children) live behind one optional pointer. |
 | Payload memo (standby / handoff load) | Shares the loaded bytes with history (`EncodedPayload::shared_json()`), never a second `Arc<str>` of the same record. |
 | Record cache | Budgeted, and holds record text a live session does not already own. |
 | Load / reload / replay | One streaming pass: each record's bytes become the owner directly; no full parse tree of history is kept beside it. |
@@ -41,13 +43,16 @@ The owner is the committed message's canonical serialized JSON, one `Arc<str>` p
 
 ```sh
 SHIPPY_REMOTE_BUILD=0 cargo build --release --locked --offline -p nanocode-sim
-target/release/nanocode-sim --memory                     # report only; exit 1 on a broken prefix
-target/release/nanocode-sim --memory --memory-gate       # exit 1 on any breach
-target/release/nanocode-sim --memory --only claude/reload --turns 150 --rounds 24 --verbose
-bin/nanocode-sim/memory-mutations.sh                     # the mutations the check catches
+target/release/nanocode-sim --memory                          # report only; exit 1 on a broken prefix
+target/release/nanocode-sim --memory --memory-gate-retained   # also exit 1 on a retained breach
+target/release/nanocode-sim --memory --memory-gate            # exit 1 on any breach
+target/release/nanocode-sim --memory --only claude/reload --turns 150 --rounds 24 --size-profile tools --verbose
+bin/nanocode-sim/memory-mutations.sh                          # the mutations the check catches
 ```
 
-Each combination of a backend and a durability mode runs one session against an in-process mock model: `--turns` turns (default 60) of `--rounds` tool rounds (default 16), each tool result a seeded log-uniform size between `--min-bytes` (200) and `--max-bytes` (64 KiB), about 10 MiB of history by default. The durable store keeps its records on disk, so they do not count as session heap. A counting global allocator (`nanocode_sys::alloc::Counted`) gives live and peak bytes; after each turn the check records retained (live minus the baseline before the first turn) and transient (peak during the turn minus the larger of start and end). The mock keeps only one hash per message, and checks every request's message prefix against the previous request's.
+`nc-build check` (`scripts/check`) runs the combos listed in `bin/nanocode-sim/memory-gate.txt` with `--memory --memory-gate` beside the simulator's `--tidy` and `--machines` walks, so a breach in a listed combo fails the check. A combo is listed once it holds the invariant on master. A `combo=retained` line (also accepted by `--only`) gates retained and prefix only, for a combo whose load transient is still open: memo, reload and replay hydrate the whole checkpoint as one `Value` on open. `--memory-gate-retained` does the same for every combo.
+
+Each combination of a backend and a durability mode runs one session against an in-process mock model: `--turns` turns (default 60) of `--rounds` tool rounds (default 16), each tool result a seeded log-uniform size between `--min-bytes` and `--max-bytes`. `--size-profile` picks a mix: `mixed` (the default, 200 B to 64 KiB, about 3.5 KiB per message), `tools` (1 KiB to 64 KiB, coding-agent tool output) and `chat` (64 B to 2 KiB, where bookkeeping dominates and `M` is what the check tests). The durable store keeps its records on disk, so they do not count as session heap. A counting global allocator (`nanocode_sys::alloc::Counted`) gives live and peak bytes; after each turn the check records retained (live minus the baseline before the first turn) and transient (peak during the turn minus the larger of start and end). The report's `B/msg` column is retained minus history, per message. The mock keeps only one hash per message, and checks every request's message prefix against the previous request's.
 
 Backends (`BACKENDS`): `claude`, `codex`. Modes (`MODES`):
 
@@ -59,38 +64,6 @@ Backends (`BACKENDS`): `claude`, `codex`. Modes (`MODES`):
 | `replay` | After each turn, reopen and resubmit the same request id: the completed step replays without a model call |
 
 There is no unpaged mode: every runtime has a durable store (the default is a home JSONL store), and Claude durable policies always page messages.
-
-## Baseline (d3b5744f8, default sizes, 2026-11-19)
-
-| combo | history | retained | ratio max / final | transient (x body) | prefix | verdict |
-| --- | --- | --- | --- | --- | --- | --- |
-| claude/paged | 10.3 MiB | 27.2 MiB | 2.75 / 2.64 | 1.6 MiB (2.57) | stable | RETAINED |
-| claude/memo | 10.3 MiB | 38.0 MiB | 3.72 / 3.69 | 10.7 MiB (17.06) | stable | RETAINED, TRANSIENT |
-| claude/reload | 10.3 MiB | 26.9 MiB | 2.69 / 2.62 | 1.6 MiB (2.57) | stable | RETAINED |
-| claude/replay | 10.3 MiB | 12.8 MiB | 1.29 / 1.24 | 25.7 MiB (40.88) | stable | TRANSIENT |
-| codex/paged | 9.9 MiB | 21.7 MiB | 2.25 / 2.19 | 20.1 MiB (2.03) | stable | RETAINED, TRANSIENT |
-| codex/memo | 9.9 MiB | 46.1 MiB | 4.64 / 4.64 | 30.8 MiB (3.10) | broken | RETAINED, TRANSIENT, PREFIX |
-| codex/reload | 9.9 MiB | 21.7 MiB | 2.18 / 2.18 | 30.8 MiB (3.10) | broken | RETAINED, TRANSIENT, PREFIX |
-| codex/replay | 9.9 MiB | 11.5 MiB | 1.87 / 1.16 | 41.0 MiB (4.12) | broken | RETAINED, TRANSIENT, PREFIX |
-
-At production size (`--only claude/reload,claude/paged --turns 150 --rounds 24`): claude/reload holds 101.7 MiB for 39.2 MiB of history (2.59x), 0.68 MiB retained per turn for 0.26 MiB of history per turn; claude/paged 103.1 MiB (2.63x). The ratio is flat from 6 MiB to 39 MiB of history, so retained heap is linear in history at about 2.6x.
-
-## Violations
-
-Measured excess is the combination's retained bytes minus `K x history`. The production column is the matching stack's size in the 24 GiB profile above.
-
-| # | Site (d3b5744f8) | Backend x mode | What | Sim excess | Production |
-| --- | --- | --- | --- | --- | --- |
-| V1 | `crates/backends/claude/src/agent/history.rs` (`json`, `record`) < `agent/durable.rs` | claude x paged, reload, memo | A restored or new message kept a fresh JSON `Arc<str>` and a record beside its parsed `Message`, and the paged sequence logs kept every committed record | **fixed** by `perf(claude): keep one serialized form per history message`: entries keep only the parsed message, records are encoded when written, and committed sequence logs keep key-only refs; paged 2.75x -> 1.59x, reload 2.69x -> 1.53x, memo 3.72x -> 2.56x. The canary in `bin/nanocode-sim/memory-mutations.sh` stops releasing the committed log (claude/paged, `--retained-k 2.0`) | 1338 + 394 + 202 + 188 MiB |
-| V2 | `crates/core/durability/src/payload.rs:831` < `crates/runtime/durability/src/payload_memo.rs:65` | claude x memo, codex x memo | Partly fixed (perf(durability): drop memo payloads that no load asks for and nothing else holds): the memo now drops kept payloads that a load no longer asks for and nothing else holds. Inline loads already share the stored record (`Text::Record`, no copy). Left: claude restore decodes each loaded payload and history serializes its own JSON, so the memo's record is a second copy (fix in claude history: keep `payload.shared()` as the message JSON and the payload as its record); most of codex memo's excess is the loaded-resume history, not the memo (memo disabled: 41.8 MiB) | claude +1.04x (10.8 MiB), codex +2.08x (20.6 MiB) over reload | 698 + 362 + 147 + 127 MiB |
-| V3 | `Message` parse trees (`ContentBlock` `Value` fields, flattened extras) and the reopen hydrate (`crates/runtime/durability/src/catalog.rs` `whole_checkpoint` < `crates/backends/claude/src/durability/format.rs` `advance_snapshot` < `advance_sequence`) | claude x all | A parsed tree of every message is kept; on reopen the whole checkpoint is first built as one `serde_json::Value` tree beside the typed messages built from it | retained: the 1.2x floor (replay 1.24x). Reopen: the `Value` tree is about 1.3x history at the peak, so with V1 fixed claude/reload reports transient 13.4 MiB (21.4x body), which the larger retained heap used to hide; the absolute peak did not change. Open: decode paged messages straight into `Message` (the runtime's `CheckpointFormat` hands checkpoints over as `Value`). `claude_transcript` no longer clones every message | ~1.6 GiB |
-| V4 | `crates/backends/claude/src/agent/history.rs:227` < `:241` (`digests`) | claude, subscription wire | A second serialized copy per message in the `wire` `Box<str>` cache | not driven (the sim's client is an API-key client) | 330 MiB |
-| V5 | `crates/backends/claude/src/durability/mod.rs:223` (`hydrated` `Slot<(String, Value, bool)>`, cloned in `continuation`) | claude x reload, memo | The hydrated cursor `Value` is kept and cloned | not measured separately; open | 400 MiB |
-| V6 | `crates/backends/claude/client/src/lib.rs:3586` < `:2443` < `:2481` | claude x all | The kept request body; allowed once per session as a borrower, a violation when it is a third copy | ~0.16x (cleared tool results keep the Claude body small) | 670 MiB |
-| V7 | `crates/backends/claude/src/agent/rounds.rs` | claude x all | The token estimate forced the JSON cache on new tool results | **fixed** with V1: the estimate counts bytes through a write sink and keeps nothing | 136 MiB |
-| V8 | Codex history beside its loaded and request copies (`crates/backends/codex/src/durability/context.rs:177` shares loaded bytes; the live list and the request copy do not) | codex x paged, reload | Retained 2.2x history | 9.8 MiB over K at 9.9 MiB history; **fixed** by faa613683 (perf(codex): serialize request input straight into the body): no encoded or stored copy beside the live list, codex paged/memo/reload retain 1.16 to 1.21x | not profiled |
-| V9 | Request build and load, both backends | claude x memo, replay; codex x all | A step allocates 2 to 4 request bodies (codex) or 2.5x history on load (claude replay) beyond what it keeps | codex 20 to 41 MiB per turn at 10 MiB history; claude/replay 25.7 MiB, **partly fixed**: 15.9 MiB once `load_sequence` (`crates/runtime/durability/src/paged.rs:268`) drops each encoded payload as it decodes (perf(durability): drop each encoded payload as load_sequence decodes it); the rest is the replayed checkpoint hydrated as a whole `Value` (`crates/backends/claude/src/durability/mod.rs:755`) | ~475 MiB staged writes (`crates/core/durability/src/staged.rs:619`) |
-| V10 | `crates/backends/codex/client/src/session/context.rs:105` (`truncate_tool_output`, `:808`) | codex x reload, memo, replay | On reload a tool output already cut to its token budget is cut again: the marker changes from `…2759 tokens truncated…` to `…7 tokens truncated…` and the cached prefix breaks at the first long output | prefix broken; **fixed** by `fix(codex): keep truncated tool output within its token budget`: a cut output fits its budget, so a second cut is a no-op | prompt-cache misses after every reload |
 
 ## Adding a backend or a mode
 

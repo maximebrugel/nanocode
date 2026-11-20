@@ -79,8 +79,13 @@ fn chunk_key(hash: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct EncodedPayload {
     body: Body,
-    pending: Arc<[crate::StoreRecord]>,
-    children: Arc<[Self]>,
+    closure: Option<Arc<Closure>>,
+}
+
+#[derive(Debug, Default)]
+struct Closure {
+    pending: Box<[crate::StoreRecord]>,
+    children: Box<[EncodedPayload]>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,7 +115,6 @@ impl Text {
 #[derive(Clone, Debug)]
 struct Keyed {
     key: Arc<str>,
-    layout: Option<Arc<Layout>>,
 }
 
 impl serde::Serialize for EncodedPayload {
@@ -229,13 +233,10 @@ fn keyed(json: &str) -> Keyed {
     if json.len() < INLINE_BYTES {
         return Keyed {
             key: record_key(json).into(),
-            layout: None,
         };
     }
-    let layout = Layout::of(json);
     Keyed {
-        key: record_key(&layout.root).into(),
-        layout: Some(Arc::new(layout)),
+        key: record_key(&Layout::of(json).root).into(),
     }
 }
 
@@ -258,11 +259,10 @@ impl EncodedPayload {
         }
     }
 
-    fn of(body: Body) -> Self {
+    const fn of(body: Body) -> Self {
         Self {
             body,
-            pending: Arc::default(),
-            children: Arc::default(),
+            closure: None,
         }
     }
 
@@ -387,7 +387,7 @@ impl EncodedPayload {
     pub fn keyed(key: Arc<str>, json: Arc<str>) -> Self {
         Self::of(Body::Content {
             json: Text::Json(json),
-            keyed: Arc::new(OnceLock::from(Keyed { key, layout: None })),
+            keyed: Arc::new(OnceLock::from(Keyed { key })),
         })
     }
 
@@ -455,12 +455,26 @@ impl EncodedPayload {
     }
 
     pub fn with_records(mut self, records: Vec<crate::StoreRecord>) -> Self {
-        self.pending = records.into();
+        let children = self.closure.take().map(|closure| match Arc::try_unwrap(closure) {
+            Ok(closure) => closure.children,
+            Err(closure) => closure.children.clone(),
+        });
+        self.closure = Some(Arc::new(Closure {
+            pending: records.into(),
+            children: children.unwrap_or_default(),
+        }));
         self
     }
 
     pub fn with_payloads(mut self, payloads: Vec<Self>) -> Self {
-        self.children = payloads.into();
+        let pending = self.closure.take().map(|closure| match Arc::try_unwrap(closure) {
+            Ok(closure) => closure.pending,
+            Err(closure) => closure.pending.clone(),
+        });
+        self.closure = Some(Arc::new(Closure {
+            pending: pending.unwrap_or_default(),
+            children: payloads.into(),
+        }));
         self
     }
 
@@ -479,8 +493,7 @@ impl EncodedPayload {
 
     fn release(&mut self) {
         self.body = Body::Reference(Arc::clone(self.shared_key()));
-        self.pending = Arc::default();
-        self.children = Arc::default();
+        self.closure = None;
     }
 
     fn stage_tree(&self, records: &mut Vec<crate::StoreRecord>, known: &dyn Fn(&str) -> bool) {
@@ -488,35 +501,26 @@ impl EncodedPayload {
             return;
         }
         self.stage_closure(records, known);
-        let Body::Content {
-            json: content,
-            keyed,
-        } = &self.body
-        else {
+        let Body::Content { json: content, .. } = &self.body else {
             return;
         };
-        let layout = match keyed.get().and_then(|keyed| keyed.layout.as_ref()) {
-            Some(layout) => Arc::clone(layout),
-            None if content.json().len() >= INLINE_BYTES && self.key().starts_with(KEY_PREFIX) => {
-                Arc::new(Layout::of(content.json()))
-            }
-            None => {
-                let value = match content {
-                    Text::Record(record) => Arc::clone(record),
-                    Text::Json(json) => {
-                        let mut value = String::with_capacity(1 + json.len());
-                        value.push('=');
-                        value.push_str(json);
-                        value.into()
-                    }
-                };
-                records.push(crate::StoreRecord {
-                    key: self.key().to_owned(),
-                    value,
-                });
-                return;
-            }
-        };
+        if content.json().len() < INLINE_BYTES || !self.key().starts_with(KEY_PREFIX) {
+            let value = match content {
+                Text::Record(record) => Arc::clone(record),
+                Text::Json(json) => {
+                    let mut value = String::with_capacity(1 + json.len());
+                    value.push('=');
+                    value.push_str(json);
+                    value.into()
+                }
+            };
+            records.push(crate::StoreRecord {
+                key: self.key().to_owned(),
+                value,
+            });
+            return;
+        }
+        let layout = Layout::of(content.json());
         let content = content.json();
         let mut offset = 0;
         for (index, &end) in layout.ends.iter().enumerate() {
@@ -552,7 +556,7 @@ impl EncodedPayload {
         (json.len() < limit
             && keyed
                 .get()
-                .is_none_or(|keyed| keyed.layout.is_none() && keyed.key.starts_with(KEY_PREFIX)))
+                .is_none_or(|keyed| keyed.key.starts_with(KEY_PREFIX)))
         .then_some(json)
     }
 
@@ -591,18 +595,21 @@ impl EncodedPayload {
             return;
         }
         self.stage_closure(records, known);
-        self.pending = Arc::default();
-        self.children = Arc::default();
+        self.closure = None;
     }
 
     fn stage_closure(&self, records: &mut Vec<crate::StoreRecord>, known: &dyn Fn(&str) -> bool) {
+        let Some(closure) = &self.closure else {
+            return;
+        };
         records.extend(
-            self.pending
+            closure
+                .pending
                 .iter()
                 .filter(|record| !known(&record.key))
                 .cloned(),
         );
-        for child in self.children.iter() {
+        for child in &closure.children {
             child.stage_tree(records, known);
         }
     }
@@ -883,7 +890,6 @@ impl EncodedPayload {
                 json,
                 keyed: Arc::new(OnceLock::from(Keyed {
                     key: Arc::clone(value.shared_key()),
-                    layout: None,
                 })),
             }));
         }

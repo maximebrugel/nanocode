@@ -12,23 +12,63 @@ nanocode --harness antigravity -m gemini-3-pro
 nanocode -m gemini-4-neon                      # a gemini-* model picks this harness
 ```
 
-Credentials, read in this order:
+Credentials: pick a method with `--google-auth auto|api-key|vertex|vertex-express|gateway` (or `NANOCODE_GOOGLE_AUTH`).
+
+| Method | Endpoint | Auth | Configured by |
+| --- | --- | --- | --- |
+| `gateway` | `$AGY_LLM_GATEWAY_URL/v1beta/models/{m}:streamGenerateContent` | `Bearer $AGY_LLM_GATEWAY_API_KEY`, agy's gateway headers | `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_API_KEY`. `claude-*` models on the Gemini wire run only here |
+| `api-key` | `generativelanguage.googleapis.com/v1beta/models/{m}:streamGenerateContent` | `x-goog-api-key` | `GEMINI_API_KEY` or `GOOGLE_API_KEY`; `GEMINI_BASE_URL` for another base URL |
+| `vertex-express` | `aiplatform.googleapis.com/v1/publishers/google/models/{m}:streamGenerateContent` | `x-goog-api-key` (an express mode key) | `GOOGLE_API_KEY` |
+| `vertex` | `{location}-aiplatform.googleapis.com/v1/projects/{p}/locations/{location}/publishers/google/models/{m}:streamGenerateContent` (`aiplatform.googleapis.com` for `global`) | OAuth bearer from Application Default Credentials; `x-goog-user-project` for user credentials | `--google-project`, `--google-location`, the variables below |
+
+`auto` (the default) takes the first that applies:
+
+1. `AGY_LLM_GATEWAY_URL` is set: `gateway`.
+2. `GOOGLE_GENAI_USE_VERTEXAI=true`: `vertex` when a project is given (`--google-project` or `GOOGLE_CLOUD_PROJECT`), else `vertex-express` when `GOOGLE_API_KEY` is set, else `vertex`.
+3. `GEMINI_API_KEY` or `GOOGLE_API_KEY`: `api-key`.
+4. Otherwise `vertex` with Application Default Credentials. When none are found the error lists everything tried.
+
+Vertex AI (`vertex`) finds credentials in this order, through `nanocode-google-auth`:
+
+1. `GOOGLE_OAUTH_ACCESS_TOKEN`: a ready access token.
+2. `GOOGLE_APPLICATION_CREDENTIALS`: a credentials file.
+3. gcloud's `application_default_credentials.json` (`$CLOUDSDK_CONFIG`, else `~/.config/gcloud`, `%APPDATA%\gcloud` on Windows), from `gcloud auth application-default login`.
+4. The GCE/GKE metadata server (`GCE_METADATA_HOST`, else 169.254.169.254; a 3 s probe; skipped with `NO_GCE_CHECK=true`).
+5. `gcloud auth print-access-token`, as a last resort.
+
+Credential files may be `authorized_user` (refresh token grant), `service_account` (an RS256 JWT grant for the `cloud-platform` scope),
+`impersonated_service_account` (IAM Credentials `generateAccessToken`), `external_account` with a file or URL subject token
+(STS token exchange, then optional service account impersonation) or `external_account_authorized_user`. Tokens are cached
+and refreshed five minutes before they expire; concurrent requests share one refresh, and a 401 refreshes once and retries.
 
 | Variable | Use |
 | --- | --- |
-| `AGY_LLM_GATEWAY_URL`, `AGY_LLM_GATEWAY_API_KEY` | An Antigravity gateway: bearer auth, agy's gateway headers. `claude-*` models run only here |
-| `GEMINI_API_KEY` or `GOOGLE_API_KEY` | The Gemini API, sent as `x-goog-api-key` |
-| `GEMINI_BASE_URL` | Another base URL for the Gemini API |
-| `NANOCODE_ANTIGRAVITY_EXPLICIT_CACHE=1` | Turns on explicit context caching (off by default) |
+| `GOOGLE_CLOUD_PROJECT` | The project, after `--google-project`; then the credentials' `quota_project_id`, `GOOGLE_CLOUD_QUOTA_PROJECT`, a service account's `project_id`, the metadata server's project |
+| `GOOGLE_CLOUD_LOCATION` | The location, after `--google-location`; `global` otherwise |
+| `GOOGLE_CLOUD_QUOTA_PROJECT` | The `x-goog-user-project` billing project when the credentials name none |
+| `GOOGLE_VERTEX_BASE_URL` | Another base URL for `vertex` and `vertex-express` |
+| `NANOCODE_ANTIGRAVITY_EXPLICIT_CACHE=1` | Turns on explicit context caching (off by default; not available in express mode) |
 
-Embedders configure the same with `AntigravityHarness::new().endpoint(..).retry(..).explicit_cache(..)` and
+Vertex requests carry the same Gemini body as the Gemini API, serialized the same cache-stable way, without agy's
+`labels` (their values break Vertex AI's label rules). Claude models on Vertex AI are served by Anthropic's Model Garden
+publisher (`streamRawPredict` with the Messages API), which this harness does not speak, so `claude-*` under `vertex`
+fails and names the route that works: `--harness claude` with `CLAUDE_CODE_USE_VERTEX=1`, `ANTHROPIC_VERTEX_PROJECT_ID` (else
+`GOOGLE_CLOUD_PROJECT`), `CLOUD_ML_REGION` (else `GOOGLE_CLOUD_LOCATION`, then `global`) and optionally `ANTHROPIC_VERTEX_BASE_URL`.
+nanocode's Claude client then posts to `publishers/anthropic/models/{m}:streamRawPredict` with `anthropic_version: vertex-2023-10-16`
+and a bearer from the same Application Default Credentials. Vertex names some Claude models with a version suffix
+(`claude-…@20250929`); pass the name Vertex AI lists with `-m`.
+
+Antigravity and Google AI subscription sign-in are not supported.
+
+Embedders configure the same with `AntigravityHarness::new().google(GoogleConfig { .. }).endpoint(..).retry(..).explicit_cache(..)` and
 `RuntimeBuilder::harness`.
 
 ## Crates
 
 | Crate | Owns |
 | --- | --- |
-| `nanocode-backend-antigravity-client` | The Gemini wire format and its byte-exact encoder, SSE streaming, retries, explicit context caching |
+| `nanocode-backend-antigravity-client` | The Gemini wire format and its byte-exact encoder, SSE streaming, retries, explicit context caching, the Gemini API, Vertex AI and gateway routes |
+| `nanocode-google-auth` | Google Cloud access tokens from Application Default Credentials (in `crates/core`, shared with the Claude on Vertex route) |
 | `nanocode-backend-antigravity-tools` | The engine tools with agy's declarations, validation errors and output formats, background tasks and timers |
 | `nanocode-backend-antigravity` | The driver: pinned prompts, request assembly, reminders, messages, compaction, model profiles |
 

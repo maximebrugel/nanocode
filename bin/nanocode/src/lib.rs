@@ -29,6 +29,7 @@ mod split;
 mod stream;
 mod telemetry;
 mod tempo;
+mod vertex_claude;
 mod view;
 
 use std::{

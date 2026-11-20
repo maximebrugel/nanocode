@@ -47,6 +47,7 @@ pub struct Request<'a> {
     pub call: u64,
     pub max_output_tokens: u32,
     pub execution: Option<&'a str>,
+    pub labels: bool,
 }
 
 impl Request<'_> {
@@ -68,40 +69,42 @@ impl Request<'_> {
             }
         }
         let flag = |value: bool| Json::str(if value { "true" } else { "false" });
-        fields.push((
-            "labels".to_owned(),
-            Json::Object(
-                [
-                    ("cascade_id", Json::str(self.ids.cascade.clone())),
-                    ("client", Json::str("antigravity-cli")),
-                    (
-                        "goog-originating-logical-product-id",
-                        Json::str("48c6cd67-05ce-4112-a170-ad8e0c7c136c"),
-                    ),
-                    ("goog-originating-service-id", Json::str("a153-a454-6272")),
-                ]
-                .into_iter()
-                .chain(
-                    self.execution
-                        .map(|execution| ("last_execution_id", Json::str(execution))),
-                )
-                .chain([
-                    ("last_step_index", Json::str(self.step.to_string())),
-                    ("model_enum", Json::str(self.profile.model_enum)),
-                    (
-                        "request_id",
-                        Json::str(format!("{}-{}", self.ids.trajectory, self.call)),
-                    ),
-                    ("root_cascade_id", Json::str(self.ids.cascade.clone())),
-                    ("trajectory_id", Json::str(self.ids.trajectory.clone())),
-                    ("used_claude", flag(false)),
-                    ("used_claude_conservative", flag(false)),
-                    ("used_non_gemini_model", flag(!self.profile.gemini)),
-                ])
-                .map(|(key, value)| (key.to_owned(), value))
-                .collect(),
-            ),
-        ));
+        fields.extend(self.labels.then(|| {
+            (
+                "labels".to_owned(),
+                Json::Object(
+                    [
+                        ("cascade_id", Json::str(self.ids.cascade.clone())),
+                        ("client", Json::str("antigravity-cli")),
+                        (
+                            "goog-originating-logical-product-id",
+                            Json::str("48c6cd67-05ce-4112-a170-ad8e0c7c136c"),
+                        ),
+                        ("goog-originating-service-id", Json::str("a153-a454-6272")),
+                    ]
+                    .into_iter()
+                    .chain(
+                        self.execution
+                            .map(|execution| ("last_execution_id", Json::str(execution))),
+                    )
+                    .chain([
+                        ("last_step_index", Json::str(self.step.to_string())),
+                        ("model_enum", Json::str(self.profile.model_enum)),
+                        (
+                            "request_id",
+                            Json::str(format!("{}-{}", self.ids.trajectory, self.call)),
+                        ),
+                        ("root_cascade_id", Json::str(self.ids.cascade.clone())),
+                        ("trajectory_id", Json::str(self.ids.trajectory.clone())),
+                        ("used_claude", flag(false)),
+                        ("used_claude_conservative", flag(false)),
+                        ("used_non_gemini_model", flag(!self.profile.gemini)),
+                    ])
+                    .map(|(key, value)| (key.to_owned(), value))
+                    .collect(),
+                ),
+            )
+        }));
         fields.push((
             "generationConfig".to_owned(),
             self.profile.generation(self.max_output_tokens),

@@ -91,7 +91,7 @@ impl ExplicitCache {
 
     async fn refresh(&self, client: &Client, name: &str) -> bool {
         let body = Json::object([("ttl", Json::str(self.ttl()))]).encode();
-        let path = format!("/v1beta/{name}?updateMask=ttl");
+        let path = format!("{}?updateMask=ttl", client.endpoint().resource_path(name));
         if client.json(Method::PATCH, &path, &body).await.is_err() {
             return false;
         }
@@ -112,16 +112,14 @@ impl ExplicitCache {
         key: u64,
     ) -> Option<String> {
         let body = Json::object([
-            ("model", Json::str(format!("models/{model}"))),
+            ("model", Json::str(client.endpoint().cache_model(model))),
             ("systemInstruction", Json::Raw(system.to_owned())),
             ("tools", Json::Raw(tools.to_owned())),
             ("ttl", Json::str(self.ttl())),
         ])
         .encode();
-        let created = client
-            .json(Method::POST, "/v1beta/cachedContents", &body)
-            .await
-            .ok()?;
+        let collection = client.endpoint().cache_collection()?;
+        let created = client.json(Method::POST, &collection, &body).await.ok()?;
         let name = created.get("name")?.as_str()?.to_owned();
         if let Ok(mut entry) = self.entry.lock() {
             *entry = Some(Entry {

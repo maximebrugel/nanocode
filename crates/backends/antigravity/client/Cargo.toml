@@ -10,6 +10,7 @@ publish.workspace = true
 description = "Gemini generateContent wire format, SSE streaming, retries and context caching for the Antigravity backend"
 
 [dependencies]
+nanocode-google-auth.workspace = true
 nanocode-http.workspace = true
 nanocode-platform.workspace = true
 nanocode-sync.workspace = true

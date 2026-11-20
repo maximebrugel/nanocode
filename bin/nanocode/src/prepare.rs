@@ -141,6 +141,7 @@ pub(super) fn prepare<'a>(
             runner_servers: runner_configs.servers,
             tab: runner_configs.tab,
             gateway,
+            google: args.google.config(),
             clients,
             headless,
             cyber_access_program: args.cyber_access_program.map(Into::into),

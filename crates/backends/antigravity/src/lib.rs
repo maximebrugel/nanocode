@@ -12,5 +12,8 @@ mod request;
 mod search;
 
 pub use harness::{AntigravityHarness, DEFAULT_MODEL, FAMILY};
-pub use nanocode_backend_antigravity_client::{Auth, CacheConfig, Client, Endpoint, RetryPolicy};
+pub use nanocode_backend_antigravity_client::{
+    Auth, AuthMethod, CacheConfig, Client, Endpoint, GoogleAuth, GoogleConfig, RetryPolicy, Route,
+    vertex_base_url,
+};
 pub use profile::Profile;

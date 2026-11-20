@@ -3,7 +3,7 @@ use nanocode_agent_core::{
     BackendId, HarnessFamily, ModelSelection, NanocodeError, Result, Thinking,
     backend::BackendFuture,
 };
-use nanocode_backend_antigravity_client::{CacheConfig, Endpoint, RetryPolicy};
+use nanocode_backend_antigravity_client::{CacheConfig, Endpoint, GoogleConfig, RetryPolicy};
 use nanocode_durability::CheckpointFormat;
 use std::sync::Arc;
 
@@ -13,6 +13,7 @@ pub const DEFAULT_MODEL: &str = "gemini-4-neon";
 #[derive(Clone, Default)]
 pub struct AntigravityHarness {
     endpoint: Option<Endpoint>,
+    google: GoogleConfig,
     retry: Option<RetryPolicy>,
     cache: CacheConfig,
     model: Option<String>,
@@ -28,6 +29,12 @@ impl AntigravityHarness {
     #[must_use]
     pub fn endpoint(mut self, endpoint: Endpoint) -> Self {
         self.endpoint = Some(endpoint);
+        self
+    }
+
+    #[must_use]
+    pub fn google(mut self, google: GoogleConfig) -> Self {
+        self.google = google;
         self
     }
 
@@ -151,13 +158,24 @@ impl AntigravityHarness {
                 nanocode_platform::system_time()
             ))
         });
+        let sender = Client::native_sender().map_err(|error| invalid(error.to_string()))?;
         let endpoint = match self.endpoint.clone() {
             Some(endpoint) => endpoint,
-            None => Endpoint::from_env(|name| std::env::var(name).ok()).ok_or_else(|| {
-                invalid("the antigravity harness needs GEMINI_API_KEY (or GOOGLE_API_KEY), or AGY_LLM_GATEWAY_URL for a gateway".to_owned())
-            })?,
+            None => Endpoint::discover(
+                &self.google,
+                &|name: &str| std::env::var(name).ok(),
+                Arc::clone(&sender),
+            )
+            .await
+            .map_err(invalid)?,
         };
-        let mut client = Client::native(endpoint).map_err(|error| invalid(error.to_string()))?;
+        if endpoint.route.is_vertex() && model.as_str().to_ascii_lowercase().starts_with("claude") {
+            return Err(invalid(format!(
+                "{model} on Vertex AI is served by Anthropic's Model Garden publisher (streamRawPredict with the Messages API), not the Gemini generateContent API the antigravity harness speaks; run it with --harness claude and CLAUDE_CODE_USE_VERTEX=1 (ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION), which uses the same Application Default Credentials",
+                model = model.as_str()
+            )));
+        }
+        let mut client = Client::new(endpoint, sender);
         if let Some(retry) = self.retry {
             client = client.with_retry(retry);
         }

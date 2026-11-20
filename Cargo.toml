@@ -38,6 +38,7 @@ members = [
     "crates/backends/codex/client",
     "crates/core/home",
     "crates/core/http",
+    "crates/core/google-auth",
     "crates/core/bytes",
     "crates/core/zstd",
     "crates/core/digest",
@@ -149,6 +150,7 @@ nanocode-backend-claude-client = { version = "0.7.0", path = "crates/backends/cl
 nanocode-arguments = { version = "0.7.0", path = "crates/core/arguments" }
 nanocode-home = { version = "0.7.0", path = "crates/core/home" }
 nanocode-http = { version = "0.7.0", path = "crates/core/http" }
+nanocode-google-auth = { version = "0.7.0", path = "crates/core/google-auth" }
 nanocode-bytes = { version = "0.7.0", path = "crates/core/bytes" }
 nanocode-mcp = { version = "0.7.0", path = "crates/core/mcp" }
 nanocode-mcp-http = { version = "0.7.0", path = "crates/core/mcp-http" }

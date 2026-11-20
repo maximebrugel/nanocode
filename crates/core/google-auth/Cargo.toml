@@ -1,0 +1,29 @@
+[package]
+autotests = false
+autobenches = false
+name = "nanocode-google-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Google Cloud access tokens from Application Default Credentials: user, service account, impersonated and workload identity credentials, the metadata server and the gcloud CLI"
+
+[dependencies]
+nanocode-http.workspace = true
+nanocode-platform.workspace = true
+nanocode-sync.workspace = true
+nanocode-sys.workspace = true
+nanocode-url.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+graviola.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false

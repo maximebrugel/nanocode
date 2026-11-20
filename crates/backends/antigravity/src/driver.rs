@@ -187,6 +187,7 @@ impl Inner {
             call,
             max_output_tokens,
             execution: state.last_execution.as_deref(),
+            labels: !config.client.endpoint().route.is_vertex(),
         }
         .encode();
         emit(

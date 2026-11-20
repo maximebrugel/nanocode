@@ -148,6 +148,47 @@ impl GatewayArg {
     ];
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoogleAuthArg {
+    Auto,
+    ApiKey,
+    Vertex,
+    VertexExpress,
+    Gateway,
+}
+
+impl GoogleAuthArg {
+    const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::ApiKey,
+        Self::Vertex,
+        Self::VertexExpress,
+        Self::Gateway,
+    ];
+    const CHOICES: [Choice; 5] = [
+        Choice::new("auto").help(
+            "Pick the first that is configured: AGY_LLM_GATEWAY_URL, GOOGLE_GENAI_USE_VERTEXAI, GEMINI_API_KEY or GOOGLE_API_KEY, then Application Default Credentials for Vertex AI",
+        ),
+        Choice::new("api-key").help("Gemini API with GEMINI_API_KEY or GOOGLE_API_KEY"),
+        Choice::new("vertex").help(
+            "Vertex AI with Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS, gcloud auth application-default login, the metadata server or gcloud)",
+        ),
+        Choice::new("vertex-express").help("Vertex AI express mode with a GOOGLE_API_KEY express key"),
+        Choice::new("gateway").help("An Antigravity LLM gateway at AGY_LLM_GATEWAY_URL"),
+    ];
+
+    pub const fn method(self) -> Option<nanocode::antigravity::AuthMethod> {
+        use nanocode::antigravity::AuthMethod;
+        match self {
+            Self::Auto => None,
+            Self::ApiKey => Some(AuthMethod::ApiKey),
+            Self::Vertex => Some(AuthMethod::Vertex),
+            Self::VertexExpress => Some(AuthMethod::VertexExpress),
+            Self::Gateway => Some(AuthMethod::Gateway),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RunnerModeArg {
     #[default]
@@ -428,6 +469,26 @@ const GATEWAY: Group = Group::named(
     ],
 );
 
+const GOOGLE: Group = Group::named(
+    "GoogleArgs",
+    &[
+        Argument::value("google_auth", "METHOD", Parser::Choice(&GoogleAuthArg::CHOICES))
+            .long("google-auth")
+            .env("NANOCODE_GOOGLE_AUTH")
+            .help(
+                "How the antigravity harness reaches Gemini: auto (the default), api-key, vertex, vertex-express or gateway",
+            ),
+        Argument::value("google_project", "PROJECT", Parser::Text)
+            .long("google-project")
+            .help(
+                "Google Cloud project for --google-auth vertex; defaults to GOOGLE_CLOUD_PROJECT, then the credentials' quota or service account project, then the metadata server's",
+            ),
+        Argument::value("google_location", "LOCATION", Parser::Text)
+            .long("google-location")
+            .help("Vertex AI location such as us-central1; defaults to GOOGLE_CLOUD_LOCATION, then global"),
+    ],
+);
+
 const REMOTE: Group = Group::named(
     "RemoteArgs",
     &[
@@ -574,7 +635,7 @@ pub static COMMAND: arguments::Command = arguments::Command::new("nanocode")
     .long_about(
         "Interactive coding agent for Codex and Claude. Run without a subcommand to open the terminal interface; 'nc' is an alias of 'nanocode'.",
     )
-    .groups(&[SESSION, GATEWAY, REMOTE, ObservabilityOutputArgs::ARGUMENTS])
+    .groups(&[SESSION, GATEWAY, GOOGLE, REMOTE, ObservabilityOutputArgs::ARGUMENTS])
     .subcommands(&[
         arguments::Command::new("hand")
             .aliases(&[Alias::visible("runner")])
@@ -587,7 +648,7 @@ pub static COMMAND: arguments::Command = arguments::Command::new("nanocode")
             .about(
                 "Run one prompt without the terminal interface, streaming the reply to stdout and reasoning summaries and tool calls to stderr",
             )
-            .groups(&[SESSION, ATTEMPTS, ESCALATION, GATEWAY, REMOTE]),
+            .groups(&[SESSION, ATTEMPTS, ESCALATION, GATEWAY, GOOGLE, REMOTE]),
         arguments::Command::new("models").about("List models per harness with thinking levels and speed tiers"),
         arguments::Command::new("resume")
             .about("Resume a saved session; without an id, pick one interactively")
@@ -695,7 +756,43 @@ pub struct SessionArgs {
     pub min_wait_ms: Option<u64>,
     pub time_limit: Option<u64>,
     pub gateway: GatewayArgs,
+    pub google: GoogleArgs,
     pub remote: RemoteArgs,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GoogleArgs {
+    pub auth: Option<GoogleAuthArg>,
+    pub project: Option<String>,
+    pub location: Option<String>,
+}
+
+impl GoogleArgs {
+    fn from_matches(matches: &Matches) -> Self {
+        Self {
+            auth: matches
+                .choice("google_auth")
+                .map(|index| GoogleAuthArg::ALL[index]),
+            project: matches.text("google_project"),
+            location: matches.text("google_location"),
+        }
+    }
+
+    fn or(self, root: Self) -> Self {
+        Self {
+            auth: self.auth.or(root.auth),
+            project: self.project.or(root.project),
+            location: self.location.or(root.location),
+        }
+    }
+
+    pub fn config(&self) -> nanocode::antigravity::GoogleConfig {
+        nanocode::antigravity::GoogleConfig {
+            method: self.auth.and_then(GoogleAuthArg::method),
+            project: self.project.clone(),
+            location: self.location.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -765,6 +862,7 @@ impl SessionArgs {
             min_wait_ms: matches.u64("min_wait_ms"),
             time_limit: matches.u64("time_limit"),
             gateway: GatewayArgs::from_matches(matches),
+            google: GoogleArgs::from_matches(matches),
             remote: RemoteArgs::from_matches(matches),
         }
     }
@@ -849,6 +947,7 @@ impl SessionArgs {
                     false => self.gateway.identity_attestation,
                 },
             },
+            google: self.google.or(root.google),
             remote: RemoteArgs {
                 runner_connect: self.remote.runner_connect.or(root.remote.runner_connect),
                 runner_host: self.remote.runner_host.or(root.remote.runner_host),

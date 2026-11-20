@@ -34,6 +34,7 @@
 | `nanocode-machine` | `machine!`: a lifecycle declared once as states, wire names and moves, with its stored-state check and fence text |
 | `nanocode-http`, `nanocode-zstd`, `nanocode-tls` | HTTP layer contracts and retry rules, a streaming zstd decoder, cached TLS configuration |
 | `nanocode-mcp`, `nanocode-mcp-http` | The MCP client: portable session engine; native Streamable HTTP and OAuth |
+| `nanocode-google-auth` | Google Cloud access tokens from Application Default Credentials: user, service account, impersonated and workload identity credentials, the metadata server, gcloud |
 | `nanocode-schema` | JSON Schema validation for output contracts |
 | `nanocode-home` | The Nanocode home, AGENTS.md and skill discovery, shell detection, user services |
 | `nanocode-image`, `nanocode-audio` | Prompt image preparation; audio token accounting |

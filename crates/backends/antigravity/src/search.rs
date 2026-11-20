@@ -14,56 +14,60 @@ impl WebSearch for GoogleSearch {
                 Some(domain) => format!("{query} site:{domain}"),
                 None => query.to_owned(),
             };
-            let body = Json::object([
-                (
-                    "contents",
-                    Json::Array(vec![Json::object([
-                        ("role", Json::str("user")),
-                        (
-                            "parts",
-                            Json::Array(vec![Json::object([("text", Json::str(text))])]),
-                        ),
-                    ])]),
-                ),
-                (
-                    "systemInstruction",
-                    Json::object([
-                        ("role", Json::str("user")),
-                        (
-                            "parts",
-                            Json::Array(vec![Json::object([("text", Json::str(SEARCH))])]),
-                        ),
-                    ]),
-                ),
-                (
-                    "tools",
-                    Json::Array(vec![Json::object([(
-                        "googleSearch",
-                        Json::object([(
-                            "enhancedContent",
+            let body = Json::object(
+                [
+                    (
+                        "contents",
+                        Json::Array(vec![Json::object([
+                            ("role", Json::str("user")),
+                            (
+                                "parts",
+                                Json::Array(vec![Json::object([("text", Json::str(text))])]),
+                            ),
+                        ])]),
+                    ),
+                    (
+                        "systemInstruction",
+                        Json::object([
+                            ("role", Json::str("user")),
+                            (
+                                "parts",
+                                Json::Array(vec![Json::object([("text", Json::str(SEARCH))])]),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "tools",
+                        Json::Array(vec![Json::object([(
+                            "googleSearch",
                             Json::object([(
-                                "imageSearch",
-                                Json::object([("maxResultCount", Json::int(5))]),
+                                "enhancedContent",
+                                Json::object([(
+                                    "imageSearch",
+                                    Json::object([("maxResultCount", Json::int(5))]),
+                                )]),
                             )]),
-                        )]),
-                    )])]),
-                ),
-                (
-                    "labels",
-                    Json::object([
-                        ("client", Json::str("antigravity-cli")),
-                        (
-                            "goog-originating-logical-product-id",
-                            Json::str("48c6cd67-05ce-4112-a170-ad8e0c7c136c"),
-                        ),
-                        ("goog-originating-service-id", Json::str("a153-a454-6272")),
-                    ]),
-                ),
-                (
-                    "generationConfig",
-                    Json::object([("candidateCount", Json::int(1))]),
-                ),
-            ])
+                        )])]),
+                    ),
+                    (
+                        "labels",
+                        Json::object([
+                            ("client", Json::str("antigravity-cli")),
+                            (
+                                "goog-originating-logical-product-id",
+                                Json::str("48c6cd67-05ce-4112-a170-ad8e0c7c136c"),
+                            ),
+                            ("goog-originating-service-id", Json::str("a153-a454-6272")),
+                        ]),
+                    ),
+                    (
+                        "generationConfig",
+                        Json::object([("candidateCount", Json::int(1))]),
+                    ),
+                ]
+                .into_iter()
+                .filter(|(key, _)| *key != "labels" || !self.client.endpoint().route.is_vertex()),
+            )
             .encode();
             let reply = self
                 .client

@@ -232,6 +232,7 @@ dependencies = [
 name = "nanocode-backend-antigravity-client"
 version = "0.7.0"
 dependencies = [
+ "nanocode-google-auth",
  "nanocode-http",
  "nanocode-platform",
  "nanocode-sync",
@@ -600,6 +601,19 @@ version = "0.7.0"
 [[package]]
 name = "nanocode-gif"
 version = "0.7.0"
+
+[[package]]
+name = "nanocode-google-auth"
+version = "0.7.0"
+dependencies = [
+ "graviola",
+ "nanocode-http",
+ "nanocode-platform",
+ "nanocode-sync",
+ "nanocode-sys",
+ "nanocode-url",
+ "serde_json",
+]
 
 [[package]]
 name = "nanocode-hands"

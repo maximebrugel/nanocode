@@ -90,8 +90,14 @@ impl DurableAgentExt for ClaudeBuilder {
             .abandon_stale_kinds(MAINTENANCE_KINDS)
             .await
             .map_err(agent_error)?;
-        let preloaded =
-            state.take_checkpoint_preload(checkpoint.as_ref().map_or("", EncodedPayload::key));
+        let preloaded = state
+            .take_checkpoint_preload_hydrated(checkpoint.as_ref().map_or("", EncodedPayload::key))
+            .map(|(preloaded, _, hydrated)| {
+                let stored = hydrated
+                    .and_then(nanocode_durability::Hydrated::take::<format::HydratedConversation>)
+                    .map(Into::into);
+                (preloaded, stored)
+            });
         let record = state.record().await.map_err(agent_error)?;
         let branches = Branches {
             store: state.shared_store(),
@@ -116,16 +122,20 @@ impl DurableAgentExt for ClaudeBuilder {
         } else {
             builder
         };
+        let mut stored_pages = None;
         let checkpoint = match (checkpoint, preloaded) {
-            (Some(_), Some(preloaded)) => Some(
-                hydrate(PayloadReader::from(&owner), preloaded)
-                    .instrument(nanocode_trace::info_span!(
-                        target: "nanocode",
-                        "claude.open.hydrate",
-                        preloaded = true
-                    ))
-                    .await?,
-            ),
+            (Some(_), Some((preloaded, stored))) => {
+                stored_pages = stored;
+                Some(
+                    hydrate(PayloadReader::from(&owner), preloaded)
+                        .instrument(nanocode_trace::info_span!(
+                            target: "nanocode",
+                            "claude.open.hydrate",
+                            preloaded = true
+                        ))
+                        .await?,
+                )
+            }
             (Some(value), None) => {
                 let span = nanocode_trace::info_span!(
                     target: "nanocode",
@@ -133,11 +143,13 @@ impl DurableAgentExt for ClaudeBuilder {
                     preloaded = false
                 );
                 let decoded = span.in_scope(|| value.decode()).map_err(agent_error)?;
-                Some(
-                    hydrate(PayloadReader::from(&owner), decoded)
+                let (hydrated, stored) =
+                    format::hydrate_stored(PayloadReader::from(&owner), decoded)
                         .instrument(span)
-                        .await?,
-                )
+                        .await
+                        .map_err(agent_error)?;
+                stored_pages = stored;
+                Some(hydrated)
             }
             (None, _) => {
                 let imported = builder.configured_checkpoint()?;
@@ -159,17 +171,20 @@ impl DurableAgentExt for ClaudeBuilder {
         };
         let _decode =
             nanocode_trace::info_span!(target: "nanocode", "claude.open.decode").entered();
-        builder.child_journal(journal).execution_policy(
-            Arc::new(ClaudeExecution {
-                state_id,
-                owner,
-                session: state,
-                branches,
-                hydrated: nanocode_sync::Slot::default(),
-                hydrating: nanocode_sync::Sequencer::new(),
-            }),
-            checkpoint,
-        )
+        builder
+            .child_journal(journal)
+            .stored_pages(stored_pages)
+            .execution_policy(
+                Arc::new(ClaudeExecution {
+                    state_id,
+                    owner,
+                    session: state,
+                    branches,
+                    hydrated: nanocode_sync::Slot::default(),
+                    hydrating: nanocode_sync::Sequencer::new(),
+                }),
+                checkpoint,
+            )
     }
 }
 

@@ -60,10 +60,28 @@ struct AdmittedBase {
 }
 
 #[derive(Clone, Default)]
-struct HydratedConversation {
+pub(super) struct HydratedConversation {
     messages: Vec<EncodedPayload>,
     code_calls: Option<Vec<EncodedPayload>>,
     compacted: Option<Vec<EncodedPayload>>,
+}
+
+impl From<HydratedConversation> for crate::agent::StoredPages {
+    fn from(hydrated: HydratedConversation) -> Self {
+        Self {
+            messages: hydrated.messages,
+            code_calls: hydrated.code_calls,
+            compacted: hydrated.compacted,
+        }
+    }
+}
+
+pub(super) async fn hydrate_stored(
+    reader: PayloadReader<'_>,
+    stored: Value,
+) -> Result<(Value, Option<crate::agent::StoredPages>)> {
+    let (value, hydrated, _) = advance_snapshot(reader, stored, &mut HashSet::new(), None).await?;
+    Ok((value, hydrated.map(Into::into)))
 }
 
 #[derive(Default)]
@@ -365,12 +383,39 @@ pub(super) async fn hydrate_cursor(reader: PayloadReader<'_>, stored: Value) -> 
     let prompt: serde_json::Map<String, Value> =
         reader.load_payload(paged.template).await?.decode()?;
     let mut cursor = paged.cursor;
-    conversation
-        .restore(reader, object(&mut cursor, "/snapshot/conversation")?, read)
+    let stored = conversation
+        .advance(
+            reader,
+            object(&mut cursor, "/snapshot/conversation")?,
+            read,
+            None,
+            &mut Reuse::default(),
+        )
         .await?;
     insert(&mut cursor, "", "pending", pending)?;
+    object(&mut cursor, "")?.insert("stored_pages".into(), stored_keys(stored));
     object(&mut cursor, "/template")?.extend(prompt);
     Ok(cursor)
+}
+
+fn stored_keys(stored: HydratedConversation) -> Value {
+    let keys = |payloads: Vec<EncodedPayload>| {
+        Value::Array(
+            payloads
+                .iter()
+                .map(|payload| Value::String(payload.key().to_owned()))
+                .collect(),
+        )
+    };
+    let mut object = serde_json::Map::new();
+    object.insert("messages".into(), keys(stored.messages));
+    if let Some(code_calls) = stored.code_calls {
+        object.insert("code_calls".into(), keys(code_calls));
+    }
+    if let Some(compacted) = stored.compacted {
+        object.insert("compacted".into(), keys(compacted));
+    }
+    Value::Object(object)
 }
 
 async fn record(reader: PayloadReader<'_>, key: &str) -> Result<Value> {

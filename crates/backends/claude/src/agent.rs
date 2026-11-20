@@ -42,6 +42,7 @@ mod turn;
 #[cfg(not(target_family = "wasm"))]
 mod web;
 use crate::execution::{Admission, ClaudeExecutionPolicy, Step};
+pub(crate) use durable::StoredPages;
 pub use durable::{
     ClaudeCheckpointView, checkpoint_thinking, decode_checkpoint, decode_session_checkpoint,
     rewind_checkpoint, session_checkpoint,
@@ -923,6 +924,7 @@ pub struct ClaudeBuilder {
     code_only: bool,
     policy: Option<Arc<dyn ClaudeExecutionPolicy>>,
     restored: Option<Snapshot>,
+    stored_pages: Option<StoredPages>,
     lineage: Option<Lineage>,
     conversation_id: Option<String>,
     system_context: Option<(String, Option<String>)>,
@@ -1033,6 +1035,7 @@ impl ClaudeBuilder {
             code_only: false,
             policy: None,
             restored: None,
+            stored_pages: None,
             lineage: None,
             conversation_id: None,
             system_context: None,
@@ -1062,6 +1065,11 @@ impl ClaudeBuilder {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))
+    }
+
+    pub(crate) fn stored_pages(mut self, pages: Option<StoredPages>) -> Self {
+        self.stored_pages = pages;
+        self
     }
 
     pub fn execution_policy(

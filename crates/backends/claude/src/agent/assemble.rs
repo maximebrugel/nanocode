@@ -391,6 +391,14 @@ pub(super) fn build(mut builder: ClaudeBuilder) -> Result<(Agent, AgentEvents)> 
     let restore_span =
         nanocode_trace::info_span!(target: "nanocode", "claude.build.restore").entered();
     let mut restored = builder.restored.unwrap_or_default();
+    let paging = Slot::default();
+    if let Some(stored) = builder
+        .stored_pages
+        .take()
+        .and_then(|stored| durable::Paging::stored(&restored.conversation, stored))
+    {
+        paging.put(stored);
+    }
     restored
         .developer_notices
         .extend(std::mem::take(&mut builder.initial_developer_notices));
@@ -596,7 +604,7 @@ pub(super) fn build(mut builder: ClaudeBuilder) -> Result<(Agent, AgentEvents)> 
         developer_notices: Atom::new(restored.developer_notices),
         persistence_update: Sequencer::new(),
         persistence_ready: Notify::new(),
-        paging: Slot::default(),
+        paging,
         conversation: Owned::new(restored.conversation),
         round_boundary: Atom::new(round_boundary),
         side_view: Atom::default(),

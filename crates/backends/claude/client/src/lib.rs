@@ -1072,6 +1072,25 @@ impl MessageLayout {
 }
 
 #[doc(hidden)]
+pub enum Encoded<'a> {
+    Borrowed(&'a str),
+    Shared(Arc<str>),
+    Owned(String),
+}
+
+impl std::ops::Deref for Encoded<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Borrowed(json) => json,
+            Self::Shared(json) => json,
+            Self::Owned(json) => json,
+        }
+    }
+}
+
+#[doc(hidden)]
 pub trait WireMessage {
     fn message(&self) -> &Message;
 
@@ -1083,8 +1102,8 @@ pub trait WireMessage {
         &'a self,
         _subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<std::borrow::Cow<'a, str>, ClaudeError> {
-        encode(self.message()).map(std::borrow::Cow::Owned)
+    ) -> Result<Encoded<'a>, ClaudeError> {
+        encode(self.message()).map(Encoded::Owned)
     }
 
     fn digests(
@@ -1147,7 +1166,7 @@ impl<T: WireMessage + ?Sized> WireMessage for &T {
         &'a self,
         subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<std::borrow::Cow<'a, str>, ClaudeError> {
+    ) -> Result<Encoded<'a>, ClaudeError> {
         (**self).encoded(subscription, encode)
     }
 
@@ -3571,13 +3590,18 @@ fn api_body<M: WireMessage>(
     let reused = kept.as_ref().map_or(0, |(_, ends)| shared.min(ends.len()));
     let encoded = messages[reused..]
         .iter()
-        .map(|message| message.encoded(false, &encode))
+        .map(|message| {
+            message.encoded(false, &encode).map(|json| match json {
+                Encoded::Owned(json) => Err(json.len()),
+                kept => Ok(kept),
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let added = tail.iter().map(|part| part.len()).sum::<usize>()
         + "],".len()
         + encoded
             .iter()
-            .map(|message| message.len() + 1)
+            .map(|json| json.as_ref().map_or_else(|len| *len, |json| json.len()) + 1)
             .sum::<usize>();
     let (mut body, mut ends) = match kept {
         Some((mut body, mut ends)) => {
@@ -3599,11 +3623,14 @@ fn api_body<M: WireMessage>(
         messages[known..].iter().map(WireMessage::wire_id),
         fresh,
     );
-    for message in &encoded {
+    for (message, json) in messages[reused..].iter().zip(&encoded) {
         if !ends.is_empty() {
             body.push(',');
         }
-        body.push_str(message);
+        match json {
+            Ok(json) => body.push_str(json),
+            Err(_) => body.push_str(&message.encoded(false, &encode)?),
+        }
         ends.push(body.len());
     }
     let end = body.len();

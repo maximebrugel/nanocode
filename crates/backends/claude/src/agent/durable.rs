@@ -139,6 +139,8 @@ impl Snapshot {
 pub(super) struct Cursor {
     #[serde(skip)]
     pub(super) recovered_code_index: Option<u32>,
+    #[serde(default, skip_serializing)]
+    stored_pages: Option<StoredKeys>,
     pub(super) snapshot: Snapshot,
     pub(super) template: MessagesRequest,
     #[serde(default)]
@@ -201,6 +203,7 @@ impl Cursor {
     }
     pub(super) fn effect<'a>(&'a self, state: &'a State, step: &str) -> Option<Effect<'a>> {
         Some(Effect {
+            state,
             policy: state.policy.as_deref()?,
             operation: self.operation.as_deref()?,
             step: step.to_owned(),
@@ -213,6 +216,7 @@ impl Cursor {
     }
 }
 pub(super) struct Effect<'a> {
+    state: &'a State,
     policy: &'a dyn ClaudeExecutionPolicy,
     operation: &'a str,
     step: String,
@@ -225,6 +229,7 @@ impl Effect<'_> {
 
     pub(super) fn scoped(&self, scope: &str) -> Self {
         Effect {
+            state: self.state,
             policy: self.policy,
             operation: self.operation,
             step: format!("{scope}-{}", self.step),
@@ -266,10 +271,19 @@ impl Effect<'_> {
         self.admit(writes, request).await
     }
     async fn admit(&self, writes: Vec<JournalWrite>, request: BeginRequest<'_>) -> Result<Step> {
-        self.policy
+        let released = matches!(
+            request.recovery,
+            nanocode_durability::StepRecovery::AtMostOnce
+        ) && advances(&writes);
+        let admitted = self
+            .policy
             .commit_writes(self.operation.to_owned(), writes, Some(request))
             .await?
-            .ok_or_else(|| recovery_error("the Claude step admission returned no outcome"))
+            .ok_or_else(|| recovery_error("the Claude step admission returned no outcome"))?;
+        if released {
+            self.state.committed();
+        }
+        Ok(admitted)
     }
     pub(super) async fn complete(&self, output: Value) -> Result<()> {
         self.policy
@@ -334,6 +348,12 @@ impl Effect<'_> {
             Some(recorded),
         ))
     }
+}
+
+fn advances(writes: &[JournalWrite]) -> bool {
+    writes
+        .iter()
+        .any(|write| matches!(write, JournalWrite::Advance(_)))
 }
 
 pub(super) struct Recorded {
@@ -524,9 +544,16 @@ impl State {
                 return Err(recovery_error("invalid Claude execution continuation"));
             }
 
+            let stored = cursor.stored_pages.take();
             self.restore_snapshot(conversation, std::mem::take(&mut cursor.snapshot))
                 .await
                 .map_err(recovery_error)?;
+            if let Some(paging) =
+                stored.and_then(|stored| Paging::stored(conversation, StoredPages::from(stored)))
+            {
+                self.paging.take();
+                self.paging.put(paging);
+            }
             self.merge_developer_notices(
                 policy.as_ref(),
                 operation,
@@ -582,6 +609,7 @@ impl State {
         #[cfg_attr(target_family = "wasm", allow(unused_mut))]
         let mut cursor = Cursor {
             recovered_code_index: None,
+            stored_pages: None,
             lifecycle_turn_id: candidate_id("lifecycle"),
             stop_hook_active: false,
             finish_checked: false,
@@ -757,11 +785,10 @@ impl State {
         if writes.is_empty() {
             return Ok(());
         }
-        let advanced = writes
-            .iter()
-            .any(|write| matches!(write, JournalWrite::Advance(_)));
+        let advanced = advances(&writes);
         policy.commit_writes(operation, writes, None).await?;
         if advanced {
+            self.committed();
             self.persistence_ready.notify_waiters();
         }
         Ok(())
@@ -817,7 +844,9 @@ impl State {
         let settled = policy
             .settle_encoded(operation.clone(), checkpoint, settlement)
             .await;
-        if settled.is_err() {
+        if settled.is_ok() {
+            self.committed();
+        } else {
             self.life.stop();
         }
         if let Some(turn) = self.steering.acquire().await.get_mut(&request.key) {
@@ -1055,6 +1084,12 @@ impl State {
             );
         }
         Ok((result, deferred))
+    }
+    fn committed(&self) {
+        if let Some(mut paging) = self.paging.take() {
+            paging.committed();
+            self.paging.put(paging);
+        }
     }
     pub(super) async fn policy_writes(
         &self,
@@ -1306,6 +1341,7 @@ struct TemplatePrompt<'a> {
 pub(super) trait Paged: Clone {
     fn same(&self, other: &Self) -> bool;
     fn record(&self) -> serde_json::Result<EncodedPayload>;
+    fn committed(&self) {}
 }
 
 impl Paged for HistoryMessage {
@@ -1315,6 +1351,10 @@ impl Paged for HistoryMessage {
 
     fn record(&self) -> serde_json::Result<EncodedPayload> {
         Self::record(self)
+    }
+
+    fn committed(&self) {
+        Self::committed(self);
     }
 }
 
@@ -1331,6 +1371,7 @@ impl Paged for history::CodeRound {
 pub(super) struct Pages<T> {
     items: Vec<T>,
     log: SequenceLog,
+    released: usize,
 }
 
 impl<T> Default for Pages<T> {
@@ -1338,6 +1379,7 @@ impl<T> Default for Pages<T> {
         Self {
             items: Vec::new(),
             log: SequenceLog::default(),
+            released: 0,
         }
     }
 }
@@ -1368,9 +1410,103 @@ impl<T: Paged> Pages<T> {
             )
             .map_err(provider_error)?;
         self.items.truncate(unchanged);
+        self.released = self.released.min(unchanged);
         self.items.extend_from_slice(&items[unchanged..]);
         records.extend(self.log.frontier().cloned());
         Ok(self.log.sequence())
+    }
+
+    fn stored(items: &[T], keys: Vec<EncodedPayload>) -> Option<Self> {
+        if items.len() != keys.len() {
+            return None;
+        }
+        let mut log = SequenceLog::default();
+        for key in &keys {
+            log.push(key.reference()).ok()?;
+        }
+        log.release();
+        Some(Self {
+            items: items.to_vec(),
+            log,
+            released: items.len(),
+        })
+    }
+
+    fn adopt(&mut self, from: &Self, items: &[T]) {
+        let shared = from
+            .items
+            .iter()
+            .zip(items)
+            .take_while(|(kept, item)| kept.same(item))
+            .count()
+            .min(from.log.len());
+        if shared <= self.unchanged(items) {
+            return;
+        }
+        let mut log = from.log.clone();
+        log.truncate(shared);
+        log.release();
+        self.items = items[..shared].to_vec();
+        self.log = log;
+        self.released = shared;
+    }
+
+    fn committed(&mut self) {
+        self.items[self.released..].iter().for_each(T::committed);
+        self.log.release();
+        self.released = self.items.len();
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredKeys {
+    messages: Vec<String>,
+    #[serde(default)]
+    code_calls: Option<Vec<String>>,
+    #[serde(default)]
+    compacted: Option<Vec<String>>,
+}
+
+impl From<StoredKeys> for StoredPages {
+    fn from(keys: StoredKeys) -> Self {
+        let payloads =
+            |keys: Vec<String>| keys.iter().map(|key| EncodedPayload::by_key(key)).collect();
+        Self {
+            messages: payloads(keys.messages),
+            code_calls: keys.code_calls.map(payloads),
+            compacted: keys.compacted.map(payloads),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StoredPages {
+    pub(crate) messages: Vec<EncodedPayload>,
+    pub(crate) code_calls: Option<Vec<EncodedPayload>>,
+    pub(crate) compacted: Option<Vec<EncodedPayload>>,
+}
+
+impl Paging {
+    pub(super) fn stored(conversation: &Conversation, stored: StoredPages) -> Option<Self> {
+        let mut paging = Self {
+            messages: Pages::stored(&conversation.messages, stored.messages)?,
+            ..Self::default()
+        };
+        if let Some(code_calls) = stored.code_calls {
+            paging.code_calls = Pages::stored(&conversation.code_calls, code_calls)?;
+        }
+        if let Some(compacted) = stored.compacted {
+            paging.compacted = Pages::stored(&conversation.compacted, compacted)?;
+        }
+        Some(paging)
+    }
+
+    fn committed(&mut self) {
+        self.messages.committed();
+        self.code_calls.committed();
+        self.compacted.committed();
+        self.pending.committed();
     }
 }
 
@@ -1432,12 +1568,7 @@ fn encode_snapshot(
     paging: &mut Paging,
 ) -> Result<EncodedState> {
     if !paged {
-        return snapshot
-            .conversation
-            .messages
-            .iter()
-            .try_for_each(HistoryMessage::cache_json)
-            .and_then(|()| serde_json::value::to_raw_value(&*snapshot))
+        return serde_json::value::to_raw_value(&*snapshot)
             .map(|json| EncodedState {
                 json,
                 records: Vec::new(),
@@ -1510,6 +1641,7 @@ fn paged_cursor(
 ) -> Result<EncodedState> {
     let mut records = Vec::new();
     let conversation = detached.page(&mut records, paging, false)?;
+    paging.pending.adopt(&paging.messages, pending);
     let unchanged = paging.pending.unchanged(pending);
     let pending = paging.pending.page(pending, unchanged, &mut records)?;
     let template = template_record(prompt, paging)?;
@@ -1557,14 +1689,7 @@ fn encode_cursor(cursor: &mut Cursor, paged: bool, paging: &mut Paging) -> Resul
     let pending = std::mem::take(&mut cursor.pending);
     cursor.pending = pending[base.map_or(0, |_| shared)..].to_vec();
     cursor.pending_base = base;
-    let encoded = cursor
-        .snapshot
-        .conversation
-        .messages
-        .iter()
-        .chain(&cursor.pending)
-        .try_for_each(HistoryMessage::cache_json)
-        .and_then(|()| serde_json::value::to_raw_value(&*cursor));
+    let encoded = serde_json::value::to_raw_value(&*cursor);
     cursor.pending = pending;
     cursor.pending_base = None;
     encoded

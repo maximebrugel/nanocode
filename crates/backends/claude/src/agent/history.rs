@@ -1,9 +1,9 @@
-use crate::{ClaudeError, ContentBlock, Message, MessageDigests, WireMessage};
+use crate::{ClaudeError, ContentBlock, Encoded, Message, MessageDigests, WireMessage};
 use nanocode_durability::EncodedPayload;
+use nanocode_sync::Atom;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 use std::{
-    borrow::Cow,
     ops::Deref,
     sync::{
         Arc, OnceLock,
@@ -20,14 +20,29 @@ fn wire_id() -> u64 {
     WIRE_IDS.fetch_add(1, Ordering::Relaxed)
 }
 
+#[derive(Clone)]
+struct Kept {
+    json: Arc<str>,
+    record: EncodedPayload,
+}
+
+impl Kept {
+    fn encode(message: &Message) -> serde_json::Result<Self> {
+        let json = Arc::<str>::from(serde_json::to_string(message)?);
+        Ok(Self {
+            record: EncodedPayload::from_json(Arc::clone(&json)),
+            json,
+        })
+    }
+}
+
 struct Entry {
     message: Message,
     wire: OnceLock<Box<str>>,
-    json: OnceLock<Arc<str>>,
     digests: OnceLock<MessageDigests>,
     images: OnceLock<usize>,
     companions: OnceLock<bool>,
-    record: OnceLock<EncodedPayload>,
+    record: Atom<Option<Kept>>,
     results: OnceLock<Box<[(usize, u64)]>>,
     cleared: OnceLock<HistoryMessage>,
 }
@@ -37,11 +52,10 @@ impl Clone for Entry {
         Self {
             message: self.message.clone(),
             wire: OnceLock::new(),
-            json: OnceLock::new(),
             digests: OnceLock::new(),
             images: OnceLock::new(),
             companions: OnceLock::new(),
-            record: OnceLock::new(),
+            record: Atom::new(None),
             results: OnceLock::new(),
             cleared: OnceLock::new(),
         }
@@ -53,11 +67,10 @@ impl HistoryMessage {
         self.1 = wire_id();
         let entry = Arc::make_mut(&mut self.0);
         entry.wire = OnceLock::new();
-        entry.json = OnceLock::new();
         entry.digests = OnceLock::new();
         entry.images = OnceLock::new();
         entry.companions = OnceLock::new();
-        entry.record = OnceLock::new();
+        entry.record = Atom::new(None);
         entry.results = OnceLock::new();
         entry.cleared = OnceLock::new();
         &mut entry.message
@@ -110,40 +123,31 @@ impl HistoryMessage {
     }
 
     pub(super) fn recorded(message: Message, json: Arc<str>, record: EncodedPayload) -> Self {
-        Self(
-            Arc::new(Entry {
-                message,
-                wire: OnceLock::new(),
-                json: OnceLock::from(json),
-                digests: OnceLock::new(),
-                images: OnceLock::new(),
-                companions: OnceLock::new(),
-                record: OnceLock::from(record),
-                results: OnceLock::new(),
-                cleared: OnceLock::new(),
-            }),
-            wire_id(),
-        )
+        let recorded = Self::from(message);
+        recorded.0.record.set(Some(Kept { json, record }));
+        recorded
     }
 
-    pub(super) fn cache_json(&self) -> serde_json::Result<()> {
-        self.json().map(drop)
-    }
-
-    pub(super) fn json(&self) -> serde_json::Result<&Arc<str>> {
-        if let Some(json) = self.0.json.get() {
-            return Ok(json);
+    pub(super) fn with_json<R>(&self, read: impl FnOnce(&str) -> R) -> serde_json::Result<R> {
+        match &*self.0.record.get() {
+            Some(kept) => Ok(read(&kept.json)),
+            None => Ok(read(&serde_json::to_string(&self.0.message)?)),
         }
-        let encoded = Arc::from(serde_json::to_string(&self.0.message)?);
-        Ok(self.0.json.get_or_init(|| encoded))
     }
 
     pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
-        if let Some(record) = self.0.record.get() {
-            return Ok(record.clone());
+        if let Some(kept) = &*self.0.record.get() {
+            return Ok(kept.record.clone());
         }
-        let record = EncodedPayload::from_json(Arc::clone(self.json()?));
-        Ok(self.0.record.get_or_init(|| record).clone())
+        let encoded = Kept::encode(&self.0.message)?;
+        Ok(self
+            .0
+            .record
+            .update(|kept| kept.get_or_insert_with(|| encoded.clone()).record.clone()))
+    }
+
+    pub(super) fn committed(&self) {
+        self.0.record.set(None);
     }
 }
 
@@ -153,11 +157,10 @@ impl From<Message> for HistoryMessage {
             Arc::new(Entry {
                 message,
                 wire: OnceLock::new(),
-                json: OnceLock::new(),
                 digests: OnceLock::new(),
                 images: OnceLock::new(),
                 companions: OnceLock::new(),
-                record: OnceLock::new(),
+                record: Atom::new(None),
                 results: OnceLock::new(),
                 cleared: OnceLock::new(),
             }),
@@ -182,8 +185,8 @@ impl PartialEq for HistoryMessage {
 
 impl Serialize for HistoryMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.0.json.get() {
-            Some(json) => serde_json::from_str::<&RawValue>(json)
+        match &*self.0.record.get() {
+            Some(kept) => serde_json::from_str::<&RawValue>(&kept.json)
                 .map_err(serde::ser::Error::custom)?
                 .serialize(serializer),
             None => self.0.message.serialize(serializer),
@@ -210,7 +213,7 @@ impl WireMessage for HistoryMessage {
         &'a self,
         subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<Cow<'a, str>, ClaudeError> {
+    ) -> Result<Encoded<'a>, ClaudeError> {
         if subscription {
             let wire = match self.0.wire.get() {
                 Some(wire) => wire,
@@ -219,16 +222,12 @@ impl WireMessage for HistoryMessage {
                     self.0.wire.get_or_init(|| encoded)
                 }
             };
-            return Ok(Cow::Borrowed(wire));
+            return Ok(Encoded::Borrowed(wire));
         }
-        let json = match self.0.json.get() {
-            Some(json) => json,
-            None => {
-                let encoded = Arc::from(encode(&self.0.message)?);
-                self.0.json.get_or_init(|| encoded)
-            }
-        };
-        Ok(Cow::Borrowed(json))
+        match &*self.0.record.get() {
+            Some(kept) => Ok(Encoded::Shared(Arc::clone(&kept.json))),
+            None => encode(&self.0.message).map(Encoded::Owned),
+        }
     }
 
     fn digests(

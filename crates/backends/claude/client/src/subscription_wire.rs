@@ -393,7 +393,7 @@ pub(crate) fn wire<M: WireMessage>(
         .enumerate()
         .map(|(index, message)| match &patched {
             Some((at, patched)) if *at == index => {
-                encode_message(patched).map(std::borrow::Cow::Owned)
+                encode_message(patched).map(crate::Encoded::Owned)
             }
             _ => message.encoded(true, &encode_message),
         })

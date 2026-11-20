@@ -1173,8 +1173,7 @@ pub(super) fn run_rounds<'a>(
                         pending
                             .last()
                             .expect("tool result was appended")
-                            .json()
-                            .map(|text| estimate_text_tokens(text))
+                            .with_json(estimate_text_tokens)
                             .unwrap_or(0),
                     );
 

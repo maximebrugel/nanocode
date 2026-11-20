@@ -366,7 +366,7 @@ impl ExecutionPolicy for DurableExecution {
                 .admit_typed::<_, context::Snapshot, Value>(operation_id, &input)
                 .await
                 .map_err(agent_error)?;
-            map_admission(owner, admission).await
+            map_admission(owner, &self.continuation_cache, admission).await
         })
     }
 
@@ -386,7 +386,10 @@ impl ExecutionPolicy for DurableExecution {
                 .await
                 .map_err(agent_error)?;
             let (operation_id, admission) = admission.into_parts();
-            Ok((operation_id, map_admission(&self.owner, admission).await?))
+            Ok((
+                operation_id,
+                map_admission(&self.owner, &self.continuation_cache, admission).await?,
+            ))
         })
     }
 
@@ -1370,6 +1373,7 @@ impl ExecutionPolicy for LazyExecution {
 
 async fn map_admission(
     owner: &DurableOwner,
+    cache: &Slot<context::ContinuationCache>,
     admission: Admission<context::Snapshot, Value>,
 ) -> AgentResult<ExecutionAdmission> {
     Ok(match admission {
@@ -1378,11 +1382,7 @@ async fn map_admission(
         // None: the durable head, which the live committed session holds.
         Admission::Completed { checkpoint, output } => ExecutionAdmission::Completed {
             snapshot: match checkpoint {
-                Some(checkpoint) => Some(
-                    context::restore_snapshot(owner.into(), checkpoint)
-                        .await
-                        .map_err(agent_error)?,
-                ),
+                Some(checkpoint) => Some(restore_cached(owner, cache, checkpoint).await?),
                 None => None,
             },
             output: context::restore_output(owner.into(), output)
@@ -1390,13 +1390,22 @@ async fn map_admission(
                 .map_err(agent_error)?,
         },
         Admission::Failed { checkpoint, error } => ExecutionAdmission::Failed {
-            snapshot: context::restore_snapshot(owner.into(), checkpoint)
-                .await
-                .map_err(agent_error)?,
+            snapshot: restore_cached(owner, cache, checkpoint).await?,
             error,
         },
         Admission::Cancelled => ExecutionAdmission::Cancelled,
     })
+}
+
+async fn restore_cached(
+    owner: &DurableOwner,
+    cache: &Slot<context::ContinuationCache>,
+    checkpoint: context::Snapshot,
+) -> AgentResult<SessionSnapshot> {
+    let mut kept = cache.take().unwrap_or_default();
+    let restored = context::restore_cached_snapshot(owner.into(), checkpoint, &mut kept).await;
+    drop(cache.put(kept));
+    restored.map_err(agent_error)
 }
 
 fn raw(json: String) -> AgentResult<Box<RawValue>> {

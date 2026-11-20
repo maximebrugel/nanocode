@@ -244,14 +244,47 @@ pub(crate) async fn advance_snapshot(
     saved: Snapshot,
     previous: HydratedSnapshot,
 ) -> Result<AdvancedSnapshot> {
-    let mut keys = HashSet::new();
-    let references = sequence_references(reader, saved.history, &mut keys).await?;
+    let keys = HashSet::new();
     let HydratedSnapshot {
         snapshot,
-        history: mut log,
+        history: log,
         prefix: previous_prefix_references,
     } = previous;
     let (_, previous_history, previous_prefix) = snapshot.into_context_parts();
+    advance_parts(
+        reader,
+        saved,
+        Earlier {
+            history: previous_history,
+            log,
+            prefix: previous_prefix,
+            prefix_references: previous_prefix_references,
+        },
+        keys,
+    )
+    .await
+}
+
+struct Earlier {
+    history: ResponseHistory,
+    log: SequenceLog,
+    prefix: Option<Arc<[ResponseItem]>>,
+    prefix_references: Option<Vec<EncodedPayload>>,
+}
+
+async fn advance_parts(
+    reader: PayloadReader<'_>,
+    saved: Snapshot,
+    earlier: Earlier,
+    mut keys: HashSet<String>,
+) -> Result<AdvancedSnapshot> {
+    let references = sequence_references(reader, saved.history, &mut keys).await?;
+    let Earlier {
+        history: previous_history,
+        mut log,
+        prefix: previous_prefix,
+        prefix_references: previous_prefix_references,
+    } = earlier;
     let reused = log
         .items()
         .iter()
@@ -511,6 +544,27 @@ pub(crate) async fn restore_snapshot(
     load_snapshot_with_keys(reader, saved)
         .await
         .map(|(snapshot, _)| snapshot)
+}
+
+pub(crate) async fn restore_cached_snapshot(
+    reader: PayloadReader<'_>,
+    saved: Snapshot,
+    cache: &mut ContinuationCache,
+) -> Result<SessionSnapshot> {
+    let prefix_references = (!cache.prefix.is_empty()
+        && cache.prefix_log.len() == cache.prefix.len())
+    .then(|| cache.prefix_log.items().to_vec());
+    let earlier = Earlier {
+        history: std::mem::take(&mut cache.history),
+        log: std::mem::take(&mut cache.history_log),
+        prefix: prefix_references.as_ref().map(|_| Arc::clone(&cache.prefix)),
+        prefix_references,
+    };
+    let advanced = advance_parts(reader, saved, earlier, HashSet::new()).await?;
+    let snapshot = advanced.hydrated.snapshot;
+    cache.history = snapshot.shared_history().clone();
+    cache.history_log = advanced.hydrated.history;
+    Ok(snapshot)
 }
 
 pub(crate) fn preloaded_snapshot(

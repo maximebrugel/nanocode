@@ -103,7 +103,7 @@ impl Snapshot {
                 .filter(|message| !message.is_effort_update())
                 .map(|message| {
                     ResponseItem::message(
-                        match message.role {
+                        match message.role() {
                             Role::User => MessageRole::User,
                             Role::Assistant => MessageRole::Assistant,
                             Role::System => MessageRole::Developer,
@@ -1244,11 +1244,19 @@ impl ToolIds {
         }
     }
 
-    fn tool_uses(message: &HistoryMessage) -> impl Iterator<Item = &str> {
-        message.content.iter().filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
+    fn tool_uses(message: &HistoryMessage) -> Vec<String> {
+        if message.role() != Role::Assistant || !message.mentions("tool_use") {
+            return Vec::new();
+        }
+        message
+            .view()
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn unlisted(&mut self, id: &str, admitted: &history::AdmittedIds) {
@@ -1267,7 +1275,8 @@ impl ToolIds {
     }
 
     fn list_message(&mut self, message: &HistoryMessage, admitted: &history::AdmittedIds) {
-        for id in Self::tool_uses(message) {
+        for id in &Self::tool_uses(message) {
+            let id = id.as_str();
             let count = self.listed.entry(id.into()).or_insert(0);
             *count += 1;
             if *count > 1 {
@@ -1285,7 +1294,8 @@ impl ToolIds {
     }
 
     fn unlist_message(&mut self, message: &HistoryMessage, admitted: &history::AdmittedIds) {
-        for id in Self::tool_uses(message) {
+        for id in &Self::tool_uses(message) {
+            let id = id.as_str();
             let Some(count) = self.listed.get_mut(id) else {
                 continue;
             };
@@ -1704,9 +1714,9 @@ fn turn_output(result: &TurnResult, last: Option<&HistoryMessage>) -> Result<Box
     let final_message = result.final_message();
     let record = last
         .filter(|message| {
-            message.role == Role::Assistant
+            message.role() == Role::Assistant
                 && !final_message.is_empty()
-                && text_of(message) == final_message
+                && text_of(&message.view()) == final_message
         })
         .map(HistoryMessage::record)
         .transpose()
@@ -1976,9 +1986,10 @@ impl Snapshot {
             )));
         }
         for message in &self.conversation.messages {
-            for block in &message.content {
+            let view = message.view();
+            for block in &view.content {
                 match block {
-                    ContentBlock::Text { text, .. } => items.push(match message.role {
+                    ContentBlock::Text { text, .. } => items.push(match message.role() {
                         Role::Assistant => TranscriptItem::Assistant(text.clone()),
                         Role::User => TranscriptItem::User(text.clone()),
                         Role::System => continue,

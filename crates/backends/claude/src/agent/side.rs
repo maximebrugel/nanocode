@@ -34,9 +34,10 @@ pub(super) fn claude_transcript(messages: &[HistoryMessage]) -> Vec<PromptMessag
     let mut transcript = TranscriptBuilder::default();
     let mut tools = HashMap::new();
     for message in messages {
-        for block in &message.content {
+        let view = message.view();
+        for block in &view.content {
             match block {
-                ContentBlock::Text { text, .. } => match message.role {
+                ContentBlock::Text { text, .. } => match message.role() {
                     Role::User => transcript.user(text),
                     Role::Assistant => transcript.assistant(text),
                     Role::System => {}
@@ -58,19 +59,19 @@ pub(super) fn claude_transcript(messages: &[HistoryMessage]) -> Vec<PromptMessag
                     &tool_result_text(content),
                 ),
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {}
-                ContentBlock::Image { .. } => match message.role {
+                ContentBlock::Image { .. } => match message.role() {
                     Role::User => transcript.user("[image]"),
                     Role::Assistant => transcript.assistant("[image]"),
                     Role::System => {}
                 },
-                ContentBlock::Document { .. } => match message.role {
+                ContentBlock::Document { .. } => match message.role() {
                     Role::User => transcript.user("[document]"),
                     Role::Assistant => transcript.assistant("[document]"),
                     Role::System => {}
                 },
                 other => {
                     let rendered = serde_json::to_string(other).unwrap_or_default();
-                    match message.role {
+                    match message.role() {
                         Role::User => transcript.user(&rendered),
                         Role::Assistant => transcript.assistant(&rendered),
                         Role::System => {}
@@ -92,9 +93,10 @@ const PENDING_REQUEST: &str = "<system-reminder>The user message above is still 
 fn side_messages(mut messages: Vec<HistoryMessage>, question: &str) -> Vec<HistoryMessage> {
     let running = messages
         .last()
-        .filter(|message| message.role == Role::Assistant)
+        .filter(|message| message.role() == Role::Assistant)
         .map(|message| {
             message
+                .view()
                 .content
                 .iter()
                 .filter_map(|block| match block {
@@ -108,8 +110,8 @@ fn side_messages(mut messages: Vec<HistoryMessage>, question: &str) -> Vec<Histo
         .unwrap_or_default();
     let text = ContentBlock::text(side_question_prompt(question));
     match messages.last_mut() {
-        Some(message) if message.role == Role::User => {
-            let message = message.make_mut();
+        Some(message) if message.role() == Role::User => {
+            let mut message = message.make_mut();
             if !message
                 .content
                 .iter()

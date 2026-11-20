@@ -174,7 +174,7 @@ impl WireCache {
         layouts.prefixes.truncate(known);
         let mut layout = layouts.prefixes.last().copied().unwrap_or_default();
         for message in &messages[known..] {
-            layout = layout.then(MessageLayout::message(message.message()));
+            layout = layout.then(message.layout());
             layouts.ids.push(message.wire_id());
             layouts.prefixes.push(layout);
         }

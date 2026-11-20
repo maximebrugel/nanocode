@@ -80,6 +80,15 @@ impl Intents {
             reports: BTreeMap::new(),
         }
     }
+
+    /// The tasks a compaction must keep whole: goals and both ends of every report.
+    pub(crate) fn pins(&self) -> impl Iterator<Item = &TaskId> {
+        self.goals.iter().chain(
+            self.reports
+                .iter()
+                .flat_map(|(goal, reports)| std::iter::once(goal).chain(reports.keys())),
+        )
+    }
 }
 
 fn digest(task: &NewTask) -> [u64; 2] {

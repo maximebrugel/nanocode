@@ -315,6 +315,25 @@ pub struct Marks {
 }
 
 impl Marks {
+    /// How many of the fold's entries the watchers have indexed.
+    pub(crate) const fn indexed(&self) -> usize {
+        self.indexed
+    }
+
+    /// Points the index at a fold whose entries a compaction thinned.
+    pub(crate) const fn reindex(&mut self, indexed: usize) {
+        self.indexed = indexed;
+    }
+
+    /// The oldest entry seq any watcher's lane still has to deliver.
+    pub(crate) fn pending_floor(&self) -> Option<u64> {
+        self.watchers
+            .values()
+            .flat_map(|watcher| watcher.lanes.values())
+            .filter_map(|lane| lane.pending.front().copied())
+            .min()
+    }
+
     pub const fn new() -> Self {
         Self {
             cursors: BTreeMap::new(),
@@ -734,7 +753,7 @@ impl Fold {
             at_ms,
             op,
         };
-        self.seen.insert(inner.id.clone(), Ok(seq));
+        self.saw(&inner.id, seq, Ok(seq));
         self.access.record(&inner.by, &inner.id, &inner.op);
         self.transition(seq, &inner);
     }
@@ -901,7 +920,7 @@ impl Fold {
                 let send = schedule.send(*n);
                 let by = schedule.by.clone();
                 let sent = EventId(format!("fire/{id}/{n}"));
-                let verdict = if self.seen.contains_key(&sent) {
+                let verdict = if self.knows(&sent) {
                     Err(Rejection::Exists)
                 } else {
                     self.authorize(&by, &send)

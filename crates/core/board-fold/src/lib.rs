@@ -10,6 +10,7 @@ pub mod deliver;
 pub mod delivery;
 pub mod intent;
 pub mod mirror;
+pub mod retain;
 pub mod schedule;
 pub mod sim;
 pub mod stage;
@@ -51,7 +52,7 @@ pub use compact::Spread;
 /// snapshot format and a hash of the fold's source, so a build whose fold changed replays the
 /// whole log once instead of trusting a fold an older build made. Bump the format when the
 /// fold's state changes in a way no source hash sees.
-pub const CHECKPOINT_VERSION: &str = concat!("board-fold/1/", env!("NANOCODE_BOARD_FOLD_SOURCE"));
+pub const CHECKPOINT_VERSION: &str = concat!("board-fold/2/", env!("NANOCODE_BOARD_FOLD_SOURCE"));
 pub use messages::{MessageId, Say};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +284,9 @@ pub enum Rejection {
     Illegal { from: String, to: String },
     Stale { fence: Fence },
     Full { cap: Cap },
+    /// The event folded before a compaction's horizon, which kept that it folded but not its
+    /// verdict ([`retain`]).
+    Forgotten,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,7 +397,10 @@ pub struct Fold {
     #[serde(with = "crate::pairs")]
     dependents: BTreeMap<TaskId, BTreeSet<TaskId>>,
     #[serde(with = "crate::pairs")]
-    seen: BTreeMap<EventId, Result<u64, Rejection>>,
+    seen: BTreeMap<EventId, retain::Seen>,
+    /// Event ids a compaction forgot the verdicts of, as `{prefix}.{n}` ranges ([`retain`]).
+    #[serde(default, with = "crate::pairs")]
+    forgot: BTreeMap<String, Vec<(u64, u64)>>,
     entries: Vec<Entry>,
     access: access::Access,
     mirror: mirror::Mirror,
@@ -427,6 +434,7 @@ impl Fold {
             children: BTreeMap::new(),
             dependents: BTreeMap::new(),
             seen: BTreeMap::new(),
+            forgot: BTreeMap::new(),
             entries: Vec::new(),
             access: access::Access::new(),
             mirror: mirror::Mirror::new(),
@@ -462,7 +470,16 @@ impl Fold {
     }
 
     pub fn outcome(&self, event: &EventId) -> Option<&Result<u64, Rejection>> {
-        self.seen.get(event)
+        static FORGOTTEN: Result<u64, Rejection> = Err(Rejection::Forgotten);
+        match self.seen.get(event) {
+            Some(seen) => Some(&seen.verdict),
+            None => self.forgotten(event).then_some(&FORGOTTEN),
+        }
+    }
+
+    /// Whether the fold has folded an event of this id, kept or forgotten.
+    pub fn knows(&self, event: &EventId) -> bool {
+        self.seen.contains_key(event) || self.forgotten(event)
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -477,6 +494,7 @@ impl Fold {
             .filter_map(|count| count.parse::<u64>().ok())
             .max()
             .unwrap_or(0)
+            .max(self.forgot_upto(writer))
     }
 
     pub fn claimable(&self, id: &TaskId, at_ms: u64) -> Result<Option<ClaimId>, Rejection> {
@@ -826,7 +844,7 @@ impl Fold {
             fold.next += 1;
         }
         if mutated(Mutation::SnapshotLosesDedupe) {
-            fold.seen.retain(|_, verdict| verdict.is_ok());
+            fold.seen.retain(|_, seen| seen.verdict.is_ok());
         }
         Ok(fold)
     }
@@ -847,23 +865,22 @@ impl Fold {
             });
         }
         self.next = seq + 1;
-        let replayed = self.seen.contains_key(&event.id) && !mutated(Mutation::ReplaysApply);
+        let replayed = self.knows(&event.id) && !mutated(Mutation::ReplaysApply);
         if replayed || !access::owns(&event.by, &event.id) {
             return Ok(());
         }
         self.now_ms = self.now_ms.max(event.at_ms);
         if let Some(original) = self.repost(event) {
-            self.seen.insert(event.id.clone(), Ok(original));
+            self.saw(&event.id, seq, Ok(original));
             return Ok(());
         }
         let verdict = self.judge(event).map(|()| seq);
-        self.seen.insert(event.id.clone(), verdict.clone());
+        self.saw(&event.id, seq, verdict.clone());
         if verdict.is_ok() {
             self.access.record(&event.by, &event.id, &event.op);
             self.transition(seq, event);
             if let Some(illegal) = self.refused.take() {
-                self.seen
-                    .insert(event.id.clone(), Err(stage::rejection(illegal)));
+                self.saw(&event.id, seq, Err(stage::rejection(illegal)));
                 return Ok(());
             }
             self.intend(seq, event);

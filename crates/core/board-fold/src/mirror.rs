@@ -551,6 +551,16 @@ fn tally(tally: &Tally, id: &EventId, target: &Target, action: &Action, revision
 }
 
 impl Mirror {
+    /// The tasks a compaction must keep whole: every task ever mirrored, whose spec and replies
+    /// a sync may still read.
+    pub(crate) fn pins(&self) -> impl Iterator<Item = &TaskId> {
+        self.ever
+            .iter()
+            .map(|(task, _)| task)
+            .chain(self.by_task.keys())
+            .chain(self.status.keys())
+    }
+
     pub const fn new() -> Self {
         Self {
             links: BTreeMap::new(),

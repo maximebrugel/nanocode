@@ -40,8 +40,27 @@ fn row_hash(body: &str) -> u64 {
     })
 }
 
-/// A checkpoint of a fold whose last row, the one before its next seq, has the body `last_body`.
+/// How many of the newest events a checkpoint keeps whole: older history is compacted
+/// ([`Fold::compact`]) before the fold is saved.
+pub const RETAIN_EVENTS: u64 = CHECKPOINT_EVERY;
+
+static RETAIN: AtomicU64 = AtomicU64::new(RETAIN_EVENTS);
+
+/// Sets how many of the newest events every board's checkpoints keep whole.
+pub fn retain_events(events: u64) {
+    RETAIN.store(events, Ordering::Relaxed);
+}
+
+/// A checkpoint of a fold whose last row, the one before its next seq, has the body `last_body`,
+/// compacted to the newest [`retain_events`] events.
 pub fn encode(fold: &Fold, last_body: &str) -> StoredCheckpoint {
+    encode_within(fold, last_body, RETAIN.load(Ordering::Relaxed))
+}
+
+/// [`encode`], keeping the newest `retain` events whole.
+pub fn encode_within(fold: &Fold, last_body: &str, retain: u64) -> StoredCheckpoint {
+    let mut fold = fold.clone();
+    fold.compact(fold.next().saturating_sub(retain));
     let snapshot = fold.snapshot();
     let mut body = format!("{:016x}:", row_hash(last_body));
     STANDARD_NO_PAD.encode_string(snapshot, &mut body);

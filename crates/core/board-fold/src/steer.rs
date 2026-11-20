@@ -78,6 +78,11 @@ impl Steers {
             queues: BTreeMap::new(),
         }
     }
+
+    /// The tasks a compaction must keep whole: every task with steers queued.
+    pub(crate) fn pins(&self) -> impl Iterator<Item = &TaskId> {
+        self.queues.keys()
+    }
 }
 
 impl Fold {
@@ -91,7 +96,7 @@ impl Fold {
         claim: &ClaimId,
     ) -> Result<impl Iterator<Item = &Steer> + '_, Rejection> {
         self.holder(task, claim)?;
-        let since = match self.seen.get(&EventId(claim.0.clone())) {
+        let since = match self.outcome(&EventId(claim.0.clone())) {
             Some(Ok(seq)) if mutated(Mutation::SteerLostOnMove) => *seq,
             _ => 0,
         };

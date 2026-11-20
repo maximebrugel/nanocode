@@ -96,6 +96,7 @@ pub enum BoardMutation {
     SnapshotLosesDedupe,
     CheckpointVersionIgnored,
     CheckpointTailUnchecked,
+    CompactionDropsTombstones,
     DueIgnored,
     DueFiresTwice,
     RecurrenceSkipsOnRestart,
@@ -128,7 +129,7 @@ pub enum BoardMutation {
 }
 
 impl BoardMutation {
-    const ALL: [Self; 74] = [
+    const ALL: [Self; 75] = [
         Self::None,
         Self::ClaimIgnoresLease,
         Self::ClaimIgnoresNeeds,
@@ -176,6 +177,7 @@ impl BoardMutation {
         Self::SnapshotLosesDedupe,
         Self::CheckpointVersionIgnored,
         Self::CheckpointTailUnchecked,
+        Self::CompactionDropsTombstones,
         Self::DueIgnored,
         Self::DueFiresTwice,
         Self::RecurrenceSkipsOnRestart,
@@ -263,6 +265,7 @@ impl BoardMutation {
             Self::SnapshotLosesDedupe => "snapshot_loses_dedupe",
             Self::CheckpointVersionIgnored => "checkpoint_version_ignored",
             Self::CheckpointTailUnchecked => "checkpoint_tail_unchecked",
+            Self::CompactionDropsTombstones => "compaction_drops_tombstones",
             Self::DueIgnored => "due_ignored",
             Self::DueFiresTwice => "due_fires_twice",
             Self::RecurrenceSkipsOnRestart => "recurrence_skips_on_restart",
@@ -357,6 +360,7 @@ impl BoardMutation {
             Self::SnapshotLosesDedupe => BoardRule::SnapshotLosesDedupe,
             Self::CheckpointVersionIgnored => BoardRule::CheckpointVersionIgnored,
             Self::CheckpointTailUnchecked => BoardRule::CheckpointTailUnchecked,
+            Self::CompactionDropsTombstones => BoardRule::CompactionDropsTombstones,
             Self::DueIgnored => BoardRule::DueIgnored,
             Self::DueFiresTwice => BoardRule::DueFiresTwice,
             Self::RecurrenceSkipsOnRestart => BoardRule::RecurrenceSkipsOnRestart,
@@ -1826,9 +1830,63 @@ fn resumes(rows: &[(u64, String)]) -> Result<(), String> {
     Ok(())
 }
 
-/// A board opened from a checkpoint at a random cut and the rows after it must fold what a full
-/// replay folds; one opened over a checkpoint another fold's version wrote, or over a log that no
-/// longer holds the row the checkpoint ends on, must replay the whole log instead.
+/// Late writes naming each task a compaction made a tombstone of (a post of its id, a child under
+/// it, a task that needs it, a claim, a reply) must be judged as a full replay judges them.
+fn tombstones_answer(
+    compacted: &nanocode_board::Fold,
+    full: &nanocode_board::Fold,
+) -> Result<(), String> {
+    let late = |id: String, parent: Option<&TaskId>, needs: Vec<TaskId>| NewTask {
+        id: TaskId(id),
+        parent: parent.cloned(),
+        spec: "late work".to_owned(),
+        labels: BTreeMap::new(),
+        needs,
+        terms: nanocode_board::tasks::Terms::default(),
+    };
+    for (id, task) in full.tasks() {
+        if compacted.task(id) == Some(task) {
+            continue;
+        }
+        let probes = [
+            Op::Post {
+                task: task.spec.clone(),
+            },
+            Op::Post {
+                task: late(format!("{}.late", id.0), Some(id), Vec::new()),
+            },
+            Op::Post {
+                task: late(format!("{}.after", id.0), None, vec![id.clone()]),
+            },
+            Op::Claim {
+                task: id.clone(),
+                lease_ms: 1_000,
+                fence: None,
+                cap: None,
+            },
+            Op::Reply {
+                task: id.clone(),
+                body: "late".to_owned(),
+            },
+        ];
+        for op in probes {
+            let at_ms = full.now_ms();
+            let (kept, replayed) = (compacted.check(at_ms, &op), full.check(at_ms, &op));
+            if kept != replayed {
+                return Err(format!(
+                    "a compacted fold answers {op:?} with {kept:?}, a full replay with {replayed:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A board opened from a checkpoint at a random cut, compacted to a random retention window, and
+/// the rows after it must answer every op a full replay answers the same way: each tail row's
+/// verdict, late writes naming any task it made a tombstone of, and everything it keeps whole.
+/// One opened over a checkpoint another fold's version wrote, or over a log that no longer holds
+/// the row the checkpoint ends on, must replay the whole log instead.
 fn reopens_from_checkpoints(seed: u64, rows: &[(u64, String)]) -> Result<(), String> {
     use nanocode_board::checkpoint::{self, Fallback, Opened};
     let fold = |rows: &[(u64, String)]| -> Result<nanocode_board::Fold, String> {
@@ -1862,7 +1920,8 @@ fn reopens_from_checkpoints(seed: u64, rows: &[(u64, String)]) -> Result<(), Str
     for _ in 0..3 {
         let cut = 1 + rng.pick(rows.len());
         let held = fold(&rows[..cut])?;
-        let saved = checkpoint::encode(&held, &rows[cut - 1].1);
+        let retain = rng.pick(cut + 1) as u64;
+        let saved = checkpoint::encode_within(&held, &rows[cut - 1].1, retain);
         let board = open(rows, &saved)?;
         let tail = (rows.len() - cut) as u64;
         let expected = Opened::Checkpoint {
@@ -1876,12 +1935,14 @@ fn reopens_from_checkpoints(seed: u64, rows: &[(u64, String)]) -> Result<(), Str
                 board.opened()
             ));
         }
-        if board.fold() != &full {
-            return Err(format!(
-                "a board opened from a checkpoint at row {cut} differs from a full replay of {} rows",
-                rows.len()
-            ));
-        }
+        tombstones_answer(board.fold(), &full)
+            .and_then(|()| board.fold().agrees(&full))
+            .map_err(|error| {
+                format!(
+                    "a board opened from a checkpoint at row {cut} of {}, keeping {retain} events: {error}",
+                    rows.len()
+                )
+            })?;
         // A fold another build wrote: the same snapshot under a version this build doesn't
         // write must not be trusted, whatever it holds.
         let stale = StoredCheckpoint {

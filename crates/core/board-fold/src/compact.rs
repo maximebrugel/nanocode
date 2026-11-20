@@ -6,7 +6,7 @@ use serde::ser::{self, Serialize};
 use serde::{Deserialize, Serializer};
 
 use crate::{
-    Entry, EventId, Fold, Rejection, Task, TaskId, access, intent, messages, mirror, steer, watch,
+    Entry, EventId, Fold, Task, TaskId, access, intent, messages, mirror, retain, steer, watch,
 };
 
 pub const MAGIC: &[u8; 8] = b"NCFOLD\x00\x01";
@@ -74,6 +74,8 @@ fn map<K: Ord, V>(pairs: Vec<(K, V)>) -> BTreeMap<K, V> {
 
 type Labelled = BTreeMap<String, BTreeMap<String, BTreeSet<TaskId>>>;
 
+type Seen = (Vec<(EventId, retain::Seen)>, Vec<(String, Vec<(u64, u64)>)>);
+
 type Head = (
     u64,
     u64,
@@ -87,7 +89,7 @@ type Head = (
 enum Part {
     Head(Head),
     Tasks(Vec<(TaskId, Task)>),
-    Seen(Vec<(EventId, Result<u64, Rejection>)>),
+    Seen(Seen),
     Entries(Vec<Entry>),
     Access(access::Access),
     Mirror(mirror::Mirror),
@@ -161,6 +163,7 @@ pub fn snapshot(fold: &Fold, spread: Spread) -> Result<Vec<u8>, Error> {
         children,
         dependents,
         seen,
+        forgot,
         entries,
         access,
         mirror,
@@ -186,7 +189,7 @@ pub fn snapshot(fold: &Fold, spread: Spread) -> Result<Vec<u8>, Error> {
             ))
         }),
         Box::new(move || encode(&Pairs(tasks))),
-        Box::new(move || encode(&Pairs(seen))),
+        Box::new(move || encode(&(Pairs(seen), Pairs(forgot)))),
         Box::new(move || encode(entries)),
         Box::new(move || encode(access)),
         Box::new(move || encode(mirror)),
@@ -275,7 +278,7 @@ pub fn restore(snapshot: &[u8], spread: Spread) -> Result<Fold, Error> {
     let Part::Tasks(tasks) = part()? else {
         return fail("snapshot tasks out of order");
     };
-    let Part::Seen(seen) = part()? else {
+    let Part::Seen((seen, forgot)) = part()? else {
         return fail("snapshot seen out of order");
     };
     let Part::Entries(entries) = part()? else {
@@ -304,6 +307,7 @@ pub fn restore(snapshot: &[u8], spread: Spread) -> Result<Fold, Error> {
         children: map(children),
         dependents: map(dependents),
         seen: map(seen),
+        forgot: map(forgot),
         entries,
         access,
         mirror,

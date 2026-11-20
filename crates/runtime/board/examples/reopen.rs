@@ -1,5 +1,7 @@
 //! How long Board::open takes over a log of 10k, 50k and 100k events: a full replay, a reopen
-//! from a checkpoint at the head, and one from a checkpoint CHECKPOINT_EVERY events behind it.
+//! from a checkpoint at the head (compacted to RETAIN_EVENTS, as boards save them, and whole, as
+//! they did before compaction), and one from a compacted checkpoint CHECKPOINT_EVERY events
+//! behind it, with each checkpoint's size.
 //!
 //! The load is the one nanocode-ts's bench/board-do.ts serves: swarms of a root and 20 children,
 //! each task posted, claimed, renewed and finished, about 2% of them steered. The log is a
@@ -16,7 +18,7 @@ use std::{
 use nanocode_board::{
     Board, NewTask, Op, Outcome, Phase, TaskId,
     access::{Identity, Verifier},
-    checkpoint::{self, CHECKPOINT_EVERY, Opened},
+    checkpoint::{self, CHECKPOINT_EVERY, Opened, RETAIN_EVENTS},
     steer::SteerOp,
 };
 use nanocode_turnlog::{LogHost, MemoryLog};
@@ -175,13 +177,27 @@ fn main() {
     checkpoint::checkpoint_every(0);
     nanocode_sync::block_on(async {
         for events in sizes {
-            for behind in [None, Some(0), Some(CHECKPOINT_EVERY)] {
+            let runs = [
+                ("replay", None, RETAIN_EVENTS),
+                ("checkpoint-whole-0-behind", Some(0), u64::MAX),
+                ("checkpoint-0-behind", Some(0), RETAIN_EVENTS),
+                (
+                    "checkpoint-4096-behind",
+                    Some(CHECKPOINT_EVERY),
+                    RETAIN_EVENTS,
+                ),
+            ];
+            for (mode, behind, retain) in runs {
+                checkpoint::retain_events(retain);
                 let log: Arc<dyn LogHost> = Arc::new(MemoryLog::new());
                 let mut board = Board::open(Arc::clone(&log), SCOPE, identity())
                     .await
                     .expect("a fresh board opens");
                 // The first writer charters the board and owns it.
-                board.submit(0, Op::Charter {}).await.expect("the board charters");
+                board
+                    .submit(0, Op::Charter {})
+                    .await
+                    .expect("the board charters");
                 fill(&mut board, events, behind).await;
                 let saved = log
                     .checkpoint(SCOPE)
@@ -190,10 +206,6 @@ fn main() {
                     .expect("the checkpoint reads");
                 let bytes = saved.as_ref().map_or(0, |saved| saved.body.len());
                 let (took, opened, head) = median(&log).await;
-                let mode = match behind {
-                    None => "replay".to_owned(),
-                    Some(behind) => format!("checkpoint-{behind}-behind"),
-                };
                 // Where a reopen's time goes: a bare fold of every row, and for a checkpoint
                 // its base64 decode and restore.
                 let rows = log.load(SCOPE).await.expect("the log loads");

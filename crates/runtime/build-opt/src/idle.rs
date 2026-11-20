@@ -21,11 +21,25 @@ pub struct IdleLease {
 
 pub const KEPT_KINDS: [&str; 3] = ["reserved", "closed-load", "bench"];
 
+/// Labels whose leases are never reaped for idling: box-closing- moves, and long-lived services
+/// (Nanofactory planes and node agents, p2live) whose cpus sit idle between scheduled work.
 pub const KEPT_LABEL_PREFIX: &str = "box-closing-";
+
+pub const KEPT_LABEL_PREFIXES: [&str; 6] = [
+    "box-closing-",
+    "nf-deploy-",
+    "nf-fan-",
+    "p2live-",
+    "lander-p2live",
+    "boardrel-red-",
+];
 
 impl LeaseCpus {
     pub fn kept(&self) -> bool {
-        KEPT_KINDS.contains(&self.kind.as_str()) || self.label.starts_with(KEPT_LABEL_PREFIX)
+        KEPT_KINDS.contains(&self.kind.as_str())
+            || KEPT_LABEL_PREFIXES
+                .iter()
+                .any(|prefix| self.label.starts_with(prefix))
     }
 }
 
@@ -111,4 +125,37 @@ pub fn idle_step(
         }
     }
     idle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LeaseCpus;
+
+    fn lease(kind: &str, label: &str) -> LeaseCpus {
+        LeaseCpus {
+            id: "l".to_owned(),
+            first: 0,
+            last: 3,
+            kind: kind.to_owned(),
+            label: label.to_owned(),
+        }
+    }
+
+    #[test]
+    fn service_leases_are_never_reaped_for_idling() {
+        for label in [
+            "nf-deploy-plane",
+            "nf-deploy-node-0",
+            "nf-fan-node-0",
+            "p2live-run",
+            "lander-p2live-a",
+            "boardrel-red-land38",
+            "box-closing-nf",
+        ] {
+            assert!(lease("build", label).kept(), "{label}");
+        }
+        assert!(!lease("build", "claims50k-metrics").kept());
+        assert!(!lease("test", "nfperf-a").kept());
+        assert!(lease("reserved", "anything").kept());
+    }
 }

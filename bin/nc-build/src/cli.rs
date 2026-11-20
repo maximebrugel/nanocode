@@ -67,7 +67,8 @@ const USAGE: &str = "usage:
                                       with --local, a lease on MACHINE whose cpus stayed under P% (default 10) busy for M minutes
                                       (default 10), from /proc/stat deltas between observations with nice time not busy, is given back
                                       and logged as a reap line with its machine, cpus, kind and label; leases of kind reserved,
-                                      closed-load or bench and labels starting box-closing- are never reaped
+                                      closed-load or bench and labels starting box-closing-, nf-deploy-, nf-fan-, p2live-,
+                                      lander-p2live or boardrel-red- are never reaped
   nc-build slots caps [--set]         the lane caps; --set replaces them with the JSON array read on stdin, each entry
                                       {lane: L, prefixes: [P, ...], cores: N, kinds: [K, ...]}: a lane covers takes whose label
                                       starts with one of its prefixes and whose kind is listed (without kinds, every kind but bench), and

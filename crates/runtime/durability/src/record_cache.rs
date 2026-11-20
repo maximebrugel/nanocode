@@ -368,6 +368,10 @@ impl<S: StateStore + ?Sized + 'static> StateStore for CachedStore<S> {
         })
     }
 
+    fn replaces_to(&self) -> bool {
+        self.base.replaces_to()
+    }
+
     fn replace_to<'a>(
         &'a mut self,
         state_id: &'a str,

@@ -3316,6 +3316,7 @@ impl DurableSession {
             .load()
             .as_ref()
             .and_then(|preload| preload.loaded.clone());
+        let adopted = preloaded.as_ref().map(|(_, records)| Arc::clone(records));
         self.send(Command::AcquireAgent {
             initial,
             checkpoint,
@@ -3325,6 +3326,15 @@ impl DurableSession {
         })
         .await?;
         let acquired = receive(receiver).await?;
+        if let Some(memo) = self.store.payload_memo.as_deref() {
+            memo.release(
+                acquired.checkpoint.iter().map(EncodedPayload::key).chain(
+                    adopted
+                        .iter()
+                        .flat_map(|records| records.iter().map(String::as_str)),
+                ),
+            );
+        }
         let owner = DurableOwner {
             generation: acquired.generation,
             commands: self.commands.clone(),

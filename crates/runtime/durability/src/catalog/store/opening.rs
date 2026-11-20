@@ -103,6 +103,25 @@ pub(super) fn prepare_resume_resumable<'a>(
 }
 
 #[inline(never)]
+pub(super) fn prepare_resume_resumable_taking<'a>(
+    this: &'a SessionStore,
+    resumable: &'a mut ResumableSession,
+) -> FormatFuture<'a, Result<DurableSession>> {
+    Box::pin(async move {
+        let checkpoint = resumable.checkpoint.take();
+        let hydrated = resumable.loaded.hydrated.take();
+        prepare_loaded(
+            this,
+            &resumable.record,
+            checkpoint.map(Cow::Owned),
+            &resumable.loaded,
+            hydrated,
+        )
+        .await
+    })
+}
+
+#[inline(never)]
 pub(super) fn prepare_resume_taking<'a>(
     this: &'a SessionStore,
     stored: &'a mut StoredSession,

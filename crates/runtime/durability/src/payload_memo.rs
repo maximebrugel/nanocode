@@ -21,6 +21,20 @@ impl PayloadMemo {
         self.0.set(Kept::Forgotten);
     }
 
+    pub(crate) fn release<'a>(&self, keys: impl IntoIterator<Item = &'a str>) {
+        let keys: Vec<&str> = keys.into_iter().collect();
+        if keys.is_empty() {
+            return;
+        }
+        self.0.update(|kept| {
+            if let Kept::Keeping(map) = kept {
+                for key in &keys {
+                    map.remove(*key);
+                }
+            }
+        });
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.0.read(|kept| match kept {
             Kept::Keeping(map) => map.len(),

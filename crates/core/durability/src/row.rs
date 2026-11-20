@@ -1813,6 +1813,10 @@ impl<H: Sql + ?Sized> StateStore for RowStore<H> {
         })
     }
 
+    fn replaces_to(&self) -> bool {
+        true
+    }
+
     fn replace_to<'a>(
         &'a mut self,
         state_id: &'a str,

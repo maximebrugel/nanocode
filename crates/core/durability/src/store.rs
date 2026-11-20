@@ -664,6 +664,10 @@ pub trait StateStore: MaybeSend {
         records: &'a [crate::StoreRecord],
     ) -> StoreFuture<'a, Result<u64, StoreError>>;
 
+    fn replaces_to(&self) -> bool {
+        false
+    }
+
     fn replace_to<'a>(
         &'a mut self,
         _state_id: &'a str,

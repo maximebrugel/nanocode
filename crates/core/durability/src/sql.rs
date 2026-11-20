@@ -1447,6 +1447,10 @@ impl<H: Sql + ?Sized> StateStore for SqlStore<H> {
         Box::pin(self.put(state_id, records))
     }
 
+    fn replaces_to(&self) -> bool {
+        true
+    }
+
     fn replace_to<'a>(
         &'a mut self,
         state_id: &'a str,

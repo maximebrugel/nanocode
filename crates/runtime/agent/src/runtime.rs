@@ -1002,13 +1002,13 @@ impl AgentRuntime {
             Opened::Live(agent) => return Ok(attached(agent)),
             Opened::Vacant(opening) => opening,
         };
-        let resumable = configured
+        let mut resumable = configured
             .load_resumable(session_id)
             .await
             .map_err(catalog_error)?;
         let thinking = resumable.checkpoint_thinking().map_err(catalog_error)?;
         let durable_state = configured
-            .prepare_resume_resumable(&resumable)
+            .prepare_resume_resumable_taking(&mut resumable)
             .await
             .map_err(catalog_error)?;
         self.open_prepared(

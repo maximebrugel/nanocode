@@ -18,6 +18,7 @@ struct Staged {
     revision: u64,
     payload: Option<Arc<str>>,
     payloads: nanocode_sync::Vector<Arc<str>>,
+    replaced: u64,
     records: nanocode_sync::OrdMap<String, Arc<str>>,
     stored: nanocode_sync::OrdSet<String>,
     reached: Option<(u64, Arc<HashSet<String>>)>,
@@ -30,9 +31,11 @@ impl Staged {
             "a staged state never falls below its base revision"
         );
         assert_eq!(
-            u64::try_from(self.payloads.len()).ok(),
+            u64::try_from(self.payloads.len())
+                .ok()
+                .and_then(|kept| kept.checked_add(self.replaced)),
             Some(self.revision - self.base_revision),
-            "a staged state keeps one payload per staged revision"
+            "a staged state keeps one payload per staged revision it did not replace"
         );
         assert!(
             self.owner.fence() >= self.base_fence,
@@ -256,6 +259,11 @@ impl StagedWrites {
             *landed = true;
             return Ok(());
         }
+        if staged.replaced > 0 {
+            return Err(StoreError::NotCommitted(format!(
+                "state {state_id} staged only its head revision, which this store cannot replace to"
+            )));
+        }
         let mut records = staged.unstored(None);
         let mut revision = staged.base_revision;
         for payload in &staged.payloads {
@@ -313,10 +321,18 @@ impl StagedWrites {
         expected_revision: u64,
         payload: &str,
         records: &[StoreRecord],
+        head_only: bool,
     ) -> Result<u64, StoreError> {
         self.0.modify(|states| {
             let staged = Arc::make_mut(states.get_mut(state_id).ok_or(StoreError::Fenced)?);
-            Self::staged_write(staged, owner, expected_revision, payload, records)
+            Self::staged_write(
+                staged,
+                owner,
+                expected_revision,
+                payload,
+                records,
+                head_only,
+            )
         })
     }
 
@@ -326,6 +342,7 @@ impl StagedWrites {
         expected_revision: u64,
         payload: &str,
         records: &[StoreRecord],
+        head_only: bool,
     ) -> Result<u64, StoreError> {
         if staged.owner != *owner {
             return Err(StoreError::Fenced);
@@ -365,6 +382,9 @@ impl StagedWrites {
                 Some(_) => {}
             }
         }
+        if head_only && staged.payloads.pop_back().is_some() {
+            staged.replaced += 1;
+        }
         let payload = Arc::<str>::from(payload);
         staged.revision = revision;
         staged.payload = Some(Arc::clone(&payload));
@@ -377,13 +397,16 @@ impl StagedWrites {
 pub struct StagedStore<S> {
     base: S,
     writes: StagedWrites,
+    head_only: bool,
 }
 
 impl<S: StateStore> StagedStore<S> {
     pub fn new(base: S) -> Self {
+        let head_only = base.replaces_to();
         Self {
             base,
             writes: StagedWrites::default(),
+            head_only,
         }
     }
 
@@ -476,6 +499,7 @@ impl<S: StateStore> StagedStore<S> {
                     revision: state.revision,
                     payload: state.payload.map(Arc::from),
                     payloads: nanocode_sync::Vector::new(),
+                    replaced: 0,
                     records: nanocode_sync::OrdMap::new(),
                     stored: nanocode_sync::OrdSet::new(),
                     reached: None,
@@ -627,8 +651,14 @@ impl<S: StateStore> StateStore for StagedStore<S> {
         records: &'a [StoreRecord],
     ) -> StoreFuture<'a, Result<u64, StoreError>> {
         Box::pin(async move {
-            self.writes
-                .write(state_id, owner, expected_revision, payload, records)
+            self.writes.write(
+                state_id,
+                owner,
+                expected_revision,
+                payload,
+                records,
+                self.head_only,
+            )
         })
     }
 
@@ -651,6 +681,7 @@ impl<S: StateStore> StateStore for StagedStore<S> {
                 expected_revision,
                 commit.payload,
                 commit.records,
+                self.head_only,
             )?;
             Ok(Committed {
                 revision,

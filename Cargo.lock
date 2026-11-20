@@ -744,6 +744,7 @@ dependencies = [
 name = "nanocode-live"
 version = "0.7.0"
 dependencies = [
+ "nanocode-durability-core",
  "nanocode-live-fold",
  "nanocode-sync",
  "serde",

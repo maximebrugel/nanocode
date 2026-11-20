@@ -6,10 +6,13 @@
   fanout work --bin BIN --tasks FILE [--hosts FILE --host NAME] [--ids A,B] [--history FILE] [--jobs J] [--timeout S]
                                        run this host's share of the plan; one JSONL result per task on stdout
   fanout merge --tasks FILE RESULTS... verdict line (exit 1 when red), then each failure with its replay command
-  fanout run --bin BIN --hosts FILE [--via 'ssh {host}'] [--tasks FILE] [--history FILE] [--out FILE]
+  fanout run --bin BIN [--hosts FILE | --slots N --cores C] [--pool large|small] [--no-slots] [--via 'ssh {host}'] [--tasks FILE] [--history FILE] [--out FILE]
                                        ship BIN once per host, run every share at once, hand what is still missing
                                        when half the hosts are idle (a dead or slow host's tasks) to them, merge;
                                        a host's "via" overrides --via, and "local" is this machine
+                                       each host's share runs inside an nc-build slot lease (a host file's entry leases
+                                       its own machine for its jobs; without one, N leases of C cores wherever there is room),
+                                       pinned to the lease's CPUs, renewed while it runs and given back on exit, even when killed
 
 The table is cfo.sh's default_table (weight name pass|canary[:N] flags...), with a pass and a --twice job for every
 scenario it leaves out, as scripts/check builds it. A task is {"id", "runs": [argv, ...], "must"?: regex} and passes
@@ -21,7 +24,7 @@ host that finishes it soonest for its jobs and speed. A host file is a JSON list
 "start", "end", "run", "line", "replay"?}; a run's results are the next run's --history.
 """
 import argparse, concurrent.futures, hashlib, io, json, os, re, shlex, statistics, subprocess, sys, tarfile
-import queue, tempfile, threading, time
+import queue, signal, socket, tempfile, threading, time
 
 MARKS = ("FAIL", "CAUGHT", "MUTATION", "SWEEP", "RESULT")
 CAUGHT = r"^MUTATION .* caught by"
@@ -93,17 +96,32 @@ def pick(text):
     return (marked or lines or [""])[0][:500]
 
 
+CHILDREN = set()
+
+
+def kill_children(*_):
+    for pid in list(CHILDREN):
+        try:
+            os.killpg(pid, 9)
+        except OSError:
+            pass
+    os._exit(143)
+
+
 def run_task(binary, task, host, timeout, shown):
     start = time.time()
     must = task.get("must")
     for index, argv in enumerate(task["runs"]):
         p = subprocess.Popen([binary, *argv], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        CHILDREN.add(p.pid)
         try:
             out, code = p.communicate(timeout=timeout)[0], p.returncode
         except subprocess.TimeoutExpired:
             os.killpg(p.pid, 9)
             out, code = p.stdout.read(), "timeout"
             out = b"timed out after %gs: " % timeout + out[-300:]
+        finally:
+            CHILDREN.discard(p.pid)
         text = out.decode(errors="replace")
         if code == 0 and must and not re.search(must, text, re.M):
             code, text = "missed", "no output line matched %s\n%s" % (must, text)
@@ -133,10 +151,16 @@ def work(a):
     jobs = a.jobs or me.get("jobs") or (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count())
     lock = threading.Lock()
 
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, kill_children)
+
     def one(task):
         result = run_task(a.bin, task, a.host, a.timeout, a.replay_as)
         with lock:
-            print(json.dumps(result), flush=True)
+            try:
+                print(json.dumps(result), flush=True)
+            except (BrokenPipeError, OSError):
+                kill_children()
         return result["ok"]
 
     with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
@@ -214,8 +238,144 @@ def merge(a):
     return 0 if green else 1
 
 
+class Slots:
+    """nc-build slot leases under fanout run's hosts: taken before a share runs, renewed while it runs, given back on
+    exit. A guard process outlives a killed run: it stops the shares still running and gives their leases back."""
+
+    def __init__(self, a):
+        self.nc = a.nc_build or os.environ.get("NC_BUILD") or "nc-build"
+        self.pool, self.minutes = a.pool, a.lease_minutes
+        self.label = "fanout:%s:%d@%s" % (a.pool, os.getpid(), socket.gethostname())
+        self.leases, self.pgids, self.lost = {}, set(), set()
+        self.lock, self.done = threading.Lock(), threading.Event()
+        self.dir = tempfile.mkdtemp(prefix="fanout-slots-")
+        self.save()
+        guard = ("while kill -0 {pid} 2>/dev/null; do sleep 1; done; "
+                 "for g in $(cat {d}/pgids); do kill -TERM -$g 2>/dev/null; done; sleep 2; "
+                 "for g in $(cat {d}/pgids); do kill -KILL -$g 2>/dev/null; done; "
+                 "for l in $(cat {d}/leases); do {nc} slots give $l --pool {pool} >/dev/null 2>&1; done; rm -rf {d}").format(
+            pid=os.getpid(), d=shlex.quote(self.dir), nc=shlex.quote(self.nc), pool=shlex.quote(self.pool))
+        self.guard = subprocess.Popen(["sh", "-c", guard], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, start_new_session=True)
+        threading.Thread(target=self.renewing, daemon=True).start()
+
+    def save(self):
+        for name, items in (("leases", self.leases), ("pgids", self.pgids)):
+            with open(os.path.join(self.dir, name + ".new"), "w") as f:
+                f.write("\n".join(str(i) for i in items) + "\n")
+            os.replace(os.path.join(self.dir, name + ".new"), os.path.join(self.dir, name))
+
+    def slots(self, *args):
+        try:
+            return subprocess.run([self.nc, "slots", *args, "--pool", self.pool], capture_output=True, text=True)
+        except OSError as error:
+            return subprocess.CompletedProcess(args, 127, "", "%s: %s (set $NC_BUILD or --nc-build)" % (self.nc, error))
+
+    def take(self, cores, machine=None, wait=0):
+        args = ["take", "--cores", str(cores), "--label", self.label, "--minutes", str(self.minutes), "--wait", str(int(wait))]
+        p = self.slots(*args, *(["--machine", machine] if machine else []))
+        if p.returncode:
+            return None, (p.stderr or p.stdout).strip()
+        lease = json.loads(p.stdout)
+        with self.lock:
+            self.leases[lease["lease"]] = lease
+            self.save()
+        return lease, ""
+
+    def running(self, pid):
+        with self.lock:
+            self.pgids.add(pid)
+            self.save()
+
+    def give(self, lease_id):
+        with self.lock:
+            if self.leases.pop(lease_id, None) is None:
+                return
+            self.save()
+        self.slots("give", lease_id)
+
+    def renewing(self):
+        every = max(5.0, self.minutes * 60 / 3)
+        while not self.done.wait(every):
+            for lease_id in list(self.leases):
+                if lease_id in self.leases and self.slots("renew", lease_id, "--minutes", str(self.minutes)).returncode:
+                    self.lost.add(lease_id)
+                    print("fanout: lease %s lost, stopping its share" % lease_id, file=sys.stderr, flush=True)
+
+    def close(self):
+        self.done.set()
+        for sig, pause in ((signal.SIGTERM, 1.0), (signal.SIGKILL, 0)):
+            alive = []
+            for pgid in self.pgids:
+                try:
+                    os.killpg(pgid, sig)
+                    alive.append(pgid)
+                except OSError:
+                    pass
+            if not alive:
+                break
+            time.sleep(pause)
+        for lease_id in list(self.leases):
+            self.give(lease_id)
+        self.guard.kill()
+        self.guard.wait()
+        subprocess.run(["rm", "-rf", self.dir])
+
+
+def leased_hosts(a, slots):
+    """The hosts a run's shares run on: one lease each, pinned to its CPUs (or niced where the machine says so)."""
+    hosts, refused = [], []
+
+    def host_of(lease, base, n):
+        h = dict(base, name="%s#%d" % (lease["machine"], n), machine=lease["machine"], cores=lease["cores"],
+                 jobs=lease["cores"], lease=lease["lease"])
+        h.pop("cpus", None), h.pop("nice", None)
+        if lease["prefix"].startswith("taskset"):
+            h["cpus"] = lease["cpus"]
+        else:
+            h["nice"] = 19
+        if "via" not in h and lease["machine"] in (socket.gethostname(), "local"):
+            h["via"] = "local"
+        return h
+
+    if a.hosts:
+        for n, base in enumerate(json.load(open(a.hosts))):
+            lease, why = slots.take(a.cores or jobs_of(base), base["name"], a.slot_wait)
+            if lease:
+                hosts.append(host_of(lease, base, n))
+            else:
+                refused.append("%s (%s)" % (base["name"], why))
+    else:
+        for n in range(a.slots):
+            lease, why = slots.take(a.cores or 8, None, a.slot_wait if not hosts else 0)
+            if not lease:
+                refused.append(why)
+                break
+            hosts.append(host_of(lease, {}, n))
+    return hosts, refused
+
+
 def run(a):
-    hosts = json.load(open(a.hosts))
+    if a.no_slots:
+        return run_on(a, json.load(open(a.hosts)), None)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(143))
+    slots = Slots(a)
+    try:
+        hosts, refused = leased_hosts(a, slots)
+        for why in refused:
+            print("fanout: no slot: %s" % why, file=sys.stderr, flush=True)
+        if not hosts:
+            print("RED fanout: no nc-build slot in pool %s" % a.pool)
+            return 1
+        for h in hosts:
+            print("fanout: lease %s %s cpus %s" % (h["lease"], h["machine"], h.get("cpus", "nice")), file=sys.stderr, flush=True)
+        return run_on(a, hosts, slots)
+    finally:
+        slots.close()
+
+
+def run_on(a, hosts, slots):
     here = os.path.abspath(__file__)
     with open(a.bin, "rb") as f, open(here, "rb") as g:
         digest = hashlib.sha256(f.read() + g.read()).hexdigest()[:16]
@@ -232,7 +392,8 @@ def run(a):
 
     def argv_for(host, command):
         how = host.get("via", a.via)
-        return ["sh", "-c", command] if how == "local" else shlex.split(how.format(host=host["name"])) + [command]
+        name = host.get("machine", host["name"])
+        return ["sh", "-c", command] if how == "local" else shlex.split(how.format(host=name)) + [command]
 
     def tar(files):
         buf = io.BytesIO()
@@ -293,19 +454,45 @@ def run(a):
                 dead.add(host["name"])
                 continue
             running[host["name"]] = p
+            if slots:
+                slots.running(p.pid)
             threading.Thread(target=read, args=(host["name"], p), daemon=True).start()
+
+    shipped_to, ship_lock = {}, threading.Lock()
+
+    def ship_once(host):
+        machine = host.get("machine", host["name"])
+        with ship_lock:
+            box = shipped_to.setdefault(machine, [threading.Lock(), None])
+        with box[0]:
+            if box[1] is None:
+                box[1] = ship(host)
+            return box[1]
 
     t0 = time.time()
     with concurrent.futures.ThreadPoolExecutor(len(hosts)) as pool:
-        alive = [h["name"] for h, ok in zip(hosts, pool.map(ship, hosts)) if ok]
+        alive = [h["name"] for h, ok in zip(hosts, pool.map(ship_once, hosts)) if ok]
+    if slots:
+        for h in hosts:
+            if h["name"] not in alive:
+                slots.give(h["lease"])
     shipped, t1 = time.time() - t0, time.time()
     done, ids = set(), [t["id"] for t in tasks]
     if alive:
         issue(alive, None)
     while running and len(done) < len(ids):
+        for h in hosts:
+            if slots and h.get("lease") in slots.lost and h["name"] in running:
+                try:
+                    os.killpg(running[h["name"]].pid, 9)
+                except OSError:
+                    pass
+                dead.add(h["name"])
         try:
-            what, name, value = events.get(timeout=max(0.0, t1 + a.host_timeout - time.time()))
+            what, name, value = events.get(timeout=min(5.0, max(0.0, t1 + a.host_timeout - time.time())))
         except queue.Empty:
+            if time.time() < t1 + a.host_timeout:
+                continue
             break
         if what == "row":
             rows.append(value)
@@ -316,6 +503,7 @@ def run(a):
             dead.add(name)
         idle = [n for n in alive if n not in running and n not in dead]
         missing = [i for i in ids if i not in done]
+        idle = [n for n in idle if not (slots and next(h for h in hosts if h["name"] == n).get("lease") in slots.lost)]
         if missing and idle and len(idle) * 2 >= len(alive) - len(dead) and issued[0] <= a.retries:
             issue(idle, missing)
     for p in running.values():
@@ -360,6 +548,13 @@ def main():
     r.add_argument("--host-timeout", type=float, default=900)
     r.add_argument("--retries", type=int, default=3, help="times the missing tasks are handed again to idle hosts")
     r.add_argument("--out")
+    r.add_argument("--pool", default="large", choices=("large", "small"), help="nc-build slot pool")
+    r.add_argument("--slots", type=int, default=2, help="leases to take without --hosts")
+    r.add_argument("--cores", type=int, help="cores per lease (default: a host's jobs, else 8)")
+    r.add_argument("--slot-wait", type=int, default=600, help="seconds to wait for the first lease")
+    r.add_argument("--lease-minutes", type=int, default=20, help="lease length; renewed every third of it")
+    r.add_argument("--nc-build", help="nc-build binary (default $NC_BUILD, else nc-build on PATH)")
+    r.add_argument("--no-slots", action="store_true", help="run on --hosts as they are, without leases")
     a = p.parse_args()
     return {"manifest": manifest, "work": work, "merge": merge, "run": run}[a.cmd](a)
 

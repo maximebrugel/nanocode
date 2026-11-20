@@ -9,7 +9,7 @@ const fs = require("fs"), path = require("path");
 const DIR = process.argv[2];
 const J = (f) => JSON.parse(fs.readFileSync(path.join(DIR, f), "utf8"));
 const esc = (s) => '"' + [...s].map((c) => { const u = c.codePointAt(0); return c === '"' ? '\\"' : c === "\\" ? "\\\\" : c === "\n" ? "\\n" : u < 0x20 || u > 0x7e ? "\\u{" + u.toString(16) + "}" : c; }).join("") + '"';
-const LOCALES = ["en", "de", "fr", "es", "it", "pt", "nl", "ja", "zh", "ko", "ru"];
+const LOCALES = ["en", "de", "fr", "es", "it", "pt", "nl", "ja", "zh", "ko", "ru", "pl", "tr", "ar", "hi", "id", "vi", "th", "sv", "da", "nb", "fi", "cs", "el", "he", "uk", "ro", "hu", "bn", "fa", "ms", "ta", "ca", "sk", "bg", "hr", "sr", "lt", "lv", "et", "sl", "fil", "sw", "ur"];
 // Regional variants with their own names, kept as their differences from the language's.
 const OVERLAYS = ["zh-Hant", "pt-PT", "en-GB", "es-419", "es-MX", "fr-CA", "de-AT"];
 const names = (f, k) => Object.keys(Object.values(J("names/" + f + ".json").main)[0].localeDisplayNames[k]);
@@ -82,6 +82,8 @@ for (const loc of [...LOCALES, ...OVERLAYS]) {
   for (const [k, v] of sorted) out.push("    " + esc(k + " " + v + "\n") + ",");
   out.push(");");
 }
+out.push("/// The languages with their own names.");
+out.push("pub(super) const LANGS: [&str; " + LOCALES.length + "] = [" + LOCALES.map((l) => JSON.stringify(l)).join(", ") + "];");
 out.push("/// The overlay (or \"\") and the language's table for a resolved locale.");
 out.push("pub(super) fn tables(locale: &str) -> (&'static str, &'static str) {");
 out.push("    let mut p = locale.split('-');");

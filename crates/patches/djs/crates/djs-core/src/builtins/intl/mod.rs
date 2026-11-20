@@ -346,6 +346,7 @@ pub(crate) fn intrinsic(heap: &mut Heap, k: u16, a: [Value; 5]) -> Result<Option
                 1 => &date::LANGS[..],
                 2 => &collator_langs[..],
                 0 | 3 | 4 | 5 => &NUM_LANGS[..],
+                DISPLAY_NAMES => &dndata::LANGS[..],
                 _ => &LANGS[..],
             });
             let raw = Spec::parse(&raw);

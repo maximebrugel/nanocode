@@ -425,6 +425,8 @@ struct ShardLog {
     after_ppm: u64,
     read_ppm: u64,
     abort_ppm: u64,
+    /// Outer mode: every append is a transaction that also writes the records its rows derive from.
+    outer: bool,
     /// The OuterTxSplits canary: an outer transaction may write its board rows without their records.
     splits: bool,
     calls: Mutex<BTreeMap<String, Vec<Call>>>,
@@ -512,15 +514,29 @@ impl ShardLog {
             return Resolution::Committed;
         }
         self.appends.fetch_add(1, Ordering::SeqCst);
+        let call = |ok: bool| {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .entry(scope.to_owned())
+                .or_default()
+                .push(Call {
+                    rows: rows.to_vec(),
+                    ok,
+                });
+        };
         if self.roll(|rng| rng.chance(self.abort_ppm)) {
             self.aborts.fetch_add(1, Ordering::SeqCst);
+            call(false);
             return Resolution::Aborted(self.injected("outer transaction"));
         }
         if let Err(error) = self.inner.append(scope, rows).await {
             self.conflicts.fetch_add(1, Ordering::SeqCst);
             self.aborts.fetch_add(1, Ordering::SeqCst);
+            call(false);
             return Resolution::Aborted(error);
         }
+        call(true);
         let records: Vec<(u64, String)> = rows
             .iter()
             .map(|(seq, body)| (*seq, record_for(body)))
@@ -589,6 +605,15 @@ impl LogHost for ShardLog {
                 self.conflicts.fetch_add(1, Ordering::SeqCst);
             } else {
                 self.rows.fetch_add(rows.len() as u64, Ordering::SeqCst);
+                if self.outer {
+                    // A group append is its own transaction: its rows' records land with it.
+                    let records: Vec<(u64, String)> =
+                        rows.iter().map(|(seq, body)| (*seq, record_for(body))).collect();
+                    self.inner
+                        .append(&records_of(scope), &records)
+                        .await
+                        .expect("the records' seqs are the rows' seqs, just taken");
+                }
             }
             self.calls
                 .lock()
@@ -1733,6 +1758,7 @@ fn simulate_shape(seed: u64, shape: Shape, mutation: ShardsMutation) -> ShardsOu
         after_ppm: shape.after_ppm,
         read_ppm: shape.read_ppm,
         abort_ppm: shape.abort_ppm,
+        outer: shape.outer,
         splits: mutation == ShardsMutation::OuterTxSplits,
         calls: Mutex::new(BTreeMap::new()),
         appends: AtomicU64::new(0),

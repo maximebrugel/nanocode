@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 
-use nanocode_live_fold::{Ack, Cursor, Failure, Intent};
+use nanocode_live_fold::{Ack, Cursor, Failure, Intent, ViewKey};
 use nanocode_sync::Mailbox;
+
+use crate::follow::Feed;
 
 pub mod sim;
 
@@ -59,6 +61,8 @@ pub trait Applier: Send + Sync + 'static {
 
     fn submit<'a>(&'a self, intent: &'a Intent) -> Submitting<'a>;
 
+    fn partition(&self, intent: &Intent) -> u32;
+
     fn outcome(&self, record: &Self::Record) -> Option<Outcome>;
 }
 
@@ -80,21 +84,27 @@ pub enum Admit {
 #[derive(Clone, Debug, Default)]
 struct Seen {
     floor: u64,
-    below: Option<Cursor>,
+    below: BTreeMap<u32, Cursor>,
     failed: BTreeMap<u64, Failure>,
     above: BTreeMap<u64, Settled>,
 }
 
 impl Seen {
-    fn settled(&self, mid: u64) -> Option<Settled> {
+    fn settled(&self, partition: u32, mid: u64) -> Option<Settled> {
         if mid >= self.floor {
             return self.above.get(&mid).cloned();
         }
-        Some(match (self.failed.get(&mid), self.below) {
-            (Some(failure), _) => Settled::Failed(failure.clone()),
-            (None, Some(below)) => Settled::Applied(below),
-            (None, None) => unreachable!("a floor past an applied mid holds its cursor"),
-        })
+        match self.failed.get(&mid) {
+            Some(failure) => Some(Settled::Failed(failure.clone())),
+            None => self.below(partition).map(Settled::Applied),
+        }
+    }
+
+    fn below(&self, partition: u32) -> Option<Cursor> {
+        if mutated(Mutation::BelowAcrossPartitions) {
+            return self.below.values().copied().max_by_key(|below| below.pos);
+        }
+        self.below.get(&partition).copied()
     }
 
     fn settle(&mut self, mid: u64, settled: Settled) {
@@ -105,10 +115,10 @@ impl Seen {
             }
             match entry.remove() {
                 Settled::Applied(cursor) => {
-                    self.below = Some(match self.below {
-                        Some(below) if below.pos >= cursor.pos => below,
-                        _ => cursor,
-                    });
+                    let below = self.below.entry(cursor.partition).or_insert(cursor);
+                    if cursor.pos > below.pos {
+                        *below = cursor;
+                    }
                 }
                 Settled::Failed(failure) => {
                     self.failed.insert(self.floor, failure);
@@ -136,22 +146,22 @@ impl Ledger {
         Self::default()
     }
 
-    pub fn settled(&self, client: &str, mid: u64) -> Option<Settled> {
+    pub fn settled(&self, client: &str, partition: u32, mid: u64) -> Option<Settled> {
         if mutated(Mutation::RepeatsReapplied) {
             return None;
         }
-        self.clients.get(client)?.settled(mid)
+        self.clients.get(client)?.settled(partition, mid)
     }
 
-    pub fn admit(&self, intent: &Intent) -> Admit {
-        match self.settled(&intent.client, intent.mid) {
+    pub fn admit(&self, partition: u32, intent: &Intent) -> Admit {
+        match self.settled(&intent.client, partition, intent.mid) {
             Some(settled) => Admit::Repeat(settled),
             None => Admit::Apply,
         }
     }
 
     pub fn fold(&mut self, at: Cursor, outcome: Outcome) -> Fold {
-        if let Some(settled) = self.settled(&outcome.client, outcome.mid) {
+        if let Some(settled) = self.settled(&outcome.client, at.partition, outcome.mid) {
             return match outcome.verdict {
                 Verdict::Repeated(_) => Fold::Repeat(settled),
                 Verdict::Applied | Verdict::Failed(_) => Fold::Twice(settled),
@@ -215,8 +225,8 @@ impl<C: Clone + PartialEq> Intake<C> {
         &self.ledger
     }
 
-    pub fn receive(&mut self, conn: C, intent: Intent) -> Receipt {
-        if let Some(settled) = self.ledger.settled(&intent.client, intent.mid) {
+    pub fn receive(&mut self, conn: C, partition: u32, intent: Intent) -> Receipt {
+        if let Some(settled) = self.ledger.settled(&intent.client, partition, intent.mid) {
             return Receipt::Settled(settled.ack(intent.client, intent.mid));
         }
         let key = (intent.client.clone(), intent.mid);
@@ -334,9 +344,10 @@ impl<A: Applier, V: Views<Record = A::Record>> Intents<A, V> {
 
     pub async fn receive(&self, conn: V::Conn, intent: Intent) {
         let held = conn.clone();
+        let partition = self.applier.partition(&intent);
         match self
             .intake
-            .call(move |intake| intake.receive(held, intent))
+            .call(move |intake| intake.receive(held, partition, intent))
             .await
         {
             Receipt::Settled(ack) => self.views.ack(&conn, ack),
@@ -406,6 +417,28 @@ impl<A: Applier, V: Views<Record = A::Record>> Intents<A, V> {
                 }
             }
         });
+    }
+}
+
+impl<A, V> Feed for Intents<A, V>
+where
+    A: Applier,
+    V: Views<Record = A::Record> + Feed<Record = A::Record>,
+{
+    type Record = A::Record;
+
+    fn commit(&self, partition: u32, epoch: u64, batch: Vec<(u64, A::Record)>) {
+        Self::commit(self, partition, epoch, batch);
+    }
+
+    fn backfilled(
+        &self,
+        key: ViewKey,
+        epoch: u64,
+        records: Vec<(u64, A::Record)>,
+        exhausted: bool,
+    ) {
+        self.views.backfilled(key, epoch, records, exhausted);
     }
 }
 

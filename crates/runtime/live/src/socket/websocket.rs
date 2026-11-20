@@ -14,15 +14,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Frames<S> {
     type Item = Result<Inbound, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.0).poll_next(context).map(|message| match message? {
-            Ok(Message::Text(text)) => Some(Ok(Inbound::Text(text.into()))),
-            Ok(Message::Ping(_) | Message::Pong(_)) => Some(Ok(Inbound::Control)),
-            Ok(Message::Binary(_) | Message::Frame(_)) => {
-                Some(Ok(Inbound::Invalid("live frames are JSON text")))
-            }
-            Ok(Message::Close(_)) => None,
-            Err(error) => Some(Err(error)),
-        })
+        Pin::new(&mut self.0)
+            .poll_next(context)
+            .map(|message| match message? {
+                Ok(Message::Text(text)) => Some(Ok(Inbound::Text(text.into()))),
+                Ok(Message::Ping(_) | Message::Pong(_)) => Some(Ok(Inbound::Control)),
+                Ok(Message::Binary(_) | Message::Frame(_)) => {
+                    Some(Ok(Inbound::Invalid("live frames are JSON text")))
+                }
+                Ok(Message::Close(_)) => None,
+                Err(error) => Some(Err(error)),
+            })
     }
 }
 

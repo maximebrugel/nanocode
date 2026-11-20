@@ -1,10 +1,13 @@
-use std::collections::HashSet;
-use std::num::NonZeroUsize;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::{Future, pending};
+use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::sync::Arc;
 
-use nanocode_live_fold::{ClientFrame, ErrCode, Intent, ServerFrame, ViewKey, decode_client, encode};
+use nanocode_live_fold::{
+    ClientFrame, ErrCode, Intent, ServerFrame, ViewKey, decode_client, encode,
+};
 use nanocode_sync::future::{Either, select};
 use nanocode_sync::mpsc::{self, error::TrySendError};
 use nanocode_sync::stream::FuturesUnordered;
@@ -52,7 +55,7 @@ where
 
 #[derive(Clone, Copy)]
 enum Overflow {
-    Sub(u32),
+    Sub(u32, u64),
     Socket,
 }
 
@@ -66,7 +69,7 @@ impl Outbound for Queue {
         let overflow = match (frame.kind, frame.id) {
             (Kind::Eph, _) => None,
             (Kind::Ack, _) | (_, None) => Some(Overflow::Socket),
-            (_, Some(id)) => Some(Overflow::Sub(id)),
+            (_, Some(id)) => Some(Overflow::Sub(id, frame.generation)),
         };
         match self.frames.try_send(frame) {
             Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
@@ -98,7 +101,8 @@ struct Socket<'a, V: ViewSet, S: SealPolicy> {
     queue: Arc<Queue>,
     reader: S::Reader,
     hub: &'a Hub<V, S>,
-    active: HashSet<u32>,
+    active: HashMap<u32, u64>,
+    generation: u64,
     intents: Vec<Intent>,
     writes: Vec<String>,
 }
@@ -108,24 +112,43 @@ impl<V: ViewSet, S: SealPolicy> Socket<'_, V, S> {
         match inbound {
             Inbound::Text(text) => match decode_client(&text) {
                 Ok(frame) => self.frame(frame),
-                Err(error) => self.writes.push(error_text(None, ErrCode::BadFrame, error.to_string())),
+                Err(error) => {
+                    self.writes
+                        .push(error_text(None, ErrCode::BadFrame, error.to_string()))
+                }
             },
             Inbound::Control => {}
-            Inbound::Invalid(reason) => self.writes.push(error_text(None, ErrCode::BadFrame, reason)),
+            Inbound::Invalid(reason) => {
+                self.writes
+                    .push(error_text(None, ErrCode::BadFrame, reason))
+            }
         }
     }
 
     fn frame(&mut self, frame: ClientFrame) {
         match frame {
             ClientFrame::Sub { id, view, cursor } => {
-                if self.active.insert(id) {
-                    self.hub.subscribe(self.conn, id, view, cursor, self.reader.clone());
+                if let Entry::Vacant(entry) = self.active.entry(id) {
+                    self.generation += 1;
+                    entry.insert(self.generation);
+                    self.hub.subscribe(
+                        self.conn,
+                        id,
+                        self.generation,
+                        view,
+                        cursor,
+                        self.reader.clone(),
+                    );
                 } else {
-                    self.writes.push(error_text(Some(id), ErrCode::BadFrame, "this subscription id is in use"));
+                    self.writes.push(error_text(
+                        Some(id),
+                        ErrCode::BadFrame,
+                        "this subscription id is in use",
+                    ));
                 }
             }
             ClientFrame::Unsub { id } => {
-                if self.active.remove(&id) {
+                if self.active.remove(&id).is_some() {
                     self.hub.unsubscribe(self.conn, id);
                 }
             }
@@ -137,13 +160,13 @@ impl<V: ViewSet, S: SealPolicy> Socket<'_, V, S> {
         for frame in batch.drain(..) {
             match (frame.kind, frame.id) {
                 (Kind::Err, Some(id)) => {
-                    if !self.active.remove(&id) {
+                    if !self.retire(id, frame.generation) {
                         continue;
                     }
                 }
                 (Kind::Ack | Kind::Err, _) | (_, None) => {}
                 (_, Some(id)) => {
-                    if !self.active.contains(&id) {
+                    if self.active.get(&id) != Some(&frame.generation) {
                         continue;
                     }
                 }
@@ -154,12 +177,20 @@ impl<V: ViewSet, S: SealPolicy> Socket<'_, V, S> {
         }
     }
 
+    fn retire(&mut self, id: u32, generation: u64) -> bool {
+        if self.active.get(&id) != Some(&generation) {
+            return false;
+        }
+        self.active.remove(&id);
+        true
+    }
+
     fn overflowed(&mut self) -> bool {
         let mut socket = false;
         for overflow in self.queue.overflowed.drain() {
             match overflow {
-                Overflow::Sub(id) => {
-                    if self.active.remove(&id) {
+                Overflow::Sub(id, generation) => {
+                    if self.retire(id, generation) {
                         self.writes.push(error_text(
                             Some(id),
                             ErrCode::Overloaded,
@@ -212,7 +243,8 @@ where
         queue,
         reader,
         hub,
-        active: HashSet::new(),
+        active: HashMap::new(),
+        generation: 0,
         intents: Vec::new(),
         writes: Vec::new(),
     };

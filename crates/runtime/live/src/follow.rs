@@ -14,6 +14,7 @@ use nanocode_sync::{
     future::{join, join_all},
 };
 
+use crate::hub::Follow;
 use sim::{Mutation, mutated};
 
 pub mod sim;
@@ -270,4 +271,18 @@ fn disorder<R>(partition: u32, after: u64, records: &[(u64, R)]) -> Option<Store
         last = *pos;
     }
     None
+}
+
+impl<S: Source> Follow for Tailer<S> {
+    fn follow(&self, partition: u32, after: u64) {
+        Self::follow(self, partition, after);
+    }
+
+    fn unfollow(&self, partition: u32) {
+        Self::unfollow(self, partition);
+    }
+
+    fn backfill(&self, key: ViewKey, partition: u32, after: u64) {
+        Self::backfill(self, key, partition, after);
+    }
 }

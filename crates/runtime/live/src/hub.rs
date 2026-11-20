@@ -11,6 +11,9 @@ use nanocode_sync::Mailbox;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::follow::Feed;
+use crate::intent::Views;
+
 pub mod sim;
 
 use sim::{Mutation, mutated};
@@ -67,6 +70,7 @@ impl Kind {
 pub struct Frame {
     pub kind: Kind,
     pub id: Option<u32>,
+    pub generation: u64,
     pub tail: Arc<str>,
 }
 
@@ -224,7 +228,7 @@ struct Part {
 
 struct Conn {
     outbound: Arc<dyn Outbound>,
-    subs: BTreeMap<u32, ViewKey>,
+    subs: BTreeMap<u32, (ViewKey, u64)>,
 }
 
 struct Core<V: ViewSet, S: SealPolicy> {
@@ -302,12 +306,13 @@ impl<V: ViewSet, S: SealPolicy> Hub<V, S> {
         &self,
         conn: ConnId,
         id: u32,
+        generation: u64,
         key: ViewKey,
         cursor: Option<Cursor>,
         reader: S::Reader,
     ) {
         self.core
-            .send(move |core| core.subscribe(conn, id, key, cursor, &reader));
+            .send(move |core| core.subscribe(conn, id, generation, key, cursor, &reader));
     }
 
     pub fn unsubscribe(&self, conn: ConnId, id: u32) {
@@ -369,18 +374,22 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
             .store(subscribers as u64, Ordering::Relaxed);
     }
 
-    fn push(&self, conn: ConnId, frame: Frame) -> bool {
+    fn push(&self, conn: ConnId, mut frame: Frame) -> bool {
         let Some(target) = self.conns.get(&conn) else {
             return true;
         };
+        if let Some((_, generation)) = frame.id.and_then(|id| target.subs.get(&id)) {
+            frame.generation = *generation;
+        }
         Counters::add(&self.counters.sends, 1);
         target.outbound.push(frame).is_ok()
     }
 
-    fn refuse(&self, conn: ConnId, id: u32, code: ErrCode, message: &str) {
+    fn refuse(&self, conn: ConnId, id: u32, generation: u64, code: ErrCode, message: &str) {
         let frame = Frame {
             kind: Kind::Err,
             id: Some(id),
+            generation,
             tail: tail(&ErrBody { code, message }),
         };
         let _ = self.push(conn, frame);
@@ -401,6 +410,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
         &mut self,
         conn: ConnId,
         id: u32,
+        generation: u64,
         key: ViewKey,
         cursor: Option<Cursor>,
         reader: &S::Reader,
@@ -414,6 +424,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
             self.refuse(
                 conn,
                 id,
+                generation,
                 ErrCode::Denied,
                 "this view is sealed for this reader",
             );
@@ -421,7 +432,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
         }
         if !self.instances.contains_key(&key) {
             let Some((partition, view)) = self.views.open(&key) else {
-                self.refuse(conn, id, ErrCode::UnknownView, &key.name);
+                self.refuse(conn, id, generation, ErrCode::UnknownView, &key.name);
                 return;
             };
             self.instances.insert(
@@ -438,7 +449,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
             self.follow.backfill(key.clone(), partition, 0);
         }
         if let Some(target) = self.conns.get_mut(&conn) {
-            target.subs.insert(id, key.clone());
+            target.subs.insert(id, (key.clone(), generation));
         }
         let waiter = Waiter {
             conn,
@@ -493,6 +504,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
                     .map(|tail| Frame {
                         kind: Kind::Diff,
                         id: Some(waiter.id),
+                        generation: 0,
                         tail,
                     })
                     .collect::<Vec<_>>()
@@ -511,6 +523,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
                     .map(|encoded| Frame {
                         kind: Kind::Snap,
                         id: Some(waiter.id),
+                        generation: 0,
                         tail: shared(&encoded),
                     })
                     .into_iter()
@@ -573,6 +586,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
             let frame = Frame {
                 kind: Kind::Diff,
                 id: Some(id),
+                generation: 0,
                 tail,
             };
             if !self.push(conn, frame) {
@@ -643,6 +657,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
             .conns
             .get_mut(&conn)
             .and_then(|target| target.subs.remove(&id))
+            .map(|(key, _)| key)
         else {
             return;
         };
@@ -654,7 +669,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
         let Some(target) = self.conns.remove(&conn) else {
             return;
         };
-        for (id, key) in target.subs {
+        for (id, (key, _)) in target.subs {
             self.detach(&key, (conn, id));
         }
         self.gauge();
@@ -791,7 +806,11 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
         if let Ok(cursor) = ack.result
             && !mutated(Mutation::AckSkipsAdvance)
         {
-            let keys = target.subs.values().cloned().collect::<BTreeSet<_>>();
+            let keys = target
+                .subs
+                .values()
+                .map(|(key, _)| key.clone())
+                .collect::<BTreeSet<_>>();
             for key in keys {
                 let behind = matches!(
                     self.instances.get(&key),
@@ -810,6 +829,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
             Frame {
                 kind: Kind::Ack,
                 id: None,
+                generation: 0,
                 tail: tail(ack),
             },
         );
@@ -830,6 +850,7 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
                     Frame {
                         kind: Kind::Eph,
                         id: Some(id),
+                        generation: 0,
                         tail: Arc::clone(&body),
                     },
                 )
@@ -898,5 +919,36 @@ impl<V: ViewSet, S: SealPolicy> Core<V, S> {
                 ring: live.ring().len(),
             },
         })
+    }
+}
+
+impl<V: ViewSet, S: SealPolicy> Views for Hub<V, S> {
+    type Conn = ConnId;
+    type Record = V::Record;
+
+    fn commit(&self, partition: u32, epoch: u64, batch: Vec<(u64, V::Record)>) {
+        Self::commit(self, partition, epoch, batch);
+    }
+
+    fn ack(&self, conn: &ConnId, ack: Ack) {
+        Self::ack(self, *conn, ack);
+    }
+}
+
+impl<V: ViewSet, S: SealPolicy> Feed for Hub<V, S> {
+    type Record = V::Record;
+
+    fn commit(&self, partition: u32, epoch: u64, batch: Vec<(u64, V::Record)>) {
+        Self::commit(self, partition, epoch, batch);
+    }
+
+    fn backfilled(
+        &self,
+        key: ViewKey,
+        epoch: u64,
+        records: Vec<(u64, V::Record)>,
+        exhausted: bool,
+    ) {
+        Self::backfilled(self, key, epoch, records, exhausted);
     }
 }

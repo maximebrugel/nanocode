@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque, env, future::Future, io, net::SocketAddr, sync::Arc, time::Duration,
 };
 
+use crate::roots::Configs;
 use nanocode_executor::TcpStream;
 use nanocode_io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use nanocode_platform::sleep_until;
@@ -18,7 +19,7 @@ const CONNECT_RESPONSE_BYTES_MAX: usize = 8_192;
 const HTTP_PORT: u16 = 80;
 const HTTPS_PORT: u16 = 443;
 const SOCKS_PORT: u16 = 1080;
-const ALPN_HTTP1: &[u8] = b"http/1.1";
+pub(crate) const ALPN_HTTP1: &[u8] = b"http/1.1";
 const SOCKS_VERSION: u8 = 0x05;
 const SOCKS_NO_AUTHENTICATION: u8 = 0x00;
 const SOCKS_USERNAME_PASSWORD: u8 = 0x02;
@@ -567,13 +568,32 @@ pub enum Alpn {
     Http1,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Handshake<'a> {
+    pub alpn: Alpn,
+    pub roots: Option<&'a Configs>,
+}
+
 pub async fn tls<S>(stream: S, host: &str, alpn: Alpn) -> io::Result<ClientStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let config = match alpn {
-        Alpn::None => nanocode_tls::native_client_config().await?,
-        Alpn::Http1 => http1_config().await?,
+    handshake(stream, host, Handshake { alpn, roots: None }).await
+}
+
+async fn handshake<S>(
+    stream: S,
+    host: &str,
+    handshake: Handshake<'_>,
+) -> io::Result<ClientStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let config = match (handshake.roots, handshake.alpn) {
+        (None, Alpn::None) => nanocode_tls::native_client_config().await?,
+        (None, Alpn::Http1) => http1_config().await?,
+        (Some(roots), Alpn::None) => Arc::clone(&roots.base),
+        (Some(roots), Alpn::Http1) => Arc::clone(&roots.http1),
     };
     let name = ServerName::try_from(normalize_host(host).to_owned())
         .map_err(|_| invalid_input(format!("invalid TLS server name {host:?}")))?;
@@ -636,17 +656,34 @@ pub async fn stream(
     user_agent: Option<&str>,
     alpn: Alpn,
 ) -> io::Result<Box<dyn Duplex>> {
+    let target = Handshake { alpn, roots: None };
+    stream_with(host, port, secure, proxy, resolved, user_agent, target).await
+}
+
+pub(crate) async fn stream_with(
+    host: &str,
+    port: u16,
+    secure: bool,
+    proxy: Option<&Proxy>,
+    resolved: &[SocketAddr],
+    user_agent: Option<&str>,
+    target: Handshake<'_>,
+) -> io::Result<Box<dyn Duplex>> {
     let Some(proxy) = proxy else {
         let socket = tcp(host, port, resolved).await?;
         return Ok(if secure {
-            Box::new(tls(socket, host, alpn).await?)
+            Box::new(handshake(socket, host, target).await?)
         } else {
             Box::new(socket)
         });
     };
     let socket = tcp(&proxy.host, proxy.port, &[]).await?;
     let mut socket: Box<dyn Duplex> = if proxy.scheme == ProxyScheme::Https {
-        Box::new(tls(socket, &proxy.host, Alpn::Http1).await?)
+        let to_proxy = Handshake {
+            alpn: Alpn::Http1,
+            roots: target.roots,
+        };
+        Box::new(handshake(socket, &proxy.host, to_proxy).await?)
     } else {
         Box::new(socket)
     };
@@ -656,7 +693,7 @@ pub async fn stream(
     }
     tunnel(&mut socket, proxy, host, port, user_agent).await?;
     Ok(if secure {
-        Box::new(tls(socket, host, alpn).await?)
+        Box::new(handshake(socket, host, target).await?)
     } else {
         socket
     })

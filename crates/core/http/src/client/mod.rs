@@ -6,7 +6,9 @@ pub mod redirect;
 mod request;
 mod response;
 
-use std::{fmt, future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    fmt, future::Future, net::SocketAddr, path::PathBuf, pin::Pin, sync::Arc, time::Duration,
+};
 
 use crate::types::{
     HeaderMap, HeaderValue, Method, StatusCode, Version,
@@ -30,6 +32,7 @@ pub use response::{Response, ResponseStream};
 
 use crate::{
     connect::{self, Alpn, Proxy, ProxyScheme},
+    roots::{Roots, RootsBuilder},
     wire::{self, BodyReader, Connection, Framing, WireError},
 };
 
@@ -79,6 +82,7 @@ struct Inner {
     https_only: bool,
     resolved: Vec<(String, Vec<SocketAddr>)>,
     connector: Option<Arc<dyn Connect>>,
+    roots: Option<Arc<Roots>>,
     pool: Arc<Pool>,
 }
 
@@ -97,6 +101,7 @@ pub struct ClientBuilder {
     idle_per_host_max: usize,
     idle_timeout: Option<Duration>,
     connector: Option<Arc<dyn Connect>>,
+    roots: RootsBuilder,
     error: Option<Error>,
 }
 
@@ -127,6 +132,7 @@ impl ClientBuilder {
             idle_per_host_max: usize::MAX,
             idle_timeout: Some(IDLE_TIMEOUT),
             connector: None,
+            roots: RootsBuilder::default(),
             error: None,
         }
     }
@@ -135,6 +141,7 @@ impl ClientBuilder {
         if let Some(error) = self.error {
             return Err(error);
         }
+        let roots = self.roots.build().map_err(Error::builder)?;
         Ok(Client {
             inner: Arc::new(Inner {
                 headers: self.headers,
@@ -148,6 +155,7 @@ impl ClientBuilder {
                 https_only: self.https_only,
                 resolved: self.resolved,
                 connector: self.connector,
+                roots,
                 pool: Arc::new(Pool::new(self.idle_per_host_max, self.idle_timeout)),
             }),
         })
@@ -226,6 +234,23 @@ impl ClientBuilder {
 
     pub fn connector(mut self, connector: impl Connect) -> Self {
         self.connector = Some(Arc::new(connector));
+        self
+    }
+
+    pub const fn tls_built_in_root_certs(mut self, enabled: bool) -> Self {
+        self.roots.built_in(enabled);
+        self
+    }
+
+    pub fn add_root_certificates_pem(mut self, pem: &[u8]) -> Self {
+        if let Err(error) = self.roots.add_pem(pem) {
+            self.error.get_or_insert(Error::builder(error));
+        }
+        self
+    }
+
+    pub fn add_root_certificates_pem_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.roots.add_pem_file(path.into());
         self
     }
 
@@ -581,15 +606,20 @@ impl Client {
         let connecting: Pin<Box<dyn Future<Output = std::io::Result<wire::Io>> + Send + '_>> =
             match &self.inner.connector {
                 Some(connector) => connector.connect(&key.host, key.port, key.secure),
-                None => Box::pin(connect::stream(
-                    &key.host,
-                    key.port,
-                    key.secure,
-                    proxy,
-                    &resolved,
-                    user_agent,
-                    Alpn::Http1,
-                )),
+                None => Box::pin(async move {
+                    let roots = match &self.inner.roots {
+                        Some(roots) => Some(roots.configs().await?),
+                        None => None,
+                    };
+                    let target = connect::Handshake {
+                        alpn: Alpn::Http1,
+                        roots: roots.as_deref(),
+                    };
+                    connect::stream_with(
+                        &key.host, key.port, key.secure, proxy, &resolved, user_agent, target,
+                    )
+                    .await
+                }),
             };
         let stream = match self.inner.connect_timeout {
             Some(limit) => timeout(limit, connecting)

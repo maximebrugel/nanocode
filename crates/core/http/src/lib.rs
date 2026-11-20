@@ -13,6 +13,8 @@ pub mod connect;
 #[cfg(not(target_family = "wasm"))]
 mod flate;
 #[cfg(not(target_family = "wasm"))]
+mod roots;
+#[cfg(not(target_family = "wasm"))]
 mod sender;
 #[cfg(not(target_family = "wasm"))]
 pub mod server;

@@ -12,6 +12,20 @@ pub const CLOSE_WINDOW_MS: u64 = 15 * 60_000;
 /// A waiter whose take has not retried for this long (its client died) is dropped.
 pub const WAITER_GONE_MS: u64 = 2 * 60_000;
 
+/// A standing reservation (label prefix P) with no lease inside it (no take labelled P*) for this
+/// long is given back whenever a client reads or writes the state.
+pub const RESERVATION_IDLE_MS: u64 = 15 * 60_000;
+
+/// Standing reservations under these label prefixes are never given back for being idle.
+pub const IDLE_EXEMPT_PREFIXES: [&str; 3] = ["p2live-", "nf-deploy-", "lander-p2live"];
+
+/// Whether a standing reservation with label prefix P is kept however long it sits idle.
+pub fn idle_exempt(prefix: &str) -> bool {
+    IDLE_EXEMPT_PREFIXES
+        .iter()
+        .any(|exempt| prefix.starts_with(exempt))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pin {
     Taskset,
@@ -61,6 +75,10 @@ pub struct Lease {
     pub label: String,
     pub taken_ms: u64,
     pub until_ms: u64,
+    /// For a standing reservation: when it was made or a lease was last taken inside it. Optional
+    /// in the state, so files written before it load; a reservation without it counts from the
+    /// first time the state is read.
+    pub used_ms: Option<u64>,
 }
 
 pub const DEFAULT_KIND: &str = "build";
@@ -348,6 +366,7 @@ impl State {
                 label: text(lease, "label")?,
                 taken_ms: number(lease, "taken_ms")?,
                 until_ms: number(lease, "until_ms")?,
+                used_ms: number(lease, "used_ms"),
             });
         }
         Some(Self {
@@ -389,7 +408,7 @@ impl State {
             .leases
             .iter()
             .map(|lease| {
-                json!({
+                let mut value = json!({
                     "id": lease.id,
                     "machine": lease.machine,
                     "first_cpu": lease.first_cpu,
@@ -398,7 +417,11 @@ impl State {
                     "label": lease.label,
                     "taken_ms": lease.taken_ms,
                     "until_ms": lease.until_ms,
-                })
+                });
+                if let Some(used_ms) = lease.used_ms {
+                    value["used_ms"] = json!(used_ms);
+                }
+                value
             })
             .collect();
         let mut value = json!({
@@ -421,6 +444,43 @@ impl State {
         self.leases = live;
         self.waiters.retain(|waiter| waiter.live(now_ms));
         expired
+    }
+
+    /// Gives back every standing reservation that has had no lease inside it for
+    /// RESERVATION_IDLE_MS, except those under IDLE_EXEMPT_PREFIXES. A live lease inside one
+    /// counts as use now, and one with no recorded use (an older state) starts counting now.
+    pub fn give_back_idle(&mut self, now_ms: u64) -> Vec<Lease> {
+        let in_use: Vec<String> = self
+            .leases
+            .iter()
+            .filter(|outer| {
+                outer.label_prefix().is_some_and(|prefix| {
+                    self.leases.iter().any(|lease| {
+                        lease.until_ms > now_ms
+                            && lease.label.starts_with(prefix)
+                            && lease.within(outer)
+                    })
+                })
+            })
+            .map(|outer| outer.id.clone())
+            .collect();
+        for lease in &mut self.leases {
+            if lease.label_prefix().is_some()
+                && (lease.used_ms.is_none() || in_use.contains(&lease.id))
+            {
+                lease.used_ms = Some(now_ms);
+            }
+        }
+        let (idle, kept) = self.leases.drain(..).partition(|lease| {
+            lease
+                .label_prefix()
+                .is_some_and(|prefix| !idle_exempt(prefix))
+                && lease
+                    .used_ms
+                    .is_some_and(|used| now_ms.saturating_sub(used) >= RESERVATION_IDLE_MS)
+        });
+        self.leases = kept;
+        idle
     }
 
     pub fn leased_cpus(&self, name: &str, cores: u32) -> u32 {
@@ -683,9 +743,16 @@ impl State {
             {
                 return None;
             }
-            Some((held.machine.clone(), self.gap_within(held, want.cores)?))
+            Some((
+                held.id.clone(),
+                held.machine.clone(),
+                self.gap_within(held, want.cores)?,
+            ))
         });
-        if let Some((machine, first_cpu)) = standing {
+        if let Some((id, machine, first_cpu)) = standing {
+            if let Some(held) = self.leases.iter_mut().find(|held| held.id == id) {
+                held.used_ms = Some(now_ms);
+            }
             return Ok(self.add(&machine, first_cpu, want, now_ms, now_ms + want.ttl_ms));
         }
         let claim = self.leases.iter().position(|lease| {
@@ -802,6 +869,11 @@ impl State {
             label: want.label.clone(),
             taken_ms: now_ms,
             until_ms,
+            used_ms: None,
+        };
+        let lease = Lease {
+            used_ms: lease.label_prefix().map(|_| now_ms),
+            ..lease
         };
         self.leases.push(lease.clone());
         lease

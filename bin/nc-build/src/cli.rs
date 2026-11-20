@@ -608,17 +608,39 @@ fn stored_caps(write: Option<&[slots::Cap]>) -> Result<Option<Vec<slots::Cap>>, 
 fn with_state<T>(mut change: impl FnMut(&mut State) -> T) -> Result<T, String> {
     let stored = stored_caps(None)?;
     let mut caps = Vec::new();
+    let mut idle = Vec::new();
     let result = with_slots_state(|state| {
+        idle = state.give_back_idle(now_ms());
         let legacy = std::mem::take(&mut state.caps);
         state.caps = stored.clone().unwrap_or(legacy);
         let result = change(state);
         caps = std::mem::take(&mut state.caps);
         result
     })?;
+    log_idle(&idle, now_ms());
     if stored.as_ref() != Some(&caps) && (stored.is_some() || !caps.is_empty()) {
         stored_caps(Some(&caps))?;
     }
     Ok(result)
+}
+
+fn idle_line(lease: &slots::Lease, now: u64) -> String {
+    let idle = lease
+        .used_ms
+        .map_or(0, |used| now.saturating_sub(used) / 60_000);
+    format!(
+        "reservation {} {} cpus {} {} idle {idle}m, given back",
+        lease.id,
+        lease.machine,
+        lease.cpus(),
+        lease.label
+    )
+}
+
+fn log_idle(idle: &[slots::Lease], now: u64) {
+    for lease in idle {
+        log_line(&idle_line(lease, now));
+    }
 }
 
 fn with_slots_state<T>(mut change: impl FnMut(&mut State) -> T) -> Result<T, String> {
@@ -1631,6 +1653,7 @@ mod tests {
                 label: "held".to_owned(),
                 taken_ms: NOW - 1_000,
                 until_ms: NOW + 3_600_000,
+                used_ms: None,
             });
         }
         state
@@ -1726,6 +1749,7 @@ mod tests {
             label: label.to_owned(),
             taken_ms: NOW - 1_000,
             until_ms: NOW + 3_600_000,
+            used_ms: None,
         }
     }
 
@@ -2265,6 +2289,100 @@ mod tests {
                 .unwrap_err()
                 .contains("box closes at")
         );
+    }
+
+    fn standing(state: &mut State, prefix: &str, first_cpu: u32, at: u64) -> Lease {
+        let want = Want {
+            cores: 8,
+            kind: slots::RESERVED_KIND.to_owned(),
+            label: format!("{prefix}{}", slots::PREFIX_MARK),
+            only: Some("m".to_owned()),
+            ttl_ms: 600 * MIN,
+            queue: None,
+        };
+        state
+            .reserve("m", first_cpu, &want, at, at + 600 * MIN, false)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_idle_standing_reservation_is_given_back_after_15_minutes() {
+        let mut state = State::default();
+        let reserved = standing(&mut state, "py-", 0, NOW);
+        assert_eq!(reserved.used_ms, Some(NOW));
+        assert!(state.give_back_idle(NOW + 14 * MIN).is_empty());
+        assert_eq!(state.leases.len(), 1);
+        let given = state.give_back_idle(NOW + 15 * MIN);
+        assert_eq!(given.len(), 1);
+        assert!(state.leases.is_empty());
+        assert_eq!(
+            super::idle_line(&given[0], NOW + 15 * MIN),
+            format!(
+                "reservation {} m cpus 0-7 py-* idle 15m, given back",
+                reserved.id
+            )
+        );
+    }
+
+    #[test]
+    fn exempt_standing_reservations_are_never_given_back_for_idling() {
+        let mut state = State::default();
+        for (at, prefix) in ["p2live-api-", "nf-deploy-", "lander-p2live", "py-"]
+            .iter()
+            .enumerate()
+        {
+            standing(&mut state, prefix, 8 * u32::try_from(at).unwrap(), NOW);
+        }
+        let given = state.give_back_idle(NOW + 600 * MIN - 1);
+        assert_eq!(
+            given
+                .iter()
+                .map(|lease| lease.label.as_str())
+                .collect::<Vec<_>>(),
+            ["py-*"]
+        );
+        assert_eq!(state.leases.len(), 3);
+        assert!(slots::idle_exempt("lander-p2live-x"));
+        assert!(!slots::idle_exempt("p2-"));
+    }
+
+    #[test]
+    fn a_take_inside_a_standing_reservation_keeps_it_alive() {
+        let machines = [machine()];
+        let mut state = State::default();
+        let reserved = standing(&mut state, "py-", 0, NOW);
+        let mut inside = labelled(4, slots::DEFAULT_KIND, "py-build");
+        inside.ttl_ms = MIN;
+        let at = NOW + 10 * MIN;
+        let lease = state.take(&machines, &inside, at).unwrap();
+        assert_eq!(lease.cpus(), "0-3");
+        assert_eq!(state.leases[0].used_ms, Some(at));
+        // The take's own lease ended at 11m; the reservation counts from the take at 10m.
+        assert!(state.give_back_idle(at + 14 * MIN).is_empty());
+        assert_eq!(state.leases[0].id, reserved.id);
+        assert_eq!(state.give_back_idle(at + 15 * MIN).len(), 1);
+        // A lease still running inside a reservation keeps it, however long ago it was taken.
+        let mut busy = State::default();
+        standing(&mut busy, "py-", 0, NOW);
+        inside.ttl_ms = 120 * MIN;
+        busy.take(&machines, &inside, NOW).unwrap();
+        assert!(busy.give_back_idle(NOW + 60 * MIN).is_empty());
+        assert_eq!(busy.leases.len(), 2);
+    }
+
+    #[test]
+    fn reservations_from_older_state_files_load_and_start_counting_when_read() {
+        let mut state = State::default();
+        standing(&mut state, "py-", 0, NOW);
+        let mut old: serde_json::Value = serde_json::from_str(&state.to_json()).unwrap();
+        old["leases"][0].as_object_mut().unwrap().remove("used_ms");
+        let mut old = State::from_json(&old.to_string()).unwrap();
+        assert_eq!(old.leases[0].used_ms, None);
+        assert!(old.give_back_idle(NOW + 60 * MIN).is_empty());
+        assert_eq!(old.leases[0].used_ms, Some(NOW + 60 * MIN));
+        let mut round = State::from_json(&old.to_json()).unwrap();
+        assert_eq!(round.leases, old.leases);
+        assert_eq!(round.give_back_idle(NOW + 75 * MIN).len(), 1);
     }
 
     fn lease_on(machine: &str, cores: u32) -> Lease {

@@ -33,7 +33,7 @@ use std::{
 use nanocode_board::{
     Applied, Board, BoardError, Cap, ClaimId, EventId, Fence, Fold, NewTask, Op, Outcome, Phase,
     Rejection, Resolution, TaskId, Write,
-    access::{Can, Grant, Who},
+    access::{Can, Denied, Grant, Who},
     deliver::Outbox,
     shards::{self, Committer, Merged, ReadyIndex, Route, Stats as CommitStats},
     sim::{self as board_sim, Mutation as BoardRule},
@@ -370,12 +370,22 @@ impl Shape {
         } else {
             (false, 0)
         };
+        // An outer transaction carries one write, so the outer arm has no group commit: under
+        // heavy claim polling a partition's committer lands a few times fewer writes, and
+        // holders' finishes queue behind refused claims (seed 1405). It gets twice the time;
+        // the lapse budget stays the one drawn for the shorter deadline.
+        let deadline_ms = if outer {
+            shape.deadline_ms * 2
+        } else {
+            shape.deadline_ms
+        };
         Self {
             lease_ms,
             lapse_ppm,
             lapse_budget,
             outer,
             abort_ppm,
+            deadline_ms,
             ..shape
         }
     }
@@ -1326,6 +1336,15 @@ fn serial(logs: &[Vec<(u64, String)>], folds: &[Fold]) -> Result<Fold, String> {
             let mut event: nanocode_board::Event = serde_json::from_str(body)
                 .map_err(|error| format!("partition {partition} row {position}: {error}"))?;
             clock = clock.max(event.at_ms);
+            // A write its partition refused before the lead chartered it there (the fencer's
+            // first epoch bump can race the charter) would land on the one serial board, which
+            // an earlier partition already chartered.
+            if matches!(
+                folds[partition].outcome(&event.id),
+                Some(Err(Rejection::Access(Denied::Unchartered)))
+            ) {
+                continue;
+            }
             if let Op::Claim { cap, .. } = &mut event.op {
                 if matches!(
                     folds[partition].outcome(&event.id),

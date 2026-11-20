@@ -703,7 +703,7 @@ impl Client {
                 method,
                 url: self.url(path),
                 headers,
-                body: body.as_bytes().to_vec(),
+                body: body.as_bytes().to_vec().into(),
             })
             .await
             .map_err(|error| Attempt::Retry(ClientError::Transport(error.detail().to_owned())))?;

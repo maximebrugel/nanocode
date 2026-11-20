@@ -128,7 +128,8 @@ impl VertexClaude {
         );
         ordered.extend(body);
         request.body = serde_json::to_vec(&ordered)
-            .map_err(|error| Error::new(format!("Claude on Vertex AI: {error}")))?;
+            .map_err(|error| Error::new(format!("Claude on Vertex AI: {error}")))?
+            .into();
         request.url = format!(
             "{}/v1/projects/{project}/locations/{}/publishers/anthropic/models/{model}:{}",
             self.shared.base,

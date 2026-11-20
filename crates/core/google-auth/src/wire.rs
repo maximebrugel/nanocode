@@ -50,7 +50,7 @@ pub async fn call(
             method,
             url: url.to_owned(),
             headers: map,
-            body,
+            body: body.into(),
         })
         .await
         .map_err(|error| Error::new(format!("{url}: {}", error.detail())))?;

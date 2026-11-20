@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use nanocode_durability_core::StoreError;
 use nanocode_turnlog::LogHost;
 
 pub use nanocode_board_fold::*;
@@ -241,6 +242,45 @@ impl Board {
     }
 }
 
+/// How the caller's transaction that carried a planned group's rows ended.
+#[derive(Clone, Debug)]
+pub enum Resolution {
+    /// It committed: every row is in the store.
+    Committed,
+    /// It rolled back: none of the rows is. `StoreError::Fenced` means a planned seq was
+    /// taken, so the board rescans before it plans again.
+    Aborted(StoreError),
+    /// Its outcome is unknown (the acknowledgement was lost): the board rescans before it plans
+    /// again, and the writes are unsettled.
+    Unknown(StoreError),
+}
+
+/// A group of writes planned at the board's next seq for the caller's own transaction
+/// ([`Board::plan_group`]): write [`PlannedGroup::rows`] beside the caller's records, then
+/// hand it back to [`Board::settle_group`] with how the transaction ended.
+pub struct PlannedGroup {
+    planned: group::Planned,
+    members: Vec<usize>,
+    verdicts: Vec<Option<Result<Applied, BoardError>>>,
+}
+
+impl PlannedGroup {
+    /// The rows to write, in seq order, densely from [`PlannedGroup::first`].
+    pub fn rows(&self) -> &[(u64, String)] {
+        self.planned.rows()
+    }
+
+    pub const fn first(&self) -> u64 {
+        self.planned.first()
+    }
+
+    /// Every write settled before planning (refused by middleware, or already landed): no
+    /// transaction needs to carry it.
+    pub fn is_settled(&self) -> bool {
+        self.planned.rows().is_empty()
+    }
+}
+
 /// One write in a group: by another actor than the board's writer when `by` is set (a node
 /// committing for the agents it hosts), keyed for idempotence when `key` is set.
 #[derive(Clone, Debug)]
@@ -355,5 +395,98 @@ impl Board {
             .collect();
         self.keep_checkpoint();
         (verdicts, rounds)
+    }
+
+    /// Plans writes as one group at the fold's next seq for the caller's transaction, without
+    /// appending: mints and vets each write as [`Board::submit_group`] does, rescanning first when
+    /// an earlier group was fenced or lost. The fold does not move until [`Board::settle_group`]
+    /// hears the transaction committed, so a rolled-back group is never visible. Plan one group
+    /// at a time: a second plan before the first settles reuses its seqs.
+    pub async fn plan_group(&mut self, writes: Vec<Write>) -> PlannedGroup {
+        let events = writes
+            .into_iter()
+            .map(|write| {
+                let by = write.by.unwrap_or_else(|| self.writer.clone());
+                let id = self.mint(&by, write.key.as_deref());
+                (id, by, write.at_ms, write.op)
+            })
+            .collect();
+        self.plan_events(events).await
+    }
+
+    /// [`Board::plan_group`] for events whose ids the caller already minted (id, by, at_ms, op).
+    pub async fn plan_events(&mut self, events: Vec<(EventId, String, u64, Op)>) -> PlannedGroup {
+        let mut verdicts: Vec<Option<Result<Applied, BoardError>>> = vec![None; events.len()];
+        if self.contended && !mutated(Mutation::PlannedFencedNoRescan) {
+            match self.refresh().await {
+                Ok(()) => self.contended = false,
+                Err(error) => {
+                    return PlannedGroup {
+                        planned: self.fold.plan_group(Vec::new()),
+                        members: Vec::new(),
+                        verdicts: events.iter().map(|_| Some(Err(error.clone()))).collect(),
+                    };
+                }
+            }
+        }
+        let mut members = Vec::new();
+        let mut vetted = Vec::new();
+        for (index, (id, by, at_ms, op)) in events.into_iter().enumerate() {
+            match self.chain.vet(&id, &by, &op) {
+                Ok(op) => {
+                    members.push(index);
+                    vetted.push(Event { id, by, at_ms, op });
+                }
+                Err(error) => verdicts[index] = Some(Err(error)),
+            }
+        }
+        PlannedGroup {
+            planned: self.fold.plan_group(vetted),
+            members,
+            verdicts,
+        }
+    }
+
+    /// Settles a planned group with how the caller's transaction ended: on commit the fold takes
+    /// its rows and each write gets the fold's verdict; on abort the fold stays put and each
+    /// write fails with the store's error (`Fenced` when a seq was taken, after which the next
+    /// plan rescans); when unknown, each write is unsettled and the next plan rescans.
+    pub async fn settle_group(
+        &mut self,
+        group: PlannedGroup,
+        resolution: Resolution,
+    ) -> Vec<Result<Applied, BoardError>> {
+        let PlannedGroup {
+            planned,
+            members,
+            mut verdicts,
+        } = group;
+        let settled = match resolution {
+            Resolution::Committed => match planned.committed(&mut self.fold) {
+                Ok(settled) => settled,
+                Err(error) => {
+                    self.contended = true;
+                    members.iter().map(|_| Err(error.clone())).collect()
+                }
+            },
+            Resolution::Aborted(error) => {
+                if matches!(error, StoreError::Fenced) {
+                    self.contended = true;
+                }
+                planned.aborted(&mut self.fold, &error)
+            }
+            Resolution::Unknown(error) => {
+                self.contended = true;
+                planned.unknown(&error)
+            }
+        };
+        for (index, verdict) in members.into_iter().zip(settled) {
+            verdicts[index] = Some(verdict);
+        }
+        self.keep_checkpoint().await;
+        verdicts
+            .into_iter()
+            .map(|verdict| verdict.unwrap_or_else(|| Err(BoardError::Dropped("unsettled".into()))))
+            .collect()
     }
 }

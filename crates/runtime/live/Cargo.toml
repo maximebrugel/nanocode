@@ -12,6 +12,8 @@ description = "Live views over a partitioned log: follow, fold once per view, fa
 [dependencies]
 nanocode-live-fold.workspace = true
 nanocode-sync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

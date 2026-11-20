@@ -746,6 +746,8 @@ version = "0.7.0"
 dependencies = [
  "nanocode-live-fold",
  "nanocode-sync",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

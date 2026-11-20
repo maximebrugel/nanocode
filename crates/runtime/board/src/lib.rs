@@ -467,7 +467,7 @@ impl Board {
                 }
             },
             Resolution::Aborted(error) => {
-                if matches!(error, StoreError::Fenced) {
+                if matches!(error, StoreError::Fenced | StoreError::Conflict { .. }) {
                     self.contended = true;
                 }
                 planned.aborted(&mut self.fold, &error)

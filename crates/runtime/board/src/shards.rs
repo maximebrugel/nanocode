@@ -709,6 +709,10 @@ async fn plan(
             board.plan_events(events).await
         }
     };
+    if !group.is_settled() {
+        // The caller's transaction is this group's one append round.
+        stats.appends += 1;
+    }
     let (resolve, resolution) = oneshot::channel();
     let (verdict, verdicts) = oneshot::channel();
     let ticket = Ticket {

@@ -5,7 +5,7 @@ D = ["2024-03-10T09:59:59Z", "2024-03-31T01:00:00Z", "2024-10-27T00:59:59Z", "20
 Z = ["UTC", "America/Los_Angeles", "Europe/Berlin", "Asia/Tokyo", "Asia/Kolkata"]
 def case(name, body):
     return {"id": "intl-dtf-" + name.replace("/", "-"), "kind": "js", "src": "const D=" + json.dumps(D) + ".map(s=>new Date(s));const out=[];" + body + "text(out.join('\\n'))"}
-L2 = ["ko", "it", "ru", "nl", "pl", "tr", "ar", "ar-EG", "hi", "id", "vi", "zh-TW", "zh-Hant", "en-GB", "en-IN", "es-MX", "fr-CA"]
+L2 = ["ko", "it", "ru", "nl", "pl", "tr", "ar", "ar-EG", "hi", "id", "vi", "zh-TW", "zh-Hant", "en-GB", "en-IN", "es-MX", "fr-CA", "fi"]
 FIVE = ("/styles", "/month-names", "/weekday-names", "/parts", "/mixed")
 cases = []
 for l in L + L2:
@@ -20,7 +20,7 @@ for l in L + L2:
 keep = {"intl-dtf-" + (l + n).replace("/", "-") for l in L for n in FIVE + ("/toLocale",)} | {"intl-dtf-" + (l + n).replace("/", "-") for l in L2 for n in FIVE}
 cases = [c for c in cases if c["id"] in keep]
 # formatRange / formatRangeToParts: option sets x pairs whose greatest differing field is each level
-RL = L + ["ko", "it", "ru", "nl", "pl", "tr", "ar", "hi", "id", "vi", "zh-TW", "en-GB", "en-IN", "es-MX", "fr-CA"]
+RL = L + ["ko", "it", "ru", "nl", "pl", "tr", "ar", "hi", "id", "vi", "zh-TW", "en-GB", "en-IN", "es-MX", "fr-CA", "fi"]
 RP = "const a=Date.UTC(2024,4,7,9,5,7,250);const P=[[a,Date.UTC(-43,2,15,18,30)],[a,Date.UTC(2026,1,3,21,40,1)],[a,Date.UTC(2024,10,20,9,5,7)],[a,Date.UTC(2024,4,9,3,15)],[a,Date.UTC(2024,4,7,15,5,7)],[a,Date.UTC(2024,4,7,11,30)],[a,Date.UTC(2024,4,7,9,45,7)],[a,Date.UTC(2024,4,7,9,5,40)],[a,a+300],[a,a],[Date.UTC(2024,4,7,23,59),Date.UTC(2024,4,7,0,0)]];"
 RO = ("[{},{year:'numeric',month:'short',day:'numeric'},{month:'long',year:'numeric'},{weekday:'long',month:'long',day:'numeric'},{hour:'numeric',minute:'2-digit'},"
       "{hour:'2-digit',minute:'2-digit',hourCycle:'h23'},{hour:'numeric',minute:'numeric',second:'numeric'},{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'},"

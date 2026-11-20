@@ -124,7 +124,7 @@ impl State {
                 return;
             }
             (*page).free_local(block);
-            if (*page).used.get() == 0 {
+            if (*page).used.get() == 0 && self.heads[(*page).class.get()].get() != page {
                 self.retire(page);
             }
         }

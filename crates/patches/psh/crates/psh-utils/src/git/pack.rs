@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use super::repo::{parse_tree, tag_target};
@@ -26,6 +28,13 @@ const FANOUT: usize = 256;
 const LARGE: u32 = 0x8000_0000;
 const GIT_DEFAULT_ZLIB_LEVEL: u8 = 6;
 const MODE_GITLINK: u32 = 0o160000;
+const BLOCK_BYTES: usize = size_of::<u128>();
+const INSERT_BYTES_MAX: usize = LOW7 as usize;
+const COPY: u8 = 0x80;
+const COPY_SIZE_BIT: u8 = 0x10;
+const COPY_SIZE_BYTES: usize = 3;
+const COPY_BYTES_MAX: usize = 0x10000;
+const OFS_BYTES_MAX: usize = (usize::BITS as usize).div_ceil(7);
 
 #[derive(Clone, Copy)]
 enum Base {
@@ -49,6 +58,13 @@ pub struct Indexed {
     links: Vec<Vec<Oid>>,
     by_oid: HashMap<Oid, usize>,
     pub checksum: Oid,
+    /// One inflater for every `read`: a new one allocates and zeroes its window and
+    /// tables, which costs more than inflating a small object.
+    inflater: RefCell<Inflater>,
+    /// The objects `index_keeping` inflated, by entry, each handed out by its first
+    /// `read`: a clone reads every object of its pack once, so keeping them spares
+    /// inflating each a second time. Empty for `index`.
+    kept: RefCell<Vec<Option<Vec<u8>>>>,
 }
 
 fn code(kind: Kind) -> u8 {
@@ -76,7 +92,7 @@ fn sha1(data: &[u8]) -> Oid {
 
 fn inflate(inflater: &mut Inflater, input: &[u8], size: usize) -> io::Result<(Vec<u8>, usize)> {
     inflater.reset();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(size);
     match inflater.inflate(input, InputEnd::Final, &mut out, size) {
         Ok(Progress::Done { consumed }) if out.len() == size => Ok((out, consumed)),
         _ => Err(corrupt("a pack entry does not inflate to its size")),
@@ -173,6 +189,15 @@ fn entry(pack: &[u8], offset: usize, end: usize) -> io::Result<(u8, Entry)> {
 }
 
 pub fn index(pack: &[u8]) -> io::Result<Indexed> {
+    index_with(pack, false)
+}
+
+/// `index`, keeping every object it inflates for one `read` each.
+pub fn index_keeping(pack: &[u8]) -> io::Result<Indexed> {
+    index_with(pack, true)
+}
+
+fn index_with(pack: &[u8], keep: bool) -> io::Result<Indexed> {
     if pack.len() < HEAD + OID || &pack[..SIGNATURE.len()] != SIGNATURE {
         return Err(corrupt("the remote did not send a pack"));
     }
@@ -191,6 +216,7 @@ pub fn index(pack: &[u8]) -> io::Result<Indexed> {
     let mut found: Vec<Option<(Oid, Kind)>> = Vec::new();
     let mut named: Vec<Vec<Oid>> = Vec::new();
     let mut by_offset = HashMap::new();
+    let mut kept: Vec<Option<Vec<u8>>> = Vec::new();
     let mut at = HEAD;
     for _ in 0..count {
         let (_, mut item) = entry(pack, at, end)?;
@@ -206,6 +232,12 @@ pub fn index(pack: &[u8]) -> io::Result<Indexed> {
             Base::Whole(kind) => links(kind, &data)?,
             Base::Offset(_) | Base::Named(_) => Vec::new(),
         });
+        if keep {
+            kept.push(match item.base {
+                Base::Whole(_) => Some(data),
+                Base::Offset(_) | Base::Named(_) => None,
+            });
+        }
         at = item.end;
         entries.push(item);
     }
@@ -237,7 +269,10 @@ pub fn index(pack: &[u8]) -> io::Result<Indexed> {
             continue;
         }
         let item = &entries[root];
-        let (data, _) = inflate(&mut inflater, &pack[item.data..item.end], item.size)?;
+        let data = match kept.get(root) {
+            Some(Some(data)) => data.clone(),
+            _ => inflate(&mut inflater, &pack[item.data..item.end], item.size)?.0,
+        };
         let mut stack = vec![(root, oid, data)];
         while let Some((at, oid, data)) = stack.pop() {
             let mut children = by_base.remove(&at).unwrap_or_default();
@@ -249,6 +284,9 @@ pub fn index(pack: &[u8]) -> io::Result<Indexed> {
                 let oid = object_oid(kind, &whole);
                 found[child] = Some((oid, kind));
                 named[child] = links(kind, &whole)?;
+                if keep {
+                    kept[child] = Some(whole.clone());
+                }
                 stack.push((child, oid, whole));
             }
         }
@@ -267,6 +305,8 @@ pub fn index(pack: &[u8]) -> io::Result<Indexed> {
         links: named,
         by_oid,
         checksum,
+        inflater: RefCell::new(inflater),
+        kept: RefCell::new(kept),
     })
 }
 
@@ -295,6 +335,9 @@ impl Indexed {
         let Some(&first) = self.by_oid.get(oid) else {
             return Ok(None);
         };
+        if let Some(data) = self.kept.borrow_mut().get_mut(first).and_then(Option::take) {
+            return Ok(Some((self.found[first].1, data)));
+        }
         let mut chain = vec![first];
         loop {
             let last = chain[chain.len() - 1];
@@ -311,7 +354,7 @@ impl Indexed {
             };
             chain.push(next);
         }
-        let mut inflater = Inflater::new(Format::Zlib);
+        let mut inflater = self.inflater.borrow_mut();
         let mut data = Vec::new();
         for (step, &i) in chain.iter().rev().enumerate() {
             let item = &self.entries[i];
@@ -334,7 +377,7 @@ impl Indexed {
                 (self.found[i].0, item.crc, item.offset as u64)
             })
             .collect();
-        sorted.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        sorted.sort_by_key(|a| a.0.0);
         let mut out = Vec::new();
         out.extend_from_slice(&IDX_MAGIC);
         out.extend_from_slice(&IDX_VERSION.to_be_bytes());
@@ -374,22 +417,227 @@ impl Indexed {
     }
 }
 
-pub fn write(objects: &[(Kind, &[u8])]) -> Vec<u8> {
+pub struct Object<'a> {
+    pub kind: Kind,
+    pub data: &'a [u8],
+    pub name: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct Deltas {
+    pub window: usize,
+    pub depth: usize,
+}
+
+struct Source<'a> {
+    kind: Kind,
+    data: &'a [u8],
+    offset: usize,
+    depth: usize,
+    blocks: HashMap<u128, usize>,
+}
+
+pub fn name_hash(name: &[u8]) -> u32 {
+    name.iter()
+        .filter(|c| !c.is_ascii_whitespace())
+        .fold(0u32, |hash, &c| {
+            (hash >> 2).wrapping_add(u32::from(c) << 24)
+        })
+}
+
+fn block(data: &[u8], at: usize) -> u128 {
+    let mut word = [0u8; BLOCK_BYTES];
+    word.copy_from_slice(&data[at..at + BLOCK_BYTES]);
+    u128::from_le_bytes(word)
+}
+
+fn varint(out: &mut Vec<u8>, mut value: usize) {
+    while value > usize::from(LOW7) {
+        out.push(value as u8 & LOW7 | MORE);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn header(out: &mut Vec<u8>, code: u8, mut size: usize) {
+    let mut c = (code << 4) | (size as u8 & LOW4);
+    size >>= 4;
+    while size > 0 {
+        out.push(c | MORE);
+        c = size as u8 & LOW7;
+        size >>= 7;
+    }
+    out.push(c);
+}
+
+fn back(out: &mut Vec<u8>, mut distance: usize) {
+    assert!(distance > 0);
+    let mut bytes = [0u8; OFS_BYTES_MAX];
+    let mut at = OFS_BYTES_MAX - 1;
+    bytes[at] = distance as u8 & LOW7;
+    distance >>= 7;
+    while distance > 0 {
+        distance -= 1;
+        at -= 1;
+        bytes[at] = MORE | (distance as u8 & LOW7);
+        distance >>= 7;
+    }
+    out.extend_from_slice(&bytes[at..]);
+}
+
+fn insert(out: &mut Vec<u8>, data: &[u8]) {
+    for part in data.chunks(INSERT_BYTES_MAX) {
+        out.push(part.len() as u8);
+        out.extend_from_slice(part);
+    }
+}
+
+fn copy(out: &mut Vec<u8>, mut offset: usize, mut size: usize) {
+    while size > 0 {
+        let part = size.min(COPY_BYTES_MAX);
+        let op = out.len();
+        out.push(COPY);
+        let offset_bytes = u32::try_from(offset)
+            .expect("a delta source fits the copy offset")
+            .to_le_bytes();
+        for (bit, byte) in offset_bytes.into_iter().enumerate() {
+            if byte != 0 {
+                out[op] |= 1 << bit;
+                out.push(byte);
+            }
+        }
+        let size_bytes = (part as u32).to_le_bytes();
+        for (bit, &byte) in size_bytes[..COPY_SIZE_BYTES].iter().enumerate() {
+            if byte != 0 {
+                out[op] |= COPY_SIZE_BIT << bit;
+                out.push(byte);
+            }
+        }
+        offset += part;
+        size -= part;
+    }
+}
+
+impl<'a> Source<'a> {
+    fn new(kind: Kind, data: &'a [u8], offset: usize, depth: usize) -> Self {
+        let mut blocks = HashMap::with_capacity(data.len() / BLOCK_BYTES);
+        if u32::try_from(data.len()).is_ok() {
+            for at in (0..data.len().saturating_sub(BLOCK_BYTES - 1)).step_by(BLOCK_BYTES) {
+                blocks.entry(block(data, at)).or_insert(at);
+            }
+        }
+        Source {
+            kind,
+            data,
+            offset,
+            depth,
+            blocks,
+        }
+    }
+
+    fn delta(&self, target: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        varint(&mut out, self.data.len());
+        varint(&mut out, target.len());
+        let mut pending = 0;
+        let mut at = 0;
+        while at + BLOCK_BYTES <= target.len() {
+            let Some(&found) = self.blocks.get(&block(target, at)) else {
+                at += 1;
+                continue;
+            };
+            let behind = self.data[..found]
+                .iter()
+                .rev()
+                .zip(target[pending..at].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let ahead = self.data[found..]
+                .iter()
+                .zip(&target[at..])
+                .take_while(|(a, b)| a == b)
+                .count();
+            assert!(ahead >= BLOCK_BYTES);
+            insert(&mut out, &target[pending..at - behind]);
+            copy(&mut out, found - behind, behind + ahead);
+            at += ahead;
+            pending = at;
+        }
+        insert(&mut out, &target[pending..]);
+        out
+    }
+}
+
+fn best_delta(
+    window: &VecDeque<Source<'_>>,
+    object: &Object<'_>,
+    deltas: Deltas,
+) -> Option<(usize, Vec<u8>)> {
+    let mut best: Option<(usize, Vec<u8>)> = None;
+    for (i, source) in window.iter().enumerate() {
+        let bound = best
+            .as_ref()
+            .map_or(object.data.len(), |(_, delta)| delta.len());
+        if source.kind != object.kind
+            || source.depth >= deltas.depth
+            || source.blocks.is_empty()
+            || object.data.len().saturating_sub(source.data.len()) >= bound
+        {
+            continue;
+        }
+        let delta = source.delta(object.data);
+        if delta.len() < bound {
+            best = Some((i, delta));
+        }
+    }
+    best
+}
+
+pub fn write(objects: &[Object<'_>], deltas: Deltas) -> Vec<u8> {
+    let mut order: Vec<usize> = (0..objects.len()).collect();
+    order.sort_by_key(|&i| {
+        let object = &objects[i];
+        (
+            code(object.kind),
+            object.name,
+            Reverse(object.data.len()),
+            i,
+        )
+    });
     let mut out = Vec::new();
     out.extend_from_slice(SIGNATURE);
     out.extend_from_slice(&WRITE_VERSION.to_be_bytes());
     out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
-    for (kind, data) in objects {
-        let mut size = data.len();
-        let mut c = (code(*kind) << 4) | (size as u8 & LOW4);
-        size >>= 4;
-        while size > 0 {
-            out.push(c | MORE);
-            c = size as u8 & LOW7;
-            size >>= 7;
+    let mut window: VecDeque<Source<'_>> = VecDeque::with_capacity(deltas.window);
+    for i in order {
+        let object = &objects[i];
+        let offset = out.len();
+        let whole = compress(object.data, GIT_DEFAULT_ZLIB_LEVEL, Format::Zlib);
+        let chosen = best_delta(&window, object, deltas).and_then(|(base, delta)| {
+            let packed = compress(&delta, GIT_DEFAULT_ZLIB_LEVEL, Format::Zlib);
+            (packed.len() < whole.len()).then_some((base, delta, packed))
+        });
+        let depth = match chosen {
+            Some((base, delta, packed)) => {
+                let source = &window[base];
+                assert!(apply_delta(source.data, &delta).is_ok_and(|whole| whole == object.data));
+                header(&mut out, OFS_DELTA, delta.len());
+                back(&mut out, offset - source.offset);
+                out.extend_from_slice(&packed);
+                source.depth + 1
+            }
+            None => {
+                header(&mut out, code(object.kind), object.data.len());
+                out.extend_from_slice(&whole);
+                0
+            }
+        };
+        if deltas.window > 0 {
+            if window.len() == deltas.window {
+                window.pop_front();
+            }
+            window.push_back(Source::new(object.kind, object.data, offset, depth));
         }
-        out.push(c);
-        out.extend_from_slice(&compress(data, GIT_DEFAULT_ZLIB_LEVEL, Format::Zlib));
     }
     let own = sha1(&out);
     out.extend_from_slice(&own.0);

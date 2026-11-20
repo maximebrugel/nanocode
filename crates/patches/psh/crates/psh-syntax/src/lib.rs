@@ -48,4 +48,4 @@ pub use parser::{Options, Parser, parse, parse_bytes, parse_bytes_with_aliases, 
 pub use printer::print;
 pub use source::Source;
 pub use span::{LineCol, LineIndex, Span};
-pub use words::{backtick_body, decode_ansi_c, literal_text};
+pub use words::{backtick_body, decode_ansi_c, decode_ansi_c_in, literal_text};

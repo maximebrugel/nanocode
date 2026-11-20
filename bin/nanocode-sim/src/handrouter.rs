@@ -12,10 +12,9 @@ use std::{
 use nanocode_code_mode::embedded::HandCalls;
 use nanocode_code_mode::{ToolContext, ToolOutput, ToolOutputBody};
 use nanocode_hands::{
-    ChunkError, Chunks, Clock, Fetch, GetError, HandError, HandHost, HandPhase, HandProvider,
-    HandRef, HandSize, HandStatus, HostFuture, MemoryProvider, Placement, Placements, Policy,
-    ProviderError, PutError, REFUSED, Router, Sha256Digest, StepOutcome, Stored, Target, UNCERTAIN,
-    Workspace, receive,
+    Chunks, Clock, Fetch, GetError, HandError, HandHost, HandPhase, HandProvider, HandRef,
+    HandSize, HandStatus, HostFuture, MemoryProvider, Placement, Placements, Policy, ProviderError,
+    PutError, REFUSED, Router, Sha256Digest, StepOutcome, Stored, Target, UNCERTAIN, Workspace,
     sim::{self as hands_sim, Mutation as HandRule},
 };
 use nanocode_sync::{Atom, OnceCell, block_on};
@@ -26,7 +25,6 @@ use crate::rng::{FNV_OFFSET, Rng, fnv};
 const SESSION: &str = "session";
 const WORKSPACE_TOOLS: [&str; 3] = ["read", "write", "grep"];
 const HAND_TOOLS: [&str; 5] = ["read", "write", "exec", "build", "xcodebuild"];
-const PATHS: [&str; 3] = ["a.txt", "b.txt", "c.txt"];
 const BAD_WIRES: [&str; 4] = ["pool:", "cloud", "hosted:x", "native"];
 const PPM: u64 = 1_000_000;
 
@@ -40,15 +38,13 @@ pub enum HandRouterMutation {
     ReleasesBusy,
     ReleasesEarly,
     NeverReleases,
-    CommitsPartial,
-    ShaUnchecked,
     PlacementSkipsUncertain,
     StopsUnknown,
     ListKeepsStopped,
 }
 
 impl HandRouterMutation {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 11] = [
         Self::None,
         Self::ForwardsRefused,
         Self::SkipsToolCheck,
@@ -57,8 +53,6 @@ impl HandRouterMutation {
         Self::ReleasesBusy,
         Self::ReleasesEarly,
         Self::NeverReleases,
-        Self::CommitsPartial,
-        Self::ShaUnchecked,
         Self::PlacementSkipsUncertain,
         Self::StopsUnknown,
         Self::ListKeepsStopped,
@@ -80,8 +74,6 @@ impl HandRouterMutation {
             Self::ReleasesBusy => "releases_busy",
             Self::ReleasesEarly => "releases_early",
             Self::NeverReleases => "never_releases",
-            Self::CommitsPartial => "commits_partial",
-            Self::ShaUnchecked => "sha_unchecked",
             Self::PlacementSkipsUncertain => "placement_skips_uncertain",
             Self::StopsUnknown => "stops_unknown",
             Self::ListKeepsStopped => "list_keeps_stopped",
@@ -107,8 +99,6 @@ impl HandRouterMutation {
             Self::ReleasesBusy => HandRule::ReleasesBusy,
             Self::ReleasesEarly => HandRule::ReleasesEarly,
             Self::NeverReleases => HandRule::NeverReleases,
-            Self::CommitsPartial => HandRule::CommitsPartial,
-            Self::ShaUnchecked => HandRule::ShaUnchecked,
             Self::PlacementSkipsUncertain => HandRule::PlacementSkipsUncertain,
             Self::StopsUnknown => HandRule::StopsUnknown,
             Self::ListKeepsStopped => HandRule::ListKeepsStopped,
@@ -125,8 +115,6 @@ pub struct HandRouterStats {
     pub uncertain: u64,
     pub retries: u64,
     pub recovers: u64,
-    pub copies: u64,
-    pub copies_failed: u64,
     pub starts: u64,
     pub releases: u64,
     pub midstep_releases: u64,
@@ -141,8 +129,6 @@ impl HandRouterStats {
         self.uncertain += other.uncertain;
         self.retries += other.retries;
         self.recovers += other.recovers;
-        self.copies += other.copies;
-        self.copies_failed += other.copies_failed;
         self.starts += other.starts;
         self.releases += other.releases;
         self.midstep_releases += other.midstep_releases;
@@ -160,17 +146,9 @@ enum Phase {
 struct FakeHand {
     tools: Vec<String>,
     phase: Phase,
-    files: BTreeMap<String, Vec<u8>>,
     in_flight: u32,
     last_end_ms: u64,
     used_since_release: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fault {
-    None,
-    LostAt(usize),
-    Corrupt(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,13 +174,10 @@ struct Log {
 struct World {
     now_ms: AtomicU64,
     idle_ms: u64,
-    bytes_max: u64,
     loss_ppm: u64,
     midstep_ppm: u64,
     rng: Atom<Rng>,
     hands: Atom<BTreeMap<HandRef, FakeHand>>,
-    files: Atom<BTreeMap<String, Vec<u8>>>,
-    fault: Atom<Fault>,
     log: Atom<Log>,
     router: OnceCell<Weak<Router>>,
 }
@@ -315,65 +290,6 @@ impl Placements for FakePlacements {
     }
 }
 
-struct FakeChunks {
-    bytes: Vec<u8>,
-    at: usize,
-    index: usize,
-    chunk_bytes: usize,
-    lost_at: Option<usize>,
-}
-
-impl Chunks for FakeChunks {
-    fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, ChunkError>> {
-        Box::pin(async move {
-            if self.lost_at == Some(self.index) {
-                return Err(ChunkError::Lost {
-                    reason: "the source went away".into(),
-                });
-            }
-            if self.at >= self.bytes.len() {
-                return Ok(None);
-            }
-            let end = (self.at + self.chunk_bytes).min(self.bytes.len());
-            let chunk = self.bytes[self.at..end].to_vec();
-            self.at = end;
-            self.index += 1;
-            Ok(Some(chunk))
-        })
-    }
-}
-
-fn fetch<'a>(world: &World, bytes: Vec<u8>, chunk_bytes: NonZeroUsize) -> Fetch<'a> {
-    let sha256 = Sha256Digest::of(&bytes);
-    let size_bytes = bytes.len() as u64;
-    let fault = world
-        .fault
-        .update(|fault| std::mem::replace(fault, Fault::None));
-    let chunks = bytes.len().div_ceil(chunk_bytes.get());
-    let (bytes, lost_at) = match fault {
-        Fault::None => (bytes, None),
-        Fault::LostAt(at) => (bytes, Some(at % chunks.max(1))),
-        Fault::Corrupt(at) if !bytes.is_empty() => {
-            let mut bytes = bytes;
-            let at = at % bytes.len();
-            bytes[at] ^= 0x5a;
-            (bytes, None)
-        }
-        Fault::Corrupt(_) => (bytes, None),
-    };
-    Fetch {
-        size_bytes,
-        sha256,
-        chunks: Box::new(FakeChunks {
-            bytes,
-            at: 0,
-            index: 0,
-            chunk_bytes: chunk_bytes.get(),
-            lost_at,
-        }),
-    }
-}
-
 struct FakeHost(Arc<World>);
 
 impl HandHost for FakeHost {
@@ -482,25 +398,16 @@ impl HandHost for FakeHost {
         &'a self,
         _session: &'a str,
         hand: &'a HandRef,
-        path: &'a str,
-        mut chunks: Box<dyn Chunks + 'a>,
-        sha256: Sha256Digest,
+        _path: &'a str,
+        _chunks: Box<dyn Chunks + 'a>,
+        _sha256: Sha256Digest,
     ) -> HostFuture<'a, Result<Stored, PutError>> {
         Box::pin(async move {
-            let world = &self.0;
-            world.start(hand).map_err(|reason| PutError::Refused {
-                reason: reason.into(),
-            })?;
-            let received = receive(chunks.as_mut(), sha256, world.bytes_max).await;
-            if let Ok((bytes, _)) = &received {
-                world.hands.update(|hands| {
-                    if let Some(fake) = hands.get_mut(hand) {
-                        fake.files.insert(path.to_owned(), bytes.clone());
-                    }
-                });
-            }
-            world.end(hand);
-            received.map(|(_, stored)| stored)
+            self.0
+                .violate(format!("{hand} was sent a file, which no step does"));
+            Err(PutError::Refused {
+                reason: "this Hand takes no files".into(),
+            })
         })
     }
 
@@ -508,22 +415,15 @@ impl HandHost for FakeHost {
         &'a self,
         _session: &'a str,
         hand: &'a HandRef,
-        path: &'a str,
-        chunk_bytes: NonZeroUsize,
+        _path: &'a str,
+        _chunk_bytes: NonZeroUsize,
     ) -> HostFuture<'a, Result<Fetch<'a>, GetError>> {
         Box::pin(async move {
-            let world = &self.0;
-            world.start(hand).map_err(|reason| GetError::Lost {
-                reason: reason.into(),
-            })?;
-            let bytes = world.hands.read(|hands| {
-                hands
-                    .get(hand)
-                    .and_then(|fake| fake.files.get(path).cloned())
-            });
-            world.end(hand);
-            let bytes = bytes.ok_or(GetError::NotFound)?;
-            Ok(fetch(world, bytes, chunk_bytes))
+            self.0
+                .violate(format!("{hand} was asked for a file, which no step does"));
+            Err(GetError::Refused {
+                reason: "this Hand serves no files".into(),
+            })
         })
     }
 
@@ -608,48 +508,33 @@ impl Workspace for FakeWorkspace {
     fn put<'a>(
         &'a self,
         _session: &'a str,
-        path: &'a str,
-        mut chunks: Box<dyn Chunks + 'a>,
-        sha256: Sha256Digest,
+        _path: &'a str,
+        _chunks: Box<dyn Chunks + 'a>,
+        _sha256: Sha256Digest,
     ) -> HostFuture<'a, Result<Stored, PutError>> {
         Box::pin(async move {
-            let world = &self.0;
-            let (bytes, stored) = receive(chunks.as_mut(), sha256, world.bytes_max).await?;
-            world
-                .files
-                .update(|files| files.insert(path.to_owned(), bytes.clone()));
-            Ok(stored)
+            self.0
+                .violate("the workspace was sent a file, which no step does".to_owned());
+            Err(PutError::Refused {
+                reason: "this workspace takes no files".into(),
+            })
         })
     }
 
     fn get<'a>(
         &'a self,
         _session: &'a str,
-        path: &'a str,
-        chunk_bytes: NonZeroUsize,
+        _path: &'a str,
+        _chunk_bytes: NonZeroUsize,
     ) -> HostFuture<'a, Result<Fetch<'a>, GetError>> {
         Box::pin(async move {
-            let world = &self.0;
-            let bytes = world.files.read(|files| files.get(path).cloned());
-            let bytes = bytes.ok_or(GetError::NotFound)?;
-            Ok(fetch(world, bytes, chunk_bytes))
+            self.0
+                .violate("the workspace was asked for a file, which no step does".to_owned());
+            Err(GetError::Refused {
+                reason: "this workspace serves no files".into(),
+            })
         })
     }
-}
-
-fn content(rng: &mut Rng, bytes_max: u64) -> Vec<u8> {
-    let len = rng.below(bytes_max + 1) as usize;
-    (0..len).map(|_| rng.below(256) as u8).collect()
-}
-
-fn seeded_files(rng: &mut Rng, bytes_max: u64) -> BTreeMap<String, Vec<u8>> {
-    let mut files = BTreeMap::new();
-    for path in PATHS {
-        if rng.chance(PPM * 2 / 3) {
-            files.insert(path.to_owned(), content(rng, bytes_max));
-        }
-    }
-    files
 }
 
 fn code(output: &ToolOutput) -> Option<String> {
@@ -678,17 +563,6 @@ pub struct HandRouterOutcome {
     pub shape: String,
 }
 
-fn files_of(world: &World, target: &Target, path: &str) -> Option<Vec<u8>> {
-    match target {
-        Target::Workspace => world.files.read(|files| files.get(path).cloned()),
-        Target::Hand(hand) => world.hands.read(|hands| {
-            hands
-                .get(hand)
-                .and_then(|fake| fake.files.get(path).cloned())
-        }),
-    }
-}
-
 fn runnable(world: &World, wire: &str, tool: &str) -> bool {
     match Target::parse(wire) {
         Err(_) => false,
@@ -704,8 +578,6 @@ fn runnable(world: &World, wire: &str, tool: &str) -> bool {
 pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
     let mut rng = Rng::derive(seed, "hand_router");
     let idle_ms = rng.range(2, 60);
-    let bytes_max = rng.range(1, 64);
-    let chunk_bytes = NonZeroUsize::new(rng.range(1, 17) as usize).unwrap_or(NonZeroUsize::MIN);
     let loss_ppm = rng.range(PPM / 20, PPM / 4);
     let midstep_ppm = rng.range(PPM / 20, PPM / 3);
     let pool = ["hosted", "pool:a", "pool:b", "native:dev", "mac"];
@@ -724,13 +596,11 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
             .filter(|_| rng.chance(PPM / 2))
             .map(|tool| (*tool).to_owned())
             .collect();
-        let files = seeded_files(&mut rng, bytes_max);
         hands.insert(
             hand,
             FakeHand {
                 tools,
                 phase: Phase::Stopped,
-                files,
                 in_flight: 0,
                 last_end_ms: 0,
                 used_since_release: false,
@@ -738,17 +608,13 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
         );
     }
     let attached: Vec<String> = hands.keys().map(ToString::to_string).collect();
-    let files = seeded_files(&mut rng, bytes_max);
     let world = Arc::new(World {
         now_ms: AtomicU64::new(idle_ms),
         idle_ms,
-        bytes_max,
         loss_ppm,
         midstep_ppm,
         rng: Atom::new(Rng::derive(seed, "hand_router_host")),
         hands: Atom::new(hands),
-        files: Atom::new(files),
-        fault: Atom::new(Fault::None),
         log: Atom::new(Log::default()),
         router: OnceCell::new(),
     });
@@ -761,7 +627,7 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
     ));
     let _ = world.router.set(Arc::downgrade(&router));
     let shape = format!(
-        "hands={} idle_ms={idle_ms} chunk={chunk_bytes} loss_ppm={loss_ppm} midstep_ppm={midstep_ppm}",
+        "hands={} idle_ms={idle_ms} loss_ppm={loss_ppm} midstep_ppm={midstep_ppm}",
         attached.join(",")
     );
     hands_sim::mutate(mutation.rule());
@@ -785,7 +651,7 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
                 wrong = Some(format!("op {op}: {message}"));
             }
         };
-        if kind < 50 {
+        if kind < 62 {
             let wire = match rng.below(10) {
                 0 => BAD_WIRES[rng.pick(BAD_WIRES.len())].to_owned(),
                 1 if !absent.is_empty() => absent[rng.pick(absent.len())].clone(),
@@ -859,7 +725,7 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
                 None => fail(format!("step {step}: runnable on {wire} but nothing ran")),
             }
             calls.push(Call { wire, tool, step });
-        } else if kind < 58 && !calls.is_empty() {
+        } else if kind < 72 && !calls.is_empty() {
             let call = &calls[rng.pick(calls.len())];
             let before = world
                 .log
@@ -883,7 +749,7 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
                     call.step
                 ));
             }
-        } else if kind < 66 && !calls.is_empty() {
+        } else if kind < 82 && !calls.is_empty() {
             let call = &calls[rng.pick(calls.len())];
             let before = world
                 .log
@@ -928,74 +794,6 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
                     output.as_ref().map(code)
                 )),
             }
-        } else if kind < 86 {
-            let from =
-                Target::parse(&targets[rng.pick(targets.len())]).unwrap_or(Target::Workspace);
-            let to = Target::parse(&targets[rng.pick(targets.len())]).unwrap_or(Target::Workspace);
-            let from_path = PATHS[rng.pick(PATHS.len())];
-            let to_path = PATHS[rng.pick(PATHS.len())];
-            for target in [&from, &to] {
-                if let Target::Hand(hand) = target {
-                    named.insert(hand.clone());
-                }
-            }
-            let fault = match rng.below(4) {
-                0 => Fault::LostAt(rng.below(64) as usize),
-                1 => Fault::Corrupt(rng.below(64) as usize),
-                _ => Fault::None,
-            };
-            world.fault.set(fault);
-            let source = files_of(&world, &from, from_path);
-            let old = files_of(&world, &to, to_path);
-            let copied =
-                block_on(router.copy(SESSION, (&from, from_path), (&to, to_path), chunk_bytes));
-            world.fault.set(Fault::None);
-            stats.copies += 1;
-            let now = files_of(&world, &to, to_path);
-            world.note(format!(
-                "copy {from}:{from_path} -> {to}:{to_path} {fault:?} -> {}",
-                copied.is_ok()
-            ));
-            if now != old && now != source {
-                fail(format!(
-                    "copy {from}:{from_path} -> {to}:{to_path} ({fault:?}) left {} bytes, neither the old {:?} nor the new {:?}",
-                    now.as_ref().map_or(0, Vec::len),
-                    old.as_ref().map(Vec::len),
-                    source.as_ref().map(Vec::len)
-                ));
-            }
-            match copied {
-                Ok(stored) => {
-                    let corrupt = matches!(fault, Fault::Corrupt(_))
-                        && source.as_ref().is_some_and(|bytes| !bytes.is_empty());
-                    let lost = matches!(fault, Fault::LostAt(_))
-                        && source.as_ref().is_some_and(|bytes| !bytes.is_empty());
-                    if corrupt || lost {
-                        fail(format!(
-                            "copy {from}:{from_path} -> {to}:{to_path} succeeded despite {fault:?}"
-                        ));
-                    }
-                    if now != source {
-                        fail(format!(
-                            "copy {from}:{from_path} -> {to}:{to_path} succeeded but the destination differs"
-                        ));
-                    }
-                    if Some(stored.sha256) != source.as_deref().map(Sha256Digest::of) {
-                        fail(format!(
-                            "copy {from}:{from_path} -> {to}:{to_path} reported sha {}",
-                            stored.sha256
-                        ));
-                    }
-                }
-                Err(_) => {
-                    stats.copies_failed += 1;
-                    if now != old {
-                        fail(format!(
-                            "failed copy {from}:{from_path} -> {to}:{to_path} changed the destination"
-                        ));
-                    }
-                }
-            }
         } else {
             world.advance(rng.below(idle_ms * 2));
             let released = block_on(router.release_idle());
@@ -1027,7 +825,7 @@ pub fn simulate(seed: u64, mutation: HandRouterMutation) -> HandRouterOutcome {
                 "{unreleased:?} still held {idle_ms} ms after their last use"
             ));
         } else if let Some(hand) = log.starts.iter().find(|hand| !named.contains(*hand)) {
-            wrong = Some(format!("{hand} started without any step or copy naming it"));
+            wrong = Some(format!("{hand} started without any step naming it"));
         } else {
             let mut placed: BTreeMap<String, Vec<Placement>> = BTreeMap::new();
             for (step, placement) in &log.placements {

@@ -58,6 +58,8 @@ try:
 except AttributeError:
     _CRLock = None
 TIMEOUT_MAX = _thread.TIMEOUT_MAX
+# Without OS threads, _thread queues a started thread until another one blocks.
+_COOPERATIVE = getattr(_thread, '_COOPERATIVE', False)
 del _thread
 
 # get thread-local implementation, either from the thread
@@ -1008,6 +1010,12 @@ class Thread:
             with _active_limbo_lock:
                 del _limbo[self]
             raise
+        if _COOPERATIVE:
+            # The thread is queued and runs when this one blocks (see _thread):
+            # it counts as started now, under the ident it will run with.
+            self._ident = self._os_thread_handle.ident
+            self._started.set()
+            return
         self._started.wait()  # Will set ident and native_id
 
     def run(self):

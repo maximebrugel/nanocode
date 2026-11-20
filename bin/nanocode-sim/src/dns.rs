@@ -36,6 +36,7 @@ const COMPRESS_PPM: u64 = 500_000;
 const EMPTY_ENTRY_PPM: u64 = 250_000;
 const CNAME_PPM: u64 = 300_000;
 const NODATA_PPM: u64 = 150_000;
+const SAME_ID_PPM: u64 = 100_000;
 const TYPE_AAAA: u16 = 28;
 const TYPE_CNAME: u16 = 5;
 const CLASS_IN: u16 = 1;
@@ -146,6 +147,7 @@ struct FakeWire {
     tcp: bool,
     trace: u64,
     wrong: Option<String>,
+    id: Option<u16>,
 }
 
 fn label(rng: &mut Rng) -> String {
@@ -527,7 +529,12 @@ impl FakeWire {
 
 impl Wire for FakeWire {
     fn id(&mut self) -> io::Result<u16> {
-        Ok(u16::try_from(self.rng.below(1 << 16)).expect("a draw below 2^16 fits"))
+        let id = match self.id {
+            Some(id) if self.rng.chance(SAME_ID_PPM) => id,
+            _ => u16::try_from(self.rng.below(1 << 16)).expect("a draw below 2^16 fits"),
+        };
+        self.id = Some(id);
+        Ok(id)
     }
 
     fn open(&mut self, server: SocketAddr, _: Duration) -> io::Result<()> {
@@ -659,6 +666,7 @@ fn simulate(seed: u64, mutation: DnsMutation) -> DnsOutcome {
         tcp: world.config.tcp,
         trace: fnv(FNV_OFFSET, shape.as_bytes()),
         wrong: None,
+        id: None,
     };
     let queried = if world.absolute {
         format!("{}.", world.name)

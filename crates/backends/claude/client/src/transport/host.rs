@@ -33,7 +33,7 @@ impl<S: nanocode_http::layer::Sender + 'static> HttpTransport for SenderTranspor
                     method: nanocode_http::types::Method::POST,
                     url: request.endpoint,
                     headers: request.headers,
-                    body: request.body.into_bytes(),
+                    body: request.body.into(),
                 })
                 .await?;
             Ok(HttpResponse::from_layer(response))

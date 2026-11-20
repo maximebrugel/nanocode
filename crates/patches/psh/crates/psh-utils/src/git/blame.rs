@@ -2,7 +2,7 @@
 //! to the parent whose version of the file still has it, by the same comparison git
 //! diff makes, following the file across renames.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::Write;
 use std::rc::Rc;
 
@@ -254,6 +254,8 @@ pub fn blame(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     let repo = &git.repo;
     let mut ranges: Vec<String> = Vec::new();
     let mut suppress = false;
+    // Porcelain output, and whether every line repeats its commit's details.
+    let mut porcelain: Option<bool> = None;
     let mut email = false;
     let mut long = false;
     let mut root = repo.config.bool("blame.showroot") == Some(true);
@@ -271,6 +273,8 @@ pub fn blame(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
                 break;
             }
             "-s" => suppress = true,
+            "-p" | "--porcelain" => porcelain = Some(false),
+            "--line-porcelain" => porcelain = Some(true),
             "-e" | "--show-email" => email = true,
             "-l" => long = true,
             "--root" => root = true,
@@ -388,6 +392,9 @@ pub fn blame(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     }
     blame.run(Some(start))?;
     crate::order::sort_by_key(&mut blame.entries, |e| e.lno);
+    if let Some(every) = porcelain {
+        return porcelain_out(git, io, &blame, &path, root, every);
+    }
 
     // What each version's commit prints as.
     struct Shown {
@@ -480,6 +487,103 @@ pub fn blame(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
                 )?;
             }
             write!(io.out, " {:>digits$}) ", entry.lno + k + 1)?;
+            let text = final_lines[entry.lno + k];
+            io.out.write_all(text)?;
+            if text.last() != Some(&b'\n') {
+                io.out.write_all(b"\n")?;
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// A zone as git writes it: +0100.
+fn zone_text(zone: i32) -> String {
+    let sign = if zone < 0 { '-' } else { '+' };
+    format!("{sign}{:04}", zone.abs())
+}
+
+/// One person's porcelain lines: author or committer.
+fn person_lines(out: &mut dyn Write, role: &str, ident: &Ident<'_>) -> Res<()> {
+    write!(out, "{role} ")?;
+    out.write_all(ident.name)?;
+    write!(out, "\n{role}-mail <")?;
+    out.write_all(ident.email)?;
+    writeln!(out, ">\n{role}-time {}\n{role}-tz {}", ident.time, zone_text(ident.zone))?;
+    Ok(())
+}
+
+/// git blame --porcelain (and --line-porcelain, every true): each line with the
+/// commit it comes from, and that commit's details the first time it is met.
+fn porcelain_out(
+    git: &Git<'_>,
+    io: &mut Io<'_>,
+    blame: &Blame<'_, '_>,
+    path: &[u8],
+    root: bool,
+    every: bool,
+) -> Res<i32> {
+    let repo = &git.repo;
+    let final_lines = TextDiff::new(b"", &blame.origins[0].data).new;
+    let mut shown: HashSet<usize> = HashSet::new();
+    let minutes = git.offset / 60;
+    let local_zone = (minutes / 60 * 100 + minutes % 60) as i32;
+    for entry in &blame.entries {
+        let origin = &blame.origins[entry.origin];
+        let hex = origin.commit.map_or_else(|| Oid::ZERO.hex(), |oid| oid.hex());
+        for k in 0..entry.count {
+            write!(io.out, "{hex} {} {}", entry.s_lno + k + 1, entry.lno + k + 1)?;
+            if k == 0 {
+                write!(io.out, " {}", entry.count)?;
+            }
+            io.out.write_all(b"\n")?;
+            if every || shown.insert(entry.origin) {
+                match origin.commit {
+                    Some(oid) => {
+                        let commit = repo.commit(&oid)?;
+                        person_lines(&mut io.out, "author", &Ident::parse(&commit.author))?;
+                        person_lines(&mut io.out, "committer", &Ident::parse(&commit.committer))?;
+                        io.out.write_all(b"summary ")?;
+                        io.out.write_all(&super::pretty::subject(commit.message()))?;
+                        io.out.write_all(b"\n")?;
+                        if commit.parents.is_empty() && !root {
+                            io.out.write_all(b"boundary\n")?;
+                        }
+                        if let Some(parent) = commit.parents.first() {
+                            let tree = repo.commit(parent)?.tree;
+                            if repo.tree_entry(&tree, &origin.path)?.is_some() {
+                                write!(io.out, "previous {} ", parent.hex())?;
+                                io.out.write_all(&origin.path)?;
+                                io.out.write_all(b"\n")?;
+                            }
+                        }
+                    }
+                    None => {
+                        let nobody = Ident {
+                            name: b"Not Committed Yet",
+                            email: b"not.committed.yet",
+                            time: git.now,
+                            zone: local_zone,
+                        };
+                        person_lines(&mut io.out, "author", &nobody)?;
+                        person_lines(&mut io.out, "committer", &nobody)?;
+                        io.out.write_all(b"summary Version of ")?;
+                        io.out.write_all(path)?;
+                        io.out.write_all(b" from ")?;
+                        io.out.write_all(path)?;
+                        io.out.write_all(b"\n")?;
+                        if let Some(head) = repo.head()? {
+                            write!(io.out, "previous {} ", head.hex())?;
+                            io.out.write_all(path)?;
+                            io.out.write_all(b"\n")?;
+                        }
+                    }
+                }
+                io.out.write_all(b"filename ")?;
+                io.out.write_all(&origin.path)?;
+                io.out.write_all(b"\n")?;
+            }
+            io.out.write_all(b"\t")?;
             let text = final_lines[entry.lno + k];
             io.out.write_all(text)?;
             if text.last() != Some(&b'\n') {

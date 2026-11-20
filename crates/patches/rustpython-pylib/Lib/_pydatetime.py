@@ -561,12 +561,12 @@ def _check_date_fields(year, month, day):
     month = _index(month)
     day = _index(day)
     if not MINYEAR <= year <= MAXYEAR:
-        raise ValueError(f"year must be in {MINYEAR}..{MAXYEAR}, not {year}")
+        raise ValueError(f"year {year} is out of range")
     if not 1 <= month <= 12:
-        raise ValueError(f"month must be in 1..12, not {month}")
+        raise ValueError("month must be in 1..12")
     dim = _days_in_month(year, month)
     if not 1 <= day <= dim:
-        raise ValueError(f"day {day} must be in range 1..{dim} for month {month} in year {year}")
+        raise ValueError("day is out of range for month")
     return year, month, day
 
 def _check_time_fields(hour, minute, second, microsecond, fold):
@@ -575,13 +575,13 @@ def _check_time_fields(hour, minute, second, microsecond, fold):
     second = _index(second)
     microsecond = _index(microsecond)
     if not 0 <= hour <= 23:
-        raise ValueError(f"hour must be in 0..23, not {hour}")
+        raise ValueError("hour must be in 0..23")
     if not 0 <= minute <= 59:
-        raise ValueError(f"minute must be in 0..59, not {minute}")
+        raise ValueError("minute must be in 0..59")
     if not 0 <= second <= 59:
-        raise ValueError(f"second must be in 0..59, not {second}")
+        raise ValueError("second must be in 0..59")
     if not 0 <= microsecond <= 999999:
-        raise ValueError(f"microsecond must be in 0..999999, not {microsecond}")
+        raise ValueError("microsecond must be in 0..999999")
     if fold not in (0, 1):
         raise ValueError(f"fold must be either 0 or 1, not {fold}")
     return hour, minute, second, microsecond, fold
@@ -1051,9 +1051,11 @@ class date:
             raise ValueError(f'Invalid isoformat string: {date_string!r}')
 
         try:
-            return cls(*_parse_isoformat_date(date_string))
+            components = _parse_isoformat_date(date_string)
         except Exception:
-            raise ValueError(f'Invalid isoformat string: {date_string!r}')
+            raise ValueError(f'Invalid isoformat string: {date_string!r}') from None
+        # Out-of-range fields raise the constructor's own error, as _datetime does.
+        return cls(*components)
 
     @classmethod
     def fromisocalendar(cls, year, week, day):
@@ -1374,8 +1376,12 @@ class IsoCalendarDate(tuple):
         return (tuple, (tuple(self),))
 
     def __repr__(self):
-        return (f'{self.__class__.__name__}'
-                f'(year={self[0]}, week={self[1]}, weekday={self[2]})')
+        # _datetime reports the type's tp_name, which is qualified for its own class.
+        name = self.__class__.__name__
+        if self.__class__ is _IsoCalendarDate:
+            name = 'datetime.' + name
+        return f'{name}(year={self[0]}, week={self[1]}, weekday={self[2]})'
+
 
 
 _IsoCalendarDate = IsoCalendarDate
@@ -2326,7 +2332,7 @@ class datetime(date):
         if myoff == otoff:
             return base
         if myoff is None or otoff is None:
-            raise TypeError("cannot mix naive and timezone-aware time")
+            raise TypeError("can't subtract offset-naive and offset-aware datetimes")
         return base + otoff - myoff
 
     def __hash__(self):

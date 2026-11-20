@@ -14,7 +14,8 @@ pub const SPEC: Spec = Spec {
         both('s', "suffix").value(),
         both('z', "zero"),
     ],
-    posix_order: false,
+    // GNU stops at the first operand: NAME -x takes -x as SUFFIX.
+    posix_order: true,
 };
 
 pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {

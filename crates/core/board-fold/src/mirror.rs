@@ -2,10 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use nanocode_machine::Illegal;
+
 use super::{
     Change, Event, EventId, Fold, Op, Outcome, Phase, Rejection, TaskId,
     access::Can,
+    delivery::{Held, Plan, Signal, Slot, Stage},
     sim::{Mutation, mutated},
+    stage::Act,
     tasks::Moved,
 };
 
@@ -284,6 +288,7 @@ pub enum Refusal {
     NoCopy,
     NoAttempt,
     UnknownReply(EventId),
+    Illegal { from: Stage, to: Stage },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +431,38 @@ pub struct Delivery {
     pub attempts: u64,
     pub throttled: u64,
     pub action: Action,
+}
+
+impl Delivery {
+    #[must_use]
+    pub fn plan(&self, limit: u64) -> Plan {
+        Slot {
+            attempts: self.attempts,
+            throttled: self.throttled,
+            ..Slot::default()
+        }
+        .plan(&self.action, limit)
+    }
+}
+
+enum Write<'a> {
+    Attempt { revision: u64 },
+    Refund { revision: u64 },
+    Receipt { external: &'a str, revision: u64 },
+    Remove,
+    GiveUp { error: &'a str },
+}
+
+impl Write<'_> {
+    const fn signal(&self) -> Signal {
+        match self {
+            Self::Attempt { .. } => Signal::Attempt,
+            Self::Refund { .. } => Signal::Refund,
+            Self::Receipt { .. } => Signal::Receipt,
+            Self::Remove => Signal::Remove,
+            Self::GiveUp { .. } => Signal::GiveUp,
+        }
+    }
 }
 
 type Parked = (EventId, u64, SyncOp);
@@ -671,6 +708,109 @@ impl Mirror {
 
     fn tries(&self, id: &EventId, target: &Target) -> u64 {
         sum(&self.attempts, id, target)
+    }
+
+    pub fn held(&self, id: &EventId, target: &Target) -> Option<&Copy> {
+        self.copies.get(&(id.clone(), target.clone()))
+    }
+
+    pub fn slot(&self, id: &EventId, target: &Target) -> Slot {
+        let key = (id.clone(), target.clone());
+        Slot {
+            attempts: sum(&self.attempts, id, target),
+            throttled: sum(&self.throttled, id, target),
+            copy: self.copies.get(&key).map(|copy| {
+                if copy.removed {
+                    Held::Removed
+                } else {
+                    Held::Live
+                }
+            }),
+            dead: self.dead.contains_key(&key),
+            orphan: self
+                .messages
+                .get(id)
+                .is_some_and(|message| self.rootless(&message.task, target)),
+        }
+    }
+
+    fn moves(&self, id: &EventId, target: &Target, signal: Signal) -> Result<(), Rejection> {
+        self.slot(id, target)
+            .on(signal)
+            .map(drop)
+            .map_err(|Illegal { from, to }| Rejection::Sync(Refusal::Illegal { from, to }))
+    }
+
+    fn step(&mut self, id: &EventId, target: &Target, write: Write<'_>) -> Stage {
+        let next = self
+            .slot(id, target)
+            .on(write.signal())
+            .expect("a checked delivery move is in the table");
+        let key = (id.clone(), target.clone());
+        match write {
+            Write::Attempt { revision } if !mutated(Mutation::DeliveryAttemptUncounted) => {
+                *self
+                    .attempts
+                    .entry((id.clone(), target.clone(), revision))
+                    .or_default() += 1;
+            }
+            Write::Attempt { .. } => {}
+            Write::Refund { revision } => {
+                *self
+                    .throttled
+                    .entry((id.clone(), target.clone(), revision))
+                    .or_default() += 1
+            }
+            Write::Receipt { external, revision } => match self.copies.get_mut(&key) {
+                Some(copy) => copy.revision = revision,
+                None => {
+                    self.copies.insert(
+                        key.clone(),
+                        Copy {
+                            external: external.to_owned(),
+                            revision,
+                            removed: false,
+                        },
+                    );
+                    if !mutated(Mutation::DeliveryReceiptKeepsDead) {
+                        self.dead.remove(&key);
+                    }
+                }
+            },
+            Write::Remove => {
+                if let Some(copy) = self.copies.get_mut(&key) {
+                    copy.removed = true;
+                }
+            }
+            Write::GiveUp { error } => {
+                self.dead.insert(key, error.to_owned());
+            }
+        }
+        next.stage()
+    }
+
+    pub(crate) fn leak(&mut self, op: &Op) {
+        if let Op::Sync {
+            sync:
+                SyncOp::Attempt {
+                    message,
+                    target,
+                    revision,
+                    ..
+                }
+                | SyncOp::Throttled {
+                    message,
+                    target,
+                    revision,
+                    ..
+                },
+        } = op
+        {
+            *self
+                .attempts
+                .entry((message.clone(), target.clone(), *revision))
+                .or_default() += 1;
+        }
     }
 
     fn rootless(&self, task: &TaskId, target: &Target) -> bool {
@@ -986,9 +1126,7 @@ impl Fold {
             SyncOp::Label { task, .. } => known(task),
             SyncOp::Settle { task, .. } => {
                 let state = self.tasks.get(task).ok_or(Rejection::UnknownTask)?;
-                if state.phase.terminal() {
-                    return Err(Rejection::Terminal);
-                }
+                state.may(Act::Settle, self.now_ms)?;
                 let owned = mirror
                     .links
                     .values()
@@ -1014,7 +1152,7 @@ impl Fold {
                 if *revision > state.revision || done {
                     return refuse(Refusal::Delivered);
                 }
-                Ok(())
+                mirror.moves(message, target, Signal::Attempt)
             }
             SyncOp::Synced {
                 task,
@@ -1035,7 +1173,7 @@ impl Fold {
                     Some(copy) if copy.external != *external => refuse(Refusal::Delivered),
                     Some(copy) if copy.revision > *revision => refuse(Refusal::Stale),
                     _ if *revision > state.revision => refuse(Refusal::Stale),
-                    _ => Ok(()),
+                    _ => mirror.moves(message, target, Signal::Receipt),
                 }
             }
             SyncOp::Removed {
@@ -1045,7 +1183,7 @@ impl Fold {
             } => {
                 routable(task, message, target)?;
                 match mirror.copies.get(&(message.clone(), target.clone())) {
-                    Some(_) => Ok(()),
+                    Some(_) => mirror.moves(message, target, Signal::Remove),
                     None => refuse(Refusal::NoCopy),
                 }
             }
@@ -1065,7 +1203,7 @@ impl Fold {
                 if mirror.tries(message, target) == 0 && !mirror.rootless(task, target) {
                     return refuse(Refusal::NoAttempt);
                 }
-                Ok(())
+                mirror.moves(message, target, Signal::GiveUp)
             }
             SyncOp::Throttled {
                 task,
@@ -1079,7 +1217,7 @@ impl Fold {
                 if tried <= mirror.throttled.get(&slot).copied().unwrap_or_default() {
                     return refuse(Refusal::NoAttempt);
                 }
-                Ok(())
+                mirror.moves(message, target, Signal::Refund)
             }
         }
     }
@@ -1415,10 +1553,13 @@ impl Fold {
             SyncOp::Label { .. } => self.label(seq, event, op),
             SyncOp::Settle { task, outcome } => match outcome {
                 Settle::Done(result) => {
-                    if let Some(state) = self.tasks.get_mut(task) {
-                        state.phase = Phase::Done {
-                            result: result.clone(),
-                        };
+                    let now = self.now_ms;
+                    let done = Phase::Done {
+                        result: result.clone(),
+                        worker: None,
+                    };
+                    if !self.enter(task, done, None, now) {
+                        return;
                     }
                     self.record(
                         seq,
@@ -1435,11 +1576,13 @@ impl Fold {
                 revision,
                 ..
             } => {
-                *self
-                    .mirror
-                    .attempts
-                    .entry((message.clone(), target.clone(), *revision))
-                    .or_default() += 1;
+                self.mirror.step(
+                    message,
+                    target,
+                    Write::Attempt {
+                        revision: *revision,
+                    },
+                );
             }
             SyncOp::Synced { .. } => self.synced(seq, event, op),
             SyncOp::Removed {
@@ -1447,15 +1590,7 @@ impl Fold {
                 message,
                 target,
             } => {
-                let copy = self
-                    .mirror
-                    .copies
-                    .get_mut(&(message.clone(), target.clone()))
-                    .expect("a checked copy is indexed");
-                if copy.removed {
-                    return;
-                }
-                copy.removed = true;
+                self.mirror.step(message, target, Write::Remove);
                 self.note(
                     seq,
                     event,
@@ -1472,9 +1607,7 @@ impl Fold {
                 target,
                 error,
             } => {
-                self.mirror
-                    .dead
-                    .insert((message.clone(), target.clone()), error.clone());
+                self.mirror.step(message, target, Write::GiveUp { error });
                 let dead = Synced::Undelivered {
                     message: message.clone(),
                     target: target.clone(),
@@ -1488,11 +1621,13 @@ impl Fold {
                 revision,
                 ..
             } => {
-                *self
-                    .mirror
-                    .throttled
-                    .entry((message.clone(), target.clone(), *revision))
-                    .or_default() += 1;
+                self.mirror.step(
+                    message,
+                    target,
+                    Write::Refund {
+                        revision: *revision,
+                    },
+                );
             }
         }
     }
@@ -1566,15 +1701,14 @@ impl Fold {
                         .contains_key(&((*marker).clone(), link.clone()))
             });
             if let Some(marker) = ours.cloned() {
-                let copy = Copy {
-                    external: message.clone(),
-                    revision: 0,
-                    removed: false,
-                };
-                self.mirror
-                    .copies
-                    .insert((marker.clone(), link.clone()), copy);
-                self.mirror.dead.remove(&(marker.clone(), link.clone()));
+                self.mirror.step(
+                    &marker,
+                    &link,
+                    Write::Receipt {
+                        external: message,
+                        revision: 0,
+                    },
+                );
                 self.mirror.external.insert(key, marker.clone());
                 let delivered = Synced::Delivered {
                     message: marker.clone(),
@@ -1645,21 +1779,19 @@ impl Fold {
             return;
         };
         let key = (message.clone(), target.clone());
-        if let Some(copy) = self.mirror.copies.get_mut(&key) {
-            if copy.revision == *revision {
-                return;
-            }
-            copy.revision = *revision;
-        } else {
-            self.mirror.copies.insert(
-                key.clone(),
-                Copy {
-                    external: external.clone(),
-                    revision: *revision,
-                    removed: false,
-                },
-            );
-            self.mirror.dead.remove(&key);
+        let held = self.mirror.copies.get(&key).map(|copy| copy.revision);
+        if held == Some(*revision) && !mutated(Mutation::DeliveryReceiptsRenote) {
+            return;
+        }
+        self.mirror.step(
+            message,
+            target,
+            Write::Receipt {
+                external,
+                revision: *revision,
+            },
+        );
+        if held.is_none() {
             self.mirror
                 .external
                 .insert((target.clone(), external.clone()), message.clone());

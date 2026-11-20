@@ -3,8 +3,8 @@
 use crate::{
     AsObject, Py, PyObject, PyObjectRef, PyRef, PyResult, TryFromObject, VirtualMachine,
     builtins::{
-        PyBaseObject, PyBytes, PyDict, PyDictRef, PyGenericAlias, PyInt, PyList, PyStr, PyTuple,
-        PyTupleRef, PyType, PyTypeRef, PyUtf8Str, int::check_int_to_str_digits, pystr::AsPyStr,
+        PyBytes, PyDict, PyDictRef, PyGenericAlias, PyInt, PyList, PyStr, PyTuple, PyTupleRef,
+        PyType, PyTypeRef, PyUtf8Str, int::check_int_to_str_digits, pystr::AsPyStr,
     },
     common::{hash::PyHash, str::to_ascii},
     convert::ToPyObject,
@@ -199,25 +199,11 @@ impl PyObject {
                     "'{name}' object attribute '{attr_name}' is read-only"
                 )));
             }
-            // Only a type that left __setattr__ alone can be told about the
-            // missing __dict__, since overriding it is what hides the slot.
-            let generic_setattro = self.class().slots().setattro.load().is_some_and(|f| {
-                crate::types::fn_addr(f)
-                    == crate::types::fn_addr(
-                        PyBaseObject::slot_setattro as crate::types::SetattroFunc,
-                    )
-            });
-            let msg = if generic_setattro {
-                format!(
-                    "'{name}' object has no attribute '{attr_name}' and no \
-                     __dict__ for setting new attributes"
-                )
-            } else {
-                format!("'{name}' object has no attribute '{attr_name}'")
-            };
-            let exc = vm.new_attribute_error(msg);
-            vm.set_attribute_error_context(&exc, self.to_owned(), attr_name.to_owned());
-            return Err(exc);
+            // CPython 3.12 says only that the attribute is missing and leaves the error's name and obj unset; the
+            // "and no __dict__ for setting new attributes" tail and the context are 3.13's.
+            return Err(
+                vm.new_attribute_error(format!("'{name}' object has no attribute '{attr_name}'"))
+            );
         };
 
         if let PySetterValue::Assign(value) = value {

@@ -11,6 +11,7 @@ autotests = false
 autobenches = false
 
 [dependencies]
+nanocode-bytes.workspace = true
 nanocode-compression.workspace = true
 nanocode-platform.workspace = true
 nanocode-python-capi.workspace = true

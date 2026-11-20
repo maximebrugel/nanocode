@@ -1,5 +1,5 @@
 use crate::{
-    fs::{Reply, Write},
+    fs::{Kind, Reply, Write},
     host::Vfs,
     machine::Machine,
 };
@@ -19,7 +19,7 @@ use std::{
 };
 
 pub(crate) const PIPE_BYTES: usize = 65_536;
-const FILE_MODE: u32 = 0o644;
+pub(crate) const FILE_MODE: u32 = 0o644;
 
 pub(crate) fn bad_descriptor() -> io::Error {
     io::Error::other("Bad file descriptor")
@@ -165,8 +165,17 @@ impl HostFile for Device {
 }
 
 struct Reader {
+    path: Vec<u8>,
     data: Bytes,
     at: Cell<usize>,
+}
+
+/// A virtual file's identity for `HostFile::identity`: its path stands for the inode.
+fn identity(path: &[u8], size: u64) -> Option<(u64, u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    Some((u64::MAX, hasher.finish(), size))
 }
 
 impl HostFile for Reader {
@@ -185,15 +194,75 @@ impl HostFile for Reader {
     fn kind(&self) -> Option<FileKind> {
         Some(FileKind::File)
     }
+
+    fn identity(&self) -> Option<(u64, u64, u64)> {
+        identity(&self.path, self.data.len() as u64)
+    }
+}
+
+/// A directory opened for reading (`< dir`), as `open(2)` opens one: reading it fails.
+struct Directory;
+
+impl HostFile for Directory {
+    fn poll_read(&self, _cx: &mut Context<'_>, _buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::IsADirectory.into()))
+    }
+
+    fn poll_write(&self, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(bad_descriptor()))
+    }
+
+    fn kind(&self) -> Option<FileKind> {
+        Some(FileKind::Dir)
+    }
 }
 
 type Pending = Pin<Box<dyn Future<Output = io::Result<()>>>>;
 
+/// A file opened for writing only, with `>` or `>>`. Its writes are appends to the
+/// file system while nothing changed the file since this file's own last write. A `>`
+/// file keeps its own offset, as a descriptor does: once something else wrote,
+/// truncated or replaced the file, its next write lands at that offset (zero-filling
+/// past the end), not at the end. `>>` always writes at the end.
 struct Appender {
     vfs: Rc<Vfs>,
     path: Vec<u8>,
     size: Cell<u64>,
+    /// `>`: the offset of the next write. `None` for `>>`.
+    at: Option<Cell<u64>>,
+    /// `vfs.writes` after this file's last write (or its open).
+    seen: Rc<Cell<u64>>,
     pending: RefCell<Option<(Pending, usize)>>,
+}
+
+/// Writes `data` at offset `at` of the file at `path`: an append when the file ends
+/// there, else the file rewritten with `data` in place.
+async fn write_at(
+    vfs: Rc<Vfs>,
+    path: Vec<u8>,
+    data: Vec<u8>,
+    at: u64,
+    seen: Rc<Cell<u64>>,
+) -> io::Result<()> {
+    let reply = match vfs.stat(&path, true).get().await {
+        Ok(stat) if stat.size != at => {
+            let mut content = vfs.read(&path).get().await?.to_vec();
+            let start = usize::try_from(at).map_err(|_| io::Error::from(io::ErrorKind::FileTooLarge))?;
+            let end = start + data.len();
+            if content.len() < end {
+                content.resize(end, 0);
+            }
+            content[start..end].copy_from_slice(&data);
+            vfs.write(&path, &content, Write::Replace)
+        }
+        Ok(_) => vfs.write(&path, &data, Write::Append),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            vfs.write(&path, &data, Write::Append)
+        }
+        Err(error) => return Err(error),
+    };
+    seen.set(vfs.writes.get());
+    reply.get().await
 }
 
 impl HostFile for Appender {
@@ -204,14 +273,35 @@ impl HostFile for Appender {
     fn poll_write(&self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let mut pending = self.pending.borrow_mut();
         if pending.is_none() {
-            let size = self.size.get() + buf.len() as u64;
-            if size > self.vfs.limits.file {
+            let len = buf.len() as u64;
+            let start = self.at.as_ref().map(Cell::get);
+            let end = start.unwrap_or_else(|| self.size.get()) + len;
+            if end > self.vfs.limits.file {
                 return Poll::Ready(Err(io::ErrorKind::FileTooLarge.into()));
             }
-            self.size.set(size);
-            match self.vfs.write(&self.path, buf, Write::Append) {
-                Reply::Now(result) => return Poll::Ready(result.map(|()| buf.len())),
-                Reply::Later(write) => *pending = Some((write, buf.len())),
+            self.size.set(self.size.get().max(end));
+            if let Some(at) = &self.at {
+                at.set(end);
+            }
+            match start {
+                Some(start) if self.vfs.writes.get() != self.seen.get() => {
+                    let write = write_at(
+                        self.vfs.clone(),
+                        self.path.clone(),
+                        buf.to_vec(),
+                        start,
+                        self.seen.clone(),
+                    );
+                    *pending = Some((Box::pin(write), buf.len()));
+                }
+                _ => {
+                    let reply = self.vfs.write(&self.path, buf, Write::Append);
+                    self.seen.set(self.vfs.writes.get());
+                    match reply {
+                        Reply::Now(result) => return Poll::Ready(result.map(|()| buf.len())),
+                        Reply::Later(write) => *pending = Some((write, buf.len())),
+                    }
+                }
             }
         }
         let Some((write, count)) = pending.as_mut() else {
@@ -229,6 +319,10 @@ impl HostFile for Appender {
 
     fn kind(&self) -> Option<FileKind> {
         Some(FileKind::File)
+    }
+
+    fn identity(&self) -> Option<(u64, u64, u64)> {
+        identity(&self.path, self.size.get())
     }
 }
 
@@ -294,6 +388,10 @@ impl HostFile for Updater {
     fn kind(&self) -> Option<FileKind> {
         Some(FileKind::File)
     }
+
+    fn identity(&self) -> Option<(u64, u64, u64)> {
+        identity(&self.path, self.data.borrow().len() as u64)
+    }
 }
 
 pub(crate) async fn open(
@@ -302,8 +400,18 @@ pub(crate) async fn open(
     options: OpenOptions,
 ) -> io::Result<Rc<dyn HostFile>> {
     if !options.write && !options.append {
-        let data = vfs.read(&path).get().await?;
+        let data = match vfs.read(&path).get().await {
+            Ok(data) => data,
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                if matches!(vfs.stat(&path, true).get().await, Ok(stat) if stat.kind == Kind::Dir) {
+                    return Ok(Rc::new(Directory));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         return Ok(Rc::new(Reader {
+            path,
             data,
             at: Cell::new(0),
         }));
@@ -344,6 +452,8 @@ pub(crate) async fn open(
             vfs: vfs.clone(),
             path: path.clone(),
             size: Cell::new(size),
+            at: (!options.append).then(|| Cell::new(0)),
+            seen: Rc::new(Cell::new(vfs.writes.get())),
             pending: RefCell::new(None),
         })
     } else {
@@ -474,5 +584,109 @@ impl HostFile for PipeEnd {
 
     fn kind(&self) -> Option<FileKind> {
         Some(FileKind::Fifo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Config, Ended, Identity, Limits, Machine, MemFs, NoCommands, Script, Shell, Step};
+    use std::{future::Future, pin::Pin, rc::Rc, time::Duration};
+
+    struct Still;
+
+    impl Machine for Still {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()>>> {
+            Box::pin(std::future::ready(()))
+        }
+
+        fn random(&self, bytes: &mut [u8]) {
+            bytes.fill(4);
+        }
+    }
+
+    fn run(source: &str) -> (Vec<u8>, Vec<u8>) {
+        let machine: Rc<dyn Machine> = Rc::new(Still);
+        let fs = Rc::new(MemFs::new(machine.clone()));
+        let mut shell = Shell::new(Config {
+            fs,
+            commands: Rc::new(NoCommands),
+            machine,
+            identity: Identity {
+                info: psh_engine::host::HostInfo::default(),
+                pid: 2,
+                user: b"u".to_vec(),
+                group: b"u".to_vec(),
+                home: b"/".to_vec(),
+            },
+            limits: Limits {
+                fuel: 10_000_000,
+                output: 1 << 20,
+                file: 1 << 20,
+                operations: 100_000,
+                depth: 100,
+            },
+            env: Vec::new(),
+            cwd: b"/".to_vec(),
+            without: Vec::new(),
+            strict: false,
+        });
+        shell.start(Script {
+            source: source.as_bytes().to_vec(),
+            name: b"bash".to_vec(),
+            args: Vec::new(),
+            options: Vec::new(),
+            stdin: None,
+        });
+        for _ in 0..10_000 {
+            if let Step::Done(ran) = shell.step(10_000) {
+                assert!(matches!(ran.ended, Ended::Exited(_)), "{:?}", ran.ended);
+                return (ran.stdout, ran.stderr);
+            }
+        }
+        panic!("the script did not finish");
+    }
+
+    fn out(source: &str) -> String {
+        String::from_utf8(run(source).0).unwrap()
+    }
+
+    #[test]
+    fn truncating_redirect_keeps_its_offset() {
+        assert_eq!(out("( echo x >> out; cat out; echo x ) > out; cat out"), "x\n");
+        assert_eq!(out("{ echo x >> out; cat out; echo x; } > out; cat out"), "x\n");
+        assert_eq!(out("( echo x > out; cat out; echo x ) > out; cat out"), "x\n");
+        assert_eq!(
+            out("for x in x x x; do echo \"<$x>\"; echo x >> out; cat out; done > out; cat out"),
+            "<x>\n<x>\n<x>\nx\n"
+        );
+        assert_eq!(
+            out("f() { echo \"$#:$1\"; echo x > out; cat out; shift; echo \"$@\"; }; f x x > out; cat out"),
+            "x\n\0\0x\n"
+        );
+    }
+
+    #[test]
+    fn tee_into_its_own_output() {
+        assert_eq!(out("echo x | tee out > out; cat out"), "x\n");
+        assert_eq!(out("echo x | tee out >> out; cat out"), "x\n");
+        assert_eq!(out("echo x | tee out | cat > out; cat out"), "x\n");
+    }
+
+    #[test]
+    fn appending_redirect_writes_at_the_end() {
+        assert_eq!(out("{ echo a; echo b >> out; echo c; } >> out; cat out"), "a\nb\nc\n");
+        assert_eq!(out("exec 3> out; echo abc >&3; echo z > out; echo d >&3; cat out"), "z\n\0\0d\n");
+    }
+
+    #[test]
+    fn reading_a_directory() {
+        assert_eq!(out("let n=1 < .; echo $n"), "1\n");
+        let (stdout, stderr) = run("cat < .; echo $?");
+        assert_eq!(String::from_utf8(stdout).unwrap(), "1\n");
+        assert!(String::from_utf8_lossy(&stderr).contains("Is a directory"), "{stderr:?}");
     }
 }

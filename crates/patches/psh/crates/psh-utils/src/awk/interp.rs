@@ -1093,9 +1093,10 @@ impl<'c, 'v> Interp<'c, 'v> {
                 Op::ConcatMulti(n) => {
                     let n = *n as usize;
                     let at = self.stack.len() - n;
-                    let mut out = Vec::new();
-                    for v in &self.stack[at..] {
-                        out.extend_from_slice(&self.to_str(v));
+                    let parts: Vec<S> = self.stack[at..].iter().map(|v| self.to_str(v)).collect();
+                    let mut out = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
+                    for p in &parts {
+                        out.extend_from_slice(p);
                     }
                     self.stack.truncate(at);
                     self.push(Value::Str(Rc::from(out)));
@@ -1103,9 +1104,10 @@ impl<'c, 'v> Interp<'c, 'v> {
                 Op::Concat => {
                     let r = self.pop();
                     let l = self.pop();
-                    let mut out = self.to_str(&l).to_vec();
-                    out.extend_from_slice(&self.to_str(&r));
-                    self.push(Value::Str(Rc::from(out)));
+                    let (l, r) = (self.to_str(&l), self.to_str(&r));
+                    // Collected straight into one allocation of the joined length.
+                    let out: S = l.iter().chain(r.iter()).copied().collect();
+                    self.push(Value::Str(out));
                 }
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow => {
                     let r = self.pop().num();

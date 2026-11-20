@@ -77,6 +77,10 @@ impl ArithEnv for Env<'_> {
                 let v = match index {
                     ArithIndex::Key(k) => self.vp.get_elem(&name, &unquote(k)),
                     ArithIndex::Num(i) => self.vp.get_elem(&name, i.to_string().as_bytes()),
+                    ArithIndex::Empty => {
+                        self.vp.arith_notes.push(format!("{name}[]: bad array subscript"));
+                        self.vp.get_elem(&name, b"0")
+                    }
                 };
                 // Out of range below the start: 0, with bash's message.
                 let v = match v {
@@ -155,6 +159,12 @@ impl ArithEnv for Env<'_> {
             Some(ArithIndex::Num(i)) => {
                 self.vp
                     .assign_elem(&name, i.to_string().as_bytes(), v, false)
+            }
+            // bash reports it and goes on, with nothing stored.
+            Some(ArithIndex::Empty) => {
+                self.vp.arith_notes.push(format!("{name}[]: bad array subscript"));
+                self.vp.arith_notes.push(format!("`{name}[]': not a valid identifier"));
+                Ok(())
             }
         }
     }
@@ -406,38 +416,6 @@ pub(crate) fn could_expand_subscript(text: &[u8]) -> bool {
     false
 }
 
-#[cfg(test)]
-mod tests {
-    use super::could_expand_subscript as could;
-
-    #[test]
-    fn plain_arithmetic_keeps_the_gate_off() {
-        for s in [
-            "i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done",
-            "i=0; while ((i<100000)); do ((i++)); done",
-            "i=0; while [[ $i -lt 100000 ]]; do i=$((i+1)); done",
-            "a=(1 2 3); echo \"${a[$i]}\" $((a[$i] + 1)); a[$i]=2; x=\"${a[${#a[@]}-1]}\"",
-            "echo '[ok]' '$HOME' \"[$x]\"; echo \\$5 [ \\$x",
-        ] {
-            assert!(!could(s.as_bytes()), "{s}");
-        }
-    }
-
-    #[test]
-    fn a_written_subscript_turns_it_on() {
-        for s in [
-            "x='a[$(echo 2)]'; echo $((x))",
-            "x='a[`echo 2`]'",
-            "expr='a[ $(echo 2) ]'",
-            "x=a[\\$i]",
-            "x=\"a[\\$(echo 2)]\"",
-            "x=$'a[$i]'",
-        ] {
-            assert!(could(s.as_bytes()), "{s}");
-        }
-    }
-}
-
 fn unquote(k: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if !k.iter().any(|&b| matches!(b, b'\'' | b'"' | b'\\')) {
         return std::borrow::Cow::Borrowed(k);
@@ -470,10 +448,14 @@ pub(crate) async fn notes(vp: &mut Vp) {
 /// Evaluates `text`; the error is bash's message without the `line N:` prefix.
 pub(crate) fn eval(vp: &mut Vp, text: &[u8]) -> Result<i64, String> {
     vp.arith_unbound = false;
+    vp.arith_syntax = false;
     match eval_arith(text, &mut Env { vp }) {
         Ok(v) => Ok(v),
         Err(EvalError::Env(msg)) => Err(msg),
-        Err(e) => Err(e.bash_text().unwrap_or_default()),
+        Err(e) => {
+            vp.arith_syntax = true;
+            Err(e.bash_text().unwrap_or_default())
+        }
     }
 }
 
@@ -526,5 +508,37 @@ pub(crate) fn eval_literal(vp: &mut Vp, lit: &Literal) -> Result<i64, String> {
         Ok(v) => Ok(v),
         Err(EvalError::Env(msg)) => Err(msg),
         Err(e) => Err(e.bash_text().unwrap_or_default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::could_expand_subscript as could;
+
+    #[test]
+    fn plain_arithmetic_keeps_the_gate_off() {
+        for s in [
+            "i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done",
+            "i=0; while ((i<100000)); do ((i++)); done",
+            "i=0; while [[ $i -lt 100000 ]]; do i=$((i+1)); done",
+            "a=(1 2 3); echo \"${a[$i]}\" $((a[$i] + 1)); a[$i]=2; x=\"${a[${#a[@]}-1]}\"",
+            "echo '[ok]' '$HOME' \"[$x]\"; echo \\$5 [ \\$x",
+        ] {
+            assert!(!could(s.as_bytes()), "{s}");
+        }
+    }
+
+    #[test]
+    fn a_written_subscript_turns_it_on() {
+        for s in [
+            "x='a[$(echo 2)]'; echo $((x))",
+            "x='a[`echo 2`]'",
+            "expr='a[ $(echo 2) ]'",
+            "x=a[\\$i]",
+            "x=\"a[\\$(echo 2)]\"",
+            "x=$'a[$i]'",
+        ] {
+            assert!(could(s.as_bytes()), "{s}");
+        }
     }
 }

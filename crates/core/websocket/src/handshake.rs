@@ -138,7 +138,7 @@ fn generate_key() -> Result<String> {
     Ok(STANDARD.encode(key))
 }
 
-pub(crate) fn derive_accept_key(key: &[u8]) -> String {
+pub fn derive_accept_key(key: &[u8]) -> String {
     let mut input = Vec::with_capacity(key.len() + ACCEPT_GUID.len());
     input.extend_from_slice(key);
     input.extend_from_slice(ACCEPT_GUID);

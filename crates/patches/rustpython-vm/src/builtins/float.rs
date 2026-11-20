@@ -57,29 +57,14 @@ impl PyPayload for PyFloat {
     #[inline]
     unsafe fn freelist_push(obj: *mut PyObject) -> bool {
         FLOAT_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let stored = if list.len() < Self::MAX_FREELIST {
-                    list.push(obj);
-                    true
-                } else {
-                    false
-                };
-                fl.set(list);
-                stored
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::push_in(fl, obj, Self::MAX_FREELIST) })
             .unwrap_or(false)
     }
 
     #[inline]
     unsafe fn freelist_pop(_payload: &Self) -> Option<NonNull<PyObject>> {
         FLOAT_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let result = list.pop().map(|p| unsafe { NonNull::new_unchecked(p) });
-                fl.set(list);
-                result
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::pop_in(fl) })
             .ok()
             .flatten()
     }
@@ -127,11 +112,11 @@ macro_rules! impl_try_from_object_float {
 impl_try_from_object_float!(f32, f64);
 
 fn inner_div(v1: f64, v2: f64, vm: &VirtualMachine) -> PyResult<f64> {
-    float_ops::div(v1, v2).ok_or_else(|| vm.new_zero_division_error("division by zero"))
+    float_ops::div(v1, v2).ok_or_else(|| vm.new_zero_division_error("float division by zero"))
 }
 
 fn inner_mod(v1: f64, v2: f64, vm: &VirtualMachine) -> PyResult<f64> {
-    float_ops::mod_(v1, v2).ok_or_else(|| vm.new_zero_division_error("division by zero"))
+    float_ops::mod_(v1, v2).ok_or_else(|| vm.new_zero_division_error("float modulo"))
 }
 
 pub fn try_to_bigint(value: f64, vm: &VirtualMachine) -> PyResult<BigInt> {
@@ -154,17 +139,17 @@ pub fn try_to_bigint(value: f64, vm: &VirtualMachine) -> PyResult<BigInt> {
 }
 
 fn inner_floordiv(v1: f64, v2: f64, vm: &VirtualMachine) -> PyResult<f64> {
-    float_ops::floordiv(v1, v2).ok_or_else(|| vm.new_zero_division_error("division by zero"))
+    float_ops::floordiv(v1, v2).ok_or_else(|| vm.new_zero_division_error("float floor division by zero"))
 }
 
 fn inner_divmod(v1: f64, v2: f64, vm: &VirtualMachine) -> PyResult<(f64, f64)> {
-    float_ops::divmod(v1, v2).ok_or_else(|| vm.new_zero_division_error("division by zero"))
+    float_ops::divmod(v1, v2).ok_or_else(|| vm.new_zero_division_error("float divmod()"))
 }
 
 pub(crate) fn float_pow(v1: f64, v2: f64, vm: &VirtualMachine) -> PyResult {
     if v1.is_zero() && v2.is_sign_negative() {
-        Err(vm.new_zero_division_error("zero to a negative power"))
-    } else if v1.is_sign_negative() && (v2.floor() - v2).abs() > f64::EPSILON {
+        Err(vm.new_zero_division_error("0.0 cannot be raised to a negative power"))
+    } else if v1 < 0.0 && v1.is_finite() && v2.is_finite() && v2.floor() != v2 {
         let v1 = Complex64::new(v1, 0.);
         let v2 = Complex64::new(v2, 0.);
         Ok(super::complex::complex_pow(v1, v2, vm)?.to_pyobject(vm))

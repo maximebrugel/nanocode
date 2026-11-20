@@ -83,6 +83,12 @@ async fn unary(vp: &mut Vp, op: UnaryTest, op_text: &[u8], v: &[u8]) -> R {
         UnaryTest::StringHasNonZeroLength => !v.is_empty(),
         _ => match builtins::test::unary(vp, op_text, v).await {
             Ok(t) => t,
+            // `-v a[sub]`: a subscript that is not arithmetic abandons the command,
+            // as an expansion error does (bash).
+            Err(msg) if op_text == b"-v" => {
+                vp.error(&msg).await;
+                return Err(Unwind::Abort(1));
+            }
             // `-t x`: not a file descriptor number.
             Err(msg) => {
                 vp.error(&format!("[[: {msg}")).await;

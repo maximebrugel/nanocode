@@ -1,11 +1,11 @@
 //! Number to string conversion.
 //!
-//! Decimal shortest output uses Ryu. Everything else (fixed-point, precision, exponential,
-//! other radixes) follows QuickJS' `js_dtoa` (`dtoa.c`, MIT, Fabrice Bellard) with exact big
-//! integer arithmetic, so the digits and the corner cases match qjs.
+//! Decimal shortest output uses Ryu. Fixed-point, precision and exponential output follow
+//! QuickJS' `js_dtoa` (`dtoa.c`, MIT, Fabrice Bellard) with exact big integer arithmetic, so
+//! the digits and the corner cases match qjs. Other radixes print what V8 prints.
 
 use super::big::Big;
-use super::exact::{Round, scale_round, scale_to_f64};
+use super::exact::{Round, scale_round};
 use super::ryu;
 use super::{MAX_FIXED_LEN, MAX_RADIX_LEN, MAX_SHORT_LEN, NumStr, RangeError};
 
@@ -20,13 +20,6 @@ const MUL_LOG2_RADIX: [u32; 35] = [
     0x3d645a, 0x3c43c2, 0x3b3b9a, 0x3a4899, 0x39680b, 0x3897b3, 0x37d5af, 0x372069,
     0x367686, 0x35d6df, 0x354072, 0x34b261, 0x342bea, 0x33ac62, 0x000000, 0x32bfd9,
     0x3251dd, 0x31e8d6, 0x318465,
-];
-
-/// `1 + ceil(53 / log2(radix))`: enough digits to round-trip any double (from qjs).
-#[rustfmt::skip]
-const DTOA_MAX_DIGITS: [u8; 35] = [
-    54, 35, 28, 24, 22, 20, 19, 18, 17, 17, 16, 16, 15, 15, 15, 14, 14, 14, 14, 14, 13, 13,
-    13, 13, 13, 13, 13, 12, 12, 12, 12, 12, 12, 12, 12,
 ];
 
 /// `floor(a / log2(radix))` for -2048 <= a <= 2047.
@@ -44,7 +37,6 @@ enum Exp {
     /// Exponential notation when the decimal point position `e` is `<= -6` or `> max`.
     Auto(i32),
     Always,
-    Never,
 }
 
 /// Writes `digits` (the significant digits) with the decimal point after `e` digits (so the
@@ -53,7 +45,6 @@ fn layout<const N: usize>(out: &mut NumStr<N>, digits: &[u8], e: i32, exp: Exp) 
     let p = digits.len() as i32;
     let exponential = match exp {
         Exp::Always => true,
-        Exp::Never => false,
         Exp::Auto(max) => e <= -6 || e > max,
     };
     if exponential {
@@ -261,9 +252,10 @@ fn short_decimal(a: f64) -> Option<(u64, i32)> {
 /// `Number.prototype.toString(radix)` for an integer `radix` (the caller applies
 /// ToIntegerOrInfinity and saturates). Radix 10 is [`to_string`].
 ///
-/// Other radixes print the shortest digit string that round-trips in that radix (qjs'
-/// behavior; the spec leaves non-integers implementation-defined), never in exponential
-/// notation.
+/// The spec leaves other radixes implementation-defined for non-integers; this prints what
+/// V8 prints (`DoubleToRadixCString`), never in exponential notation: fraction digits only
+/// up to the double's precision (half the gap to the next double, scaled with each digit),
+/// rounded half to even, and integer digits past 2^53 written as zeros.
 pub fn to_string_radix(x: f64, radix: i32) -> Result<NumStr<MAX_RADIX_LEN>, RangeError> {
     if !(2..=36).contains(&radix) {
         return Err(RangeError::Radix);
@@ -277,87 +269,78 @@ pub fn to_string_radix(x: f64, radix: i32) -> Result<NumStr<MAX_RADIX_LEN>, Rang
     if non_finite_or_zero(&mut out, x) {
         return Ok(out);
     }
+    const CHARS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let r = radix as f64;
+    let value = x.abs();
+    let mut integer = djs_libm::floor(value);
+    let mut fraction = value - integer;
+    let mut delta = (0.5 * (f64::from_bits(value.to_bits() + 1) - value)).max(f64::from_bits(1));
+    // Fraction digits; a carry out of them can reach the integer part.
+    let mut frac = [0u8; MAX_RADIX_LEN];
+    let mut nf = 0;
+    if fraction >= delta {
+        loop {
+            fraction *= r;
+            delta *= r;
+            let digit = fraction as u32;
+            frac[nf] = CHARS[digit as usize];
+            nf += 1;
+            fraction -= digit as f64;
+            if (fraction > 0.5 || (fraction == 0.5 && digit & 1 == 1)) && fraction + delta > 1.0 {
+                // Round up, carrying through the digits already written.
+                loop {
+                    if nf == 0 {
+                        integer += 1.0;
+                        break;
+                    }
+                    nf -= 1;
+                    let c = frac[nf];
+                    let d = if c > b'9' { c - b'a' + 10 } else { c - b'0' } as u32;
+                    if d + 1 < radix {
+                        frac[nf] = CHARS[d as usize + 1];
+                        nf += 1;
+                        break;
+                    }
+                }
+                break;
+            }
+            if fraction < delta {
+                break;
+            }
+        }
+    }
+    // Integer digits, least significant first; those below the double's precision are zeros.
+    let exponent = |d: f64| match (d.to_bits() >> 52) & 0x7ff {
+        0 => -1074,
+        b => b as i32 - 1075,
+    };
+    let mut int = [0u8; 1100];
+    let mut ni = 0;
+    while exponent(integer / r) > 0 {
+        integer /= r;
+        int[ni] = b'0';
+        ni += 1;
+    }
+    loop {
+        let rem = integer % r;
+        int[ni] = CHARS[rem as usize];
+        ni += 1;
+        integer = (integer - rem) / r;
+        if integer <= 0.0 {
+            break;
+        }
+    }
     if x < 0.0 {
         out.push(b'-');
     }
-    let a = x.abs();
-    let (m, e) = decompose(a);
-    let mut tmp = [0u8; 64];
-    if (1..=53).contains(&e) && m & ((1 << (53 - e)) - 1) == 0 {
-        // An integer below 2^53: print it exactly.
-        out.extend(u64_digits(m >> (53 - e), radix, &mut tmp));
-        return Ok(out);
+    for &c in int[..ni].iter().rev() {
+        out.push(c);
     }
-    let (mant, p, e10) = shortest_radix(a, m, e, radix);
-    let digits = u64_digits(mant, radix, &mut tmp);
-    // `mant` has had its trailing zeros removed, so it may have fewer than `p` digits only if
-    // it has leading zeros, which cannot happen (mant >= radix^(p - 1)).
-    debug_assert_eq!(digits.len() as i32, p);
-    layout(&mut out, digits, e10, Exp::Never);
+    if nf > 0 {
+        out.push(b'.');
+        out.extend(&frac[..nf]);
+    }
     Ok(out)
-}
-
-/// The shortest `mant` (with `p` digits) such that `mant * radix^(e - p)` rounds to `a`, and
-/// `e`: qjs' JS_DTOA_FORMAT_FREE search. `a = m * 2^(e2 - 53)` as from `decompose`.
-fn shortest_radix(a: f64, m: u64, e2: i32, radix: u32) -> (u64, i32, i32) {
-    let p_max = DTOA_MAX_DIGITS[radix as usize - 2] as i32;
-    let e0 = 1 + mul_log2_radix(e2 - 1, radix);
-    let mut found: Option<(u64, i32, i32)> = None;
-    let mut p = p_max;
-    loop {
-        let mant_max = (radix as u64).pow(p as u32);
-        // The nearest p-digit mantissa and its exponent.
-        let mut e = e0;
-        let mut mant;
-        loop {
-            let t = scale_round(Big::from_u64(m), e2 - 53, radix, p - e, Round::HalfEven);
-            mant = if t.fits_u64() { t.low_u64() } else { u64::MAX };
-            if mant < mant_max {
-                break;
-            }
-            e += 1;
-        }
-        let (p1, e1, mant1) = (p, e, mant);
-        let mut ok = false;
-        let mut i = 0;
-        loop {
-            while mant % radix as u64 == 0 {
-                mant /= radix as u64;
-                p -= 1;
-            }
-            if found.is_none() {
-                // p_max digits always round-trip.
-                ok = true;
-                break;
-            }
-            if scale_to_f64(Big::from_u64(mant), 0, radix, e - p, false) == a {
-                ok = true;
-                break;
-            }
-            // When m is a power of two the rounding interval is asymmetric: the nearest
-            // p-digit number may be below the interval while the next one up is inside.
-            if i != 0 || m != 1 << 52 {
-                break;
-            }
-            p = p1;
-            e = e1;
-            mant = mant1 + 1;
-            if mant == mant_max {
-                mant /= radix as u64;
-                e += 1;
-            }
-            i += 1;
-        }
-        if !ok {
-            break;
-        }
-        found = Some((mant, p, e));
-        if p == 1 {
-            break;
-        }
-        p -= 1;
-    }
-    found.unwrap_or((m, 0, 0))
 }
 
 /// `Number.prototype.toFixed(digits)`. The caller passes ToIntegerOrInfinity(digits),

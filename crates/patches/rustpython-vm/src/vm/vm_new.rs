@@ -929,6 +929,10 @@ impl VirtualMachine {
         {
             msg.make_ascii_lowercase();
         }
+        // CPython words an over-indented line as "unexpected indent".
+        if msg == "unexpected indentation" {
+            msg = "unexpected indent".to_owned();
+        }
 
         cfg_select! {
             feature = "parser" => {

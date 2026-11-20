@@ -50,7 +50,7 @@ impl CellCallsMutation {
             .iter()
             .map(|mutation| mutation.name())
             .collect::<Vec<_>>()
-            .join(",")
+            .join("|")
     }
 }
 

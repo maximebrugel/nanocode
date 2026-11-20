@@ -226,6 +226,20 @@ pub(crate) async fn exit_trap(vp: &mut Vp, status: i32) -> i32 {
     }
 }
 
+/// Makes an EXIT trap inherited from the parent run when this subshell ends: a forked
+/// simple command whose own expansion failed dies with the trap bash's child still holds.
+pub(crate) fn arm_inherited_exit(vp: &mut Vp) {
+    let inherited = vp.parent_exit
+        && vp
+            .traps
+            .map
+            .get(&TrapKey::Exit)
+            .is_some_and(|t| !t.active && !t.action.is_empty());
+    if inherited && let Some(t) = Rc::make_mut(&mut vp.traps).map.get_mut(&TrapKey::Exit) {
+        t.active = true;
+    }
+}
+
 /// The ERR trap after a failed command (the caller checked errexit's exemptions).
 pub(crate) async fn err_trap(vp: &mut Vp, status: i32) -> Result<(), Unwind> {
     if vp.in_err_trap {

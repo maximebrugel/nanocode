@@ -39,6 +39,29 @@ pub(crate) fn buffer_create(
     len: f64,
     max: Option<f64>,
 ) -> Result<Obj, Fault> {
+    buffer_alloc(heap, proto, len, max, 2)
+}
+
+/// AllocateSharedArrayBuffer: a buffer whose slot 2 is its Atomics waiter list.
+pub(crate) fn shared_buffer_create(
+    heap: &mut Heap,
+    proto: Obj,
+    len: f64,
+    max: Option<f64>,
+    waiters: Obj,
+) -> Result<Obj, Fault> {
+    let o = buffer_alloc(heap, proto, len, max, 3)?;
+    heap.set_object_slot(o, 2, Value::object(waiters));
+    Ok(o)
+}
+
+fn buffer_alloc(
+    heap: &mut Heap,
+    proto: Obj,
+    len: f64,
+    max: Option<f64>,
+    slots: u32,
+) -> Result<Obj, Fault> {
     if !(0.0..=MAX_BUFFER).contains(&len) || max.is_some_and(|m| !(0.0..=MAX_BUFFER).contains(&m)) {
         return range_error("invalid array buffer length");
     }
@@ -49,7 +72,7 @@ pub(crate) fn buffer_create(
     }
     let cap = max.unwrap_or(len) as u32;
     let bytes = alloc_bytes(heap, len as u32, cap)?;
-    let o = heap.alloc_object(ObjectClass::ArrayBuffer, Some(proto), 2)?;
+    let o = heap.alloc_object(ObjectClass::ArrayBuffer, Some(proto), slots)?;
     heap.set_object_slot(o, 0, Value::internal(bytes));
     heap.set_object_slot(o, 1, max.map_or(Value::UNDEFINED, Value::number));
     Ok(o)
@@ -71,7 +94,7 @@ pub(crate) fn as_buffer(heap: &Heap, v: Value) -> Result<Obj, Fault> {
 }
 
 /// `%BufferInfo(b, field)`: 0 byteLength, 1 maxByteLength, 2 resizable, 3 detached,
-/// 4 immutable.
+/// 4 immutable, 5 shared, 6 the waiter list of a SharedArrayBuffer (else undefined).
 pub(crate) fn buffer_info(heap: &Heap, b: Obj, field: i32) -> Value {
     let detached = heap.buffer_bytes(b).is_none();
     let max = heap.object_slot(b, 1);
@@ -88,6 +111,9 @@ pub(crate) fn buffer_info(heap: &Heap, b: Obj, field: i32) -> Value {
         }
         2 => Value::bool(heap.buffer_resizable(b)),
         3 => Value::bool(detached),
+        5 => Value::bool(heap.buffer_shared(b)),
+        6 if heap.buffer_shared(b) => heap.object_slot(b, 2),
+        6 => Value::UNDEFINED,
         _ => Value::bool(heap.buffer_immutable(b)),
     }
 }
@@ -622,4 +648,58 @@ fn view_range(heap: &Heap, view: Obj, at: f64, size: usize) -> Option<core::ops:
     }
     let start = at as usize;
     (start + size <= heap.buffer_len(buffer) as usize).then_some(start..start + size)
+}
+
+/// `%AtomicOp(o, i, op, v, w)` on element `i` of an integer typed array: op 0 add, 1
+/// and, 2 exchange, 3 or, 4 sub, 5 xor, 6 compareExchange (`v` expected, `w` the
+/// replacement), 7 load. The operands are integral Numbers or BigInts, taken modulo
+/// 2^bits as NumericToRawBytes does; the result is the old element. Op 8 compares the
+/// element with `v` the same way (Atomics.wait).
+pub(crate) fn atomic_op(
+    heap: &mut Heap,
+    o: Obj,
+    i: u32,
+    op: i32,
+    v: Value,
+    w: Value,
+) -> Result<Value, Fault> {
+    if heap.ta_length(o).is_none_or(|len| i >= len) {
+        return range_error("Invalid atomic access index");
+    }
+    let kind = heap.ta_kind(o);
+    if op != 7 && op != 8 && heap.ta_immutable(o) {
+        return type_error("ArrayBuffer is immutable");
+    }
+    let bits = |heap: &Heap, v: Value| -> u64 {
+        if kind.is_bigint() {
+            v.as_bigint().map_or(0, |_| heap.bigint(v).to_u64_wrapping())
+        } else {
+            typed::to_int_bits(v.as_number().unwrap_or(0.0))
+        }
+    };
+    let size = kind.size() as usize;
+    let mask = if size == 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
+    let (x, y) = (bits(heap, v) & mask, bits(heap, w) & mask);
+    let at = heap.ta_byte_offset(o) as usize + i as usize * size;
+    let buffer = heap.ta_buffer(o);
+    let mut raw = [0u8; 8];
+    raw[..size].copy_from_slice(&heap.buffer_data(buffer)[at..at + size]);
+    let old = u64::from_le_bytes(raw);
+    let new = match op {
+        0 => old.wrapping_add(x),
+        1 => old & x,
+        2 => x,
+        3 => old | x,
+        4 => old.wrapping_sub(x),
+        5 => old ^ x,
+        6 if old == x => y,
+        6 | 7 => old,
+        8 => return Ok(Value::bool(old == x)),
+        _ => return type_error("bad atomic operation"),
+    } & mask;
+    if new != old {
+        heap.buffer_data_mut(buffer)[at..at + size].copy_from_slice(&new.to_le_bytes()[..size]);
+    }
+    let e = typed::decode_elem(kind, &raw[..size]);
+    Ok(heap.elem_value(kind, e)?)
 }

@@ -1,16 +1,19 @@
 //! log, show, diff, rev-list and ls-files: the commands that walk history or compare
 //! trees.
 
+use std::collections::HashSet;
 use std::io::Write;
+use std::rc::Rc;
 
 use super::cmd::{quote_path, shorten};
 use super::diff::{Change, DiffOpts, Printer, detect_renames, reversed, trees};
+use super::graph::{Graph, topo_sort};
 use super::pretty::{DateMode, Decorations, Format, Pretty, tag_header};
 use super::repo::{Commit, Ident, Repo};
 use super::rev::{self, Walk, Walker};
 use super::store::{Kind, Oid, join};
 use super::wild::Pathspec;
-use super::worktree::{State, Untracked, Work, untracked};
+use super::worktree::{State, Untracked, Work, scan_untracked};
 use super::{Error, Git, Io, Res, option};
 use crate::timefmt::days_from_civil;
 
@@ -125,6 +128,10 @@ struct Revs {
     named: Vec<(String, Oid)>,
     /// A...B was given: its two sides, for rev-list --left-right.
     symmetric: Option<(Oid, Oid)>,
+    graph: bool,
+    topo: bool,
+    /// With graph: every commit the walk shows, before -n and --skip.
+    shown: HashSet<Oid>,
 }
 
 impl Revs {
@@ -141,6 +148,9 @@ impl Revs {
             no_walk: false,
             named: Vec::new(),
             symmetric: None,
+            graph: false,
+            topo: false,
+            shown: HashSet::new(),
         }
     }
 
@@ -209,9 +219,12 @@ impl Revs {
             | "--no-graph"
             | "--no-follow"
             | "--end-of-options" => {}
-            "--graph"
-            | "--follow"
-            | "--topo-order"
+            "--graph" => {
+                self.graph = true;
+                self.topo = true;
+            }
+            "--topo-order" => self.topo = true,
+            "--follow"
             | "--author-date-order"
             | "--ancestry-path"
             | "--left-right"
@@ -434,15 +447,38 @@ impl Revs {
                 }
             }
         }
+        let first_parent = walk.first_parent;
         let mut walker = Walker::new(&git.repo, walk)?;
+        // In topological order the whole list is sorted before -n and --skip apply.
+        let mut sorted = None;
+        if self.topo {
+            let mut all = Vec::new();
+            while let Some(commit) = walker.next()? {
+                if self.matches(&commit)? {
+                    all.push(commit);
+                }
+            }
+            self.shown = all.iter().map(|c| c.id).collect();
+            sorted = Some(topo_sort(all, first_parent).into_iter());
+        }
+        let mut next = || -> Res<Option<Rc<Commit>>> {
+            match &mut sorted {
+                Some(list) => Ok(list.next()),
+                None => loop {
+                    let Some(commit) = walker.next()? else {
+                        return Ok(None);
+                    };
+                    if self.matches(&commit)? {
+                        return Ok(Some(commit));
+                    }
+                },
+            }
+        };
         let mut skip = self.skip;
         let mut left = self.max_count;
         let mut held = Vec::new();
         while left != Some(0) {
-            let Some(commit) = walker.next()? else { break };
-            if !self.matches(&commit)? {
-                continue;
-            }
+            let Some(commit) = next()? else { break };
             if skip > 0 {
                 skip -= 1;
                 continue;
@@ -767,6 +803,9 @@ pub fn log(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         Merges::Skip
     };
     let pretty = shape.pretty(git)?;
+    if revs.graph {
+        return log_graph(io, &pretty, &shape, &opts, &mut revs, git);
+    }
     let mut first = true;
     revs.commits(git, &mut |commit| {
         print_commit(
@@ -774,6 +813,66 @@ pub fn log(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         )?;
         Ok(true)
     })?;
+    Ok(0)
+}
+
+/// log --graph: each commit's text beside the history graph, as git's log-tree.c
+/// prints it.
+fn log_graph(
+    io: &mut Io<'_>,
+    pretty: &Pretty<'_, '_>,
+    shape: &Shape,
+    opts: &DiffOpts,
+    revs: &mut Revs,
+    git: &Git<'_>,
+) -> Res<i32> {
+    if revs.reverse {
+        return Err(Error::Fatal(
+            "options '--reverse' and '--graph' cannot be used together".to_string(),
+        ));
+    }
+    if opts.any() || !revs.paths.is_empty() {
+        return Err(Error::Lacks(
+            "log --graph with a diff or paths".to_string(),
+            "git that draws those graphs",
+        ));
+    }
+    let terminates = shape.terminates();
+    let first_parent = revs.walk.first_parent;
+    let mut list = Vec::new();
+    revs.commits(git, &mut |commit| {
+        list.push(commit.id);
+        Ok(true)
+    })?;
+    let mut graph = Graph::new(std::mem::take(&mut revs.shown), first_parent);
+    // Whether the last commit's text ended without a newline.
+    let mut missing_newline = true;
+    let mut out = Vec::new();
+    for (n, oid) in list.iter().enumerate() {
+        let commit = git.repo.commit(oid)?;
+        graph.update(&commit);
+        if n > 0 && !terminates {
+            if !missing_newline {
+                out.extend_from_slice(&graph.padding_line());
+            }
+            out.push(b'\n');
+        }
+        graph.show_commit(&mut out);
+        let mut msg = pretty.commit(&commit)?;
+        if !terminates && !matches!(shape.format, Format::Oneline) && msg.last() != Some(&b'\n') {
+            msg.push(b'\n');
+        }
+        missing_newline = msg.last() != Some(&b'\n');
+        graph.show_message(&mut out, &msg);
+        if terminates && !matches!(&shape.format, Format::User(format, _) if format.is_empty()) {
+            if !missing_newline {
+                out.extend_from_slice(&graph.padding_line());
+            }
+            out.push(b'\n');
+        }
+        io.out.write_all(&out)?;
+        out.clear();
+    }
     Ok(0)
 }
 
@@ -1117,9 +1216,6 @@ pub fn ls_files(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     if !(modified || deleted || others) {
         cached = true;
     }
-    if others && !standard {
-        return Err(option("ls-files", "--others without --exclude-standard"));
-    }
     let root = git.work_tree()?.to_vec();
     let own = if paths.is_empty() && !git.prefix.is_empty() {
         vec![".".to_string()]
@@ -1148,7 +1244,7 @@ pub fn ls_files(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v.clone())
         };
-        for path in untracked(&work, Untracked::All, &spec, &env)? {
+        for path in scan_untracked(&work, Untracked::All, &spec, &env, standard)? {
             let line = name(&path);
             lines.push((path, line));
         }
@@ -1208,6 +1304,98 @@ pub fn ls_files(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     for (_, line) in lines {
         io.out.write_all(&line)?;
         io.out.write_all(end)?;
+    }
+    Ok(0)
+}
+
+/// git shortlog: commits grouped by author (or committer), with their subjects or
+/// (-s) only how many there are.
+pub fn shortlog(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
+    let mut revs = Revs::new();
+    let mut summary = false;
+    let mut numbered = false;
+    let mut email = false;
+    let mut committer = false;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            rest.extend(args[i..].iter().cloned());
+            break;
+        }
+        match arg {
+            "-s" | "--summary" => summary = true,
+            "-n" | "--numbered" => numbered = true,
+            "-e" | "--email" => email = true,
+            "-c" | "--committer" => committer = true,
+            _ if !arg.starts_with('-') => rest.push(arg.to_string()),
+            _ if arg.len() > 2 && !arg.starts_with("--") => {
+                for flag in arg[1..].chars() {
+                    match flag {
+                        's' => summary = true,
+                        'n' => numbered = true,
+                        'e' => email = true,
+                        'c' => committer = true,
+                        _ => return Err(option("shortlog", arg)),
+                    }
+                }
+            }
+            _ => {
+                if !revs.option(git, "shortlog", args, &mut i)? {
+                    return Err(option("shortlog", arg));
+                }
+            }
+        }
+        i += 1;
+    }
+    if rest.iter().all(|a| a == "--" || a.starts_with('-')) {
+        rest.insert(0, "HEAD".to_string());
+    }
+    revs.positional(git, &rest)?;
+    // Each person's subjects, newest first as the walk meets them.
+    let mut people: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    revs.commits(git, &mut |commit| {
+        let ident = Ident::parse(if committer {
+            &commit.committer
+        } else {
+            &commit.author
+        });
+        let mut who = ident.name.to_vec();
+        if email {
+            who.extend_from_slice(b" <");
+            who.extend_from_slice(ident.email);
+            who.push(b'>');
+        }
+        let line = super::pretty::subject(commit.message());
+        match people.iter_mut().find(|(name, _)| *name == who) {
+            Some((_, lines)) => lines.push(line),
+            None => people.push((who, vec![line])),
+        }
+        Ok(true)
+    })?;
+    people.sort_by(|a, b| {
+        if numbered {
+            b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0))
+        } else {
+            a.0.cmp(&b.0)
+        }
+    });
+    for (who, lines) in &people {
+        if summary {
+            write!(io.out, "{:6}\t", lines.len())?;
+            io.out.write_all(who)?;
+            io.out.write_all(b"\n")?;
+            continue;
+        }
+        io.out.write_all(who)?;
+        writeln!(io.out, " ({}):", lines.len())?;
+        for line in lines.iter().rev() {
+            io.out.write_all(b"      ")?;
+            io.out.write_all(line)?;
+            io.out.write_all(b"\n")?;
+        }
+        io.out.write_all(b"\n")?;
     }
     Ok(0)
 }

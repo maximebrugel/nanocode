@@ -60,6 +60,11 @@ pub trait HostFile: Any {
     fn seek(&self, _pos: io::SeekFrom) -> Option<io::Result<u64>> {
         None
     }
+    /// A regular file's device, inode and size (`fstat`), where the host can tell:
+    /// `cat` refuses to read the file it writes to. `None`: unknown or not regular.
+    fn identity(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
     fn is_null(&self) -> bool {
         false
     }
@@ -434,9 +439,27 @@ impl Default for HostInfo {
 
 /// The engine's view of the outside world. Minimal on purpose; it grows with the
 /// features that need it (ARCH.md lists what is planned).
+/// A file [`Host::write_files`] writes whole.
+#[derive(Clone, Copy)]
+pub struct WholeFile<'a> {
+    pub path: &'a [u8],
+    pub data: &'a [u8],
+    /// Permission bits of the file when the write makes it, as [`OpenOptions::mode`].
+    pub mode: u32,
+}
+
 pub trait Host {
     /// Opens a file. The path is absolute.
     fn open(&self, path: &[u8], opts: OpenOptions) -> HostFuture<io::Result<Rc<dyn HostFile>>>;
+    /// Writes the leading files of `files` (absolute paths) in one step, each as making
+    /// its missing directories with `dir_mode`, opening it with [`OpenOptions::write`]
+    /// and its mode, and writing all of its data would: how many it wrote. A host stops
+    /// before a file the step cannot take, and an error means it wrote none; the caller
+    /// writes the rest one by one. A host without such a step writes none.
+    fn write_files(&self, files: &[WholeFile<'_>], dir_mode: u32) -> HostFuture<io::Result<usize>> {
+        let _ = (files, dir_mode);
+        Box::pin(std::future::ready(Ok(0)))
+    }
     /// `stat` (`follow`) or `lstat`.
     fn stat(&self, path: &[u8], follow: bool) -> HostFuture<io::Result<Metadata>>;
     /// Whether the current user may read, write or execute the file.

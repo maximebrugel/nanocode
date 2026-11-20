@@ -283,6 +283,10 @@ pub fn format_double(f: f64) -> String {
     if f == 0.0 {
         return if f.is_sign_negative() { "-0" } else { "0" }.into();
     }
+    // An integer below 2^53 is its own shortest digits, at most 16 of them: plain.
+    if f.fract() == 0.0 && f.abs() < 9007199254740992.0 {
+        return (f as i64).to_string();
+    }
     let sci = format!("{:e}", f.abs());
     let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
     let digits: String = mant.chars().filter(|c| *c != '.').collect();

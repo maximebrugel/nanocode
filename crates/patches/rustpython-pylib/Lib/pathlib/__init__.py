@@ -12,7 +12,6 @@ import os
 import posixpath
 import sys
 from errno import *
-from glob import _StringGlobber, _no_recurse_symlinks
 from itertools import chain
 from stat import S_ISDIR, S_ISREG, S_ISSOCK, S_ISBLK, S_ISCHR, S_ISFIFO
 from _collections_abc import Sequence
@@ -564,6 +563,7 @@ class PurePath:
         # paths shouldn't match wildcards, so we change it to the empty string.
         path = str(self) if self.parts else ''
         pattern = str(pattern) if pattern.parts else ''
+        from glob import _StringGlobber
         globber = _StringGlobber(self.parser.sep, case_sensitive, recursive=True)
         return globber.compile(pattern)(path) is not None
 
@@ -586,6 +586,7 @@ class PurePath:
             return False
         if len(path_parts) > len(pattern_parts) and path_pattern.anchor:
             return False
+        from glob import _StringGlobber
         globber = _StringGlobber(self.parser.sep, case_sensitive)
         for path_part, pattern_part in zip(path_parts, pattern_parts):
             match = globber.compile(pattern_part)
@@ -854,6 +855,7 @@ class Path(PurePath):
             # must use scandir() for everything, including non-wildcard parts.
             case_pedantic = True
         parts = self._parse_pattern(pattern)
+        from glob import _StringGlobber, _no_recurse_symlinks
         recursive = True if recurse_symlinks else _no_recurse_symlinks
         globber = _StringGlobber(self.parser.sep, case_sensitive, case_pedantic, recursive)
         select = globber.selector(parts[::-1])

@@ -23,7 +23,6 @@ mod prep;
 mod time;
 mod val;
 
-
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Read};
@@ -101,6 +100,8 @@ struct Args {
     color: Option<bool>,
     seq: bool,
     stream: bool,
+    /// `--unbuffered`: stdout is flushed after each output.
+    unbuffered: bool,
     /// `--arg`, `--argjson`, `--slurpfile`, `--rawfile`, in order.
     named: Vec<(String, NamedArg)>,
     positional: Vec<String>,
@@ -233,7 +234,7 @@ fn parse_args(argv: &[Vec<u8>]) -> Result<Args, ArgError> {
                 "from-file" => a.from_file = true,
                 "seq" => a.seq = true,
                 "stream" => a.stream = true,
-                "unbuffered" => {}
+                "unbuffered" => a.unbuffered = true,
                 "args" => rest_mode = 1,
                 "jsonargs" => rest_mode = 2,
                 "arg" => {
@@ -883,6 +884,11 @@ fn body(sync: &mut SyncCtx, args: Args) -> i32 {
     let mut status = 0;
     let mut last: Option<bool> = None;
     let mut out = Vec::new();
+    // jq's stdout as C stdio keeps it: in blocks when it is not a terminal, by lines
+    // when it is, and flushed after each output with `--unbuffered`. Its errors go out
+    // at once, so under `2>&1` they come ahead of outputs still held here.
+    let held: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    let line_buffered = shared.borrow().is_terminal(1);
 
     // One input through the filter: outputs written as they come.
     let mut run_one = |input: Val, last: &mut Option<bool>, status: &mut i32| -> Result<(), i32> {
@@ -905,8 +911,11 @@ fn body(sync: &mut SyncCtx, args: Args) -> i32 {
                     } else if !args.join {
                         out.push(b'\n');
                     }
+                    let mut held = held.borrow_mut();
+                    held.extend_from_slice(&out);
                     let mut sync = shared.borrow_mut();
-                    if sync.write(&out).is_err() || sync.cancelled() {
+                    let all = args.unbuffered || (line_buffered && out.contains(&b'\n'));
+                    if emit_held(&mut sync, &mut held, all).is_err() || sync.cancelled() {
                         return Err(141);
                     }
                 }
@@ -952,7 +961,9 @@ fn body(sync: &mut SyncCtx, args: Args) -> i32 {
     };
 
     let finish = |shared: &Shared<'_>| {
-        let _ = shared.borrow_mut().flush();
+        let mut sync = shared.borrow_mut();
+        let _ = emit_held(&mut sync, &mut held.borrow_mut(), true);
+        let _ = sync.flush();
     };
     if args.null_input {
         if let Err(code) = run_one(Val::Null, &mut last, &mut status) {
@@ -1004,6 +1015,28 @@ fn body(sync: &mut SyncCtx, args: Args) -> i32 {
         };
     }
     0
+}
+
+/// The size of the blocks C stdio writes a non-terminal stdout in.
+const STDIO_BLOCK: usize = 4096;
+
+/// Passes held stdout on: whole blocks, or with `all` everything.
+fn emit_held(sync: &mut SyncCtx, held: &mut Vec<u8>, all: bool) -> io::Result<()> {
+    let n = if all {
+        held.len()
+    } else {
+        held.len() / STDIO_BLOCK * STDIO_BLOCK
+    };
+    if n == 0 {
+        return Ok(());
+    }
+    let r = sync.write(&held[..n]);
+    held.drain(..n);
+    if all {
+        r.and_then(|()| sync.flush())
+    } else {
+        r
+    }
 }
 
 /// `<stdin>:N`, `FILE:N`, or `<unknown>` before any input was read.

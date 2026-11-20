@@ -56,13 +56,10 @@ fn find_frozen(name: &str, vm: &VirtualMachine) -> Result<crate::import::Frozen,
         return Ok(frozen);
     }
 
-    // use_frozen(): override > 0 → true, override < 0 → false, 0 → default (true)
-    // When disabled, non-bootstrap modules are simply not found (same as look_up_frozen)
-    let override_val = vm.state.override_frozen_modules.load();
-    if override_val < 0 {
-        return Err(FrozenError::NotFound);
-    }
-
+    // CPython's use_frozen() hides frozen stdlib modules when the override is negative, because its
+    // path finder then imports them from Lib/ instead. Here the frozen blob is the only copy of the
+    // stdlib, so honouring the override (test.support.import_helper.import_fresh_module sets it)
+    // would make json, functools, bisect and the rest unimportable: frozen modules stay available.
     Ok(frozen)
 }
 

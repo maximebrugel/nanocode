@@ -165,6 +165,9 @@ pub enum ObjectClass {
     /// A TextEncoder or TextDecoder (0244, `builtins/encoding.rs`): slot 0 the flags,
     /// slot 1 a decoder's stream state (both int32).
     TextCodec = 35,
+    /// An Intl object (builtins/intl): slot 0 its kind (int32), 1 its resolved options (a
+    /// string) and 2 its bound format or compare function (undefined until read).
+    Intl = 36,
 }
 
 impl ObjectClass {
@@ -206,6 +209,7 @@ impl ObjectClass {
             29 => Some(ObjectClass::RawJSON),
             34 => Some(ObjectClass::CallSite),
             35 => Some(ObjectClass::TextCodec),
+            36 => Some(ObjectClass::Intl),
             _ => None,
         }
     }
@@ -246,6 +250,7 @@ impl ObjectClass {
             ObjectClass::FinalizationRegistry => 5,
             ObjectClass::CallSite => 7,
             ObjectClass::TextCodec => 2,
+            ObjectClass::Intl => 3,
         }
     }
 

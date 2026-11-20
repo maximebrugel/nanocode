@@ -51,6 +51,16 @@ impl Policy {
     pub fn command_with_channel(&self, _launcher: &Path, _program: &Path) -> io::Result<Command> {
         Err(unsupported())
     }
+
+    pub fn command_joined(
+        &self,
+        _launcher: &Path,
+        _procs: Option<&Path>,
+        _channel: bool,
+        _program: &Path,
+    ) -> io::Result<Command> {
+        Err(unsupported())
+    }
 }
 
 pub const fn launch_if_requested() {}

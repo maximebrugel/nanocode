@@ -253,3 +253,23 @@ Py_ssize_t _Py_write(int fd, const void *buf, size_t count) {
     Py_DECREF(written);
     return size;
 }
+
+/* The ident of the running thread, as _thread.get_ident() reports it, so a
+ * C extension that remembers its creating thread (sqlite3's check_same_thread)
+ * sees each thread run under its own ident. */
+unsigned long PyThread_get_thread_ident(void) {
+    PyObject *raised = PyErr_GetRaisedException();
+    unsigned long ident = 1UL;
+    PyObject *thread = PyImport_ImportModule("_thread");
+    if (thread != NULL) {
+        PyObject *value = PyObject_CallMethod(thread, "get_ident", NULL);
+        Py_DECREF(thread);
+        if (value != NULL) {
+            ident = PyLong_AsUnsignedLongMask(value);
+            Py_DECREF(value);
+        }
+    }
+    PyErr_Clear();
+    PyErr_SetRaisedException(raised);
+    return ident;
+}

@@ -1,6 +1,6 @@
 //! Line and field tools (nanocode's addition), after GNU coreutils and util-linux: tac,
-//! rev, fold, expand, unexpand, column, join, shuf, split and numfmt. Inputs are read
-//! whole, except by fold, which writes each block as it reads.
+//! rev, fold, expand, unexpand, column, join, shuf, split, numfmt, tsort and fmt.
+//! Inputs are read whole, except by fold, which writes each block as it reads.
 
 use psh_engine::host::{OpenOptions, error_text};
 use psh_engine::util::UtilCtx;
@@ -621,27 +621,29 @@ pub async fn join(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         return common::usage(ctx, "missing operand").await;
     };
     let mut tables: Vec<Vec<Vec<Vec<u8>>>> = Vec::new();
+    // Each row's line number and text, for order errors.
+    let mut raws: Vec<Vec<(usize, Vec<u8>)>> = Vec::new();
     for name in [first, second] {
         let data = match read_all(ctx, std::slice::from_ref(name)).await {
             Ok(data) => data,
             Err(st) => return st,
         };
         let mut rows = Vec::new();
-        for line in data.split(|&b| b == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
+        let mut raw = Vec::new();
+        // Every line counts, an empty one too (it has no fields, so an empty key).
+        let body = data.strip_suffix(b"\n").unwrap_or(&data);
+        let lines = (!data.is_empty()).then(|| body.split(|&b| b == b'\n'));
+        for (n, line) in lines.into_iter().flatten().enumerate() {
+            raw.push((n + 1, line.to_vec()));
             let fields: Vec<Vec<u8>> = match sep {
+                Some(_) if line.is_empty() => Vec::new(),
                 Some(s) => line.split(|&b| b == s).map(<[u8]>::to_vec).collect(),
-                None => line
-                    .split(|&b| b == b' ' || b == b'\t')
-                    .filter(|f| !f.is_empty())
-                    .map(<[u8]>::to_vec)
-                    .collect(),
+                None => blank_fields(line),
             };
             rows.push(fields);
         }
         tables.push(rows);
+        raws.push(raw);
     }
     let key = |row: &[Vec<u8>], side: usize| -> Vec<u8> {
         let k = row.get(keys[side] - 1).cloned().unwrap_or_default();
@@ -703,6 +705,20 @@ pub async fn join(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         out.extend_from_slice(&fields.join(&out_sep));
         out.push(b'\n');
     };
+    // GNU's order check: lines are checked as they are read, from the first unpairable
+    // line on (always with --check-order, never with --nocheck-order).
+    let check = if p.has(&JOIN, "nocheck-order") {
+        None
+    } else {
+        Some(p.has(&JOIN, "check-order"))
+    };
+    let names = [first.as_slice(), second.as_slice()];
+    let mut order = Order {
+        check,
+        seen_unpairable: false,
+        warned: [false, false],
+        errors: Vec::new(),
+    };
     let (mut i, mut j) = (0, 0);
     while i < tables[0].len() && j < tables[1].len() {
         let (ka, kb) = (key(&tables[0][i], 0), key(&tables[1][j], 1));
@@ -712,12 +728,20 @@ pub async fn join(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                     line(Some(&tables[0][i]), None);
                 }
                 i += 1;
+                if order.read(0, i, &tables, &key, &raws, names) {
+                    break;
+                }
+                order.seen_unpairable = true;
             }
             std::cmp::Ordering::Greater => {
                 if unpaired[1] {
                     line(None, Some(&tables[1][j]));
                 }
                 j += 1;
+                if order.read(1, j, &tables, &key, &raws, names) {
+                    break;
+                }
+                order.seen_unpairable = true;
             }
             std::cmp::Ordering::Equal => {
                 let i_end = (i..tables[0].len())
@@ -726,6 +750,8 @@ pub async fn join(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 let j_end = (j..tables[1].len())
                     .find(|&n| key(&tables[1][n], 1) != kb)
                     .unwrap_or(tables[1].len());
+                let fatal = (i + 1..=i_end).any(|n| order.read(0, n, &tables, &key, &raws, names))
+                    || (j + 1..=j_end).any(|n| order.read(1, n, &tables, &key, &raws, names));
                 if !only_unpaired {
                     for a in &tables[0][i..i_end] {
                         for b in &tables[1][j..j_end] {
@@ -735,20 +761,125 @@ pub async fn join(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 }
                 i = i_end;
                 j = j_end;
+                if fatal {
+                    break;
+                }
             }
         }
     }
-    if unpaired[0] {
-        for a in &tables[0][i..] {
-            line(Some(a), None);
+    let fatal = order.check == Some(true) && order.warned.contains(&true);
+    let checktail = order.check.is_some() && !(order.warned[0] && order.warned[1]);
+    if !fatal {
+        for side in 0..2 {
+            let (at, other) = if side == 0 { (i, j) } else { (j, i) };
+            if !(unpaired[side] || checktail) || at >= tables[side].len() {
+                continue;
+            }
+            if other < tables[1 - side].len() {
+                order.seen_unpairable = true;
+            }
+            for n in at..tables[side].len() {
+                if n > at && order.read(side, n, &tables, &key, &raws, names) {
+                    break;
+                }
+                if unpaired[side] {
+                    let row = Some(&tables[side][n]);
+                    if side == 0 {
+                        line(row, None);
+                    } else {
+                        line(None, row);
+                    }
+                } else if order.warned[side] {
+                    break;
+                }
+            }
         }
     }
-    if unpaired[1] {
-        for b in &tables[1][j..] {
-            line(None, Some(b));
+    for e in std::mem::take(&mut order.errors) {
+        ctx.error(&e).await;
+    }
+    let st = emit(ctx, &out).await;
+    if order.warned.contains(&true) {
+        if order.check.is_none_or(|on| !on) {
+            ctx.error("input is not in sorted order").await;
+        }
+        return 1;
+    }
+    st
+}
+
+/// GNU join's default field split: leading blanks are skipped and runs of blanks
+/// separate fields, so blanks at the end of a line leave an empty last field.
+fn blank_fields(line: &[u8]) -> Vec<Vec<u8>> {
+    let blank = |b: &u8| *b == b' ' || *b == b'\t';
+    let Some(start) = line.iter().position(|b| !blank(b)) else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    let mut rest = &line[start..];
+    loop {
+        let end = rest.iter().position(blank).unwrap_or(rest.len());
+        fields.push(rest[..end].to_vec());
+        if end == rest.len() {
+            return fields;
+        }
+        let next = rest[end..].iter().position(|b| !blank(b));
+        match next {
+            Some(k) => rest = &rest[end + k..],
+            None => {
+                fields.push(Vec::new());
+                return fields;
+            }
         }
     }
-    emit(ctx, &out).await
+}
+
+/// A line of `join`'s input: its fields.
+type Row = Vec<Vec<u8>>;
+
+/// `join`'s join field of a row, by side.
+type KeyFn<'a> = dyn Fn(&[Vec<u8>], usize) -> Vec<u8> + 'a;
+
+/// `join`'s input order check (GNU `check_order`).
+struct Order {
+    /// `None`: --nocheck-order; `Some(true)`: --check-order (fatal).
+    check: Option<bool>,
+    seen_unpairable: bool,
+    warned: [bool; 2],
+    errors: Vec<String>,
+}
+
+impl Order {
+    /// Line `n` of `side` is read: checks it against the line before. True when the
+    /// disorder is fatal.
+    fn read(
+        &mut self,
+        side: usize,
+        n: usize,
+        tables: &[Vec<Row>],
+        key: &KeyFn<'_>,
+        raws: &[Vec<(usize, Vec<u8>)>],
+        names: [&[u8]; 2],
+    ) -> bool {
+        let Some(check) = self.check else {
+            return false;
+        };
+        if n == 0 || n >= tables[side].len() || self.warned[side] || !(check || self.seen_unpairable)
+        {
+            return false;
+        }
+        if key(&tables[side][n - 1], side) > key(&tables[side][n], side) {
+            let (no, text) = &raws[side][n];
+            self.errors.push(format!(
+                "{}:{no}: is not sorted: {}",
+                String::from_utf8_lossy(names[side]),
+                String::from_utf8_lossy(text)
+            ));
+            self.warned[side] = true;
+            return check;
+        }
+        false
+    }
 }
 
 /// Random bytes from the host's /dev/urandom.
@@ -1006,4 +1137,537 @@ pub async fn split(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         }
     }
     0
+}
+
+pub const NUMFMT: Spec = Spec {
+    name: "numfmt",
+    opts: &[
+        long("to").value(),
+        long("from").value(),
+        long("suffix").value(),
+        long("to-unit").value(),
+        long("from-unit").value(),
+        long("padding").value(),
+        long("field").value(),
+        // Thousands separators: none in the C locale, the only one psh has.
+        long("grouping"),
+    ],
+    posix_order: false,
+};
+
+/// A unit system of numfmt: its base and whether suffixes end in `i`.
+#[derive(Clone, Copy, PartialEq)]
+enum Scale {
+    None,
+    Si,
+    Iec,
+    IecI,
+    Auto,
+}
+
+fn scale_of(text: &[u8]) -> Option<Scale> {
+    Some(match text {
+        b"none" => Scale::None,
+        b"si" => Scale::Si,
+        b"iec" => Scale::Iec,
+        b"iec-i" => Scale::IecI,
+        b"auto" => Scale::Auto,
+        _ => return None,
+    })
+}
+
+const NUMFMT_SUFFIXES: &[u8] = b"KMGTPEZYRQ";
+
+/// Reads a number with an optional unit suffix, as `--from` reads it.
+fn numfmt_parse(text: &str, from: Scale, unit: f64) -> Option<f64> {
+    let digits = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
+        .unwrap_or(text.len());
+    let (number, suffix) = text.split_at(digits);
+    let mut value: f64 = number.parse().ok()?;
+    if !suffix.is_empty() {
+        let mut chars = suffix.chars();
+        let letter = chars.next()?.to_ascii_uppercase();
+        let power = NUMFMT_SUFFIXES.iter().position(|&s| s as char == letter)? as i32 + 1;
+        let rest = chars.as_str();
+        let base = match (from, rest) {
+            (Scale::Si, "") => 1000.0,
+            (Scale::Iec, "") => 1024.0,
+            (Scale::IecI | Scale::Auto, "i") => 1024.0,
+            (Scale::Auto, "") => 1000.0,
+            _ => return None,
+        };
+        value *= f64::powi(base, power);
+    }
+    Some(value * unit)
+}
+
+/// Writes a number in a unit system, rounding away from zero as GNU does by default:
+/// one decimal below 10, none above.
+fn numfmt_show(value: f64, to: Scale) -> String {
+    let base = match to {
+        Scale::Si => 1000.0,
+        Scale::Iec | Scale::IecI => 1024.0,
+        Scale::None | Scale::Auto => {
+            return format!("{}", value.abs().ceil().copysign(value));
+        }
+    };
+    let magnitude = value.abs();
+    if magnitude < base {
+        return format!("{}", magnitude.ceil().copysign(value));
+    }
+    let mut scaled = magnitude;
+    let mut power = 0;
+    while scaled >= base && power < NUMFMT_SUFFIXES.len() {
+        scaled /= base;
+        power += 1;
+    }
+    let text = loop {
+        let shown = if scaled < 10.0 {
+            let tenths = (scaled * 10.0 - 1e-9).ceil() / 10.0;
+            if tenths >= 10.0 {
+                scaled = tenths;
+                continue;
+            }
+            format!("{tenths:.1}")
+        } else {
+            let whole = (scaled - 1e-9).ceil();
+            if whole >= base && power < NUMFMT_SUFFIXES.len() {
+                scaled = whole / base;
+                power += 1;
+                continue;
+            }
+            format!("{whole}")
+        };
+        break shown;
+    };
+    let sign = if value < 0.0 { "-" } else { "" };
+    let i = if to == Scale::IecI { "i" } else { "" };
+    format!("{sign}{text}{}{i}", NUMFMT_SUFFIXES[power - 1] as char)
+}
+
+/// A --field list: `N`, `N-M`, `N-`, `-M` or `-`, separated by commas, as
+/// inclusive ranges from 1.
+fn numfmt_fields(spec: &[u8]) -> Option<Vec<(usize, usize)>> {
+    let num = |s: &str| s.parse::<usize>().ok().filter(|&n| n > 0);
+    std::str::from_utf8(spec)
+        .ok()?
+        .split(',')
+        .map(|part| match part.split_once('-') {
+            None => num(part).map(|n| (n, n)),
+            Some(("", "")) => Some((1, usize::MAX)),
+            Some((a, "")) => Some((num(a)?, usize::MAX)),
+            Some(("", b)) => Some((1, num(b)?)),
+            Some((a, b)) => Some((num(a)?, num(b)?)).filter(|(a, b)| a <= b),
+        })
+        .collect()
+}
+
+pub async fn numfmt(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
+    let p = match common::parse(ctx, &NUMFMT, argv).await {
+        Ok(p) => p,
+        Err(st) => return st,
+    };
+    let mut scales = [Scale::None, Scale::None];
+    for (slot, key) in scales.iter_mut().zip(["to", "from"]) {
+        if let Some(v) = p.last(&NUMFMT, key) {
+            match scale_of(v) {
+                Some(s) if key == "from" || s != Scale::Auto => *slot = s,
+                _ => {
+                    let v = common::quote(ctx, v);
+                    return common::usage(ctx, &format!("invalid argument {v} for '--{key}'"))
+                        .await;
+                }
+            }
+        }
+    }
+    let [to, from] = scales;
+    let unit = |key: &str| -> Option<f64> {
+        match p.last(&NUMFMT, key) {
+            None => Some(1.0),
+            Some(v) => numfmt_parse(std::str::from_utf8(v).ok()?, Scale::Auto, 1.0),
+        }
+    };
+    let (Some(from_unit), Some(to_unit)) = (unit("from-unit"), unit("to-unit")) else {
+        return common::usage(ctx, "invalid unit size").await;
+    };
+    let suffix = p.last(&NUMFMT, "suffix").unwrap_or_default().to_vec();
+    let padding = match p.last(&NUMFMT, "padding") {
+        None => 0,
+        Some(v) => match std::str::from_utf8(v).ok().and_then(|v| v.parse::<i64>().ok()) {
+            Some(n) if n != 0 => n,
+            _ => {
+                let v = common::quote(ctx, v);
+                return common::usage(ctx, &format!("invalid padding value {v}")).await;
+            }
+        },
+    };
+    let fields = match p.last(&NUMFMT, "field") {
+        None => vec![(1, 1)],
+        Some(v) => match numfmt_fields(v) {
+            Some(f) => f,
+            None => {
+                let v = common::quote(ctx, v);
+                return common::usage(ctx, &format!("invalid field value {v}")).await;
+            }
+        },
+    };
+    let pad = |text: String| -> String {
+        let width = padding.unsigned_abs() as usize;
+        match padding {
+            n if n > 0 => format!("{text:>width$}"),
+            n if n < 0 => format!("{text:<width$}"),
+            _ => text,
+        }
+    };
+    let numbers: Vec<Vec<u8>> = if p.operands.is_empty() {
+        let data = match read_all(ctx, &[]).await {
+            Ok(data) => data,
+            Err(st) => return st,
+        };
+        data.split(|&b| b == b'\n').map(<[u8]>::to_vec).collect::<Vec<_>>()
+    } else {
+        p.operands.clone()
+    };
+    let last_empty = p.operands.is_empty() && numbers.last().is_some_and(Vec::is_empty);
+    let count = numbers.len() - usize::from(last_empty);
+    let mut out = Vec::new();
+    let only_first = p.last(&NUMFMT, "field").is_none();
+    for raw in &numbers[..count] {
+        let text = String::from_utf8_lossy(raw);
+        // Fields are runs of non-blanks, each kept with the blanks before it; without
+        // --field the whole line is the number.
+        let mut tokens: Vec<(&str, &str)> = Vec::new();
+        if only_first {
+            tokens.push(("", text.trim()));
+        } else {
+            let mut rest: &str = &text;
+            while !rest.is_empty() {
+                let lead = rest.len() - rest.trim_start().len();
+                let (blanks, after) = rest.split_at(lead);
+                let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                let (word, next) = after.split_at(end);
+                tokens.push((blanks, word));
+                rest = next;
+            }
+        }
+        for (n, (blanks, word)) in tokens.iter().enumerate() {
+            out.extend_from_slice(blanks.as_bytes());
+            let n = n + 1;
+            if !fields.iter().any(|&(a, b)| a <= n && n <= b) || (word.is_empty() && !only_first) {
+                out.extend_from_slice(word.as_bytes());
+                continue;
+            }
+            let body = word.strip_suffix(std::str::from_utf8(&suffix).unwrap_or("")).unwrap_or(word);
+            let Some(value) = numfmt_parse(body, from, from_unit) else {
+                let _ = ctx.write(&out).await;
+                let shown = common::quote(ctx, word.as_bytes());
+                ctx.error(&format!("invalid number: {shown}")).await;
+                return 2;
+            };
+            let mut shown = numfmt_show(value / to_unit, to);
+            shown.push_str(std::str::from_utf8(&suffix).unwrap_or(""));
+            out.extend_from_slice(pad(shown).as_bytes());
+        }
+        out.push(b'\n');
+    }
+    emit(ctx, &out).await
+}
+
+pub const TSORT: Spec = Spec {
+    name: "tsort",
+    opts: &[],
+    posix_order: false,
+};
+
+/// tsort: Kahn's algorithm, nodes taken in the order they first appear. A loop is
+/// reported (its nodes listed) and broken, and the status is 1, as GNU does.
+pub async fn tsort(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
+    let p = match common::parse(ctx, &TSORT, argv).await {
+        Ok(p) => p,
+        Err(st) => return st,
+    };
+    if p.operands.len() > 1 {
+        let extra = common::quote(ctx, &p.operands[1]);
+        return common::usage(ctx, &format!("extra operand {extra}")).await;
+    }
+    let data = match read_all(ctx, &p.operands).await {
+        Ok(data) => data,
+        Err(st) => return st,
+    };
+    let shown = p.operands.first().map_or_else(|| "-".to_string(), |n| String::from_utf8_lossy(n).into_owned());
+    let tokens: Vec<&[u8]> = data
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() % 2 == 1 {
+        ctx.error(&format!("{shown}: input contains an odd number of tokens")).await;
+        return 1;
+    }
+    let mut names: Vec<&[u8]> = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    let mut next: Vec<Vec<usize>> = Vec::new();
+    let mut indegree: Vec<usize> = Vec::new();
+    for pair in tokens.as_chunks::<2>().0 {
+        let mut ids = [0usize; 2];
+        for (slot, &token) in ids.iter_mut().zip(pair) {
+            *slot = *index.entry(token).or_insert_with(|| {
+                names.push(token);
+                next.push(Vec::new());
+                indegree.push(0);
+                names.len() - 1
+            });
+        }
+        if ids[0] != ids[1] {
+            next[ids[0]].push(ids[1]);
+            indegree[ids[1]] += 1;
+        }
+    }
+    let mut out = Vec::new();
+    let mut done = vec![false; names.len()];
+    let mut status = 0;
+    let mut left = names.len();
+    while left > 0 {
+        let ready: Vec<usize> = (0..names.len()).filter(|&n| !done[n] && indegree[n] == 0).collect();
+        let ready = if ready.is_empty() {
+            // A loop: report it from the first node left, and break it there.
+            status = 1;
+            let start = (0..names.len()).find(|&n| !done[n]).unwrap_or(0);
+            ctx.error(&format!("{shown}: input contains a loop:")).await;
+            let mut at = start;
+            let mut seen = vec![false; names.len()];
+            while !seen[at] {
+                seen[at] = true;
+                ctx.error(&String::from_utf8_lossy(names[at])).await;
+                match next[at].iter().find(|&&n| !done[n]) {
+                    Some(&n) => at = n,
+                    None => break,
+                }
+            }
+            indegree[start] = 0;
+            vec![start]
+        } else {
+            ready
+        };
+        for n in ready {
+            if done[n] {
+                continue;
+            }
+            done[n] = true;
+            left -= 1;
+            out.extend_from_slice(names[n]);
+            out.push(b'\n');
+            for &m in &next[n] {
+                indegree[m] = indegree[m].saturating_sub(1);
+            }
+        }
+    }
+    let st = emit(ctx, &out).await;
+    if st != 0 { st } else { status }
+}
+
+pub const FMT: Spec = Spec {
+    name: "fmt",
+    opts: &[
+        both('w', "width").value(),
+        both('p', "prefix").value(),
+        both('s', "split-only"),
+        both('u', "uniform-spacing"),
+        both('c', "crown-margin"),
+        both('t', "tagged-paragraph"),
+    ],
+    posix_order: false,
+};
+
+/// fmt: fills each paragraph (lines between blank lines with the same indentation)
+/// with GNU's line breaking: least cost against a goal width, sentence ends kept two
+/// spaces apart.
+pub async fn fmt(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
+    let mut args = argv.to_vec();
+    for arg in args.iter_mut().skip(1) {
+        if arg.len() > 1 && arg[0] == b'-' && arg[1..].iter().all(u8::is_ascii_digit) {
+            let mut wide = b"-w".to_vec();
+            wide.extend_from_slice(&arg[1..]);
+            *arg = wide;
+        }
+    }
+    let p = match common::parse(ctx, &FMT, &args).await {
+        Ok(p) => p,
+        Err(st) => return st,
+    };
+    if p.has(&FMT, "prefix") || p.has(&FMT, "tagged-paragraph") || p.has(&FMT, "crown-margin") {
+        return crate::textio::fall_through(ctx, argv, "fmt -p, -t and -c").await;
+    }
+    let width = match p.last(&FMT, "width") {
+        Some(w) => match count(w) {
+            Some(n) if n > 0 => n,
+            _ => {
+                let w = common::quote(ctx, w);
+                return common::usage(ctx, &format!("invalid width: {w}")).await;
+            }
+        },
+        None => 75,
+    };
+    let split_only = p.has(&FMT, "split-only");
+    let uniform = p.has(&FMT, "uniform-spacing");
+    let data = match read_all(ctx, &p.operands).await {
+        Ok(data) => data,
+        Err(st) => return st,
+    };
+    let mut out = Vec::new();
+    let mut words: Vec<FmtWord> = Vec::new();
+    let mut indent: &[u8] = b"";
+    for line in data.split_inclusive(|&b| b == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let lead = body.iter().take_while(|b| **b == b' ' || **b == b'\t').count();
+        if lead == body.len() {
+            fmt_paragraph(&mut out, &mut words, indent, width);
+            out.extend_from_slice(body);
+            out.push(b'\n');
+            continue;
+        }
+        if words.is_empty() || split_only || body[..lead] != *indent {
+            fmt_paragraph(&mut out, &mut words, indent, width);
+            indent = &body[..lead];
+        }
+        fmt_words(&body[lead..], uniform, &mut words);
+    }
+    // The input's last word ends a sentence, as GNU counts it.
+    if let Some(last) = words.last_mut() {
+        last.final_ = true;
+    }
+    fmt_paragraph(&mut out, &mut words, indent, width);
+    emit(ctx, &out).await
+}
+
+/// A word of fmt, with what GNU's line breaking weighs.
+struct FmtWord {
+    text: Vec<u8>,
+    /// Spaces after it within a line.
+    space: usize,
+    /// Ends a sentence (`.?!` then two spaces or the line's end).
+    final_: bool,
+    period: bool,
+    punct: bool,
+    paren: bool,
+}
+
+fn fmt_words(line: &[u8], uniform: bool, words: &mut Vec<FmtWord>) {
+    let mut at = 0;
+    while at < line.len() {
+        let end = line[at..].iter().position(|&b| b == b' ' || b == b'\t').map_or(line.len(), |n| at + n);
+        let text = line[at..end].to_vec();
+        let gap_end = line[end..].iter().position(|&b| b != b' ' && b != b'\t').map_or(line.len(), |n| end + n);
+        let last_real = text.iter().rev().find(|&&b| !matches!(b, b')' | b']' | b'}' | b'\'' | b'"'));
+        let period = last_real.is_some_and(|&b| matches!(b, b'.' | b'?' | b'!'));
+        let at_end = gap_end == line.len();
+        let gap = gap_end - end;
+        let final_ = period && (gap > 1 || at_end);
+        let space = if at_end || uniform { if final_ { 2 } else { 1 } } else { gap };
+        words.push(FmtWord {
+            punct: text.last().is_some_and(u8::is_ascii_punctuation),
+            paren: text.first().is_some_and(|b| matches!(b, b'(' | b'[' | b'{' | b'\'' | b'"' | b'`')),
+            text,
+            space,
+            final_,
+            period,
+        });
+        at = gap_end;
+    }
+}
+
+/// GNU fmt's costs: the square of a shortfall, scaled.
+const fn fmt_equiv(n: i64) -> i64 {
+    n * n
+}
+
+fn fmt_short_cost(n: i64) -> i64 {
+    fmt_equiv(n * 10)
+}
+
+fn fmt_ragged_cost(n: i64) -> i64 {
+    fmt_short_cost(n) / 2
+}
+
+/// The cost of breaking a line before word `i`, as GNU's base_cost.
+fn fmt_base_cost(words: &[FmtWord], i: usize) -> i64 {
+    let mut cost = fmt_equiv(70);
+    if i > 0 {
+        let prev = &words[i - 1];
+        if prev.period {
+            if prev.final_ {
+                cost -= fmt_equiv(50);
+            } else {
+                cost += fmt_equiv(600);
+            }
+        } else if prev.punct {
+            cost -= fmt_equiv(40);
+        } else if i > 1 && words[i - 2].final_ {
+            cost += fmt_equiv(200) / (words[i - 2].text.len() as i64 + 2);
+        }
+    }
+    if words[i].paren {
+        cost -= fmt_equiv(40);
+    } else if words[i].final_ {
+        cost += fmt_equiv(150) / (words[i].text.len() as i64 + 2);
+    }
+    cost
+}
+
+/// Breaks a paragraph into lines as GNU fmt does: the least total cost, lines shorter
+/// than the width, aiming at 93.5% of it, with ragged edges costing too.
+fn fmt_paragraph(out: &mut Vec<u8>, words: &mut Vec<FmtWord>, indent: &[u8], width: usize) {
+    let count = words.len();
+    if count == 0 {
+        return;
+    }
+    let goal = (width * 187 / 200) as i64;
+    let mut best = vec![0i64; count + 1];
+    let mut next = vec![count; count + 1];
+    let mut length = vec![0i64; count + 1];
+    for start in (0..count).rev() {
+        let mut best_cost = i64::MAX;
+        let mut len = (indent.len() + words[start].text.len()) as i64;
+        let mut w = start;
+        loop {
+            w += 1;
+            let line_cost = if w == count {
+                0
+            } else {
+                let mut c = fmt_short_cost(goal - len);
+                if next[w] != count {
+                    c += fmt_ragged_cost(len - length[w]);
+                }
+                c
+            };
+            let cost = line_cost.saturating_add(best[w]);
+            if cost < best_cost {
+                best_cost = cost;
+                next[start] = w;
+                length[start] = len;
+            }
+            if w == count {
+                break;
+            }
+            len += (words[w - 1].space + words[w].text.len()) as i64;
+            if len >= width as i64 {
+                break;
+            }
+        }
+        best[start] = best_cost.saturating_add(fmt_base_cost(words, start));
+    }
+    let mut start = 0;
+    while start < count {
+        let end = next[start];
+        out.extend_from_slice(indent);
+        for (i, w) in words.iter().enumerate().take(end).skip(start) {
+            out.extend_from_slice(&w.text);
+            if i + 1 < end {
+                out.extend(std::iter::repeat_n(b' ', w.space));
+            }
+        }
+        out.push(b'\n');
+        start = end;
+    }
+    words.clear();
 }

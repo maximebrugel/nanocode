@@ -655,7 +655,7 @@ impl PyBytesInner {
 
             let (i, b) = match iter.next() {
                 Some(val) => val,
-                None => break None, // odd number of hex digits
+                None => break Some(i + 1), // odd number of hex digits: CPython 3.12 reads the end as a bad digit
             };
 
             let bot = match b {

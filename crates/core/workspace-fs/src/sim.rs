@@ -8,6 +8,14 @@ pub enum Mutation {
     LostUpdate,
     TornCommit,
     VisibleBeforeCommit,
+    SqlSkipVersionCas,
+    SqlReleaseBeforeCommit,
+    SqlSplitTransaction,
+    SqlSweepSkipsTombstone,
+    AnswersNow,
+    StaleReadSkipsReload,
+    BackendFailureAcked,
+    StaleRetryOverwrites,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

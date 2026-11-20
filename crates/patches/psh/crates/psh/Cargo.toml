@@ -14,6 +14,8 @@ psh-classify.workspace = true
 psh-os.workspace = true
 # The in-process utilities (D1080).
 psh-utils.workspace = true
+# The allocator (main.rs).
+nanocode-sys.workspace = true
 
 [lints]
 workspace = true

@@ -474,7 +474,7 @@ mod store {
     }
 
     type HydratedCheckpoint = (
-        Value,
+        crate::Checkpoint,
         EncodedPayload,
         HashSet<String>,
         Option<crate::Hydrated>,
@@ -496,17 +496,28 @@ mod store {
     pub struct StoredSession {
         pub summary: SessionSummary,
 
-        pub transcript: Vec<TranscriptItem>,
+        transcript: Transcript,
 
         pub turns: Vec<StoredTurn>,
 
         pub in_progress: Option<String>,
 
-        pub checkpoint: Option<Value>,
+        pub checkpoint: Option<crate::Checkpoint>,
 
         formats: Formats,
 
         loaded: Loaded,
+    }
+
+    /// A stored session's transcript: read when loaded, or read from its
+    /// checkpoint on demand, so loading one doesn't copy the conversation.
+    #[derive(Clone, Debug)]
+    enum Transcript {
+        Read(Vec<TranscriptItem>),
+        Checkpoint {
+            family: HarnessFamily,
+            steers: Vec<usize>,
+        },
     }
 
     #[derive(Clone, Debug)]
@@ -520,7 +531,7 @@ mod store {
     }
 
     pub struct ResumableSession {
-        pub checkpoint: Option<Value>,
+        pub checkpoint: Option<crate::Checkpoint>,
 
         pub pending: Vec<StoredTurn>,
 
@@ -540,23 +551,72 @@ mod store {
     fn checkpoint_thinking(
         formats: &Formats,
         record: &SessionRecord,
-        checkpoint: Option<&Value>,
+        checkpoint: Option<&crate::Checkpoint>,
     ) -> Result<Option<nanocode_agent_core::Thinking>> {
         let Some(checkpoint) = checkpoint else {
             return Ok(None);
         };
-        if is_portable(checkpoint) {
-            return Ok(Some(
-                session_checkpoint(formats, record, checkpoint)?.thinking(),
-            ));
+        match checkpoint {
+            crate::Checkpoint::Value(value) if is_portable(value) => {
+                Ok(Some(session_checkpoint(formats, record, value)?.thinking()))
+            }
+            crate::Checkpoint::Value(value) => formats
+                .family(record.family())?
+                .thinking(record, value)
+                .map(Some),
+            crate::Checkpoint::Typed { head, hydrated } => {
+                let format = formats.family(record.family())?;
+                match format.thinking_typed(record, head, hydrated) {
+                    Some(thinking) => thinking.map(Some),
+                    None => format.thinking(record, &*checkpoint.value()?).map(Some),
+                }
+            }
         }
-        formats
-            .family(record.family())?
-            .thinking(record, checkpoint)
-            .map(Some)
     }
 
     impl StoredSession {
+        /// The session's transcript, read from its checkpoint when it was
+        /// not read at load.
+        pub fn transcript(&self) -> Result<Vec<TranscriptItem>> {
+            match &self.transcript {
+                Transcript::Read(items) => Ok(items.clone()),
+                Transcript::Checkpoint { family, steers } => self.checkpoint_transcript(family, steers),
+            }
+        }
+
+        pub fn clear_transcript(&mut self) {
+            self.transcript = Transcript::Read(Vec::new());
+        }
+
+        pub fn into_transcript(self) -> Result<Vec<TranscriptItem>> {
+            match self.transcript {
+                Transcript::Read(items) => Ok(items),
+                Transcript::Checkpoint { ref family, ref steers } => {
+                    self.checkpoint_transcript(family, steers)
+                }
+            }
+        }
+
+        fn checkpoint_transcript(
+            &self,
+            family: &HarnessFamily,
+            steers: &[usize],
+        ) -> Result<Vec<TranscriptItem>> {
+            let Some(checkpoint) = &self.checkpoint else {
+                return Ok(Vec::new());
+            };
+            let admitted = self
+                .turns
+                .iter()
+                .zip(steers.iter().copied().chain(std::iter::repeat(0)))
+                .map(|(turn, steers)| AdmittedTurn {
+                    input: &turn.input,
+                    steers,
+                })
+                .collect::<Vec<_>>();
+            checkpoint_transcript(&self.formats, checkpoint, family.clone(), &admitted)
+        }
+
         pub fn checkpoint_thinking(&self) -> Result<Option<nanocode_agent_core::Thinking>> {
             checkpoint_thinking(
                 &self.formats,
@@ -569,8 +629,38 @@ mod store {
             let Some(checkpoint) = &self.checkpoint else {
                 return Ok(None);
             };
-            session_checkpoint(&self.formats, &self.summary.record, checkpoint).map(Some)
+            session_checkpoint(&self.formats, &self.summary.record, &*checkpoint.value()?).map(Some)
         }
+    }
+
+    fn value_transcript(
+        formats: &Formats,
+        checkpoint: &Value,
+        family: HarnessFamily,
+        turns: &[AdmittedTurn<'_>],
+    ) -> Result<Vec<TranscriptItem>> {
+        let checkpoint = if is_portable(checkpoint) {
+            &checkpoint["payload"]
+        } else {
+            checkpoint
+        };
+        Ok(formats.family(family)?.transcript(checkpoint, turns))
+    }
+
+    fn checkpoint_transcript(
+        formats: &Formats,
+        checkpoint: &crate::Checkpoint,
+        family: HarnessFamily,
+        turns: &[AdmittedTurn<'_>],
+    ) -> Result<Vec<TranscriptItem>> {
+        if let Some(hydrated) = checkpoint.hydrated()
+            && let Some(transcript) = formats
+                .family(family.clone())?
+                .transcript_typed(hydrated, turns)
+        {
+            return Ok(transcript);
+        }
+        value_transcript(formats, &*checkpoint.value()?, family, turns)
     }
 
     fn session_checkpoint(
@@ -761,7 +851,7 @@ mod store {
             else {
                 return Ok(crate::ChildPreload::default());
             };
-            let bytes = crate::kept_checkpoints::value_bytes(&checkpoint);
+            let bytes = crate::kept_checkpoints::checkpoint_bytes(&checkpoint);
             let kept = kept.keep(
                 id,
                 crate::kept_checkpoints::KeptCheckpoint {
@@ -1236,6 +1326,13 @@ mod store {
             opening::prepare_resume_resumable(self, resumable).await
         }
 
+        pub async fn prepare_resume_resumable_taking(
+            &self,
+            resumable: &mut ResumableSession,
+        ) -> Result<DurableSession> {
+            opening::prepare_resume_resumable_taking(self, resumable).await
+        }
+
         async fn resume_record(
             &self,
             id: &str,
@@ -1633,12 +1730,7 @@ mod store {
             family: HarnessFamily,
             turns: &[AdmittedTurn<'_>],
         ) -> Result<Vec<TranscriptItem>> {
-            let checkpoint = if is_portable(checkpoint) {
-                &checkpoint["payload"]
-            } else {
-                checkpoint
-            };
-            Ok(self.formats.family(family)?.transcript(checkpoint, turns))
+            value_transcript(&self.formats, checkpoint, family, turns)
         }
 
         async fn progress(
@@ -1724,7 +1816,7 @@ mod store {
                 .await?;
             let value: Value = loaded.decode()?;
             if is_portable(&value) {
-                return Ok(Some((value, loaded, records, None)));
+                return Ok(Some((value.into(), loaded, records, None)));
             }
             let format = match state.session().map(SessionRecord::family) {
                 Some(family) => self.formats.family(family)?,
@@ -1766,7 +1858,7 @@ mod store {
                 ..Advance::default()
             };
             if is_portable(&value) {
-                return Ok(Some(((value, loaded, records, None), whole)));
+                return Ok(Some(((value.into(), loaded, records, None), whole)));
             }
             let format = match state.session().map(SessionRecord::family) {
                 Some(family) => self.formats.family(family)?,

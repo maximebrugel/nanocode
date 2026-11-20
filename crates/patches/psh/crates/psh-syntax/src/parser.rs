@@ -596,6 +596,7 @@ impl<'a> P<'a> {
                 message: String::from("script too large"),
                 incomplete: false,
                 resume: None,
+                keeps_status: false,
                 warnings: Vec::new(),
                 alias_text: None,
             });
@@ -722,6 +723,7 @@ impl<'a> P<'a> {
             message,
             incomplete: false,
             resume: None,
+            keeps_status: false,
             warnings: Vec::new(),
             alias_text: None,
         }
@@ -737,15 +739,19 @@ impl<'a> P<'a> {
             message,
             incomplete: true,
             resume: None,
+            keeps_status: false,
             warnings: Vec::new(),
             alias_text: None,
         }
     }
 
     fn unterminated(&self, what: &str) -> ParseError {
-        self.eof_error(format!(
-            "unexpected EOF while looking for matching `{what}'"
-        ))
+        ParseError {
+            keeps_status: true,
+            ..self.eof_error(format!(
+                "unexpected EOF while looking for matching `{what}'"
+            ))
+        }
     }
 
     fn unterminated_from(&self, what: &str, start: usize) -> ParseError {
@@ -766,7 +772,10 @@ impl<'a> P<'a> {
 
     fn eof_from(&self, opener: Opener) -> ParseError {
         if opener.matching {
-            self.unterminated(opener.what)
+            ParseError {
+                keeps_status: false,
+                ..self.unterminated(opener.what)
+            }
         } else {
             self.eof_error(format!(
                 "syntax error: unexpected end of file from `{}' command on line {}",
@@ -1541,6 +1550,16 @@ impl<'a> P<'a> {
                     });
                     prefix_end = self.pos;
                     prefixed = true;
+                }
+                // `time time cmd`: bash's grammar nests timespecs; the inner one is taken
+                // in (one report), so the command after it still runs.
+                Some("time") => {
+                    self.pos += 4;
+                    self.skip_blanks();
+                    if self.run() == b"-p" || self.run() == b"--" {
+                        self.pos += 2;
+                    }
+                    prefix_end = self.pos;
                 }
                 Some("!") => {
                     self.pos += 1;
@@ -2428,7 +2447,19 @@ impl<'a> P<'a> {
         self.read_word(Ctx::Word, true)
     }
 
+    /// A compound array value `( … )`. Bash reports an error inside one and goes on
+    /// with status 1 rather than ending the script with 2: at the end of the input
+    /// too, where the status is then 1 (`arr=(x 'y`).
     fn parse_array_lit(&mut self) -> R<ArrayLit> {
+        self.array_lit().map_err(|mut e| {
+            if e.incomplete && e.resume.is_none() {
+                e.resume = Some(self.end);
+            }
+            e
+        })
+    }
+
+    fn array_lit(&mut self) -> R<ArrayLit> {
         let start = self.pos;
         self.pos += 1;
         let mut elems = Vec::new();
@@ -3310,7 +3341,17 @@ impl<'a> P<'a> {
         let before = out.len();
         self.parse_dollar_here(ctx, out)?;
         if out.len() > before {
-            out.last_mut().unwrap().span.start = start as u32;
+            let last = out.last_mut().unwrap();
+            if matches!(last.kind, Part::Lit)
+                && last.span.start as usize == next - 1
+                && last.span.end as usize == next
+            {
+                // A plain `$` (before a quote that is literal here, say): the
+                // continuation is gone, as in bash.
+                last.span = sp(start, start + 1);
+            } else {
+                last.span.start = start as u32;
+            }
         }
         Ok(())
     }
@@ -3483,6 +3524,7 @@ impl<'a> P<'a> {
             // `${ list; }` and `${| list; }`: bash 5.3's command substitution in the
             // current shell.
             self.pos = if c == b'|' { p + 1 } else { p };
+            let depth = self.depth;
             let outer = self.stash_pending();
             let closer = self.closer.replace("}");
             let r = self.parse_compound_list(
@@ -3495,10 +3537,25 @@ impl<'a> P<'a> {
                 true,
             );
             self.closer = closer;
+            // Not a command list closed by `}` (`${ $() }`): bash 5.2 has no such
+            // substitution and scans it as a `${…}` that is a bad substitution when
+            // expanded.
+            let closed = match &r {
+                Ok(_) => {
+                    self.skip_blanks();
+                    self.peek() == Some(b'}')
+                }
+                Err(_) => false,
+            };
+            if !closed && self.pending.is_empty() {
+                self.pending = outer;
+                self.depth = depth;
+                self.pos = p;
+                return self.finish_bad_subst(start, dq);
+            }
             self.unstash_pending(outer, r.is_ok())?;
             let list = r?;
-            self.skip_blanks();
-            if self.peek() != Some(b'}') {
+            if !closed {
                 return Err(self.unexpected());
             }
             self.pos += 1;
@@ -3514,6 +3571,9 @@ impl<'a> P<'a> {
         let head = match self.byte(p) {
             Some(b'#') => match self.byte(p + 1) {
                 Some(b'}') => Some((ParamName::Special(b'#'), p, p + 1)),
+                // `${#+}`, `${#/}`: an operator with nothing after it is a bad
+                // substitution in bash (`${#-}` and `${#?}` are lengths).
+                Some(b'+' | b'=' | b'/' | b'%') if self.byte(p + 2) == Some(b'}') => None,
                 _ => match self.param_name_at(p + 1) {
                     Some((n, e)) if matches!(self.byte(e), Some(b'}' | b'[')) => {
                         prefix = ParamPrefix::Length;
@@ -3524,6 +3584,10 @@ impl<'a> P<'a> {
             },
             Some(b'!') => match self.byte(p + 1) {
                 Some(b'}') => Some((ParamName::Special(b'!'), p, p + 1)),
+                // `${!-word}` is `$!` with a default, as in bash.
+                Some(b'-') if self.byte(p + 2) != Some(b'}') => {
+                    Some((ParamName::Special(b'!'), p, p + 1))
+                }
                 _ => match self.param_name_at(p + 1) {
                     Some((n, e)) => {
                         prefix = ParamPrefix::Indirect;
@@ -3782,5 +3846,28 @@ fn default_kind(c: u8) -> DefaultKind {
         b'=' => DefaultKind::Assign,
         b'?' => DefaultKind::Error,
         _ => DefaultKind::Alternative,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn an_unterminated_quote_keeps_the_status() {
+        for s in ["echo 'a", "echo \"a", "echo ${a", "true\necho 'a"] {
+            let e = parse(s).unwrap_err();
+            assert!(e.incomplete && e.keeps_status, "{s}");
+        }
+        for s in ["if true; then", "{ echo"] {
+            assert!(!parse(s).unwrap_err().keeps_status, "{s}");
+        }
+    }
+
+    #[test]
+    fn an_unterminated_array_value_goes_on() {
+        for s in ["arr=(x 'y)", "arr+=(\"x-'d\"q'\")", "arr=(x"] {
+            assert!(parse(s).unwrap_err().resume.is_some(), "{s}");
+        }
     }
 }

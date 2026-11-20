@@ -349,9 +349,9 @@ class FrameSummary:
             lines = []
             for lineno in range(self.lineno, self.end_lineno + 1):
                 # treat errors (empty string) and empty lines (newline) as the same
+                # CPython 3.12 reads lines only from linecache: a program from -c
+                # or stdin shows none.
                 line = linecache.getline(self.filename, lineno).rstrip()
-                if not line and self._code is not None and self.filename.startswith("<"):
-                    line = linecache._getline_from_code(self._code, lineno).rstrip()
                 lines.append(line)
             self._lines = "\n".join(lines) + "\n"
 
@@ -529,179 +529,62 @@ class StackSummary(list):
 
         Returns a string representing one frame involved in the stack. This
         gets called for every frame to be printed in the stack summary.
+
+        Formatted as CPython 3.12 does: the first source line only, carets only
+        when they do not span that whole line, anchors for binary operators and
+        subscripts, no colour.
         """
-        colorize = kwargs.get("colorize", False)
         row = []
         filename = frame_summary.filename
-        if frame_summary.filename.startswith("<stdin-") and frame_summary.filename.endswith('>'):
+        if filename.startswith("<stdin-") and filename.endswith('>'):
             filename = "<stdin>"
-        if colorize:
-            theme = _colorize.get_theme(force_color=True).traceback
-        else:
-            theme = _colorize.get_theme(force_no_color=True).traceback
-        row.append(
-            '  File {}"{}"{}, line {}{}{}, in {}{}{}\n'.format(
-                theme.filename,
-                filename,
-                theme.reset,
-                theme.line_no,
-                frame_summary.lineno,
-                theme.reset,
-                theme.frame,
-                frame_summary.name,
-                theme.reset,
-            )
-        )
-        if frame_summary._dedented_lines and frame_summary._dedented_lines.strip():
+        row.append('  File "{}", line {}, in {}\n'.format(
+            filename, frame_summary.lineno, frame_summary.name))
+        if frame_summary.line:
+            stripped_line = frame_summary.line.strip()
+            row.append('    {}\n'.format(stripped_line))
+
+            line = (frame_summary._original_lines or '').partition("\n")[0] + "\n"
+            orig_line_len = len(line)
+            frame_line_len = len(frame_summary.line.lstrip())
+            stripped_characters = orig_line_len - frame_line_len
             if (
-                frame_summary.colno is None or
-                frame_summary.end_colno is None
+                frame_summary.colno is not None
+                and frame_summary.end_colno is not None
             ):
-                # only output first line if column information is missing
-                row.append(textwrap.indent(frame_summary.line, '    ') + "\n")
-            else:
-                # get first and last line
-                all_lines_original = frame_summary._original_lines.splitlines()
-                first_line = all_lines_original[0]
-                # assume all_lines_original has enough lines (since we constructed it)
-                last_line = all_lines_original[frame_summary.end_lineno - frame_summary.lineno]
+                start_offset = _byte_offset_to_character_offset(
+                    line, frame_summary.colno)
+                end_offset = _byte_offset_to_character_offset(
+                    line, frame_summary.end_colno)
+                code_segment = line[start_offset:end_offset]
 
-                # character index of the start/end of the instruction
-                start_offset = _byte_offset_to_character_offset(first_line, frame_summary.colno)
-                end_offset = _byte_offset_to_character_offset(last_line, frame_summary.end_colno)
-
-                all_lines = frame_summary._dedented_lines.splitlines()[
-                    :frame_summary.end_lineno - frame_summary.lineno + 1
-                ]
-
-                # adjust start/end offset based on dedent
-                dedent_characters = len(first_line) - len(all_lines[0])
-                start_offset = max(0, start_offset - dedent_characters)
-                end_offset = max(0, end_offset - dedent_characters)
-
-                # When showing this on a terminal, some of the non-ASCII characters
-                # might be rendered as double-width characters, so we need to take
-                # that into account when calculating the length of the line.
-                dp_start_offset = _display_width(all_lines[0], offset=start_offset)
-                dp_end_offset = _display_width(all_lines[-1], offset=end_offset)
-
-                # get exact code segment corresponding to the instruction
-                segment = "\n".join(all_lines)
-                segment = segment[start_offset:len(segment) - (len(all_lines[-1]) - end_offset)]
-
-                # attempt to parse for anchors
                 anchors = None
-                show_carets = False
-                with suppress(Exception):
-                    anchors = _extract_caret_anchors_from_line_segment(segment)
-                show_carets = self._should_show_carets(start_offset, end_offset, all_lines, anchors)
+                if frame_summary.lineno == frame_summary.end_lineno:
+                    with suppress(Exception):
+                        anchors = _extract_caret_anchors_312(code_segment)
+                else:
+                    end_offset = len(line.rstrip())
 
-                result = []
+                # show indicators if primary char doesn't span the frame line
+                if end_offset - start_offset < len(stripped_line) or (
+                        anchors and anchors.right_start_offset - anchors.left_end_offset > 0):
+                    dp_start_offset = _display_width(line, start_offset) + 1
+                    dp_end_offset = _display_width(line, end_offset) + 1
 
-                # only display first line, last line, and lines around anchor start/end
-                significant_lines = {0, len(all_lines) - 1}
+                    row.append('    ')
+                    row.append(' ' * (dp_start_offset - stripped_characters))
 
-                anchors_left_end_offset = 0
-                anchors_right_start_offset = 0
-                primary_char = "^"
-                secondary_char = "^"
-                if anchors:
-                    anchors_left_end_offset = anchors.left_end_offset
-                    anchors_right_start_offset = anchors.right_start_offset
-                    # computed anchor positions do not take start_offset into account,
-                    # so account for it here
-                    if anchors.left_end_lineno == 0:
-                        anchors_left_end_offset += start_offset
-                    if anchors.right_start_lineno == 0:
-                        anchors_right_start_offset += start_offset
-
-                    # account for display width
-                    anchors_left_end_offset = _display_width(
-                        all_lines[anchors.left_end_lineno], offset=anchors_left_end_offset
-                    )
-                    anchors_right_start_offset = _display_width(
-                        all_lines[anchors.right_start_lineno], offset=anchors_right_start_offset
-                    )
-
-                    primary_char = anchors.primary_char
-                    secondary_char = anchors.secondary_char
-                    significant_lines.update(
-                        range(anchors.left_end_lineno - 1, anchors.left_end_lineno + 2)
-                    )
-                    significant_lines.update(
-                        range(anchors.right_start_lineno - 1, anchors.right_start_lineno + 2)
-                    )
-
-                # remove bad line numbers
-                significant_lines.discard(-1)
-                significant_lines.discard(len(all_lines))
-
-                def output_line(lineno):
-                    """output all_lines[lineno] along with carets"""
-                    result.append(all_lines[lineno] + "\n")
-                    if not show_carets:
-                        return
-                    num_spaces = len(all_lines[lineno]) - len(all_lines[lineno].lstrip())
-                    carets = []
-                    num_carets = dp_end_offset if lineno == len(all_lines) - 1 else _display_width(all_lines[lineno])
-                    # compute caret character for each position
-                    for col in range(num_carets):
-                        if col < num_spaces or (lineno == 0 and col < dp_start_offset):
-                            # before first non-ws char of the line, or before start of instruction
-                            carets.append(' ')
-                        elif anchors and (
-                            lineno > anchors.left_end_lineno or
-                            (lineno == anchors.left_end_lineno and col >= anchors_left_end_offset)
-                        ) and (
-                            lineno < anchors.right_start_lineno or
-                            (lineno == anchors.right_start_lineno and col < anchors_right_start_offset)
-                        ):
-                            # within anchors
-                            carets.append(secondary_char)
-                        else:
-                            carets.append(primary_char)
-                    if colorize:
-                        # Replace the previous line with a red version of it only in the parts covered
-                        # by the carets.
-                        line = result[-1]
-                        colorized_line_parts = []
-                        colorized_carets_parts = []
-
-                        for color, group in itertools.groupby(itertools.zip_longest(line, carets, fillvalue=""), key=lambda x: x[1]):
-                            caret_group = list(group)
-                            if color == "^":
-                                colorized_line_parts.append(theme.error_highlight + "".join(char for char, _ in caret_group) + theme.reset)
-                                colorized_carets_parts.append(theme.error_highlight + "".join(caret for _, caret in caret_group) + theme.reset)
-                            elif color == "~":
-                                colorized_line_parts.append(theme.error_range + "".join(char for char, _ in caret_group) + theme.reset)
-                                colorized_carets_parts.append(theme.error_range + "".join(caret for _, caret in caret_group) + theme.reset)
-                            else:
-                                colorized_line_parts.append("".join(char for char, _ in caret_group))
-                                colorized_carets_parts.append("".join(caret for _, caret in caret_group))
-
-                        colorized_line = "".join(colorized_line_parts)
-                        colorized_carets = "".join(colorized_carets_parts)
-                        result[-1] = colorized_line
-                        result.append(colorized_carets + "\n")
+                    if anchors:
+                        dp_left_end_offset = _display_width(code_segment, anchors.left_end_offset)
+                        dp_right_start_offset = _display_width(code_segment, anchors.right_start_offset)
+                        row.append(anchors.primary_char * dp_left_end_offset)
+                        row.append(anchors.secondary_char * (dp_right_start_offset - dp_left_end_offset))
+                        row.append(anchors.primary_char * (dp_end_offset - dp_start_offset - dp_right_start_offset))
                     else:
-                        result.append("".join(carets) + "\n")
+                        row.append('^' * (dp_end_offset - dp_start_offset))
 
-                # display significant lines
-                sig_lines_list = sorted(significant_lines)
-                for i, lineno in enumerate(sig_lines_list):
-                    if i:
-                        linediff = lineno - sig_lines_list[i - 1]
-                        if linediff == 2:
-                            # 1 line in between - just output it
-                            output_line(lineno - 1)
-                        elif linediff > 2:
-                            # > 1 line in between - abbreviate
-                            result.append(f"...<{linediff - 1} lines>...\n")
-                    output_line(lineno)
+                    row.append('\n')
 
-                row.append(
-                    textwrap.indent(textwrap.dedent("".join(result)), '    ', lambda line: True)
-                )
         if frame_summary.locals:
             for name, value in sorted(frame_summary.locals.items()):
                 row.append('    {name} = {value}\n'.format(name=name, value=value))
@@ -953,6 +836,67 @@ def _extract_caret_anchors_from_line_segment(segment):
                     return _Anchors(left_lineno, left_col, right_lineno, right_col)
 
     return None
+
+
+_Anchors312 = collections.namedtuple(
+    "_Anchors312",
+    [
+        "left_end_offset",
+        "right_start_offset",
+        "primary_char",
+        "secondary_char",
+    ],
+    defaults=["~", "^"]
+)
+
+def _extract_caret_anchors_312(segment):
+    """CPython 3.12's anchors: binary operators and subscripts only."""
+    import ast
+
+    try:
+        tree = ast.parse(segment)
+    except SyntaxError:
+        return None
+
+    if len(tree.body) != 1:
+        return None
+
+    normalize = lambda offset: _byte_offset_to_character_offset(segment, offset)
+    statement = tree.body[0]
+    match statement:
+        case ast.Expr(expr):
+            match expr:
+                case ast.BinOp():
+                    operator_start = normalize(expr.left.end_col_offset)
+                    operator_end = normalize(expr.right.col_offset)
+                    operator_str = segment[operator_start:operator_end]
+                    operator_offset = len(operator_str) - len(operator_str.lstrip())
+
+                    left_anchor = expr.left.end_col_offset + operator_offset
+                    right_anchor = left_anchor + 1
+                    if (
+                        operator_offset + 1 < len(operator_str)
+                        and not operator_str[operator_offset + 1].isspace()
+                    ):
+                        right_anchor += 1
+
+                    while left_anchor < len(segment) and ((ch := segment[left_anchor]).isspace() or ch in ")#"):
+                        left_anchor += 1
+                        right_anchor += 1
+                    return _Anchors312(normalize(left_anchor), normalize(right_anchor))
+                case ast.Subscript():
+                    left_anchor = normalize(expr.value.end_col_offset)
+                    right_anchor = normalize(expr.slice.end_col_offset + 1)
+                    while left_anchor < len(segment) and ((ch := segment[left_anchor]).isspace() or ch != "["):
+                        left_anchor += 1
+                    while right_anchor < len(segment) and ((ch := segment[right_anchor]).isspace() or ch != "]"):
+                        right_anchor += 1
+                    if right_anchor < len(segment):
+                        right_anchor += 1
+                    return _Anchors312(left_anchor, right_anchor)
+
+    return None
+
 
 _WIDE_CHAR_SPECIFIERS = "WF"
 

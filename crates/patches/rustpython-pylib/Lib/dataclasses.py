@@ -685,7 +685,7 @@ def _init_fn(fields, std_fields, kw_only_fields, frozen, has_post_init,
                 seen_default = f
             elif seen_default:
                 raise TypeError(f'non-default argument {f.name!r} '
-                                f'follows default argument {seen_default.name!r}')
+                                'follows default argument')
 
     annotation_fields = [f.name for f in fields if f.init]
 

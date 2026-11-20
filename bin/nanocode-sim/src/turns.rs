@@ -807,6 +807,8 @@ struct Sim {
     profile: Profile,
     queue: BTreeMap<(u64, u64), Ev>,
     rng: Rngs,
+    /// A commit since the last writing one sealed, or would have sealed, a restart floor.
+    sealed: bool,
     seed: u64,
     shape: Shape,
     sources: Vec<Source>,
@@ -872,6 +874,7 @@ impl Sim {
                 net: Rng::derive(seed, "turns-net"),
                 tools: Rng::derive(seed, "turns-tools"),
             },
+            sealed: false,
             seed,
             shape,
             sources,
@@ -1332,6 +1335,7 @@ impl Sim {
 
     fn down(&mut self, cause: &str) {
         self.object = None;
+        self.sealed = false;
         self.disk.with(|rows| {
             rows.appends.clear();
             rows.staged.clear();
@@ -1624,6 +1628,7 @@ impl Sim {
             return false;
         };
         let unsealed = object.policy.unsealed();
+        let sealing = !unsealed.is_empty();
         if self.options.mutation != TurnMutation::SealSkipped {
             for scope in unsealed {
                 self.point(&scope, Point::Seal);
@@ -1643,10 +1648,16 @@ impl Sim {
             )
         });
         if !tick.writes() && appends.is_empty() && staged.is_empty() && tappends.is_empty() {
+            self.sealed |= sealing;
             self.release(tick.outputs, true);
             return true;
         }
-        if self.rng.crash.chance(self.shape.crash_before_ppm) {
+        // Crash at the first writing commit after one that sealed, or would have sealed, a
+        // restarted scope's floor whenever the shape crashes at all: the events numbered past
+        // that floor are live but may still be only buffered, so only a crash there makes the
+        // next incarnation number from the floor again.
+        let aimed = std::mem::take(&mut self.sealed) && self.shape.crash_before_ppm > 0;
+        if aimed || self.rng.crash.chance(self.shape.crash_before_ppm) {
             self.drop_tick(tick, "crash before commit");
             return false;
         }
@@ -1672,6 +1683,7 @@ impl Sim {
             self.down(cause);
             return false;
         }
+        self.sealed = sealing;
         self.release(tick.outputs, true);
         true
     }

@@ -39,6 +39,8 @@ pub(crate) struct Job {
     killed: Cell<Option<Signal>>,
     /// `disown`: its externals leave the shell's run.
     pub disowned: Cell<bool>,
+    /// `disown -a`: `wait PID` no longer finds it either.
+    pub forgotten: Cell<bool>,
     /// The signal that ended the job's last external, if one did.
     last_signal: Cell<Option<Signal>>,
     /// The job is one simple command: its external is the job's process.
@@ -223,6 +225,17 @@ impl Job {
         (self.status.get() == Some(128 + sig)).then_some(sig)
     }
 
+    /// A signal reached the job after it finished, before the shell noticed: it ends
+    /// as killed by it, as a bash child would that was still starting.
+    pub(crate) fn killed_late(&self, sig: Signal) {
+        // A background job ignores INT and QUIT, as `signal` does.
+        if sig == crate::host::SIGINT || sig == crate::host::SIGQUIT {
+            return;
+        }
+        self.last_signal.set(Some(sig));
+        self.status.set(Some(128 + sig));
+    }
+
     /// `disown`: hidden from `jobs` and `wait`, and its externals leave the shell's run
     /// (when their wait ends; later ones start detached).
     pub(crate) fn disown(&self) {
@@ -296,6 +309,7 @@ impl JobTable {
             procs: RefCell::new(Vec::new()),
             killed: Cell::new(None),
             disowned: Cell::new(false),
+            forgotten: Cell::new(false),
             last_signal: Cell::new(None),
             direct,
             task: Cell::new(None),
@@ -322,10 +336,37 @@ impl JobTable {
         }
     }
 
+    /// Drops the finished jobs (not stopped ones, nor a coprocess, whose variables go
+    /// when it is reported): `wait PID` still finds them.
+    pub(crate) fn drop_done(&mut self) {
+        let done: Vec<Rc<Job>> = self
+            .jobs
+            .iter()
+            .filter(|j| j.status().is_some() && j.stopped().is_none() && j.coproc.borrow().is_none())
+            .cloned()
+            .collect();
+        for j in &done {
+            self.remove(j);
+        }
+    }
+
+    /// Forgets the statuses of reported jobs, as bash's plain `wait` and `disown -a`
+    /// do: `wait PID` then says the pid is not a child of this shell.
+    pub(crate) fn forget(&mut self) {
+        self.reaped.clear();
+    }
+
     /// The job `wait PID` means: a live one, or one already reported.
     pub(crate) fn waitable(&self, pid: u32) -> Option<Rc<Job>> {
         self.by_pid(pid)
+            .filter(|j| !j.forgotten.get())
             .or_else(|| self.reaped.iter().rev().find(|j| j.owns(pid)).cloned())
+    }
+
+    /// Whether `pid` named a job of this shell that is gone: reported, forgotten, or
+    /// one of psh's own numbers (above any real pid) that names no job now.
+    pub(crate) fn gone(&self, pid: u32) -> bool {
+        pid >= VIRTUAL_PID_BASE || self.reaped.iter().any(|j| j.owns(pid))
     }
 
     pub(crate) fn by_pid(&self, pid: u32) -> Option<Rc<Job>> {
@@ -370,7 +411,7 @@ impl JobTable {
                 let n: u32 = spec.parse().map_err(|_| none())?;
                 self.jobs
                     .iter()
-                    .find(|j| j.id == n)
+                    .find(|j| j.id == n && !j.disowned.get())
                     .cloned()
                     .ok_or_else(none)
             }
@@ -382,6 +423,7 @@ impl JobTable {
                 let hits: Vec<&Rc<Job>> = self
                     .jobs
                     .iter()
+                    .filter(|j| !j.disowned.get())
                     .filter(|j| {
                         if anywhere {
                             j.text.contains(text)

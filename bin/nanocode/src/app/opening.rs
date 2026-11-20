@@ -98,7 +98,7 @@ pub(super) fn open_session<'a>(
             route,
             thinking,
             tier,
-            history: Some(stored.transcript),
+            history: Some(stored.into_transcript()?),
             reset_transcript: true,
             pending,
             prompts,

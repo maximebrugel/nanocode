@@ -13,6 +13,7 @@ description = "The board's pure fold: ops, events, phases, access rules and the 
 
 [dependencies]
 nanocode-durability-core.workspace = true
+nanocode-machine.workspace = true
 nanocode-schema.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,6 +1,12 @@
 use nanocode_code_mode::CodeModeToolObservation;
 use nanocode_tools::ToolOutputContent;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FileAccess {
+    Read(String),
+    Write(String),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceToolRouting {
     ProcessStart,
@@ -52,8 +58,8 @@ pub trait CodeModeToolPolicy: Send + Sync {
         None
     }
 
-    fn exclusive(&self, _name: &str) -> bool {
-        false
+    fn file_access(&self, _name: &str, _input: &serde_json::Value) -> Vec<FileAccess> {
+        Vec::new()
     }
 
     fn append_observation_content(

@@ -45,6 +45,8 @@ pub enum Kind {
     Ranked,
     Synced,
     Reparented,
+    Steered,
+    Reported,
 }
 
 impl Change {
@@ -62,6 +64,8 @@ impl Change {
             Self::Ranked { .. } => Kind::Ranked,
             Self::Synced(_) => Kind::Synced,
             Self::Reparented { .. } => Kind::Reparented,
+            Self::Steered(_) => Kind::Steered,
+            Self::Reported { .. } => Kind::Reported,
         }
     }
 }

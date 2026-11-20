@@ -304,6 +304,19 @@ fn fmt_g(v: f64, prec: usize, alt: bool) -> String {
 }
 
 /// Appends `n` in decimal, without a call to copy a few bytes per number.
+/// Adds one to a decimal number written in ASCII digits.
+fn increment(text: &mut Vec<u8>) {
+    for d in text.iter_mut().rev() {
+        if *d == b'9' {
+            *d = b'0';
+        } else {
+            *d += 1;
+            return;
+        }
+    }
+    text.insert(0, b'1');
+}
+
 fn push_u64(out: &mut Vec<u8>, mut n: u64) {
     let len = out.len();
     let digits = n.checked_ilog10().map_or(1, |l| l as usize + 1);
@@ -448,21 +461,39 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         };
         let mut v = f;
         let plain = width == 0 && sep.len() == 1;
-        while (s > 0 && v <= l) || (s < 0 && v >= l) {
-            if plain && let Ok(n) = u64::try_from(v) {
+        if plain && s == 1 && f >= 0 {
+            // Count up in decimal text, as GNU seq does, rather than converting each number.
+            let mut text = f.to_string().into_bytes();
+            while v <= l {
                 if count > 0 {
                     out.push(sep[0]);
                 }
-                push_u64(&mut out, n);
+                out.extend_from_slice(&text);
                 count += 1;
                 flush_full!();
-            } else {
-                let mut buf = [0u8; 48];
-                emit!(int_text(&mut buf, v, width));
+                if v == l {
+                    break;
+                }
+                v += 1;
+                increment(&mut text);
             }
-            match v.checked_add(s) {
-                Some(n) => v = n,
-                None => break,
+        } else {
+            while (s > 0 && v <= l) || (s < 0 && v >= l) {
+                if plain && let Ok(n) = u64::try_from(v) {
+                    if count > 0 {
+                        out.push(sep[0]);
+                    }
+                    push_u64(&mut out, n);
+                    count += 1;
+                    flush_full!();
+                } else {
+                    let mut buf = [0u8; 48];
+                    emit!(int_text(&mut buf, v, width));
+                }
+                match v.checked_add(s) {
+                    Some(n) => v = n,
+                    None => break,
+                }
             }
         }
     } else {

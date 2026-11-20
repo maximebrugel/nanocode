@@ -358,16 +358,12 @@ impl fmt::Debug for SessionSnapshot {
 }
 
 impl SessionSnapshot {
-    pub(crate) fn history_len(&self) -> usize {
-        self.history.len()
+    pub(crate) const fn shared_history(&self) -> &ResponseHistory {
+        &self.history
     }
 
     pub(crate) fn history_from(&self, start: usize) -> impl Iterator<Item = &ResponseItem> {
         self.history.iter_from(start)
-    }
-
-    pub(crate) fn request_prefix(&self) -> Option<&[ResponseItem]> {
-        self.request_prefix.as_deref()
     }
 
     pub(crate) fn without_context(&self) -> Self {
@@ -472,7 +468,7 @@ impl SessionSnapshot {
                 "request prefix does not match the supported model contract".to_owned(),
             ));
         }
-        let history = self.history.iter().cloned().collect::<Vec<_>>();
+        let mut history = self.history.iter().cloned().collect::<Vec<_>>();
         self.reasoning.validate(&history)?;
         let lineage_id = Arc::<str>::from(self.lineage_id);
         let prompt_cache_key = Arc::<str>::from(self.prompt_cache_key);
@@ -485,7 +481,9 @@ impl SessionSnapshot {
                     request_prefix,
                     Arc::clone(&prompt_cache_key),
                     self.canonical_context.clone(),
-                    history.clone(),
+                    // The exact checkpoint owns the history; the history-only
+                    // resume below reads it only when there is no checkpoint.
+                    std::mem::take(&mut history),
                     Some(self.history.clone()),
                     self.client_authored.clone(),
                     None,

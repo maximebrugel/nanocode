@@ -1228,10 +1228,72 @@ mod builtins {
             _ => (),
         });
 
-        for item in iterable.iter(vm)? {
-            sum = vm._add(&sum, &*item?)?;
+        let mut items = iterable.iter(vm)?;
+        loop {
+            if sum.class().is(vm.ctx.types.float_type) {
+                let start = sum
+                    .downcast_ref::<crate::builtins::PyFloat>()
+                    .expect("an exact float is a PyFloat")
+                    .to_f64();
+                let (total, rest) = sum_floats(start, &mut items, vm)?;
+                match rest {
+                    None => return Ok(vm.ctx.new_float(total).into()),
+                    Some(item) => {
+                        let partial: PyObjectRef = vm.ctx.new_float(total).into();
+                        sum = vm._add(&partial, &item)?;
+                    }
+                }
+                continue;
+            }
+            match items.next() {
+                Some(item) => sum = vm._add(&sum, &*item?)?,
+                None => return Ok(sum),
+            }
         }
-        Ok(sum)
+    }
+
+    /// Adds floats and machine-sized ints onto `total` as CPython 3.12 does,
+    /// with Neumaier's compensation for the floats, until an item of any
+    /// other kind, which it hands back for the generic addition.
+    fn sum_floats(
+        mut total: f64,
+        items: &mut crate::protocol::PyIterIter<'_, PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult<(f64, Option<PyObjectRef>)> {
+        let mut compensation = 0.0_f64;
+        let rest = loop {
+            let Some(item) = items.next() else {
+                break None;
+            };
+            let item = item?;
+            if item.class().is(vm.ctx.types.float_type) {
+                let x = item
+                    .downcast_ref::<crate::builtins::PyFloat>()
+                    .expect("an exact float is a PyFloat")
+                    .to_f64();
+                let t = total + x;
+                if total.abs() >= x.abs() {
+                    compensation += (total - t) + x;
+                } else {
+                    compensation += (x - t) + total;
+                }
+                total = t;
+                continue;
+            }
+            if let Some(int) = item.downcast_ref::<crate::builtins::PyInt>() {
+                if let Some(value) = int.as_bigint().to_i64() {
+                    #[expect(clippy::cast_precision_loss, reason = "as CPython adds a C long")]
+                    let value = value as f64;
+                    total += value;
+                    continue;
+                }
+            }
+            break Some(item);
+        };
+        if compensation != 0.0 && compensation.is_finite() {
+            total += compensation;
+        }
+        Ok((total, rest))
     }
 
     #[derive(FromArgs)]

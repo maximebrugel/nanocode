@@ -549,16 +549,22 @@ async fn exchange(
             break;
         };
         let reply = &buffer[..length];
-        let Some(question) = questions.iter_mut().find(|question| {
-            question.answer.is_none() && reply.get(..2) == Some(&question.id.to_be_bytes()[..])
-        }) else {
+        let Some((question, decoded)) = questions
+            .iter_mut()
+            .filter(|question| {
+                question.answer.is_none() && reply.get(..2) == Some(&question.id.to_be_bytes()[..])
+            })
+            .find_map(|question| {
+                let kind = question.kind;
+                decode(reply, name, kind).map(|decoded| (question, decoded))
+            })
+        else {
             continue;
         };
-        question.answer = match decode(reply, name, question.kind) {
-            None => continue,
-            Some(Reply::Answer(answer)) => Some(answer),
-            Some(Reply::Truncated) => Some(streamed(server, wait, name, question, wire).await?),
-        };
+        question.answer = Some(match decoded {
+            Reply::Answer(answer) => answer,
+            Reply::Truncated => streamed(server, wait, name, question, wire).await?,
+        });
     }
     Ok(())
 }

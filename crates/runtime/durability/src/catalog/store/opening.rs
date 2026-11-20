@@ -35,7 +35,7 @@ pub(super) fn recovery<'a>(
         let checkpoint = this.loaded_checkpoint(id, &state).await?;
         let record = match (state.session(), &checkpoint) {
             (Some(record), _) => record.clone(),
-            (None, Some((checkpoint, ..))) => this.infer_record(id, checkpoint)?,
+            (None, Some((checkpoint, ..))) => this.infer_record(id, checkpoint.head())?,
             (None, None) => return Ok((journal, None)),
         };
         if record.family() != journal.family() || record.lineage != *journal.lineage() {
@@ -45,7 +45,9 @@ pub(super) fn recovery<'a>(
         }
         let provider = is_listed(&state).then(|| record.provider.clone()).flatten();
         let checkpoint = match checkpoint {
-            Some((checkpoint, ..)) => session_checkpoint(&this.formats, &record, &checkpoint)?,
+            Some((checkpoint, ..)) => {
+                session_checkpoint(&this.formats, &record, &*checkpoint.value()?)?
+            }
             None => journal,
         };
         Ok((checkpoint, provider))
@@ -103,6 +105,25 @@ pub(super) fn prepare_resume_resumable<'a>(
 }
 
 #[inline(never)]
+pub(super) fn prepare_resume_resumable_taking<'a>(
+    this: &'a SessionStore,
+    resumable: &'a mut ResumableSession,
+) -> FormatFuture<'a, Result<DurableSession>> {
+    Box::pin(async move {
+        let checkpoint = resumable.checkpoint.take();
+        let hydrated = resumable.loaded.hydrated.take();
+        prepare_loaded(
+            this,
+            &resumable.record,
+            checkpoint.map(Cow::Owned),
+            &resumable.loaded,
+            hydrated,
+        )
+        .await
+    })
+}
+
+#[inline(never)]
 pub(super) fn prepare_resume_taking<'a>(
     this: &'a SessionStore,
     stored: &'a mut StoredSession,
@@ -124,7 +145,7 @@ pub(super) fn prepare_resume_taking<'a>(
 fn prepare_loaded<'a>(
     this: &'a SessionStore,
     record: &'a SessionRecord,
-    checkpoint: Option<Cow<'a, Value>>,
+    checkpoint: Option<Cow<'a, crate::Checkpoint>>,
     loaded: &'a Loaded,
     hydrated: Option<crate::Hydrated>,
 ) -> FormatFuture<'a, Result<DurableSession>> {
@@ -142,7 +163,7 @@ fn prepare_loaded<'a>(
         }
         let state = if loaded.record_inferred {
             let inferred = match (&loaded.checkpoint_key, checkpoint.as_deref()) {
-                (Some(key), Some(checkpoint)) => Some((key.as_str(), checkpoint)),
+                (Some(key), Some(checkpoint)) => Some((key.as_str(), checkpoint.head())),
                 _ => None,
             };
             this.prepare_resume_with(id, inferred).await?

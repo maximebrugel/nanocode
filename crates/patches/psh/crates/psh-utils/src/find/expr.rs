@@ -759,12 +759,31 @@ impl Parser<'_> {
                 });
                 Expr::Exec(self.execs.len() - 1)
             }
+            _ if a.first() == Some(&b'-') && !GNU_PRIMARIES.contains(&name.as_str()) => {
+                return usage(format!("unknown predicate `{name}'"));
+            }
             _ if a.first() == Some(&b'-') => return Err(Error::Unsupported(name)),
             _ => return usage(stray(self.args, self.i - 1)),
         };
         Ok(e)
     }
 }
+
+/// Every option, test and action GNU find knows: one psh lacks falls through to a host
+/// find; any other word with a dash is GNU's "unknown predicate" (status 1).
+const GNU_PRIMARIES: &[&str] = &[
+    "-amin", "-and", "-anewer", "-atime", "-cmin", "-cnewer", "-context", "-ctime",
+    "-d", "-daystart", "-delete", "-depth", "-empty", "-exec", "-execdir", "-executable",
+    "-false", "-files0-from", "-fls", "-follow", "-fprint", "-fprint0", "-fprintf",
+    "-fstype", "-gid", "-group", "-help", "-ignore_readdir_race", "-ilname", "-iname",
+    "-inum", "-ipath", "-iregex", "-iwholename", "-links", "-lname", "-ls", "-maxdepth",
+    "-mindepth", "-mmin", "-mount", "-mtime", "-name", "-newer", "-nogroup",
+    "-noignore_readdir_race", "-noleaf", "-not", "-nouser", "-nowarn", "-ok", "-okdir",
+    "-or", "-path", "-perm", "-print", "-print0", "-printf", "-prune", "-quit",
+    "-readable", "-regex", "-regextype", "-samefile", "-size", "-true", "-type", "-uid",
+    "-used", "-user", "-version", "-warn", "-wholename", "-writable", "-xdev", "-xtype",
+    "-a", "-o", "-L", "-H", "-P", "-O0", "-O1", "-O2", "-O3", "-D",
+];
 
 fn field_of(c: u8) -> Field {
     match c {

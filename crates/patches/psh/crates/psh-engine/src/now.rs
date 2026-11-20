@@ -127,17 +127,22 @@ fn simple<'a>(
             let AssignValue::Scalar(w) = &a.value else {
                 continue;
             };
+            // `s=$s…` on a plain string appends the rest in place, as `s+=…` does,
+            // rather than copying the old value.
+            let name = code.ast.text(a.name);
+            let skip =
+                !a.append && expand::leads_with_self(code, name, w) && vp.appends_in_place(name);
             // Only the first value may hand the command to the slow path: later ones
             // follow assignments.
             let v = match i {
-                0 => crate::arith::probe(vp, |vp| expand::single_now(vp, code, w))?,
-                _ => expand::single_now(vp, code, w),
+                0 => crate::arith::probe(vp, |vp| expand::single_now_after(vp, code, w, skip))?,
+                _ => expand::single_now_after(vp, code, w, skip),
             };
             let v = match v {
                 Ok(v) => v,
                 Err(msg) => return Some(arith_failed(vp, msg)),
             };
-            if let Err(msg) = vp.assign_with(code.ast.text(a.name), v, a.append) {
+            if let Err(msg) = vp.assign_with(name, v, a.append || skip) {
                 let errexit = vp.opts.get(crate::options::SetOpt::Errexit);
                 return Some(Now::Later(Box::pin(async move {
                     vp.error(&msg).await;

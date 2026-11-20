@@ -313,6 +313,19 @@ pub async fn targets(
         ctx.error(&msg).await;
         return Err(1);
     }
+    // `cp file missing/`: a name with a trailing slash must be a directory, and a
+    // file cannot be created as one.
+    if !is_dir && last.ends_with(b"/") && name == "cp" {
+        let src_dir = ctx
+            .stat(&sources[0], true)
+            .await
+            .is_ok_and(|m| m.kind == FileKind::Dir);
+        if !src_dir {
+            let msg = format!("cannot create regular file '{}': Not a directory", s(last));
+            ctx.error(&msg).await;
+            return Err(1);
+        }
+    }
     Ok(Plan {
         sources: sources.to_vec(),
         target: last.clone(),

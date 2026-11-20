@@ -272,7 +272,7 @@ fn paths_with(
 /// differs between the two is taken from the new one where the index and the worktree
 /// have the old one, kept where the index already has the new one, and anything else
 /// stops the checkout. The message when it stops.
-fn two_way(
+pub fn two_way(
     git: &Git<'_>,
     work: &Work<'_, '_>,
     index: &mut Index,
@@ -502,8 +502,49 @@ pub fn track(git: &Git<'_>, name: &str, remote: &str, branch: &str) -> Res<()> {
     Ok(())
 }
 
+/// Splits clustered short options into one argument each, as git's option parser
+/// reads them: `-qb name` is `-q -b name`, and a letter in `with_value` takes the
+/// rest of its cluster as its value (`-bname`), or else the next argument whole.
+fn split_shorts(args: &[String], with_value: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut value_next = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if std::mem::take(&mut value_next) {
+            out.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            out.push(arg.clone());
+            out.extend(rest.cloned());
+            break;
+        }
+        let Some(cluster) = arg
+            .strip_prefix('-')
+            .filter(|c| !c.is_empty() && !c.starts_with('-'))
+        else {
+            out.push(arg.clone());
+            continue;
+        };
+        for (k, c) in cluster.char_indices() {
+            out.push(format!("-{c}"));
+            if with_value.contains(c) {
+                let tail = &cluster[k + c.len_utf8()..];
+                if tail.is_empty() {
+                    value_next = true;
+                } else {
+                    out.push(tail.to_string());
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn run(git: &Git<'_>, io: &mut Io<'_>, args: &[String], switch: bool) -> Res<i32> {
     let command = if switch { "switch" } else { "checkout" };
+    let args = &split_shorts(args, if switch { "cC" } else { "bB" });
     let (mut quiet, mut force, mut detach) = (false, false, false);
     let mut create: Option<(String, bool)> = None;
     let mut tracking: Option<bool> = None;
@@ -882,27 +923,54 @@ pub fn switch(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
 /// them.
 pub fn merge(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     let (mut only, mut quiet, mut stat) = (false, false, true);
+    let (mut no_ff, mut commit) = (false, true);
+    let mut message: Option<String> = None;
     let mut specs = Vec::new();
-    for arg in args {
-        match arg.as_str() {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        match arg {
             "--ff-only" => only = true,
-            "--ff" | "--no-edit" | "--no-verify" => {}
+            "--no-ff" => no_ff = true,
+            "--no-commit" => commit = false,
+            "--commit" => commit = true,
+            "--ff" | "--no-edit" | "--no-verify" | "--log" | "--no-log" => {}
             "-q" | "--quiet" => quiet = true,
             "--stat" => stat = true,
             "-n" | "--no-stat" => stat = false,
+            "--abort" | "--quit" => return merge_abort(git, arg == "--abort"),
+            "--continue" => return super::commit::commit(git, io, &["--no-edit".to_string()]),
+            "-m" => {
+                i += 1;
+                let text = args.get(i).ok_or_else(|| {
+                    Error::Usage("error: switch `m' requires a value".to_string())
+                })?;
+                message = Some(match message {
+                    Some(before) => format!("{before}\n\n{text}"),
+                    None => text.clone(),
+                });
+            }
+            a if a.starts_with("-m") || a.starts_with("--message=") => {
+                let text = a.strip_prefix("--message=").unwrap_or(&a[2..]).to_string();
+                message = Some(match message {
+                    Some(before) => format!("{before}\n\n{text}"),
+                    None => text,
+                });
+            }
             a if a.starts_with('-') => {
                 return Err(Error::Lacks(
                     format!("'merge' with '{a}'"),
-                    "git that merges histories: it only moves a branch forward",
+                    "git with that merge option",
                 ));
             }
-            _ => specs.push(arg.clone()),
+            _ => specs.push(arg.to_string()),
         }
+        i += 1;
     }
     let [spec] = specs.as_slice() else {
         return Err(Error::Lacks(
             "'merge' of none or several commits".to_string(),
-            "git that merges histories: it only moves a branch forward",
+            "git's octopus merge",
         ));
     };
     let repo = &git.repo;
@@ -920,7 +988,7 @@ pub fn merge(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     let Some(head) = repo.head()? else {
         return Err(Error::Lacks(
             "'merge' into a branch with no commits".to_string(),
-            "git that merges histories: it only moves a branch forward",
+            "git that merges into an unborn branch",
         ));
     };
     let head = rev::commit_of(repo, head)?;
@@ -930,17 +998,21 @@ pub fn merge(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         }
         return Ok(0);
     }
-    if !rev::is_ancestor(repo, head, theirs)? {
-        if only {
-            return Err(Error::Says(
-                "hint: Diverging branches can't be fast-forwarded, you need to either:\nhint:\nhint: \tgit merge --no-ff\nhint:\nhint: or:\nhint:\nhint: \tgit rebase\nhint:\nhint: Disable this message with \"git config set advice.diverging false\"\nfatal: Not possible to fast-forward, aborting.\n".to_string(),
-                128,
-            ));
-        }
-        return Err(Error::Lacks(
-            format!("'merge' of '{spec}', whose history has diverged from HEAD's"),
-            "git that merges histories: it only moves a branch forward",
+    if !rev::is_ancestor(repo, head, theirs)? && only {
+        return Err(Error::Says(
+            "hint: Diverging branches can't be fast-forwarded, you need to either:\nhint:\nhint: \tgit merge --no-ff\nhint:\nhint: or:\nhint:\nhint: \tgit rebase\nhint:\nhint: Disable this message with \"git config set advice.diverging false\"\nfatal: Not possible to fast-forward, aborting.\n".to_string(),
+            128,
         ));
+    }
+    if no_ff || !commit || !rev::is_ancestor(repo, head, theirs)? {
+        let opts = super::merge::Options {
+            spec,
+            message,
+            quiet,
+            stat,
+            commit,
+        };
+        return super::merge::three_way(git, io, head, theirs, opts);
     }
     git.lock_index()?;
     git.hooks(&["post-merge"])?;
@@ -1047,6 +1119,7 @@ fn linked(git: &Git<'_>) -> Res<Vec<(Vec<u8>, Vec<u8>)>> {
 /// git worktree add: another working tree of the repository, on a branch of its own
 /// or at a commit.
 pub fn worktree_add(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
+    let args = &split_shorts(args, "bB");
     let (mut detach, mut quiet) = (false, false);
     let mut create: Option<(String, bool)> = None;
     let mut words: Vec<&str> = Vec::new();
@@ -1291,4 +1364,59 @@ pub fn worktree_remove(git: &Git<'_>, io: &mut Io<'_>, args: &[String], prune: b
     remove_tree(git, &path)?;
     remove_tree(git, &own)?;
     Ok(0)
+}
+
+/// git merge --abort (back to HEAD, the merge's files gone) and --quit (only the
+/// files gone).
+fn merge_abort(git: &Git<'_>, abort: bool) -> Res<i32> {
+    let repo = &git.repo;
+    let merge_head = join(&repo.git_dir, b"MERGE_HEAD");
+    if repo.fs.stat_opt(&merge_head, false)?.is_none() {
+        if !abort {
+            return Ok(0);
+        }
+        return Err(Error::Fatal(
+            "There is no merge to abort (MERGE_HEAD missing).".to_string(),
+        ));
+    }
+    if abort {
+        let root = git.work_tree()?.to_vec();
+        git.lock_index()?;
+        let head = repo
+            .head()?
+            .ok_or_else(|| Error::Fatal("HEAD has no commit".to_string()))?;
+        let tree = repo.commit(&rev::commit_of(repo, head)?)?.tree;
+        let work = Work::new(repo, &root)?;
+        let index = hard(git, &work, work.index.clone(), Some(&tree))?;
+        git.set_index(index);
+    }
+    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE"] {
+        git.op(Op::Remove(join(&repo.git_dir, name.as_bytes())));
+    }
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_shorts;
+
+    fn split(args: &[&str], with_value: &str) -> Vec<String> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        split_shorts(&args, with_value)
+    }
+
+    #[test]
+    fn clustered_short_options_split_as_git_reads_them() {
+        assert_eq!(split(&["-qb", "topic"], "bB"), ["-q", "-b", "topic"]);
+        assert_eq!(split(&["-qbtopic"], "bB"), ["-q", "-b", "topic"]);
+        assert_eq!(
+            split(&["-fB", "x", "main"], "bB"),
+            ["-f", "-B", "x", "main"]
+        );
+        assert_eq!(split(&["-qc", "new"], "cC"), ["-q", "-c", "new"]);
+        // A value is taken whole, and nothing after `--` is an option.
+        assert_eq!(split(&["-b", "-qx"], "bB"), ["-b", "-qx"]);
+        assert_eq!(split(&["--", "-qf"], "bB"), ["--", "-qf"]);
+        assert_eq!(split(&["-", "--quiet", "-q"], "bB"), ["-", "--quiet", "-q"]);
+    }
 }

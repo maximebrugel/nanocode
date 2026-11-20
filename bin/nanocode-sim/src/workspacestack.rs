@@ -10,22 +10,28 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
     time::Duration,
 };
 
-use nanocode_code_mode::{ToolContext, ToolOutput, ToolOutputBody};
+use nanocode_code_mode::{
+    ToolContext, ToolOutput, ToolOutputBody,
+    embedded::{HandCalls, take_hand},
+};
 use nanocode_durability_core::StoreFuture;
 use nanocode_hands::{
-    ChunkError, Chunks, Clock as RouterClock, CopyError, Fetch, GetError, HandError, HandHost,
-    HandPhase, HandRef, HandStatus, HostFuture, Placement, Placements, Policy, PutError, Router,
-    Sha256Digest, StepOutcome, Stored, Target, Workspace as HandWorkspace, receive,
+    AUTO, Auto, Chunks, Clock as RouterClock, Fetch, GetError, HandError, HandHost, HandPhase,
+    HandRef, HandStatus, HostFuture, Placement, Placements, Policy, PutError, Router, Sha256Digest,
+    Shell, StepOutcome, Stored,
     sim::{self as hands_sim, Mutation as HandRule},
 };
 use nanocode_shell::{Commands, FileSystem, HostInfo, Identity, Limits, Machine, NoCommands};
-use nanocode_sync::{Atom, block_on};
-use nanocode_workspace::{Config, Workspace, WorkspaceHost};
+use nanocode_sync::block_on;
+use nanocode_workspace::{
+    Config, Workspace, WorkspaceHost,
+    sim::{self as workspace_sim, Mutation as WorkspaceRule},
+};
 use nanocode_workspace_fs::{
     Batch, Blob, Caps, Digest, Failure, Manifest, MemStore, Store, WorkspaceFs,
     sim::{self as fs_sim, Mutation as FsRule},
@@ -36,20 +42,33 @@ use crate::rng::{FNV_OFFSET, Rng, fnv};
 
 const ROOT: &str = "/w";
 const NAME: &str = "workspace";
+const BASH: &str = "Bash";
+const SCRIPT: &str = "command";
+const SHELLS: &[Shell] = &[Shell {
+    tool: BASH,
+    script: SCRIPT,
+}];
+const HAND_ONLY: &str = "cargo build";
+const HAND_SAYS: &str = "this Hand runs no";
 const SESSION: &str = "session";
 const STORE_KEY: &str = "stack";
 const FILES: [&str; 4] = ["a.txt", "b.txt", "d/c.txt", "d/e/f.txt"];
-const COPIES: [&str; 2] = ["copy/a.txt", "copy/b.txt"];
 const SHELL_FILES: [&str; 2] = ["a.txt", "b.txt"];
 const PIECES: [&str; 5] = ["a", "b", "ab", "\n", "c"];
 const SLICE: u32 = 4096;
 const DEPTH: u32 = 64;
+const PYTHON: nanocode_python::Budget = nanocode_python::Budget {
+    steps: 1 << 24,
+    time: Duration::from_secs(60),
+    memory: None,
+    sleep: Duration::ZERO,
+    depth: DEPTH as usize,
+};
+const LINES: usize = 4;
 const OPS_MIN: u64 = 12;
 const OPS_MAX: u64 = 48;
-const CHUNK_MAX: u64 = 6;
-const KINDS: usize = 7;
+const KINDS: usize = 5;
 const CRASH_IN: usize = 4;
-const CORRUPT_IN: usize = 3;
 const IDLE_MS: u64 = 1_000;
 const CAPS: Caps = Caps {
     file_bytes: 1 << 16,
@@ -67,15 +86,21 @@ pub enum WorkspaceStackMutation {
     None,
     TornCommit,
     VisibleBeforeCommit,
-    ShaUnchecked,
+    AnswersNow,
+    HasNothing,
+    HasEverything,
+    AutoOff,
 }
 
 impl WorkspaceStackMutation {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 7] = [
         Self::None,
         Self::TornCommit,
         Self::VisibleBeforeCommit,
-        Self::ShaUnchecked,
+        Self::AnswersNow,
+        Self::HasNothing,
+        Self::HasEverything,
+        Self::AutoOff,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -89,7 +114,10 @@ impl WorkspaceStackMutation {
             Self::None => "none",
             Self::TornCommit => "torn_commit",
             Self::VisibleBeforeCommit => "visible_before_commit",
-            Self::ShaUnchecked => "sha_unchecked",
+            Self::AnswersNow => "answers_now",
+            Self::HasNothing => "has_nothing",
+            Self::HasEverything => "has_everything",
+            Self::AutoOff => "auto_off",
         }
     }
 
@@ -102,12 +130,19 @@ impl WorkspaceStackMutation {
             .join("|")
     }
 
-    const fn rules(self) -> (FsRule, HandRule) {
+    const fn rules(self) -> (FsRule, HandRule, WorkspaceRule) {
         match self {
-            Self::None => (FsRule::None, HandRule::None),
-            Self::TornCommit => (FsRule::TornCommit, HandRule::None),
-            Self::VisibleBeforeCommit => (FsRule::VisibleBeforeCommit, HandRule::None),
-            Self::ShaUnchecked => (FsRule::None, HandRule::ShaUnchecked),
+            Self::None => (FsRule::None, HandRule::None, WorkspaceRule::None),
+            Self::TornCommit => (FsRule::TornCommit, HandRule::None, WorkspaceRule::None),
+            Self::VisibleBeforeCommit => (
+                FsRule::VisibleBeforeCommit,
+                HandRule::None,
+                WorkspaceRule::None,
+            ),
+            Self::AnswersNow => (FsRule::AnswersNow, HandRule::None, WorkspaceRule::None),
+            Self::HasNothing => (FsRule::None, HandRule::None, WorkspaceRule::HasNothing),
+            Self::HasEverything => (FsRule::None, HandRule::None, WorkspaceRule::HasEverything),
+            Self::AutoOff => (FsRule::None, HandRule::AutoOff, WorkspaceRule::None),
         }
     }
 }
@@ -120,23 +155,23 @@ pub struct WorkspaceStackStats {
     pub reads: u64,
     pub scripts: u64,
     pub routed: u64,
-    pub copies: u64,
-    pub copies_corrupt: u64,
+    pub auto: u64,
+    pub auto_hand: u64,
     pub restarts: u64,
     pub crashes_before: u64,
     pub crashes_after: u64,
 }
 
 impl WorkspaceStackStats {
-    const fn add(&mut self, other: &Self) {
+    pub const fn add(&mut self, other: &Self) {
         self.seeds += other.seeds;
         self.writes += other.writes;
         self.edits += other.edits;
         self.reads += other.reads;
         self.scripts += other.scripts;
         self.routed += other.routed;
-        self.copies += other.copies;
-        self.copies_corrupt += other.copies_corrupt;
+        self.auto += other.auto;
+        self.auto_hand += other.auto_hand;
         self.restarts += other.restarts;
         self.crashes_before += other.crashes_before;
         self.crashes_after += other.crashes_after;
@@ -216,106 +251,7 @@ impl Machine for Clock {
     }
 }
 
-struct Slices {
-    bytes: Vec<u8>,
-    sent: usize,
-    size: usize,
-}
-
-impl Chunks for Slices {
-    fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, ChunkError>> {
-        let end = self.bytes.len().min(self.sent + self.size);
-        let chunk = (self.sent < end).then(|| self.bytes[self.sent..end].to_vec());
-        self.sent = end;
-        Box::pin(async move { Ok(chunk) })
-    }
-}
-
-struct Corrupt<'a> {
-    inner: Box<dyn Chunks + 'a>,
-    flipped: bool,
-}
-
-impl Chunks for Corrupt<'_> {
-    fn next(&mut self) -> HostFuture<'_, Result<Option<Vec<u8>>, ChunkError>> {
-        Box::pin(async move {
-            let chunk = self.inner.next().await?;
-            if self.flipped {
-                return Ok(chunk);
-            }
-            self.flipped = true;
-            Ok(Some(match chunk {
-                Some(mut chunk) => {
-                    chunk[0] ^= 1;
-                    chunk
-                }
-                None => vec![0],
-            }))
-        })
-    }
-}
-
-fn damaged<'a>(fetch: Fetch<'a>, corrupt: &AtomicBool) -> Fetch<'a> {
-    match corrupt.swap(false, Ordering::SeqCst) {
-        false => fetch,
-        true => Fetch {
-            size_bytes: fetch.size_bytes,
-            sha256: fetch.sha256,
-            chunks: Box::new(Corrupt {
-                inner: fetch.chunks,
-                flipped: false,
-            }),
-        },
-    }
-}
-
-struct Wire {
-    host: WorkspaceHost,
-    corrupt: Arc<AtomicBool>,
-}
-
-impl HandWorkspace for Wire {
-    fn runs(&self, tool: &str) -> bool {
-        self.host.runs(tool)
-    }
-
-    fn run<'a>(
-        &'a self,
-        session: &'a str,
-        tool: &'a str,
-        input: Value,
-        context: ToolContext<'a>,
-    ) -> HostFuture<'a, ToolOutput> {
-        HandWorkspace::run(&self.host, session, tool, input, context)
-    }
-
-    fn put<'a>(
-        &'a self,
-        session: &'a str,
-        path: &'a str,
-        chunks: Box<dyn Chunks + 'a>,
-        sha256: Sha256Digest,
-    ) -> HostFuture<'a, Result<Stored, PutError>> {
-        HandWorkspace::put(&self.host, session, path, chunks, sha256)
-    }
-
-    fn get<'a>(
-        &'a self,
-        session: &'a str,
-        path: &'a str,
-        chunk_bytes: NonZeroUsize,
-    ) -> HostFuture<'a, Result<Fetch<'a>, GetError>> {
-        Box::pin(async move {
-            let fetch = HandWorkspace::get(&self.host, session, path, chunk_bytes).await?;
-            Ok(damaged(fetch, &self.corrupt))
-        })
-    }
-}
-
-struct Hand {
-    files: Atom<BTreeMap<String, Vec<u8>>>,
-    corrupt: AtomicBool,
-}
+struct Hand;
 
 impl HandHost for Hand {
     fn status<'a>(
@@ -325,7 +261,7 @@ impl HandHost for Hand {
         Box::pin(async move {
             Ok(vec![HandStatus {
                 hand: HandRef::Hosted,
-                tools: Vec::new(),
+                tools: vec![BASH.into()],
                 phase: HandPhase::Running { since_ms: 0 },
             }])
         })
@@ -342,7 +278,7 @@ impl HandHost for Hand {
     ) -> HostFuture<'a, StepOutcome> {
         Box::pin(async move {
             StepOutcome::Refused {
-                reason: format!("this Hand runs no {tool}").into(),
+                reason: format!("{HAND_SAYS} {tool}").into(),
             }
         })
     }
@@ -351,16 +287,14 @@ impl HandHost for Hand {
         &'a self,
         _session: &'a str,
         _hand: &'a HandRef,
-        path: &'a str,
-        mut chunks: Box<dyn Chunks + 'a>,
-        sha256: Sha256Digest,
+        _path: &'a str,
+        _chunks: Box<dyn Chunks + 'a>,
+        _sha256: Sha256Digest,
     ) -> HostFuture<'a, Result<Stored, PutError>> {
         Box::pin(async move {
-            let (bytes, stored) = receive(chunks.as_mut(), sha256, u64::MAX).await?;
-            self.files.update(|files| {
-                files.insert(path.to_owned(), bytes.clone());
-            });
-            Ok(stored)
+            Err(PutError::Refused {
+                reason: "this Hand keeps no files".into(),
+            })
         })
     }
 
@@ -368,24 +302,13 @@ impl HandHost for Hand {
         &'a self,
         _session: &'a str,
         _hand: &'a HandRef,
-        path: &'a str,
-        chunk_bytes: NonZeroUsize,
+        _path: &'a str,
+        _chunk_bytes: NonZeroUsize,
     ) -> HostFuture<'a, Result<Fetch<'a>, GetError>> {
         Box::pin(async move {
-            let bytes = self
-                .files
-                .read(|files| files.get(path).cloned())
-                .ok_or(GetError::NotFound)?;
-            let fetch = Fetch {
-                size_bytes: bytes.len() as u64,
-                sha256: Sha256Digest::of(&bytes),
-                chunks: Box::new(Slices {
-                    bytes,
-                    sent: 0,
-                    size: chunk_bytes.get(),
-                }),
-            };
-            Ok(damaged(fetch, &self.corrupt))
+            Err(GetError::Refused {
+                reason: "this Hand keeps no files".into(),
+            })
         })
     }
 
@@ -424,11 +347,7 @@ fn clock() -> Rc<dyn Machine> {
     })
 }
 
-fn open(
-    store: &Arc<Crashing>,
-    hand: &Arc<Hand>,
-    corrupt: &Arc<AtomicBool>,
-) -> Result<Stack, String> {
+fn open(seed: u64, store: &Arc<Crashing>, hand: &Arc<Hand>) -> Result<Stack, String> {
     let store: Arc<dyn Store> = store.clone();
     let files = Workspace::start(Config {
         files: Arc::new(move || -> Rc<dyn FileSystem> {
@@ -443,7 +362,10 @@ fn open(
         machine: Arc::new(clock),
         fetch: None,
         credentials: None,
-        commands: Arc::new(|| -> Rc<dyn Commands> { Rc::new(NoCommands) }),
+        commands: Arc::new(move || -> Rc<dyn Commands> {
+            crate::host::enter(seed, &crate::executor::Clock::new());
+            Rc::new(nanocode_python::Command::new(PYTHON, Rc::new(NoCommands)))
+        }),
         identity: Identity {
             info: HostInfo::default(),
             pid: 1,
@@ -476,20 +398,32 @@ fn open(
         built.registered_tools().cloned(),
     );
     let router = Router::new(
-        Arc::new(Wire {
-            host: host.clone(),
-            corrupt: Arc::clone(corrupt),
-        }),
+        Arc::new(host.clone()),
         hand.clone(),
         Arc::new(Still),
         Arc::new(Unplaced),
         Policy { idle_ms: IDLE_MS },
-    );
+    )
+    .with_auto(Auto { shells: SHELLS });
     Ok(Stack {
         files,
         host,
         router,
     })
+}
+
+async fn auto(
+    router: &Router,
+    input: Value,
+    context: ToolContext<'_>,
+) -> Result<ToolOutput, String> {
+    match take_hand(false, router.auto(BASH), input) {
+        Ok((input, Some(hand))) if hand == AUTO => {
+            Ok(router.route(&hand, BASH, input, context).await)
+        }
+        Ok((_, hand)) => Err(format!("a {BASH} call without a hand went out as {hand:?}")),
+        Err(refused) => Err(text(&refused)),
+    }
 }
 
 fn text(output: &ToolOutput) -> String {
@@ -533,11 +467,11 @@ async fn agrees(
     when: &str,
     digest: &mut u64,
 ) -> Result<(), String> {
-    for path in FILES.iter().chain(COPIES.iter()) {
+    for path in FILES {
         let held = holds(files, path)
             .await
             .map_err(|error| format!("{when}: {error}"))?;
-        let expected = model.get(*path);
+        let expected = model.get(path);
         if held.as_ref() != expected {
             return Err(format!(
                 "{when}: {path} holds {}, the model holds {}",
@@ -601,14 +535,10 @@ fn simulate(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
         plan: AtomicU8::new(PLAN_NONE),
         fired: AtomicU8::new(PLAN_NONE),
     });
-    let hand = Arc::new(Hand {
-        files: Atom::new(BTreeMap::new()),
-        corrupt: AtomicBool::new(false),
-    });
-    let corrupt = Arc::new(AtomicBool::new(false));
-    let (fs_rule, hand_rule) = mutation.rules();
+    let hand = Arc::new(Hand);
+    let (fs_rule, hand_rule, workspace_rule) = mutation.rules();
     let wrong = block_on(async {
-        let mut stack = open(&store, &hand, &corrupt)?;
+        let mut stack = open(seed, &store, &hand)?;
         stack
             .files
             .write(absolute(".keep").as_bytes(), b"")
@@ -616,8 +546,8 @@ fn simulate(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
             .map_err(|error| format!("setup: {error}"))?;
         fs_sim::mutate(fs_rule);
         hands_sim::mutate(hand_rule);
+        workspace_sim::mutate(workspace_rule);
         let mut model: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        let mut on_hand: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for op in 0..ops {
             let step = format!("step-{op}");
             let context = ToolContext::new("", SESSION, &step, &[], usize::MAX);
@@ -688,7 +618,7 @@ fn simulate(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
                     let mut lines = Vec::new();
                     for _ in 0..rng.range(1, 4) {
                         let path = SHELL_FILES[rng.pick(SHELL_FILES.len())];
-                        let line = match rng.pick(3) {
+                        let line = match rng.pick(LINES) {
                             0 => {
                                 let content = words(&mut rng, 3);
                                 model.insert(path.to_owned(), content.clone().into_bytes());
@@ -702,19 +632,50 @@ fn simulate(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
                                     .extend(content.bytes());
                                 format!("printf '%s' {} >> {}", quoted(&content), absolute(path))
                             }
-                            _ => {
+                            2 => {
                                 model.remove(path);
                                 format!("rm -f {}", absolute(path))
+                            }
+                            _ => {
+                                let content = words(&mut rng, 3);
+                                model.insert(path.to_owned(), content.clone().into_bytes());
+                                let program =
+                                    format!("open({:?}, 'w').write({content:?})", absolute(path));
+                                format!("python3 -c {}", quoted(&program))
                             }
                         };
                         lines.push(line);
                     }
-                    let input = json!({"command": lines.join("\n")});
-                    let output = match rng.pick(2) {
-                        0 => stack.host.call("Bash", input, context).await,
-                        _ => {
+                    let input = json!({SCRIPT: lines.join("\n")});
+                    let output = match rng.pick(3) {
+                        0 => stack.host.call(BASH, input, context).await,
+                        1 => {
                             stats.routed += 1;
-                            stack.router.route(NAME, "Bash", input, context).await
+                            stack.router.route(NAME, BASH, input, context).await
+                        }
+                        _ => {
+                            stats.auto += 1;
+                            let built = format!("{}; {HAND_ONLY}", lines.join("; "));
+                            let away = format!("{step}-hand");
+                            let elsewhere = ToolContext::new("", SESSION, &away, &[], usize::MAX);
+                            let sent = auto(&stack.router, json!({SCRIPT: built}), elsewhere)
+                                .await
+                                .map_err(|error| format!("op {op}: {error}"))?;
+                            if !text(&sent).contains(HAND_SAYS) {
+                                return Err(format!(
+                                    "op {op}: auto {HAND_ONLY} stayed off the Hand: {}",
+                                    text(&sent)
+                                ));
+                            }
+                            stats.auto_hand += 1;
+                            let script = format!(
+                                "ls {ROOT}; cat {}\n{}",
+                                absolute(".keep"),
+                                lines.join("\n")
+                            );
+                            auto(&stack.router, json!({SCRIPT: script}), context)
+                                .await
+                                .map_err(|error| format!("op {op}: {error}"))?
                         }
                     };
                     stats.scripts += 1;
@@ -726,88 +687,10 @@ fn simulate(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
                     }
                     text(&output)
                 }
-                4 | 5 if !model.is_empty() => {
-                    let paths: Vec<String> = model.keys().cloned().collect();
-                    let from = paths[rng.pick(paths.len())].clone();
-                    let parked = format!("parked/{}", rng.pick(FILES.len()));
-                    let chunk = NonZeroUsize::new(rng.range(1, CHUNK_MAX + 1) as usize)
-                        .unwrap_or(NonZeroUsize::MIN);
-                    let out_corrupt = rng.pick(CORRUPT_IN) == 0;
-                    corrupt.store(out_corrupt, Ordering::SeqCst);
-                    let out = stack
-                        .router
-                        .copy(
-                            SESSION,
-                            (&Target::Workspace, &from),
-                            (&Target::Hand(HandRef::Hosted), &parked),
-                            chunk,
-                        )
-                        .await;
-                    corrupt.store(false, Ordering::SeqCst);
-                    stats.copies += 1;
-                    match (out_corrupt, &out) {
-                        (false, Ok(stored))
-                            if stored.sha256 == Sha256Digest::of(&model[&from]) =>
-                        {
-                            on_hand.insert(parked.clone(), model[&from].clone());
-                        }
-                        (true, Err(CopyError::Put(PutError::ShaMismatch { .. }))) => {
-                            stats.copies_corrupt += 1;
-                        }
-                        _ => {
-                            return Err(format!(
-                                "op {op}: copy {from} -> hand {parked} corrupt={out_corrupt} gave {out:?}"
-                            ));
-                        }
-                    }
-                    let held = hand.files.read(|files| files.get(&parked).cloned());
-                    if held.as_ref() != on_hand.get(&parked) {
-                        return Err(format!(
-                            "op {op}: the Hand's {parked} holds {}, it was sent {}",
-                            shown(held.as_deref()),
-                            shown(on_hand.get(&parked).map(Vec::as_slice))
-                        ));
-                    }
-                    match on_hand.get(&parked).cloned() {
-                        Some(sent) => {
-                            let to = COPIES[rng.pick(COPIES.len())];
-                            let back_corrupt = rng.pick(CORRUPT_IN) == 0;
-                            hand.corrupt.store(back_corrupt, Ordering::SeqCst);
-                            store.plan.store(crash, Ordering::SeqCst);
-                            let back = stack
-                                .router
-                                .copy(
-                                    SESSION,
-                                    (&Target::Hand(HandRef::Hosted), &parked),
-                                    (&Target::Workspace, to),
-                                    chunk,
-                                )
-                                .await;
-                            hand.corrupt.store(false, Ordering::SeqCst);
-                            stats.copies += 1;
-                            let before = model.get(to).cloned();
-                            let after = match back_corrupt {
-                                true => {
-                                    stats.copies_corrupt += 1;
-                                    if back.is_ok() {
-                                        return Err(format!(
-                                            "op {op}: a corrupted copy of hand {parked} -> {to} was stored: {back:?}"
-                                        ));
-                                    }
-                                    before.clone()
-                                }
-                                false => Some(sent),
-                            };
-                            touched = Some((to.to_owned(), before, after));
-                            format!("{out:?} {back:?}")
-                        }
-                        None => format!("{out:?}"),
-                    }
-                }
                 _ => {
                     stats.restarts += 1;
                     drop(stack);
-                    stack = open(&store, &hand, &corrupt)?;
+                    stack = open(seed, &store, &hand)?;
                     "restarted".to_owned()
                 }
             };
@@ -825,7 +708,7 @@ fn simulate(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
                 if fired != PLAN_NONE {
                     stats.restarts += 1;
                     drop(stack);
-                    stack = open(&store, &hand, &corrupt)?;
+                    stack = open(seed, &store, &hand)?;
                     let when = format!("op {op}: after the restart");
                     agrees(&stack.files, &model, &when, &mut digest).await?;
                 }
@@ -834,12 +717,13 @@ fn simulate(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
         }
         stats.restarts += 1;
         drop(stack);
-        let stack = open(&store, &hand, &corrupt)?;
+        let stack = open(seed, &store, &hand)?;
         agrees(&stack.files, &model, "at the last restart", &mut digest).await
     })
     .err();
     fs_sim::mutate(FsRule::None);
     hands_sim::mutate(HandRule::None);
+    workspace_sim::mutate(WorkspaceRule::None);
     WorkspaceStackOutcome {
         digest,
         wrong,
@@ -852,6 +736,7 @@ fn run_seed(seed: u64, mutation: WorkspaceStackMutation) -> WorkspaceStackOutcom
     std::panic::catch_unwind(|| simulate(seed, mutation)).unwrap_or_else(|panic| {
         fs_sim::mutate(FsRule::None);
         hands_sim::mutate(HandRule::None);
+        workspace_sim::mutate(WorkspaceRule::None);
         let message = panic
             .downcast_ref::<String>()
             .cloned()

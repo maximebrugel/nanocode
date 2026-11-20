@@ -67,22 +67,69 @@ pub(crate) fn frozen_code(
     name: &str,
     frozen: Frozen,
 ) -> PyResult<PyRef<PyCode>> {
-    if let Some(code) = frozen.code {
-        return Ok(PyCode::new_ref_from_frozen(vm, code));
+    let key = frozen.code.map_or((0, 0), |code| {
+        (code.bytes.as_ptr() as usize, code.bytes.len())
+    });
+    match cached(name, key) {
+        Some(Cached::Decoded(code)) => return Ok(PyCode::new_ref_from_shared(vm, &code)),
+        Some(Cached::Seen(decompressed)) => {
+            let code = crate::frozen::deserialize(&decompressed, crate::bytecode::BasicBag);
+            let code = std::sync::Arc::new(code);
+            keep(name, key, Cached::Decoded(code.clone()));
+            return Ok(PyCode::new_ref_from_shared(vm, &code));
+        }
+        None => {}
     }
-    let bytes = EXTERNAL_FROZEN
-        .get()
-        .and_then(|external| (external.load)(name))
-        .ok_or_else(|| {
-            vm.new_import_error(
-                format!("the frozen code of {name} could not be read"),
-                vm.ctx.new_utf8_str(name),
-            )
-        })?;
-    Ok(PyCode::new_ref_from_frozen(
-        vm,
-        crate::frozen::FrozenCodeObject { bytes },
-    ))
+    let decompressed = match frozen.code {
+        Some(code) => code.decompress(),
+        None => {
+            let bytes = EXTERNAL_FROZEN
+                .get()
+                .and_then(|external| (external.load)(name))
+                .ok_or_else(|| {
+                    vm.new_import_error(
+                        format!("the frozen code of {name} could not be read"),
+                        vm.ctx.new_utf8_str(name),
+                    )
+                })?;
+            crate::frozen::FrozenCodeObject { bytes }.decompress()
+        }
+    };
+    let code = PyCode::new_ref_from_marshaled(vm, &decompressed);
+    keep(name, key, Cached::Seen(std::sync::Arc::new(decompressed)));
+    Ok(code)
+}
+
+/// Frozen modules the process already loaded. A module's first load decodes
+/// it straight into the interpreter's objects, as without the cache, and keeps
+/// it decompressed. Its second decodes it once more, into a code object any
+/// interpreter maps into its own objects, which every later load does instead
+/// of decompressing and decoding the module again.
+#[derive(Clone)]
+enum Cached {
+    Seen(std::sync::Arc<Vec<u8>>),
+    Decoded(std::sync::Arc<crate::bytecode::CodeObject>),
+}
+
+type Loaded = std::collections::HashMap<Box<str>, ((usize, usize), Cached)>;
+
+static LOADED: std::sync::Mutex<Option<Loaded>> = std::sync::Mutex::new(None);
+
+fn cached(name: &str, key: (usize, usize)) -> Option<Cached> {
+    let loaded = LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (found, cached) = loaded.as_ref()?.get(name)?;
+    (*found == key).then(|| cached.clone())
+}
+
+fn keep(name: &str, key: (usize, usize), cached: Cached) {
+    let mut loaded = LOADED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loaded
+        .get_or_insert_with(Default::default)
+        .insert(Box::from(name), (key, cached));
 }
 
 fn no_frozen(vm: &VirtualMachine, name: &str) -> PyRef<PyBaseException> {
@@ -254,6 +301,9 @@ fn remove_importlib_frames_inner(
         || file_name == "<frozen importlib._bootstrap_external>"
         || file_name == "_frozen_importlib"
         || file_name == "_frozen_importlib_external"
+        // nanocode's own finder and loader (crates/core/python/src/boot.py, frozen as
+        // "python") stand in for importlib's, so their frames are trimmed the same way.
+        || file_name == "python"
     {
         if traceback.frame.iframe().code().obj_name.as_str() == "_call_with_frames_removed" {
             now_in_importlib = true;

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use nanocode_board::{
     BoardError, Event, EventId, Fold, Op, Rejection, Say, TaskId,
     access::{Actor, Can, Grant, Identity, Verifier, Who},
+    steer::SteerOp,
     tasks::{Need, Planned, TaskOp, Terms},
     watch::{Key, Step},
 };
@@ -272,6 +273,8 @@ pub async fn intruder(world: &World, epoch: u64) {
                     Op::Claim {
                         task,
                         lease_ms: world.shape.lease_ms,
+                        fence: None,
+                        cap: None,
                     }
                 } else {
                     Op::Cancel {
@@ -713,6 +716,7 @@ impl Gate {
         let read = |task: &TaskId| self.can(by, &task.0, Can::Read);
         match op {
             Op::Charter {} => false,
+            Op::Epoch { .. } => self.can(by, "*", Can::Manage),
             Op::Post { task } => {
                 task.parent.iter().chain(&task.needs).all(read)
                     && self.can(by, &task.id.0, Can::Read)
@@ -722,6 +726,7 @@ impl Gate {
             Op::Renew { task, claim, .. }
             | Op::Release { task, claim, .. }
             | Op::Finish { task, claim, .. }
+            | Op::Steer(SteerOp::Heed { task, claim, .. })
             | Op::Tasks(TaskOp::Block {
                 task,
                 claim: Some(claim),
@@ -757,7 +762,9 @@ impl Gate {
                     && self.can(by, &own, Can::Read)
                     && self.can(by, &own, Can::Post)
             }),
-            Op::Reply { task, .. } => read(task) && self.can(by, &task.0, Can::Post),
+            Op::Reply { task, .. } | Op::Steer(SteerOp::Send { task, .. }) => {
+                read(task) && self.can(by, &task.0, Can::Post)
+            }
             Op::Relabel { task, .. } => {
                 read(task) && (self.chain(by, task, tasks) || self.can(by, &task.0, Can::Label))
             }
@@ -910,7 +917,9 @@ impl Gate {
                 self.grants.remove(&grant.0);
             }
             Op::Post { task } => {
-                self.posters.insert(task.id.0.clone(), by.to_owned());
+                self.posters
+                    .entry(task.id.0.clone())
+                    .or_insert_with(|| by.to_owned());
             }
             Op::Claim { task, .. } => {
                 self.holders.insert(task.0.clone(), by.to_owned());

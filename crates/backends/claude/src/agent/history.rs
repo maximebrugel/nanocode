@@ -1,13 +1,16 @@
-use crate::{ClaudeError, ContentBlock, Message, MessageDigests, WireMessage};
+use crate::{
+    ClaudeError, ContentBlock, Encoded, Message, MessageLayout, MessageView,
+    OutputConfig, Role, WireMessage,
+};
 use nanocode_durability::EncodedPayload;
+use nanocode_sync::SwapOption;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 use std::{
-    borrow::Cow,
-    ops::Deref,
+    ops::{Deref, DerefMut},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -16,70 +19,200 @@ pub(super) struct HistoryMessage(Arc<Entry>, u64);
 
 static WIRE_IDS: AtomicU64 = AtomicU64::new(0);
 
+const CLEARED_WIRE: u64 = 1 << 63;
+
 fn wire_id() -> u64 {
     WIRE_IDS.fetch_add(1, Ordering::Relaxed)
 }
 
+const SAME_WIRE_KNOWN: u8 = 1;
+const SAME_WIRE: u8 = 2;
+const COMPANIONS_KNOWN: u8 = 4;
+const COMPANIONS: u8 = 8;
+const IMAGES_UNKNOWN: u32 = u32::MAX;
+
 struct Entry {
-    message: Message,
-    wire: OnceLock<Box<str>>,
-    json: OnceLock<Arc<str>>,
-    digests: OnceLock<MessageDigests>,
-    images: OnceLock<usize>,
-    companions: OnceLock<bool>,
+    typed: SwapOption<Message>,
     record: OnceLock<EncodedPayload>,
     results: OnceLock<Box<[(usize, u64)]>>,
-    cleared: OnceLock<HistoryMessage>,
+    images: AtomicU32,
+    role: Role,
+    output: Option<OutputConfig>,
+    flags: AtomicU8,
+}
+
+impl Entry {
+    fn new(message: &Message, typed: Option<Arc<Message>>, record: Option<EncodedPayload>) -> Self {
+        Self {
+            typed: SwapOption::new(typed),
+            record: record.map_or_else(OnceLock::new, OnceLock::from),
+            results: OnceLock::new(),
+            images: AtomicU32::new(IMAGES_UNKNOWN),
+            role: message.role,
+            output: message.output_config.clone(),
+            flags: AtomicU8::new(0),
+        }
+    }
+
+    fn typed(&self) -> Arc<Message> {
+        if let Some(message) = self.typed.load_full() {
+            return message;
+        }
+        let json = self
+            .record
+            .get()
+            .and_then(|record| record.json().ok())
+            .expect("a message keeps its typed form or its bytes");
+        Arc::new(serde_json::from_str(json).expect("a recorded message parses"))
+    }
+
+    fn json(&self) -> Option<&str> {
+        self.record.get().and_then(|record| record.json().ok())
+    }
+
+    fn flag(&self, known: u8, set: u8, check: impl FnOnce() -> bool) -> bool {
+        let flags = self.flags.load(Ordering::Acquire);
+        if flags & known != 0 {
+            return flags & set != 0;
+        }
+        let value = check();
+        self.flags
+            .fetch_or(known | if value { set } else { 0 }, Ordering::AcqRel);
+        value
+    }
 }
 
 impl Clone for Entry {
     fn clone(&self) -> Self {
-        Self {
-            message: self.message.clone(),
-            wire: OnceLock::new(),
-            json: OnceLock::new(),
-            digests: OnceLock::new(),
-            images: OnceLock::new(),
-            companions: OnceLock::new(),
-            record: OnceLock::new(),
-            results: OnceLock::new(),
-            cleared: OnceLock::new(),
+        let typed = self.typed();
+        Self::new(&typed, Some(Arc::clone(&typed)), self.record.get().cloned())
+    }
+}
+
+pub(super) struct MessageMut<'a> {
+    entry: &'a mut Entry,
+    message: Option<Message>,
+}
+
+impl Deref for MessageMut<'_> {
+    type Target = Message;
+
+    fn deref(&self) -> &Message {
+        self.message.as_ref().expect("a message being changed")
+    }
+}
+
+impl DerefMut for MessageMut<'_> {
+    fn deref_mut(&mut self) -> &mut Message {
+        self.message.as_mut().expect("a message being changed")
+    }
+}
+
+impl Drop for MessageMut<'_> {
+    fn drop(&mut self) {
+        if let Some(message) = self.message.take() {
+            *self.entry = Entry::new(&message, None, None);
+            self.entry.typed = SwapOption::new(Some(Arc::new(message)));
         }
     }
 }
 
 impl HistoryMessage {
-    pub(super) fn make_mut(&mut self) -> &mut Message {
+    pub(super) fn make_mut(&mut self) -> MessageMut<'_> {
+        let message = Arc::unwrap_or_clone(self.typed());
         self.1 = wire_id();
         let entry = Arc::make_mut(&mut self.0);
-        entry.wire = OnceLock::new();
-        entry.json = OnceLock::new();
-        entry.digests = OnceLock::new();
-        entry.images = OnceLock::new();
-        entry.companions = OnceLock::new();
-        entry.record = OnceLock::new();
-        entry.results = OnceLock::new();
-        entry.cleared = OnceLock::new();
-        &mut entry.message
+        *entry = Entry::new(&message, None, None);
+        MessageMut {
+            entry,
+            message: Some(message),
+        }
     }
 
-    pub(super) fn cleared(&self, clear: impl FnOnce(&mut Message)) -> Self {
-        self.0
-            .cleared
-            .get_or_init(|| {
-                let mut message = self.0.message.clone();
-                clear(&mut message);
-                Self::from(message)
-            })
-            .clone()
+    pub(super) fn role(&self) -> Role {
+        self.0.role
+    }
+
+    const fn is_cleared(&self) -> bool {
+        self.1 & CLEARED_WIRE != 0
+    }
+
+    fn typed(&self) -> Arc<Message> {
+        let typed = self.0.typed();
+        if !self.is_cleared() {
+            return typed;
+        }
+        let mut message = Message::clone(&typed);
+        for &(block, _) in self.0.results.get().map_or(&[][..], |results| &results[..]) {
+            if let Some(ContentBlock::ToolResult { content, .. }) = message.content.get_mut(block) {
+                *content = crate::ToolResultContent::Text(super::clearing::CLEARED.to_owned());
+            }
+        }
+        Arc::new(message)
+    }
+
+    pub(super) fn view(&self) -> MessageView<'static> {
+        MessageView::Shared(self.typed())
+    }
+
+    pub(super) fn any_block(&self, check: impl FnMut(&ContentBlock) -> bool) -> bool {
+        self.typed().content.iter().any(check)
+    }
+
+    pub(super) fn is_effort_update(&self) -> bool {
+        self.0.role == Role::System && self.0.output.is_some()
+    }
+
+    pub(super) fn output_config(&self) -> Option<&OutputConfig> {
+        self.0.output.as_ref()
+    }
+
+    pub(super) fn mentions(&self, text: &str) -> bool {
+        if self.is_cleared() || self.0.typed.load().is_some() {
+            return true;
+        }
+        let Some(json) = self.0.json() else {
+            return true;
+        };
+        match serde_json::to_string(text) {
+            Ok(escaped) => json.contains(&escaped[1..escaped.len() - 1]),
+            Err(_) => true,
+        }
+    }
+
+    fn settled(message: Message) -> Self {
+        match serde_json::to_string(&message) {
+            Ok(json) => Self(
+                Arc::new(Entry::new(
+                    &message,
+                    None,
+                    Some(EncodedPayload::from_json(json.into())),
+                )),
+                wire_id(),
+            ),
+            Err(_) => Self::from(message),
+        }
+    }
+
+    pub(super) fn cleared(&self) -> Self {
+        Self(Arc::clone(&self.0), self.1 | CLEARED_WIRE)
     }
 
     pub(super) fn image_count(&self, count: impl FnOnce(&Self) -> usize) -> usize {
-        if let Some(images) = self.0.images.get() {
-            return *images;
+        if self.is_cleared() {
+            return count(self);
+        }
+        let images = self.0.images.load(Ordering::Acquire);
+        if images != IMAGES_UNKNOWN {
+            return images as usize;
         }
         let images = count(self);
-        *self.0.images.get_or_init(|| images)
+        if let Ok(known) = u32::try_from(images)
+            && known != IMAGES_UNKNOWN
+        {
+            self.0.images.store(known, Ordering::Release);
+        }
+        images
     }
 
     pub(super) fn result_tokens(
@@ -88,7 +221,7 @@ impl HistoryMessage {
     ) -> &[(usize, u64)] {
         self.0.results.get_or_init(|| {
             self.0
-                .message
+                .typed()
                 .content
                 .iter()
                 .enumerate()
@@ -98,148 +231,146 @@ impl HistoryMessage {
     }
 
     pub(super) fn has_companions(&self, check: impl FnOnce(&Message) -> bool) -> bool {
-        *self.0.companions.get_or_init(|| check(&self.0.message))
+        if self.is_cleared() {
+            return check(&self.typed());
+        }
+        self.0
+            .flag(COMPANIONS_KNOWN, COMPANIONS, || check(&self.0.typed()))
     }
 
     pub(super) fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0) && self.is_cleared() == other.is_cleared()
     }
 
     pub(super) fn into_message(self) -> Message {
-        Arc::try_unwrap(self.0).map_or_else(|entry| entry.message.clone(), |entry| entry.message)
-    }
-
-    pub(super) fn recorded(message: Message, json: Arc<str>, record: EncodedPayload) -> Self {
-        Self(
-            Arc::new(Entry {
-                message,
-                wire: OnceLock::new(),
-                json: OnceLock::from(json),
-                digests: OnceLock::new(),
-                images: OnceLock::new(),
-                companions: OnceLock::new(),
-                record: OnceLock::from(record),
-                results: OnceLock::new(),
-                cleared: OnceLock::new(),
-            }),
-            wire_id(),
-        )
-    }
-
-    pub(super) fn cache_json(&self) -> serde_json::Result<()> {
-        self.json().map(drop)
-    }
-
-    pub(super) fn json(&self) -> serde_json::Result<&Arc<str>> {
-        if let Some(json) = self.0.json.get() {
-            return Ok(json);
+        if self.is_cleared() {
+            return Arc::unwrap_or_clone(self.typed());
         }
-        let encoded = Arc::from(serde_json::to_string(&self.0.message)?);
-        Ok(self.0.json.get_or_init(|| encoded))
+        match Arc::try_unwrap(self.0) {
+            Ok(entry) => Arc::unwrap_or_clone(entry.typed()),
+            Err(entry) => Message::clone(&entry.typed()),
+        }
     }
 
     pub(super) fn record(&self) -> serde_json::Result<EncodedPayload> {
+        if self.is_cleared() {
+            return Ok(EncodedPayload::from_json(
+                serde_json::to_string(&*self.typed())?.into(),
+            ));
+        }
         if let Some(record) = self.0.record.get() {
             return Ok(record.clone());
         }
-        let record = EncodedPayload::from_json(Arc::clone(self.json()?));
+        let record = EncodedPayload::from_json(serde_json::to_string(&*self.0.typed())?.into());
         Ok(self.0.record.get_or_init(|| record).clone())
+    }
+
+    fn json(&self) -> serde_json::Result<&str> {
+        if self.0.json().is_none() {
+            self.record()?;
+        }
+        Ok(self.0.json().expect("a recorded message keeps its bytes"))
+    }
+
+    pub(super) fn with_json<R>(&self, read: impl FnOnce(&str) -> R) -> serde_json::Result<R> {
+        if self.is_cleared() {
+            return Ok(read(&serde_json::to_string(&*self.typed())?));
+        }
+        Ok(read(self.json()?))
+    }
+
+    pub(super) fn committed(&self) {
+        if !self.is_cleared() && self.0.record.get().is_some() {
+            self.0.typed.store(None);
+        }
     }
 }
 
 impl From<Message> for HistoryMessage {
     fn from(message: Message) -> Self {
+        let typed = Arc::new(message);
         Self(
-            Arc::new(Entry {
-                message,
-                wire: OnceLock::new(),
-                json: OnceLock::new(),
-                digests: OnceLock::new(),
-                images: OnceLock::new(),
-                companions: OnceLock::new(),
-                record: OnceLock::new(),
-                results: OnceLock::new(),
-                cleared: OnceLock::new(),
-            }),
+            Arc::new(Entry::new(&typed, Some(Arc::clone(&typed)), None)),
             wire_id(),
         )
     }
 }
 
-impl Deref for HistoryMessage {
-    type Target = Message;
-
-    fn deref(&self) -> &Message {
-        &self.0.message
-    }
-}
-
 impl PartialEq for HistoryMessage {
     fn eq(&self, other: &Self) -> bool {
-        self.ptr_eq(other) || self.0.message == other.0.message
+        if self.ptr_eq(other) {
+            return true;
+        }
+        if !self.is_cleared()
+            && !other.is_cleared()
+            && let (Some(left), Some(right)) = (self.0.json(), other.0.json())
+        {
+            return left == right;
+        }
+        *self.typed() == *other.typed()
     }
 }
 
 impl Serialize for HistoryMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self.0.json.get() {
+        match self.0.json().filter(|_| !self.is_cleared()) {
             Some(json) => serde_json::from_str::<&RawValue>(json)
                 .map_err(serde::ser::Error::custom)?
                 .serialize(serializer),
-            None => self.0.message.serialize(serializer),
+            None => self.typed().serialize(serializer),
         }
     }
 }
 
 impl<'de> Deserialize<'de> for HistoryMessage {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Message::deserialize(deserializer).map(Self::from)
+        Message::deserialize(deserializer).map(Self::settled)
     }
 }
 
 impl WireMessage for HistoryMessage {
-    fn message(&self) -> &Message {
-        &self.0.message
+    fn message(&self) -> MessageView<'_> {
+        self.view()
     }
 
     fn wire_id(&self) -> Option<u64> {
         Some(self.1)
     }
 
+    fn layout(&self) -> MessageLayout {
+        <Message as WireMessage>::layout(&self.typed())
+    }
+
     fn encoded<'a>(
         &'a self,
         subscription: bool,
         encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<Cow<'a, str>, ClaudeError> {
-        if subscription {
-            let wire = match self.0.wire.get() {
-                Some(wire) => wire,
-                None => {
-                    let encoded = encode(&self.0.message)?.into_boxed_str();
-                    self.0.wire.get_or_init(|| encoded)
-                }
+    ) -> Result<Encoded<'a>, ClaudeError> {
+        if self.is_cleared() {
+            let typed = self.typed();
+            return match subscription {
+                true => encode(&typed).map(Encoded::Owned),
+                false => Ok(Encoded::Owned(serde_json::to_string(&*typed)?)),
             };
-            return Ok(Cow::Borrowed(wire));
         }
-        let json = match self.0.json.get() {
-            Some(json) => json,
-            None => {
-                let encoded = Arc::from(encode(&self.0.message)?);
-                self.0.json.get_or_init(|| encoded)
-            }
-        };
-        Ok(Cow::Borrowed(json))
-    }
-
-    fn digests(
-        &self,
-        encode: &dyn Fn(&Message) -> Result<String, ClaudeError>,
-    ) -> Result<MessageDigests, ClaudeError> {
-        if let Some(digests) = self.0.digests.get() {
-            return Ok(*digests);
+        let json = self.json()?;
+        if !subscription {
+            return Ok(Encoded::Borrowed(json));
         }
-        let digests = MessageDigests::of(&self.encoded(false, encode)?);
-        Ok(*self.0.digests.get_or_init(|| digests))
+        let mut wire = None;
+        let same = self.0.flag(SAME_WIRE_KNOWN, SAME_WIRE, || {
+            let encoded = encode(&self.0.typed());
+            let same = encoded.as_deref().is_ok_and(|encoded| encoded == json);
+            wire = Some(encoded);
+            same
+        });
+        if same {
+            return Ok(Encoded::Borrowed(json));
+        }
+        match wire {
+            Some(wire) => wire.map(Encoded::Owned),
+            None => crate::subscription_wire::encode_record(json).map(Encoded::Owned),
+        }
     }
 }
 
@@ -434,7 +565,7 @@ pub(super) fn media_placeholders(messages: &mut [HistoryMessage]) {
         _ => false,
     };
     for message in messages {
-        if !message.content.iter().any(media) {
+        if !(message.mentions("image") || message.mentions("document")) || !message.any_block(&media) {
             continue;
         }
         for block in &mut message.make_mut().content {
@@ -459,7 +590,7 @@ pub(super) fn media_placeholders(messages: &mut [HistoryMessage]) {
 
 pub(super) fn strip_thinking(messages: &mut Vec<HistoryMessage>) {
     messages.retain_mut(|message| {
-        if message.content.iter().any(|block| {
+        if message.mentions("thinking") && message.any_block(|block| {
             matches!(
                 block,
                 ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
@@ -472,6 +603,6 @@ pub(super) fn strip_thinking(messages: &mut Vec<HistoryMessage>) {
                 )
             });
         }
-        !message.content.is_empty() || message.is_effort_update()
+        !message.view().content.is_empty() || message.is_effort_update()
     });
 }

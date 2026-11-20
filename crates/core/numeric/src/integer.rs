@@ -86,6 +86,27 @@ impl BigInt {
         Self::from_parts(value < 0, BigUint::from_double_limb(value.unsigned_abs()))
     }
 
+    /// The value as an `i64` when its magnitude is held inline and fits,
+    /// without the generic conversion path. `None` says only that this
+    /// shortcut does not apply, not that the value is out of range.
+    #[inline]
+    pub const fn inline_i64(&self) -> Option<i64> {
+        let Some(magnitude) = self.magnitude.small() else {
+            return None;
+        };
+        if matches!(self.sign, Sign::Minus) {
+            if magnitude <= 1 << 63 {
+                Some((magnitude as i64).wrapping_neg())
+            } else {
+                None
+            }
+        } else if magnitude <= i64::MAX as Limb {
+            Some(magnitude as i64)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn small_value(&self) -> Option<i128> {
         let magnitude = i128::from(self.magnitude.small()?);
         Some(if self.sign == Sign::Minus {
@@ -645,8 +666,12 @@ impl Not for &BigInt {
 macro_rules! integer_primitive {
     ($($primitive:ty),*) => {$(
         impl From<$primitive> for BigInt {
+            #[inline]
             fn from(value: $primitive) -> Self {
-                Self::from_i128(value as i128)
+                // Every type here is at most 64 bits wide, so the magnitude
+                // always fits one inline limb.
+                let value = value as i128;
+                Self::from_parts(value < 0, BigUint::from_limb(value.unsigned_abs() as Limb))
             }
         }
 

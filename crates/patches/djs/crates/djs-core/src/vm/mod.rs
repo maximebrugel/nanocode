@@ -170,6 +170,9 @@ enum Collection {
 pub struct Vm {
     heap: Heap,
     opts: VmOptions,
+    /// The last run ended nudged to tier up at once (`Exec::tier1_nudged`): the next
+    /// starts so. Where tier 1 takes over changes no result or fuel.
+    tier1_nudged: bool,
 }
 
 impl Vm {
@@ -181,6 +184,7 @@ impl Vm {
         let mut vm = Vm {
             heap,
             opts,
+            tier1_nudged: false,
         };
         crate::builtins::number::set_seed(&mut vm.heap, opts.random_seed);
         if opts.prelude {
@@ -480,6 +484,7 @@ impl Vm {
         Ok(Vm {
             heap,
             opts,
+            tier1_nudged: false,
         })
     }
 
@@ -793,8 +798,7 @@ impl Vm {
 
     /// Runs with `fuel` (instruction cost units).
     pub fn run(&mut self, fuel: u64) -> Status {
-        let st = Exec::new(&mut self.heap, self.opts.exec).run(fuel);
-        self.after_run(st)
+        self.run_metered(fuel).0
     }
 
     /// A run that ran out of host memory abandons the call (D1690).
@@ -811,8 +815,12 @@ impl Vm {
     /// instruction that ran out (for debuggers and fuel accounting, 0064).
     pub fn run_metered(&mut self, fuel: u64) -> (Status, u64) {
         let mut ex = Exec::new(&mut self.heap, self.opts.exec);
+        if self.tier1_nudged {
+            ex.nudge_tier1();
+        }
         let st = ex.run(fuel);
         let used = ex.fuel_used();
+        self.tier1_nudged = ex.tier1_nudged();
         (self.after_run(st), used)
     }
 

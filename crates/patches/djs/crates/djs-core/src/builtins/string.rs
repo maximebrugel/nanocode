@@ -277,6 +277,26 @@ fn push_code_point(out: &mut Vec<u16>, c: u32) {
     }
 }
 
+/// StrToCase's `mode`: 0 lower, 1 upper, plus 2 for tr/az, 4 for lt and 6 for el rules
+/// (toLocaleUpperCase / toLocaleLowerCase).
+pub(crate) fn to_case_mode(heap: &mut Heap, s: Str, mode: i32) -> Result<Str, Fault> {
+    use crate::unicode::locale_case::{self, Lang};
+    let upper = mode & 1 == 1;
+    let lang = match mode >> 1 {
+        1 => Lang::Turkic,
+        2 => Lang::Lithuanian,
+        3 => Lang::Greek,
+        _ => return to_case(heap, s, upper),
+    };
+    let u = units(heap, s)?;
+    let cps: Vec<u32> = code_points_of(&u).into_iter().map(|(_, c)| c).collect();
+    let mut out = crate::buf::vec_with_capacity(u.len());
+    for c in locale_case::map(&cps, upper, lang) {
+        push_code_point(&mut out, c);
+    }
+    Ok(heap.alloc_utf16(&out)?)
+}
+
 /// toUpperCase / toLowerCase: the full Unicode mappings (SpecialCasing without
 /// language-specific rules) and Final_Sigma for lowercase.
 pub(crate) fn to_case(heap: &mut Heap, s: Str, upper: bool) -> Result<Str, Fault> {
@@ -569,10 +589,15 @@ pub(crate) fn normalize(heap: &mut Heap, s: Str, form: u8) -> Result<Option<Str>
     }
 }
 
-/// localeCompare without Intl, as QuickJS computes it: both strings NFC-normalized (with
+/// localeCompare with the default collation (builtins/intl) in builds with `embed`;
+/// without Intl, as QuickJS computes it: both strings NFC-normalized (with
 /// the `unicode-normalization` feature), then the difference of the first differing code
 /// points, else -1/0/1 by length.
 pub(crate) fn locale_compare(heap: &mut Heap, a: Str, b: Str) -> Result<f64, Fault> {
+    if crate::EMBED {
+        let (ua, ub) = (units(heap, a)?, units(heap, b)?);
+        return Ok(f64::from(crate::builtins::intl::locale_compare(&ua, &ub)));
+    }
     // One-byte strings are their own NFC form and have no surrogates: compared in place.
     let (a, b) = (heap.contiguous(a)?, heap.contiguous(b)?);
     if let (Some(StrView::Latin1(x)), Some(StrView::Latin1(y))) =

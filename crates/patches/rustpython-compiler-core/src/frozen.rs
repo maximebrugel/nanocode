@@ -21,11 +21,28 @@ impl<B: AsRef<[u8]>> FrozenCodeObject<B> {
         Self::_decode(self.bytes.as_ref(), bag.as_bag())
     }
     fn _decode<Bag: ConstantBag>(data: &[u8], bag: Bag) -> CodeObject<Bag::Constant> {
-        let decompressed = nanocode_compression::lz4::decompress_with_size(data)
-            .expect("deserialize frozen CodeObject failed");
-        marshal::deserialize_code(&mut &decompressed[..], bag)
-            .expect("deserializing frozen CodeObject failed")
+        deserialize(&Self::_decompress(data), bag)
     }
+
+    /// The marshaled code object, decompressed: deserialize decodes it, as
+    /// many times as needed, without decompressing it again.
+    pub fn decompress(&self) -> Vec<u8> {
+        Self::_decompress(self.bytes.as_ref())
+    }
+
+    fn _decompress(data: &[u8]) -> Vec<u8> {
+        nanocode_compression::lz4::decompress_with_size(data)
+            .expect("deserialize frozen CodeObject failed")
+    }
+}
+
+/// Decode a code object FrozenCodeObject::decompress returned.
+pub fn deserialize<Bag: AsBag>(
+    decompressed: &[u8],
+    bag: Bag,
+) -> CodeObject<<Bag::Bag as ConstantBag>::Constant> {
+    marshal::deserialize_code(&mut &decompressed[..], bag.as_bag())
+        .expect("deserializing frozen CodeObject failed")
 }
 
 impl FrozenCodeObject<Vec<u8>> {

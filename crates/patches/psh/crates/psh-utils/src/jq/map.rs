@@ -20,6 +20,13 @@ impl Map {
         Map::default()
     }
 
+    pub fn with_capacity(n: usize) -> Map {
+        Map {
+            entries: Vec::with_capacity(n),
+            index: None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

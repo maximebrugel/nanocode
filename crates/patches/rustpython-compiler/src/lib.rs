@@ -452,6 +452,7 @@ fn cpython_parse_diagnostic_override(
             .as_ref()
             .is_none_or(|current| current.class == OverrideClass::Print)
         && let Some(bracket) = bracket.filter(|bracket| bracket.unclosed)
+        && unclosed_bracket_outranks(source_text, error, bracket.diagnostic.range.start().to_usize())
     {
         consider_ranked(
             &mut earliest,
@@ -625,6 +626,21 @@ fn cpython_parse_diagnostic_override(
     }
 
     None
+}
+
+/// Whether an unclosed bracket replaces the parser's own error. CPython reports it when the
+/// parser ran into the end of the input, or when it failed on a line after the bracket's
+/// (_PyPegen_tokenize_full_source_to_check_for_errors); a failure on the bracket's own line,
+/// such as def f(:, stays a plain syntax error there.
+fn unclosed_bracket_outranks(source: &str, error: &parser::ParseError, bracket: usize) -> bool {
+    let at = error.location.start().to_usize().min(source.len());
+    let line_of = |offset: usize| {
+        source
+            .as_bytes()
+            .get(..offset.min(source.len()))
+            .map_or(0, |before| before.iter().filter(|byte| **byte == b'\n').count())
+    };
+    at >= source.trim_end().len() || line_of(at) > line_of(bracket)
 }
 
 fn eof_parse_diagnostic(
@@ -1244,6 +1260,11 @@ fn expected_indented_block_error(
     {
         clause = "'except*' statement";
     }
+    // CPython puts a single caret under the first character of the unindented line.
+    let end = source
+        .get(start..)
+        .and_then(|rest| rest.chars().next())
+        .map_or(end, |first| start + first.len_utf8());
     Some(CpythonDiagnostic::new(
         format!("expected an indented block after {clause} on line {line}"),
         start,
@@ -2759,6 +2780,57 @@ fn named_expression_target_start(bytes: &[u8], walrus: usize) -> usize {
     0
 }
 
+/// The end of the bitwise_or expression starting at start, before stop: it ends at the
+/// first top-level comparison, boolean or conditional keyword, comma, colon or newline.
+fn bitwise_or_end(bytes: &[u8], start: usize, stop: usize) -> usize {
+    let stop = stop.min(bytes.len());
+    let mut index = start;
+    let mut level = 0usize;
+    while index < stop {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                index = skip_quoted_string(bytes, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => level += 1,
+            b')' | b']' | b'}' => level = level.saturating_sub(1),
+            b',' | b':' | b'<' | b'>' | b'=' | b'!' | b'\n' | b';' | b'#' if level == 0 => break,
+            byte if level == 0
+                && byte.is_ascii_alphabetic()
+                && ["and", "or", "not", "in", "is", "if", "else"]
+                    .iter()
+                    .any(|word| starts_identifier(bytes, index, word.as_bytes())) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    trim_end_horizontal_whitespace(bytes, start, index.min(stop))
+}
+
+/// The end of the simple statement's expressions starting at start: the first top-level
+/// newline, semicolon or comment, without the whitespace before it.
+fn simple_statement_end(bytes: &[u8], start: usize) -> usize {
+    let mut index = start;
+    let mut level = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                index = skip_quoted_string(bytes, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => level += 1,
+            b')' | b']' | b'}' => level = level.saturating_sub(1),
+            b'\r' | b'\n' | b';' | b'#' if level == 0 => break,
+            _ => {}
+        }
+        index += 1;
+    }
+    trim_end_horizontal_whitespace(bytes, start, index.min(bytes.len()))
+}
+
 fn trim_end_horizontal_whitespace(bytes: &[u8], start: usize, mut end: usize) -> usize {
     while end > start && matches!(bytes[end - 1], b' ' | b'\t' | b'\x0c') {
         end -= 1;
@@ -3313,10 +3385,12 @@ fn invalid_condition_assignment_error(
                     continue;
                 }
                 if is_simple_keyword_name(bytes, target_start, target_end) {
+                    // invalid_named_expression: a=NAME '=' b=bitwise_or, marked from a to b.
+                    let value_end = bitwise_or_end(bytes, equal + 1, colon);
                     return Some(CpythonDiagnostic::new(
                         "invalid syntax. Maybe you meant '==' or ':=' instead of '='?".to_owned(),
                         target_start,
-                        equal + 1,
+                        value_end.max(equal + 1),
                     ));
                 }
                 if let Some((expr_name, start, end, _)) =
@@ -6389,12 +6463,14 @@ fn invalid_legacy_statement_error(source: &str) -> Option<CpythonDiagnostic> {
                 if bytes.get(cursor).is_some_and(|byte| {
                     *byte != b'(' && is_legacy_statement_expression_start(*byte)
                 }) {
+                    // invalid_legacy_expression: a=NAME !'(' b=star_expressions, marked a to b.
+                    let end = simple_statement_end(bytes, cursor);
                     return Some(CpythonDiagnostic::new(
                         format!(
                             "Missing parentheses in call to '{keyword}'. Did you mean {keyword}(...)?"
                         ),
                         index,
-                        after_keyword,
+                        end.max(after_keyword),
                     ));
                 }
                 index = after_keyword;

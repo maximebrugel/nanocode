@@ -7,6 +7,7 @@ mod sql;
 mod stream;
 mod wire;
 
+pub mod log_wake;
 pub use connection::{Notification, PgConnection};
 pub use error::{DatabaseError, PgError};
 pub use options::{Host, PgOptions, TlsMode};

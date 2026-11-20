@@ -219,4 +219,10 @@ impl HostFile for UnixFile {
         use std::io::Seek;
         (!self.stream).then(|| (&self.file).seek(pos))
     }
+
+    fn identity(&self) -> Option<(u64, u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let m = self.file.metadata().ok()?;
+        m.is_file().then(|| (m.dev(), m.ino(), m.size()))
+    }
 }

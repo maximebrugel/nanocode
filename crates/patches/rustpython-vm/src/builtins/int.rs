@@ -58,10 +58,21 @@ thread_local! {
 impl PyPayload for PyInt {
     const MAX_FREELIST: usize = 100;
     const HAS_FREELIST: bool = true;
+    const EXACT_IS_LEAF: bool = true;
 
     #[inline]
     fn class(ctx: &Context) -> &'static Py<PyType> {
         ctx.types.int_type
+    }
+
+    // Inlined into each caller so the payload is built where the object is
+    // initialised: passed by pointer to an out-of-line copy, its 16-byte
+    // reload of two 8-byte stores missed store forwarding on every new int.
+    #[inline(always)]
+    fn into_ref(self, ctx: &Context) -> PyRef<Self> {
+        // The freelist takes only exact ints (`default_dealloc`), so a
+        // reused husk is already an int.
+        PyRef::new_exact_untracked(self, ctx)
     }
 
     fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
@@ -71,29 +82,14 @@ impl PyPayload for PyInt {
     #[inline]
     unsafe fn freelist_push(obj: *mut PyObject) -> bool {
         INT_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let stored = if list.len() < Self::MAX_FREELIST {
-                    list.push(obj);
-                    true
-                } else {
-                    false
-                };
-                fl.set(list);
-                stored
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::push_in(fl, obj, Self::MAX_FREELIST) })
             .unwrap_or(false)
     }
 
     #[inline]
     unsafe fn freelist_pop(_payload: &Self) -> Option<NonNull<PyObject>> {
         INT_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let result = list.pop().map(|p| unsafe { NonNull::new_unchecked(p) });
-                fl.set(list);
-                result
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::pop_in(fl) })
             .ok()
             .flatten()
     }
@@ -183,7 +179,7 @@ fn inner_pow(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
 
 fn inner_mod(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
     if int2.is_zero() {
-        Err(vm.new_zero_division_error("division by zero"))
+        Err(vm.new_zero_division_error("integer modulo by zero"))
     } else {
         Ok(vm.ctx.new_int(int1.mod_floor(int2)).into())
     }
@@ -191,7 +187,7 @@ fn inner_mod(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
 
 fn inner_floordiv(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
     if int2.is_zero() {
-        Err(vm.new_zero_division_error("division by zero"))
+        Err(vm.new_zero_division_error("integer division or modulo by zero"))
     } else {
         Ok(vm.ctx.new_int(int1.div_floor(int2)).into())
     }
@@ -199,7 +195,7 @@ fn inner_floordiv(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult
 
 fn inner_divmod(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
     if int2.is_zero() {
-        return Err(vm.new_zero_division_error("division by zero"));
+        return Err(vm.new_zero_division_error("integer division or modulo by zero"));
     }
     let (div, modulo) = int1.div_mod_floor(int2);
     Ok(vm.new_tuple((div, modulo)).into())
@@ -364,6 +360,14 @@ impl Py<PyInt> {
     /// Extract the inline magnitude without the generic primitive-conversion path.
     #[inline(always)]
     pub(crate) fn try_to_i64_fast(&self) -> Option<i64> {
+        if let Some(value) = self.as_bigint().inline_i64() {
+            return Some(value);
+        }
+        self.try_to_i64_slow()
+    }
+
+    #[cold]
+    fn try_to_i64_slow(&self) -> Option<i64> {
         let bits = self.as_bigint().bits();
         if bits > i64::BITS as u64 {
             return None;

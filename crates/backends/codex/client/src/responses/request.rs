@@ -1,6 +1,5 @@
 use std::{borrow::Cow, sync::Arc};
 
-use nanocode_sync::SharedStr;
 
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use serde_json::value::{RawValue, to_raw_value};
@@ -9,8 +8,6 @@ use super::{ContentItem, FunctionOutputBody, FunctionOutputContent, ResponseItem
 use crate::client::{ModelConfig, Thinking, pricing::ServiceTier, responses::StrictJsonSchema};
 
 pub const DEFAULT_FUNCTION_NAMESPACE: &str = "functions";
-
-type EncodedItems = [std::sync::OnceLock<Option<Box<[SharedStr]>>>; 16];
 
 type PrefixItems = [std::sync::OnceLock<Option<Box<[Arc<str>]>>>; 16];
 
@@ -190,22 +187,7 @@ struct HistorySegment {
     previous: Option<Arc<Self>>,
     items: Arc<Vec<ResponseItem>>,
     len: usize,
-    encoded: EncodedItems,
     totals: std::sync::OnceLock<HistoryTotals>,
-    stored: std::sync::OnceLock<Option<Box<[SharedStr]>>>,
-}
-
-impl HistorySegment {
-    fn stored(&self) -> Option<&[SharedStr]> {
-        self.stored
-            .get_or_init(|| {
-                self.items
-                    .iter()
-                    .map(|item| record(item).and_then(|record| SharedStr::suffix(record, 1)))
-                    .collect()
-            })
-            .as_deref()
-    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -275,19 +257,16 @@ impl ResponseHistory {
 
     #[doc(hidden)]
     #[must_use]
-    pub fn loaded(entries: Vec<(ResponseItem, SharedStr)>) -> Self {
-        if entries.is_empty() {
+    pub fn loaded(items: Vec<ResponseItem>) -> Self {
+        if items.is_empty() {
             return Self::default();
         }
-        let (items, stored): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         Self {
             head: Some(Arc::new(HistorySegment {
                 previous: None,
                 len: items.len(),
                 items: Arc::new(items),
-                encoded: std::array::from_fn(|_| std::sync::OnceLock::new()),
                 totals: std::sync::OnceLock::new(),
-                stored: std::sync::OnceLock::from(Some(stored.into())),
             })),
             tail: Arc::default(),
         }
@@ -295,49 +274,23 @@ impl ResponseHistory {
 
     #[doc(hidden)]
     #[must_use]
-    pub fn extended_loaded(&self, keep: usize, entries: Vec<(ResponseItem, SharedStr)>) -> Self {
+    pub fn extended_loaded(&self, keep: usize, items: Vec<ResponseItem>) -> Self {
         let mut history = self.clone();
         if keep < history.len() {
             history.replace_suffix(keep, Vec::new());
         }
         history.commit_tail();
-        if entries.is_empty() {
+        if items.is_empty() {
             return history;
         }
-        let (items, stored): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         let previous_len = history.head.as_ref().map_or(0, |segment| segment.len);
         history.head = Some(Arc::new(HistorySegment {
             previous: history.head.take(),
             len: previous_len + items.len(),
             items: Arc::new(items),
-            encoded: std::array::from_fn(|_| std::sync::OnceLock::new()),
             totals: std::sync::OnceLock::new(),
-            stored: std::sync::OnceLock::from(Some(stored.into())),
         }));
         history
-    }
-
-    #[doc(hidden)]
-    #[must_use]
-    pub fn stored_from(&self, start: usize) -> Vec<Option<SharedStr>> {
-        let committed_len = self.head.as_ref().map_or(0, |segment| segment.len);
-        let mut stored = vec![None; self.len().saturating_sub(start)];
-        let mut current = self.head.as_deref().filter(|_| start < committed_len);
-        while let Some(segment) = current {
-            let previous_len = segment.previous.as_ref().map_or(0, |previous| previous.len);
-            if let Some(records) = segment.stored() {
-                for (index, record) in records.iter().enumerate() {
-                    if let Some(slot) = (previous_len + index)
-                        .checked_sub(start)
-                        .and_then(|at| stored.get_mut(at))
-                    {
-                        *slot = Some(record.clone());
-                    }
-                }
-            }
-            current = segment.previous.as_deref().filter(|_| start < previous_len);
-        }
-        stored
     }
 
     #[must_use]
@@ -378,9 +331,7 @@ impl ResponseHistory {
             previous: self.head.take(),
             len: previous_len + items.len(),
             items,
-            encoded: std::array::from_fn(|_| std::sync::OnceLock::new()),
             totals: std::sync::OnceLock::new(),
-            stored: std::sync::OnceLock::new(),
         }));
     }
 
@@ -750,20 +701,6 @@ impl RequestInput<'_> {
             | (usize::from(self.top_level_tools) << 3)
     }
 
-    fn encode(&self, segment: &HistorySegment) -> Option<Box<[SharedStr]>> {
-        let stored = segment.stored()?;
-        segment
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| self.supports(item))
-            .map(|(index, item)| match self.element(item).rewritten() {
-                Some(item) => serde_json::to_string(&item).ok().map(SharedStr::from),
-                None => stored.get(index).cloned(),
-            })
-            .collect()
-    }
-
     fn encode_prefix(&self, shared: &SharedPrefix) -> Option<Box<[Arc<str>]>> {
         shared
             .prefix
@@ -785,69 +722,45 @@ impl RequestInput<'_> {
         }
     }
 
-    fn items<'b>(
-        &self,
-        pieces: &mut Vec<Cow<'b, str>>,
-        items: &[ResponseItem],
-    ) -> Result<(), serde_json::Error> {
-        for item in items.iter().filter(|item| self.supports(item)) {
-            pieces.push(Cow::Owned(serde_json::to_string(&self.element(item))?));
+    fn write_input<W: std::io::Write>(&self, out: &mut W) -> Result<(), serde_json::Error> {
+        let mut first = true;
+        let mut separate = |out: &mut W| {
+            if !std::mem::take(&mut first) {
+                out.write_all(b",").map_err(serde_json::Error::io)?;
+            }
+            Ok::<_, serde_json::Error>(())
+        };
+        match self.prefix {
+            Some(prefix) => {
+                for record in prefix {
+                    separate(out)?;
+                    out.write_all(record[1..].as_bytes())
+                        .map_err(serde_json::Error::io)?;
+                }
+            }
+            None => {
+                for item in self.input.first.iter().filter(|item| self.supports(item)) {
+                    separate(out)?;
+                    serde_json::to_writer(&mut *out, &self.element(item))?;
+                }
+            }
+        }
+        let history = self
+            .input
+            .history
+            .map(|history| history.iter_from(self.input.history_start));
+        for item in self
+            .input
+            .second
+            .iter()
+            .chain(history.into_iter().flatten())
+            .chain(self.input.tail)
+            .filter(|item| self.supports(item))
+        {
+            separate(out)?;
+            serde_json::to_writer(&mut *out, &self.element(item))?;
         }
         Ok(())
-    }
-
-    fn history<'b>(
-        &self,
-        pieces: &mut Vec<Cow<'b, str>>,
-        history: &'b ResponseHistory,
-        start: usize,
-    ) -> Result<(), serde_json::Error> {
-        let committed_len = history.head.as_ref().map_or(0, |segment| segment.len);
-        let start = start.min(history.len());
-        let mut segments = Vec::new();
-        let mut offset = 0;
-        let mut current = history.head.as_deref().filter(|_| start < committed_len);
-        while let Some(segment) = current {
-            let previous_len = segment.previous.as_ref().map_or(0, |previous| previous.len);
-            segments.push(segment);
-            if start >= previous_len {
-                offset = start - previous_len;
-                break;
-            }
-            current = segment.previous.as_deref();
-        }
-        for (index, segment) in segments.iter().rev().enumerate() {
-            let skip = if index == 0 { offset } else { 0 };
-            match segment.encoded[self.flags()]
-                .get_or_init(|| self.encode(segment))
-                .as_deref()
-                .filter(|_| skip == 0)
-            {
-                Some(encoded) => {
-                    pieces.extend(encoded.iter().map(|item| Cow::Borrowed(&**item)));
-                }
-                None => self.items(pieces, &segment.items[skip..])?,
-            }
-        }
-        self.items(pieces, &history.tail[start.saturating_sub(committed_len)..])
-    }
-}
-
-impl<'a> RequestInput<'a> {
-    fn pieces(&self) -> Result<Vec<Cow<'a, str>>, serde_json::Error> {
-        let mut pieces = Vec::new();
-        match self.prefix {
-            Some(prefix) => pieces.extend(prefix.iter().map(|record| Cow::Borrowed(&record[1..]))),
-            None => self.items(&mut pieces, self.input.first)?,
-        }
-        self.items(&mut pieces, self.input.second)?;
-        if let Some(history) = self.input.history {
-            self.history(&mut pieces, history, self.input.history_start)?;
-        }
-        if let Some(item) = self.input.tail {
-            self.items(&mut pieces, std::slice::from_ref(item))?;
-        }
-        Ok(pieces)
     }
 }
 
@@ -1120,33 +1033,18 @@ impl<'a> ResponseCreate<'a> {
 
     pub(crate) fn encode(&self) -> Result<String, serde_json::Error> {
         const INPUT: &[u8] = b"\"input\":[";
-        let pieces = self.input.pieces()?;
-        let inserted = pieces
-            .iter()
-            .map(|piece| piece.len() + 1)
-            .sum::<usize>()
-            .saturating_sub(1);
-        let mut frame = FrameLength(0);
-        serde_json::to_writer(&mut frame, self)?;
-        let mut json = Vec::with_capacity(frame.0 + inserted);
-        serde_json::to_writer(&mut json, self)?;
-        let at = memchr::memmem::find(&json, INPUT)
+        let mut inserted = FrameLength(0);
+        self.input.write_input(&mut inserted)?;
+        let frame = serde_json::to_vec(self)?;
+        let at = memchr::memmem::find(&frame, INPUT)
             .map(|at| at + INPUT.len())
             .ok_or_else(|| {
                 <serde_json::Error as serde::ser::Error>::custom("a Responses request has no input")
             })?;
-        let end = json.len();
-        json.resize(end + inserted, 0);
-        json.copy_within(at..end, at + inserted);
-        let mut cursor = at;
-        for (index, piece) in pieces.iter().enumerate() {
-            if index > 0 {
-                json[cursor] = b',';
-                cursor += 1;
-            }
-            json[cursor..cursor + piece.len()].copy_from_slice(piece.as_bytes());
-            cursor += piece.len();
-        }
+        let mut json = Vec::with_capacity(frame.len() + inserted.0);
+        json.extend_from_slice(&frame[..at]);
+        self.input.write_input(&mut json)?;
+        json.extend_from_slice(&frame[at..]);
         String::from_utf8(json).map_err(<serde_json::Error as serde::ser::Error>::custom)
     }
 

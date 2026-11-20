@@ -14,12 +14,12 @@ mod _json {
     };
     use core::cell::RefCell;
     use core::str::FromStr;
-    use nanocode_numeric::BigInt;
+    use nanocode_numeric::{BigInt, ToPrimitive};
     use rustpython_common::{
         json,
         wtf8::{Wtf8, Wtf8Buf},
     };
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     /// Skip JSON whitespace characters (space, tab, newline, carriage return).
     /// Works with a byte slice and returns the number of bytes skipped.
@@ -38,6 +38,30 @@ mod _json {
 
     /// Check if a byte slice starts with a given ASCII pattern.
     #[inline]
+    /// Append an int's decimal form to the output, formatting a machine-sized
+    /// value on the stack rather than through an intermediate String.
+    fn push_int(out: &mut Wtf8Buf, i: &Py<PyInt>) {
+        let Some(v) = i.as_bigint().to_i64() else {
+            out.push_str(&i.to_str_radix_10());
+            return;
+        };
+        let mut buf = [0u8; 20];
+        let mut pos = buf.len();
+        let mut m = v.unsigned_abs();
+        loop {
+            pos -= 1;
+            buf[pos] = b'0' + (m % 10) as u8;
+            m /= 10;
+            if m == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            out.push_char('-');
+        }
+        out.push_str(core::str::from_utf8(&buf[pos..]).expect("digits are ASCII"));
+    }
+
     fn starts_with_bytes(bytes: &[u8], pattern: &[u8]) -> bool {
         bytes.len() >= pattern.len() && &bytes[..pattern.len()] == pattern
     }
@@ -294,23 +318,33 @@ mod _json {
                 char_idx += 1;
                 byte_idx += 1;
 
-                // Parse key string using scanstring with byte slice
-                let (key_wtf8, end_char_idx, bytes_consumed) =
-                    json::scan_string(&wtf8[byte_idx..], char_idx, self.strict)
-                        .map_err(|e| py_decode_error(e, pystr.clone(), vm))?;
+                // A key with no escapes is looked up in the memo straight from
+                // the input, so a repeated key costs no allocation at all.
+                let plain = json::plain_string_len(&bytes[byte_idx..], self.strict)
+                    .and_then(|end| memo.get(&wtf8[byte_idx..byte_idx + end]).map(|k| (end, k)));
+                let key: PyObjectRef = if let Some((end, cached)) = plain {
+                    char_idx += json::count_code_points(&bytes[byte_idx..byte_idx + end]) + 1;
+                    byte_idx += end + 1;
+                    cached.clone().into()
+                } else {
+                    // Parse key string using scanstring with byte slice
+                    let (key_wtf8, end_char_idx, bytes_consumed) =
+                        json::scan_string(&wtf8[byte_idx..], char_idx, self.strict)
+                            .map_err(|e| py_decode_error(e, pystr.clone(), vm))?;
 
-                char_idx = end_char_idx;
-                byte_idx += bytes_consumed;
+                    char_idx = end_char_idx;
+                    byte_idx += bytes_consumed;
 
-                // Key memoization - reuse existing key strings.
-                // Keyed by Wtf8Buf so lone surrogates in keys (legal per Python str)
-                // are preserved; using String here would lossy-collapse surrogates to U+FFFD.
-                let key: PyObjectRef = match memo.get(&key_wtf8) {
-                    Some(cached) => cached.clone().into(),
-                    None => {
-                        let py_key = vm.ctx.new_str(key_wtf8.clone());
-                        memo.insert(key_wtf8, py_key.clone());
-                        py_key.into()
+                    // Key memoization - reuse existing key strings.
+                    // Keyed by Wtf8Buf so lone surrogates in keys (legal per Python str)
+                    // are preserved; using String here would lossy-collapse surrogates to U+FFFD.
+                    match memo.get(&key_wtf8) {
+                        Some(cached) => cached.clone().into(),
+                        None => {
+                            let py_key = vm.ctx.new_str(key_wtf8.clone());
+                            memo.insert(key_wtf8, py_key.clone());
+                            py_key.into()
+                        }
                     }
                 };
 
@@ -361,7 +395,6 @@ mod _json {
                         break;
                     }
                     Some(b',') => {
-                        let comma_char_idx = char_idx;
                         char_idx += 1;
                         byte_idx += 1;
 
@@ -374,15 +407,6 @@ mod _json {
                         match bytes.get(byte_idx) {
                             Some(b'"') => {
                                 // Continue to next key-value pair
-                            }
-                            Some(b'}') => {
-                                // Trailing comma before end of object
-                                return Err(self.make_decode_error(
-                                    "Illegal trailing comma before end of object",
-                                    pystr,
-                                    comma_char_idx,
-                                    vm,
-                                ));
                             }
                             _ => {
                                 return Err(self.make_decode_error(
@@ -456,7 +480,6 @@ mod _json {
                         break;
                     }
                     Some(b',') => {
-                        let comma_char_idx = char_idx;
                         char_idx += 1;
                         byte_idx += 1;
 
@@ -465,15 +488,6 @@ mod _json {
                         char_idx += ws;
                         byte_idx += ws;
 
-                        // Check for trailing comma
-                        if bytes.get(byte_idx) == Some(&b']') {
-                            return Err(self.make_decode_error(
-                                "Illegal trailing comma before end of array",
-                                pystr,
-                                comma_char_idx,
-                                vm,
-                            ));
-                        }
                     }
                     _ => {
                         return Err(self.make_decode_error(
@@ -774,7 +788,7 @@ mod _json {
         #[pytraverse(skip)]
         allow_nan: bool,
         #[pytraverse(skip)]
-        markers: crate::vm::common::lock::PyMutex<HashSet<usize>>,
+        markers: crate::vm::common::lock::PyMutex<Vec<usize>>,
     }
 
     impl Constructor for JsonEncoder {
@@ -862,7 +876,7 @@ mod _json {
                 sort_keys,
                 skipkeys,
                 allow_nan,
-                markers: crate::vm::common::lock::PyMutex::new(HashSet::new()),
+                markers: crate::vm::common::lock::PyMutex::new(Vec::new()),
             })
         }
     }
@@ -890,16 +904,23 @@ mod _json {
             if !self.check_circular {
                 return Ok(None);
             }
+            // The ids form a stack as deep as the nesting being encoded,
+            // which is short, so a scan beats hashing every container.
             let id = obj.get_id();
-            if !self.markers.lock().insert(id) {
+            let mut markers = self.markers.lock();
+            if markers.contains(&id) {
                 return Err(vm.new_value_error("Circular reference detected"));
             }
+            markers.push(id);
             Ok(Some(id))
         }
 
         fn pop_marker(&self, marker: Option<usize>) {
             if let Some(id) = marker {
-                self.markers.lock().remove(&id);
+                let mut markers = self.markers.lock();
+                if let Some(pos) = markers.iter().rposition(|&m| m == id) {
+                    markers.remove(pos);
+                }
             }
         }
 
@@ -948,11 +969,11 @@ mod _json {
         fn write_text(&self, text: &Wtf8, out: &mut Wtf8Buf, vm: &VirtualMachine) -> PyResult<()> {
             match self.encoder_kind {
                 EncoderKind::Ascii => {
-                    out.push_wtf8(&json::encode_string(text, true));
+                    json::write_string(out, text, true);
                     Ok(())
                 }
                 EncoderKind::Basic => {
-                    out.push_wtf8(&json::encode_string(text, false));
+                    json::write_string(out, text, false);
                     Ok(())
                 }
                 EncoderKind::Generic => {
@@ -974,11 +995,11 @@ mod _json {
         ) -> PyResult<()> {
             match self.encoder_kind {
                 EncoderKind::Ascii => {
-                    out.push_wtf8(&json::encode_string(s.as_wtf8(), true));
+                    json::write_string(out, s.as_wtf8(), true);
                     Ok(())
                 }
                 EncoderKind::Basic => {
-                    out.push_wtf8(&json::encode_string(s.as_wtf8(), false));
+                    json::write_string(out, s.as_wtf8(), false);
                     Ok(())
                 }
                 EncoderKind::Generic => self.write_via_encoder(obj.to_owned(), out, vm),
@@ -1030,7 +1051,14 @@ mod _json {
                 return Ok(true);
             }
             if let Some(i) = key.downcast_ref::<PyInt>() {
-                self.write_text(&Wtf8Buf::from(i.to_str_radix_10()), out, vm)?;
+                if matches!(self.encoder_kind, EncoderKind::Generic) {
+                    self.write_text(&Wtf8Buf::from(i.to_str_radix_10()), out, vm)?;
+                } else {
+                    // Digits and a sign never need escaping.
+                    out.push_char('"');
+                    push_int(out, i);
+                    out.push_char('"');
+                }
                 return Ok(true);
             }
             if self.skipkeys {
@@ -1176,25 +1204,26 @@ mod _json {
             };
             let mut first = true;
             for (key, value) in &items {
-                let mut key_out = Wtf8Buf::new();
-                let wrote = match self.write_dict_key(key, &mut key_out, vm) {
-                    Ok(wrote) => wrote,
-                    Err(e) => {
-                        self.pop_marker(marker);
-                        return Err(e);
-                    }
-                };
-                if !wrote {
-                    continue;
-                }
+                // The separator goes first and the key straight after it; a
+                // skipped key takes its separator back out.
+                let sep_len = out.len();
                 if first {
-                    first = false;
                     self.push_newline_indent(out, new_level);
                 } else {
                     out.push_wtf8(self.item_separator.as_wtf8());
                     self.push_newline_indent(out, new_level);
                 }
-                out.push_wtf8(&key_out);
+                match self.write_dict_key(key, out, vm) {
+                    Ok(true) => first = false,
+                    Ok(false) => {
+                        out.truncate(sep_len);
+                        continue;
+                    }
+                    Err(e) => {
+                        self.pop_marker(marker);
+                        return Err(e);
+                    }
+                }
                 out.push_wtf8(self.key_separator.as_wtf8());
                 if let Err(e) = self.encode_value(value, new_level, out, vm) {
                     self.pop_marker(marker);
@@ -1260,7 +1289,7 @@ mod _json {
                     out.push_str("false");
                     Ok(())
                 } else if let Some(i) = obj.downcast_ref::<PyInt>() {
-                    out.push_str(&i.to_str_radix_10());
+                    push_int(out, i);
                     Ok(())
                 } else if let Some(f) = obj.downcast_ref::<PyFloat>() {
                     let text = self.float_repr(f.to_f64(), vm)?;

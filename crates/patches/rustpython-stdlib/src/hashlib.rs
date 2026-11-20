@@ -20,6 +20,22 @@ pub(crate) mod _hashlib {
     use core::mem::MaybeUninit;
     use rustpython_common::hashlib as backend;
 
+    /// Data to hash: a bytes-like object, refused with CPython's errors for str and
+    /// other objects (GET_BUFFER_VIEW_OR_ERROUT in Modules/hashlib.h).
+    #[derive(Debug)]
+    pub(crate) struct HashData(ArgBytesLike);
+
+    impl crate::vm::TryFromObject for HashData {
+        fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
+            if obj.downcast_ref::<PyStr>().is_some() {
+                return Err(vm.new_type_error("Strings must be encoded before hashing"));
+            }
+            <ArgBytesLike as crate::vm::TryFromObject>::try_from_object(vm, obj)
+                .map(Self)
+                .map_err(|_| vm.new_type_error("object supporting the buffer API required"))
+        }
+    }
+
     const HASH_ALGORITHMS: &[&str] = &[
         "md5",
         "sha1",
@@ -27,6 +43,8 @@ pub(crate) mod _hashlib {
         "sha256",
         "sha384",
         "sha512",
+        "sha512_224",
+        "sha512_256",
         "sha3_224",
         "sha3_256",
         "sha3_384",
@@ -74,19 +92,19 @@ pub(crate) mod _hashlib {
         name: PyUtf8StrRef,
         // Missing still allows the string keyword; b'' does not.
         #[pyarg(any, optional, py_default = "b''")]
-        data: OptionalArg<ArgBytesLike>,
+        data: OptionalArg<HashData>,
         #[pyarg(named, default = true)]
         usedforsecurity: bool,
         // None means no string data.
         #[pyarg(named, optional)]
-        string: Option<ArgBytesLike>,
+        string: Option<HashData>,
     }
 
     #[derive(FromArgs)]
     #[allow(unused)]
     pub(crate) struct BlakeHashArgs {
         #[pyarg(any, optional)]
-        pub data: OptionalArg<ArgBytesLike>,
+        pub data: OptionalArg<HashData>,
         #[pyarg(named, optional)]
         digest_size: OptionalArg<i64>,
         #[pyarg(named, optional)]
@@ -112,7 +130,7 @@ pub(crate) mod _hashlib {
         #[pyarg(named, default = true)]
         usedforsecurity: bool,
         #[pyarg(named, optional)]
-        pub string: Option<ArgBytesLike>,
+        pub string: Option<HashData>,
     }
 
     #[derive(FromArgs, Debug)]
@@ -120,12 +138,12 @@ pub(crate) mod _hashlib {
     pub(crate) struct HashArgs {
         // Missing still allows the string keyword; b'' does not.
         #[pyarg(any, optional, py_default = "b''")]
-        pub data: OptionalArg<ArgBytesLike>,
+        pub data: OptionalArg<HashData>,
         #[pyarg(named, default = true)]
         usedforsecurity: bool,
         // Missing string is None.
         #[pyarg(named, optional)]
-        pub string: Option<ArgBytesLike>,
+        pub string: Option<HashData>,
     }
 
     impl From<NewHashArgs> for HashArgs {
@@ -214,13 +232,13 @@ pub(crate) mod _hashlib {
     }
 
     fn resolve_data(
-        data: OptionalArg<ArgBytesLike>,
-        string: Option<ArgBytesLike>,
+        data: OptionalArg<HashData>,
+        string: Option<HashData>,
         vm: &VirtualMachine,
     ) -> PyResult<OptionalArg<ArgBytesLike>> {
         match (data.into_option(), string) {
-            (Some(d), None) => Ok(OptionalArg::Present(d)),
-            (None, Some(s)) => Ok(OptionalArg::Present(s)),
+            (Some(d), None) => Ok(OptionalArg::Present(d.0)),
+            (None, Some(s)) => Ok(OptionalArg::Present(s.0)),
             (None, None) => Ok(OptionalArg::Missing),
             (Some(_), Some(_)) => Err(vm.new_type_error(
                 "'data' and 'string' are mutually exclusive \
@@ -635,8 +653,8 @@ pub(crate) mod _hashlib {
         }
 
         #[pymethod]
-        fn update(zelf: &Py<Self>, obj: ArgBytesLike) {
-            obj.with_ref(|bytes| zelf.ctx.update(bytes));
+        fn update(zelf: &Py<Self>, obj: HashData) {
+            obj.0.with_ref(|bytes| zelf.ctx.update(bytes));
         }
 
         #[pymethod]
@@ -734,8 +752,8 @@ pub(crate) mod _hashlib {
         }
 
         #[pymethod]
-        fn update(zelf: &Py<Self>, data: ArgBytesLike) {
-            data.with_ref(|bytes| zelf.ctx.update(bytes));
+        fn update(zelf: &Py<Self>, data: HashData) {
+            data.0.with_ref(|bytes| zelf.ctx.update(bytes));
         }
 
         #[pymethod]
@@ -792,6 +810,13 @@ pub(crate) mod _hashlib {
             "sha256" => Ok(new_fixed_hasher("sha256", data).into_pyobject(vm)),
             "sha384" => Ok(new_fixed_hasher("sha384", data).into_pyobject(vm)),
             "sha512" => Ok(new_fixed_hasher("sha512", data).into_pyobject(vm)),
+            // OpenSSL also names the truncated SHA-512 digests with a dash or as SHA-512/t.
+            "sha512_224" | "sha512-224" | "sha-512/224" => {
+                Ok(new_fixed_hasher("sha512_224", data).into_pyobject(vm))
+            }
+            "sha512_256" | "sha512-256" | "sha-512/256" => {
+                Ok(new_fixed_hasher("sha512_256", data).into_pyobject(vm))
+            }
             "sha3_224" => Ok(new_fixed_hasher("sha3_224", data).into_pyobject(vm)),
             "sha3_256" => Ok(new_fixed_hasher("sha3_256", data).into_pyobject(vm)),
             "sha3_384" => Ok(new_fixed_hasher("sha3_384", data).into_pyobject(vm)),
@@ -886,7 +911,6 @@ pub(crate) mod _hashlib {
 
     struct Blake2Limits {
         name: &'static str,
-        display: &'static str,
         default_digest_size: i64,
         max_digest_size: usize,
         max_key_size: usize,
@@ -946,7 +970,6 @@ pub(crate) mod _hashlib {
     ) -> PyResult<Blake2Hash> {
         let Blake2Limits {
             name,
-            display,
             default_digest_size,
             max_digest_size,
             max_key_size,
@@ -958,7 +981,7 @@ pub(crate) mod _hashlib {
         let digest_size = args.digest_size.unwrap_or(default_digest_size);
         if digest_size < 1 || digest_size as u64 > max_digest_size as u64 {
             return Err(vm.new_value_error(format!(
-                "digest_size for {display} must be between 1 and {max_digest_size} bytes, here it is {digest_size}"
+                "digest_size must be between 1 and {max_digest_size} bytes"
             )));
         }
         let digest_size = digest_size as usize;
@@ -1068,7 +1091,6 @@ pub(crate) mod _hashlib {
         blake2_hasher(
             Blake2Limits {
                 name: "blake2b",
-                display: "Blake2b",
                 default_digest_size: 64,
                 max_digest_size: 64,
                 max_key_size: 64,
@@ -1085,7 +1107,6 @@ pub(crate) mod _hashlib {
         blake2_hasher(
             Blake2Limits {
                 name: "blake2s",
-                display: "Blake2s",
                 default_digest_size: 32,
                 max_digest_size: 32,
                 max_key_size: 32,

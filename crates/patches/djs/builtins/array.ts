@@ -1224,10 +1224,10 @@ function ArrayPrototypeToString(this: Value): Value {
 }
 
 /**
- * Array.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] ), 23.1.3.35.
+ * Array.prototype.toLocaleString ( [ locales [ , options ] ] ), ECMA-402 19.5.1: passes both to each element.
  * @builtin Array.prototype.toLocaleString
  */
-function ArrayPrototypeToLocaleString(this: Value): Str {
+function ArrayPrototypeToLocaleString(this: Value, locales?: Value, options?: Value): Str {
   const array: Obj = ToObject(this);
   const len: f64 = LengthOfArrayLike(array);
   if (!ArrayJoinEnter(array)) {
@@ -1241,7 +1241,7 @@ function ArrayPrototypeToLocaleString(this: Value): Str {
       }
       const nextElement: Value = Get(array, k);
       if (nextElement !== undefined && nextElement !== null) {
-        r += ToString(Call(GetV(nextElement, "toLocaleString"), nextElement));
+        r += ToString(Call(GetV(nextElement, "toLocaleString"), nextElement, locales, options));
       }
     }
   } finally {

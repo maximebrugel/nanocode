@@ -228,6 +228,9 @@ impl<'p> Run<'p> {
             Follow::Roots => depth == 0,
             Follow::Never => false,
         };
+        // A root named with a trailing slash (`find link/`) resolves through a link to
+        // a directory, as the kernel resolves such a name even for lstat.
+        let follow = follow || (depth == 0 && path.len() > 1 && path.ends_with(b"/"));
         if follow && let Ok(meta) = ctx.stat(&path, true).await {
             return Some(File {
                 path,

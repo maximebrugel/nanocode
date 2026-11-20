@@ -20,17 +20,17 @@ pub fn atan(n: f64) -> f64 {
 
 #[inline(always)]
 pub fn atan2(y: f64, x: f64) -> f64 {
-    djs_libm::atan2(y, x)
+    crate::glibc::atan2(y, x)
 }
 
 #[inline(always)]
 pub fn cos(n: f64) -> f64 {
-    djs_libm::cos(n)
+    crate::glibc::cos(n)
 }
 
 #[inline(always)]
 pub fn sin(n: f64) -> f64 {
-    djs_libm::sin(n)
+    crate::glibc::sin(n)
 }
 
 #[inline(always)]
@@ -74,7 +74,7 @@ pub fn tanh(n: f64) -> f64 {
 
 #[inline(always)]
 pub fn exp(n: f64) -> f64 {
-    djs_libm::exp(n)
+    crate::glibc::exp(n)
 }
 
 #[inline(always)]
@@ -89,12 +89,12 @@ pub fn expm1(n: f64) -> f64 {
 
 #[inline(always)]
 pub fn log(n: f64) -> f64 {
-    djs_libm::log(n)
+    crate::glibc::log(n)
 }
 
 #[inline(always)]
 pub fn log10(n: f64) -> f64 {
-    djs_libm::log10(n)
+    crate::glibc::log10(n)
 }
 
 #[inline(always)]
@@ -104,15 +104,10 @@ pub fn log1p(n: f64) -> f64 {
 
 #[inline(always)]
 pub fn log2(n: f64) -> f64 {
-    djs_libm::log2(n)
+    crate::glibc::log2(n)
 }
 
 // Power functions
-
-#[inline(always)]
-pub fn cbrt(n: f64) -> f64 {
-    djs_libm::cbrt(n)
-}
 
 #[inline(always)]
 pub fn hypot(x: f64, y: f64) -> f64 {

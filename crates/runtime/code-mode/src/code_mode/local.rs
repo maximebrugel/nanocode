@@ -206,7 +206,7 @@ impl CodeModeToolset for LocalTools {
             return execute(found, name, input, context);
         };
         let declared = found.is_some_and(|(_, definition)| declares_hand(definition));
-        match take_hand(declared, input) {
+        match take_hand(declared, hands.auto(name), input) {
             Err(_) if found.is_none() => Box::pin(async move { tool_not_available(name) }),
             Err(output) => Box::pin(async move { output }),
             Ok((input, Some(hand))) if hand != here.as_ref() && !hands.here(&hand) => {
@@ -237,7 +237,7 @@ impl CodeModeToolset for LocalTools {
             return recover(found, name, input, context);
         };
         let declared = found.is_some_and(|(_, definition)| declares_hand(definition));
-        match take_hand(declared, input) {
+        match take_hand(declared, hands.auto(name), input) {
             Ok((_, Some(hand))) if hand != here.as_ref() && !hands.here(&hand) => {
                 Some(Box::pin(async move { hands.recover(&hand, context).await }))
             }

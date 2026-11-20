@@ -9,7 +9,7 @@
 
 use std::io;
 
-use psh_engine::host::OpenOptions;
+use psh_engine::host::{OpenOptions, WholeFile};
 use psh_engine::util::UtilCtx;
 
 use super::index::Index;
@@ -127,10 +127,97 @@ fn at(path: &[u8], what: &str, e: io::Error) -> io::Error {
     )
 }
 
+/// The permission bits a worktree file of this mode is made with.
+fn file_bits(ctx: &UtilCtx<'_>, mode: &Mode) -> u32 {
+    let bits = if matches!(mode, Mode::Exec) {
+        0o777
+    } else {
+        0o666
+    };
+    bits & !ctx.umask()
+}
+
+/// Writes worktree files in order: as many at a time as the host takes in one step,
+/// and the rest one by one. `batch` turns false once the host takes none twice running
+/// or fails a step, and the rest go one by one.
+async fn write_run(
+    ctx: &UtilCtx<'_>,
+    run: &[(Vec<u8>, Vec<u8>, u32)],
+    batch: &mut bool,
+) -> io::Result<()> {
+    let files: Vec<WholeFile<'_>> = run
+        .iter()
+        .map(|(path, data, mode)| WholeFile {
+            path,
+            data,
+            mode: *mode,
+        })
+        .collect();
+    let dir_mode = 0o777 & !ctx.umask();
+    let mut took = true;
+    let mut next = 0;
+    while next < files.len() {
+        if *batch {
+            let wrote = ctx.write_files(&files[next..], dir_mode).await.unwrap_or_else(|_| {
+                *batch = false;
+                0
+            });
+            if wrote > 0 {
+                next += wrote;
+                took = true;
+                continue;
+            }
+            if !took {
+                *batch = false;
+            }
+            took = false;
+        }
+        let file = &files[next];
+        let opts = OpenOptions {
+            mode: Some(file.mode),
+            ..OpenOptions::write()
+        };
+        put(ctx, file.path, file.data, opts)
+            .await
+            .map_err(|e| at(file.path, "write", e))?;
+        next += 1;
+    }
+    Ok(())
+}
+
 /// Carries a plan out. The first failure ends it: what was done before stays done, as
 /// with git when a disk fills.
 pub async fn apply(ctx: &UtilCtx<'_>, plan: Plan) -> io::Result<()> {
-    for op in plan.ops {
+    let mut batch = true;
+    let mut ops = plan.ops.into_iter().peekable();
+    while let Some(op) = ops.next() {
+        let op = match op {
+            Op::Write {
+                path,
+                data,
+                mode: mode @ (Mode::Plain | Mode::Exec),
+            } => {
+                let mut run = vec![(path, data, file_bits(ctx, &mode))];
+                while let Some(Op::Write {
+                    path,
+                    data,
+                    mode: mode @ (Mode::Plain | Mode::Exec),
+                }) = ops.next_if(|op| {
+                    matches!(
+                        op,
+                        Op::Write {
+                            mode: Mode::Plain | Mode::Exec,
+                            ..
+                        }
+                    )
+                }) {
+                    run.push((path, data, file_bits(ctx, &mode)));
+                }
+                write_run(ctx, &run, &mut batch).await?;
+                continue;
+            }
+            op => op,
+        };
         let (path, what) = match &op {
             Op::Write { path, .. } | Op::Append { path, .. } => (path.clone(), "write"),
             Op::Link { path, .. } => (path.clone(), "link"),

@@ -23,6 +23,10 @@ nanocode-zstd.workspace = true
 rustls.workspace = true
 nanocode-executor.workspace = true
 
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+nanocode-partitions.workspace = true
+nanocode-turnlog.workspace = true
+
 [lints]
 workspace = true
 

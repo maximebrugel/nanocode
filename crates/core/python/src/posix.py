@@ -40,6 +40,60 @@ def _fail(code, path=None):
     return kind(code, strerror(code), path)
 
 
+def _rename_function(call, fn):
+    call.__name__ = fn.__name__
+    call.__qualname__ = fn.__qualname__
+    call.__doc__ = fn.__doc__
+    return call
+
+
+def _named(fn):
+    # The host reports the absolute path it resolved; CPython's errors name
+    # the path as the caller gave it.
+    def call(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except OSError as error:
+            path = args[0] if args else kwargs.get('path')
+            if error.errno is None or error.filename is None or path is None or isinstance(path, int):
+                raise
+            if error.errno == _errno.ENOENT and _under_file(path):
+                raise _fail(_errno.ENOTDIR, fspath(path)) from None
+            raise type(error)(error.errno, error.strerror, fspath(path)) from None
+    return _rename_function(call, fn)
+
+
+def _under_file(path):
+    # Whether a directory the path passes through is a file, as ENOTDIR reports.
+    try:
+        target = _abs(path)
+    except (OSError, TypeError, ValueError):
+        return False
+    parent = target.rsplit(b'/', 1)[0]
+    while parent:
+        try:
+            kind = _host.stat(parent)[0]
+        except OSError:
+            parent = parent.rsplit(b'/', 1)[0]
+            continue
+        return kind != 1
+    return False
+
+
+def _named2(fn):
+    # Two-path calls name both paths, as CPython's "src -> dst" errors do.
+    def call(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except OSError as error:
+            src = args[0] if args else kwargs.get('src')
+            dst = args[1] if len(args) > 1 else kwargs.get('dst')
+            if error.errno is None or src is None or dst is None:
+                raise
+            raise type(error)(error.errno, error.strerror, fspath(src), None, fspath(dst)) from None
+    return _rename_function(call, fn)
+
+
 class stat_result(tuple):
     n_sequence_fields = 10
     n_fields = 10
@@ -71,9 +125,15 @@ class stat_result(tuple):
         return 'os.stat_result(st_mode=%d, st_ino=%d, st_dev=%d, st_nlink=%d, st_uid=%d, st_gid=%d, st_size=%d, st_atime=%d, st_mtime=%d, st_ctime=%d)' % tuple(self)
 
 
-def _stat_result(mode, path, size, mtime_ns):
+def _stat_result(mode, path, size, mtime_ns, follow=True):
     seconds = mtime_ns // 1000000000
-    self = stat_result((mode, (hash(path) & 0x7FFFFFFFFFFFFFFF) or 1, 1, 1, _uid, _uid, size, seconds, seconds, seconds))
+    ino, nlink = (hash(path) & 0x7FFFFFFFFFFFFFFF) or 1, 1
+    if mode & 0o170000 == 0o100000 and isinstance(path, bytes):
+        # Hard-linked names share one inode and count each other.
+        found = _host.links(path, follow)
+        if found is not None:
+            ino, nlink = (hash((b'link', found[0])) & 0x7FFFFFFFFFFFFFFF) or 1, found[1]
+    self = stat_result((mode, ino, 1, nlink, _uid, _uid, size, seconds, seconds, seconds))
     self._ns = mtime_ns
     return self
 
@@ -130,26 +190,76 @@ def _mode(kind, mode):
     return (0o100000 if kind == 0 else 0o040000 if kind == 1 else 0o120000) | mode
 
 
+_BUILTINS = frozenset(
+    b'. : alias bg break builtin cd command continue declare dirs disown enable eval '
+    b'exec exit export fc fg getopts hash history jobs let local logout popd pushd '
+    b'read readonly return set shift shopt source suspend trap type typeset ulimit '
+    b'umask unalias unset wait'.split()
+)
+_programs = {}
+
+
+def _program(path):
+    # The workspace has no /usr/bin: a program the shell runs stands at each
+    # directory of PATH, as an executable file, for code that looks for it
+    # there (shutil.which, os.access) before running it.
+    head, _, name = path.rpartition(b'/')
+    if not name or name in _BUILTINS or not _host.spawns():
+        return False
+    search = environ.get(b'PATH', b'')
+    if (head or b'/') not in [dir.rstrip(b'/') or b'/' for dir in search.split(b':') if dir]:
+        return False
+    found = _programs.get(name)
+    if found is None:
+        try:
+            status, _, _ = _host.spawn([b'command', b'-v', name], [b'PATH', search], _cwd, b'', False)
+        except OSError:
+            status = 1
+        found = _programs[name] = status == 0
+    return found
+
+
+def _stat(path):
+    try:
+        return _host.stat(path)
+    except FileNotFoundError:
+        if _program(path):
+            return (0, 0, 0o755, 0)
+        raise
+
+
+@_named
 def stat(path, *, dir_fd=None, follow_symlinks=True):
     if isinstance(path, int):
         return fstat(path)
+    if not follow_symlinks:
+        return lstat(path)
     path = _abs(path)
-    kind, size, mode, mtime_ns = _host.stat(path)
+    kind, size, mode, mtime_ns = _stat(path)
     return _stat_result(_mode(kind, mode), path, size, mtime_ns)
 
 
+@_named
 def lstat(path, *, dir_fd=None):
-    return stat(path)
+    if isinstance(path, int):
+        return fstat(path)
+    path = _abs(path)
+    try:
+        kind, size, mode, mtime_ns = _host.lstat(path)
+    except FileNotFoundError:
+        return stat(path)
+    return _stat_result(_mode(kind, mode), path, size, mtime_ns, False)
 
 
 def access(path, mode, *, dir_fd=None, effective_ids=False, follow_symlinks=True):
     try:
-        _host.stat(_abs(path))
+        _stat(_abs(path))
     except OSError:
         return False
     return True
 
 
+@_named
 def listdir(path='.'):
     names = _host.list(_abs(path))
     if isinstance(fspath(path), bytes):
@@ -167,25 +277,30 @@ class DirEntry:
         self._stat = None
 
     def stat(self, *, follow_symlinks=True):
+        if not follow_symlinks:
+            return lstat(self._abs)
         if self._stat is None:
             kind, size, mode, mtime_ns = _host.stat(self._abs)
             self._stat = _stat_result(_mode(kind, mode), self._abs, size, mtime_ns)
         return self._stat
 
-    def _is(self, kind):
+    def _is(self, kind, follow_symlinks):
         try:
-            return self.stat().st_mode & 0o170000 == kind
+            return self.stat(follow_symlinks=follow_symlinks).st_mode & 0o170000 == kind
         except OSError:
             return False
 
     def is_dir(self, *, follow_symlinks=True):
-        return self._is(0o040000)
+        return self._is(0o040000, follow_symlinks)
 
     def is_file(self, *, follow_symlinks=True):
-        return self._is(0o100000)
+        return self._is(0o100000, follow_symlinks)
 
     def is_symlink(self):
-        return self._is(0o120000)
+        try:
+            return self.stat(follow_symlinks=False).st_mode & 0o170000 == 0o120000
+        except OSError:
+            return False
 
     def is_junction(self):
         return False
@@ -220,6 +335,7 @@ class _Scan:
         self.close()
 
 
+@_named
 def scandir(path='.'):
     given = fspath(path)
     base = _abs(given)
@@ -231,51 +347,140 @@ def scandir(path='.'):
     return _Scan([DirEntry(name.decode('utf-8', 'surrogateescape'), prefix + name.decode('utf-8', 'surrogateescape'), base + b'/' + name) for name in names])
 
 
+@_named
 def mkdir(path, mode=0o777, *, dir_fd=None):
     _host.mkdir(_abs(path), mode & ~_umask & 0o777)
 
 
+@_named
 def rmdir(path, *, dir_fd=None):
+    name = fspath(path)
+    tail = name.rstrip(b'/' if isinstance(name, bytes) else '/').rsplit(b'/' if isinstance(name, bytes) else '/', 1)[-1]
+    if tail in ('.', b'.'):
+        raise _fail(_errno.EINVAL, path)
     _host.remove(_abs(path), True)
 
 
+@_named
 def unlink(path, *, dir_fd=None):
-    _host.remove(_abs(path), False)
+    target = _abs(path)
+    _host.remove(target, False)
+    for file in _files.values():
+        if file.path == target and not file.gone:
+            _forget(file)
 
 
-remove = unlink
+def _forget(file):
+    # An open file outlives its name, as on POSIX: it keeps its bytes in
+    # memory from here on and never writes them back.
+    if file.data is None:
+        file.data = bytearray()
+    elif not isinstance(file.data, bytearray):
+        file.data = bytearray(file.data)
+    if file.base >= 0:
+        file.base = -1
+        file.pos = len(file.data)
+    file.gone = True
 
 
+@_named
+def remove(path, *, dir_fd=None):
+    return unlink(path, dir_fd=dir_fd)
+
+
+@_named2
 def rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
-    _host.rename(_abs(src), _abs(dst))
+    source, target = _abs(src), _abs(dst)
+    if target.startswith(source + b'/'):
+        # A directory cannot move into itself.
+        raise _fail(_errno.EINVAL, src)
+    _host.rename(source, target)
 
 
-replace = rename
+@_named2
+def replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    return rename(src, dst)
 
 
+@_named
 def chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
-    _host.stat(_abs(path))
+    _host.chmod(_abs(path), mode)
 
 
+def _utime_ns(value):
+    if isinstance(value, int):
+        return value * 1000000000
+    if isinstance(value, float):
+        whole = value // 1
+        return int(whole) * 1000000000 + int((value - whole) * 1e9)
+    raise TypeError("utime: 'times' must be either a tuple of two ints or None")
+
+
+@_named
 def utime(path, times=None, *, ns=None, dir_fd=None, follow_symlinks=True):
-    _host.stat(_abs(path))
+    if times is not None and ns is not None:
+        raise ValueError("utime: you may specify either 'times' or 'ns' but not both")
+    if times is not None:
+        if not isinstance(times, tuple) or len(times) != 2:
+            raise TypeError("utime: 'times' must be either a tuple of two ints or None")
+        mtime_ns = _utime_ns(times[1])
+        _utime_ns(times[0])
+    elif ns is not None:
+        if not isinstance(ns, tuple) or len(ns) != 2 or not all(isinstance(part, int) for part in ns):
+            raise TypeError("utime: 'ns' must be a tuple of two ints")
+        mtime_ns = ns[1]
+    else:
+        import time
+        mtime_ns = time.time_ns()
+    _host.utime(_abs(path), mtime_ns)
 
 
+@_named
 def chown(path, uid, gid, *, dir_fd=None, follow_symlinks=True):
     _host.stat(_abs(path))
 
 
+@_named
 def readlink(path, *, dir_fd=None):
-    _host.stat(_abs(path))
-    raise _fail(_errno.EINVAL, path)
+    given = fspath(path)
+    target = _abs(path)
+    if _host.lstat(target)[0] != 2:
+        raise _fail(_errno.EINVAL, path)
+    found = _host.readlink(target)
+    if isinstance(given, bytes):
+        return found
+    return found.decode('utf-8', 'surrogateescape')
 
 
+@_named2
 def symlink(src, dst, target_is_directory=False, *, dir_fd=None):
-    raise _fail(_errno.EPERM, dst)
+    src = fspath(src)
+    if isinstance(src, str):
+        src = src.encode('utf-8', 'surrogateescape')
+    try:
+        _host.symlink(src, _abs(dst))
+    except OSError as error:
+        if error.errno == _errno.ENOTSUP:
+            raise _fail(_errno.EPERM, dst) from None
+        raise
 
 
+@_named2
 def link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
-    raise _fail(_errno.EPERM, dst)
+    # Like CPython on Linux, which calls link(2): a symlink source is linked itself.
+    source = _abs(src)
+    kind = _host.lstat(source)[0]
+    if kind == 1:
+        raise _fail(_errno.EPERM, dst)
+    try:
+        if kind == 2:
+            _host.symlink(_host.readlink(source), _abs(dst))
+        else:
+            _host.link(source, _abs(dst))
+    except OSError as error:
+        if error.errno == _errno.ENOTSUP:
+            raise _fail(_errno.EPERM, dst) from None
+        raise
 
 
 def getcwd():
@@ -286,6 +491,7 @@ def getcwdb():
     return _cwd
 
 
+@_named
 def chdir(path):
     global _cwd
     target = _abs(path)
@@ -295,7 +501,7 @@ def chdir(path):
 
 
 class _File:
-    __slots__ = ('path', 'flags', 'data', 'pos', 'base', 'dir', 'size')
+    __slots__ = ('path', 'flags', 'data', 'pos', 'base', 'dir', 'size', 'gone')
 
 
 _RANGED = 1 << 20
@@ -313,6 +519,7 @@ def _file(fd):
         raise _fail(_errno.EBADF) from None
 
 
+@_named
 def open(path, flags, mode=0o777, *, dir_fd=None):
     global _next
     target = _abs(path)
@@ -323,6 +530,7 @@ def open(path, flags, mode=0o777, *, dir_fd=None):
     file.pos = 0
     file.base = -1
     file.dir = False
+    file.gone = False
     if target == b'/dev/null':
         file.path = None
         file.data = bytearray()
@@ -331,7 +539,7 @@ def open(path, flags, mode=0o777, *, dir_fd=None):
             kind, size, _, _ = _host.stat(target)
         except FileNotFoundError:
             if not flags & O_CREAT:
-                raise _fail(_errno.ENOENT, path) from None
+                raise _fail(_errno.ENOTDIR if _under_file(path) else _errno.ENOENT, path) from None
             _host.write(target, b'', 2)
             file.data = bytearray()
         else:
@@ -364,6 +572,8 @@ def open(path, flags, mode=0o777, *, dir_fd=None):
 
 
 def _store(file):
+    if file.gone:
+        return
     if len(file.data) > _host.file_limit():
         raise _fail(_errno.EFBIG)
     _host.write(file.path, file.data, 0)
@@ -372,6 +582,7 @@ def _store(file):
 def _reset():
     global _cwd, _umask, _run
     _files.clear()
+    _programs.clear()
     _run += 1
     _cwd = _host.cwd()
     _umask = 0o022
@@ -445,7 +656,7 @@ def write(fd, data):
     end = len(file.data)
     if file.flags & O_APPEND:
         file.pos = end
-    if file.pos == end:
+    if file.pos == end and not file.gone:
         if end + size > _host.file_limit():
             raise _fail(_errno.EFBIG)
         _host.write(file.path, data, 1)
@@ -503,6 +714,8 @@ def fstat(fd):
     file = _file(fd)
     if file.path is None:
         return _stat_result(0o020666, b'', 0, 0)
+    if file.gone:
+        return _stat_result(0o100600, file.path, len(file.data), 0)
     kind, size, mode, mtime_ns = _host.stat(file.path)
     return _stat_result(_mode(kind, mode), file.path, size, mtime_ns)
 
@@ -580,8 +793,28 @@ def times():
     return (0.0, 0.0, 0.0, 0.0, 0.0)
 
 
+def waitstatus_to_exitcode(status):
+    status = status.__index__()
+    if status & 0x7f == 0:
+        return (status >> 8) & 0xff
+    if 0 < status & 0x7f < 0x7f:
+        return -(status & 0x7f)
+    raise ValueError('invalid wait status: %d' % status)
+
+
 def _exit(status):
-    raise SystemExit(status)
+    # Ends without flushing stdio or running atexit, as CPython does: what sys.stdout
+    # still holds is dropped.
+    import sys
+    for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+        raw = getattr(getattr(stream, 'buffer', None), 'raw', None)
+        if raw is not None and hasattr(raw, '_run'):
+            raw._run = None
+    atexit = sys.modules.get('atexit')
+    if atexit is not None:
+        atexit._clear()
+    # Nothing catches it: no except, finally or __exit__ runs after it, as in CPython.
+    _host.exit(status)
 
 
 def system(command):

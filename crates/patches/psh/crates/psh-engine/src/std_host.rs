@@ -123,6 +123,11 @@ impl HostFile for StdFile {
         use std::io::Seek;
         Some((&self.file).seek(pos))
     }
+
+    fn identity(&self) -> Option<(u64, u64, u64)> {
+        let m = metadata(&self.file.metadata().ok()?);
+        (m.kind == FileKind::File).then_some((m.dev, m.ino, m.size))
+    }
 }
 
 /// The bound of a pump's buffer.

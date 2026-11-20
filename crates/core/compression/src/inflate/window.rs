@@ -19,6 +19,11 @@ impl Window {
         }
     }
 
+    pub(super) const fn clear(&mut self) {
+        self.have = 0;
+        self.next = 0;
+    }
+
     pub(super) const fn have(&self) -> usize {
         self.have
     }

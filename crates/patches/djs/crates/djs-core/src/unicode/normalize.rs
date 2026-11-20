@@ -390,3 +390,16 @@ fn compose(d: &[u32], comp: &mut Compositions) -> Vec<u32> {
     }
     out
 }
+
+/// ICU's Normalizer2::hasBoundaryBefore for NFKC: c starts a run that normalizes on its
+/// own, as it neither has a combining class nor combines with what precedes it, and
+/// neither does the first code point it decomposes to.
+pub fn nfkc_has_boundary_before(c: u32) -> bool {
+    let starter = |x: u32| ccc(x) == 0 && !in_table(&NFC_QC_MAYBE, x);
+    if !starter(c) {
+        return false;
+    }
+    let mut d = Vec::new();
+    decompose_char(c, true, &mut d);
+    d.first().is_none_or(|&x| starter(x))
+}

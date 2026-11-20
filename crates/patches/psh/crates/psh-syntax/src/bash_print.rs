@@ -238,12 +238,7 @@ impl<'a> BashPrinter<'a> {
                 self.hd = false;
             }
         }
-        if p.stages.is_empty() {
-            // `time` or `!` alone.
-            while self.out.ends_with(' ') {
-                self.out.pop();
-            }
-        }
+        // `time` or `!` alone keeps its trailing space (`time ;`), as bash prints it.
     }
 
     // ---- commands ----

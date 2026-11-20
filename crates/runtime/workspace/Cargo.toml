@@ -11,7 +11,9 @@ autotests = false
 autobenches = false
 
 [dependencies]
+nanocode-bytes.workspace = true
 nanocode-code-mode = { workspace = true, features = ["local-cells"] }
+nanocode-digest.workspace = true
 nanocode-hands.workspace = true
 nanocode-platform.workspace = true
 nanocode-process-contracts.workspace = true

@@ -8,7 +8,7 @@ use std::{
 };
 
 use nanocode_board::{
-    Board, BoardError, ClaimId, NewTask, Op, Outcome, Phase, Task, TaskId,
+    Board, BoardError, ClaimId, NewTask, Op, Outcome, Phase, Rejection, Task, TaskId,
     access::{Can, Grant, Identity, Verifier, Who},
     tasks::{OnFail, TaskOp, Terms},
 };
@@ -16,6 +16,8 @@ use nanocode_turnlog::{FileLog, FileOptions};
 use serde_json::{Value, json};
 
 const SCOPE: &str = "board";
+
+const SPREAD: usize = 8;
 
 const HELP: &str = "nc-board: a nanocode task board kept in a directory
 usage: nc-board [--dir DIR] [--as ACTOR] COMMAND
@@ -25,7 +27,8 @@ usage: nc-board [--dir DIR] [--as ACTOR] COMMAND
   list [--label K=V]... [--status open|claimed|done|failed|cancelled|blocked|ready]...
   show ID
   claim ID --lease SECS
-  claim-next [--label K=V]... --lease SECS  claim the oldest ready task matching every label; exits 2 when none is ready
+  claim-next [--label K=V]... [--spread K] --lease SECS  claim a ready task matching every label: best rank, then ACTOR's own,
+                                           then one of the K (default 8) oldest; retries the oldest after a lost race; exits 2 when none is ready
   renew ID --lease SECS [--claim CLAIM]
   finish ID [--claim CLAIM] DETAIL
   fail ID [--claim CLAIM] DETAIL
@@ -193,8 +196,8 @@ fn render(board: &Board, id: &TaskId, task: &Task, at_ms: u64) -> Value {
         } => {
             json!({"claim": claim, "worker": worker, "until_ms": until_ms, "expired": *until_ms <= at_ms})
         }
-        Phase::Done { result } => json!({"result": result}),
-        Phase::Failed { error } => json!({"error": error}),
+        Phase::Done { result, .. } => json!({"result": result}),
+        Phase::Failed { error, .. } => json!({"error": error}),
         Phase::Cancelled { reason } => json!({"reason": reason}),
         Phase::Blocked { kind, reason } => json!({"kind": kind, "reason": reason}),
     };
@@ -295,23 +298,47 @@ async fn run(parsed: &Parsed, board: &mut Board) -> Result<Option<Value>, Failur
             return shown(board, &id(&task), at_ms).map(Some);
         }
         "claim-next" => {
-            parsed.allow(&["label", "lease"])?;
+            parsed.allow(&["label", "lease", "spread"])?;
             parsed.words::<0>()?;
             let lease_ms = parsed.lease_ms()?;
             let labels = parsed.labels()?;
-            let Some(task) = board.fold().pick(board.writer(), &labels, at_ms).cloned() else {
+            let spread = match parsed.one("spread")? {
+                Some(spread) => spread
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|spread| *spread > 0)
+                    .ok_or(format!("--spread {spread} is not a positive count"))?,
+                None => SPREAD,
+            };
+            let Some(task) = board
+                .fold()
+                .spread(board.writer(), &labels, at_ms, spread)
+                .cloned()
+            else {
                 return Ok(None);
             };
-            submit(
-                board,
-                at_ms,
-                Op::Claim {
-                    task: task.clone(),
-                    lease_ms,
-                },
-            )
-            .await?;
-            task
+            let claim = |task: &TaskId| Op::Claim {
+                task: task.clone(),
+                lease_ms,
+                fence: None,
+                cap: None,
+            };
+            match board.submit(at_ms, claim(&task)).await {
+                Err(BoardError::Rejected(Rejection::Held { .. } | Rejection::Terminal))
+                    if spread > 1 =>
+                {
+                    let Some(head) = board.fold().pick(board.writer(), &labels, at_ms).cloned()
+                    else {
+                        return Ok(None);
+                    };
+                    submit(board, at_ms, claim(&head)).await?;
+                    head
+                }
+                landed => {
+                    landed.map_err(|error| error.to_string())?;
+                    task
+                }
+            }
         }
         "post" => {
             parsed.allow(&["parent", "label", "needs", "assignee", "on-fail"])?;
@@ -348,6 +375,8 @@ async fn run(parsed: &Parsed, board: &mut Board) -> Result<Option<Value>, Failur
                 Op::Claim {
                     task: id(&task),
                     lease_ms,
+                    fence: None,
+                    cap: None,
                 },
             )
             .await?;

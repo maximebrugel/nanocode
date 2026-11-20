@@ -495,13 +495,18 @@ impl<'p> Run<'p> {
         End::Input
     }
 
+    /// The program is only substitutions on every line and `/re/d`, which [`Self::batch`]
+    /// runs over the lines the reader holds.
     fn plain_substs(&self) -> bool {
         self.prog.cmds.iter().all(|c| {
-            c.a1.is_none()
-                && c.a2.is_none()
+            c.a2.is_none()
                 && !c.a1_zero
                 && !c.neg
-                && matches!(&c.kind, Kind::Subst(s) if s.re.is_some() && s.write.is_none() && !s.eval)
+                && match (&c.a1, &c.kind) {
+                    (None, Kind::Subst(s)) => s.re.is_some() && s.write.is_none() && !s.eval,
+                    (Some(Addr::Re(Some(_))), Kind::Delete) => true,
+                    _ => false,
+                }
         })
     }
 
@@ -535,7 +540,7 @@ impl<'p> Run<'p> {
             }
             return Ok(());
         }
-        while self.out.buf.len() < 64 * 1024
+        'lines: while self.out.buf.len() < 64 * 1024
             && let Some(line) = reader.buffered_line()
         {
             self.ps.clear();
@@ -547,15 +552,26 @@ impl<'p> Run<'p> {
                 self.line_name = reader.name.clone();
             }
             for cmd in &prog.cmds {
-                if let Kind::Subst(s) = &cmd.kind
-                    && self.subst(st, s)?
-                {
-                    self.tflag = true;
-                    if s.print {
-                        let ps = std::mem::take(&mut self.ps);
-                        self.emit_line(&ps, true);
-                        self.ps = ps;
+                match &cmd.kind {
+                    Kind::Subst(s) => {
+                        if self.subst(st, s)? {
+                            self.tflag = true;
+                            if s.print {
+                                let ps = std::mem::take(&mut self.ps);
+                                self.emit_line(&ps, true);
+                                self.ps = ps;
+                            }
+                        }
                     }
+                    Kind::Delete => {
+                        if let Some(Addr::Re(Some(re))) = &cmd.a1 {
+                            st.last_re = Some(re.clone());
+                            if re.find(&self.ps, ExecOptions::default()).is_some() {
+                                continue 'lines;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             if !self.set.quiet {

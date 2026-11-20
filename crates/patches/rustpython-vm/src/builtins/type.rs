@@ -290,11 +290,48 @@ pub struct HeapTypeExt {
     pub name: PyRwLock<PyUtf8StrRef>,
     pub qualname: PyRwLock<PyStrRef>,
     pub slots: Option<PyRef<PyTuple<PyStrRef>>>,
+    /// The dotted tp_name of a class CPython implements as a C static type but
+    /// nanocode defines in Python (see `c_static_type_name`): error messages
+    /// name it `datetime.date` as CPython does. `None` for other heap types.
+    pub tp_name: Option<Box<str>>,
     pub type_data: PyRwLock<Option<TypeDataSlot>>,
     pub specialization_cache: TypeSpecializationCache,
     /// The interpreter this type was created in, or `None` for the types the
     /// shared context builds before any interpreter exists.
     pub interpreter_id: Option<i64>,
+}
+
+/// Modules CPython implements in C whose classes nanocode defines in Python:
+/// _pydatetime runs as `datetime`, _pydecimal as `decimal`, and
+/// zoneinfo._zoneinfo puts `ZoneInfo` in `zoneinfo`.
+const C_STATIC_TYPE_MODULES: &[&str] = &["datetime", "decimal", "zoneinfo"];
+
+/// The tp_name CPython's static type has for a public class that the body of
+/// one of `C_STATIC_TYPE_MODULES` defines: `module.name`. Classes other code
+/// creates, even with such a `__module__`, keep the bare name of a heap type.
+fn c_static_type_name(
+    attributes: &PyAttributes,
+    name: &str,
+    vm: &VirtualMachine,
+) -> Option<Box<str>> {
+    if name.starts_with('_') {
+        return None;
+    }
+    let module = attributes.get(identifier!(vm, __module__))?;
+    let module = module.downcast_ref::<PyStr>()?.to_str()?;
+    if !C_STATIC_TYPE_MODULES.contains(&module) {
+        return None;
+    }
+    let globals = crate::frame::current_globals()?;
+    let defining = globals
+        .get_item_opt(identifier!(vm, __name__), vm)
+        .ok()??;
+    let defining = defining.downcast_ref::<PyStr>()?.to_str()?;
+    let defined_there = defining == module
+        || defining
+            .strip_prefix(module)
+            .is_some_and(|rest| rest.starts_with('.'));
+    defined_there.then(|| format!("{module}.{name}").into_boxed_str())
 }
 
 impl HeapTypeExt {
@@ -782,6 +819,7 @@ impl PyType {
             name: PyRwLock::new(name_utf8),
             qualname: PyRwLock::new(name),
             slots: None,
+            tp_name: None,
             type_data: PyRwLock::new(None),
             specialization_cache: TypeSpecializationCache::new(),
             interpreter_id: HeapTypeExt::creating_interpreter_id(),
@@ -820,6 +858,7 @@ impl PyType {
             name: PyRwLock::new(name_utf8),
             qualname: PyRwLock::new(qualname),
             slots: None,
+            tp_name: None,
             type_data: PyRwLock::new(None),
             specialization_cache: TypeSpecializationCache::new(),
             interpreter_id: HeapTypeExt::creating_interpreter_id(),
@@ -1552,7 +1591,10 @@ impl PyType {
     pub fn slot_name(&self) -> BorrowedValue<'_, str> {
         self.name_inner(
             |name| name.into(),
-            |ext| PyRwLockReadGuard::map(ext.name.read(), |name| name.as_str()).into(),
+            |ext| match ext.tp_name.as_deref() {
+                Some(tp_name) => tp_name.into(),
+                None => PyRwLockReadGuard::map(ext.name.read(), |name| name.as_str()).into(),
+            },
         )
     }
 
@@ -2077,6 +2119,7 @@ impl Constructor for PyType {
             flags |= WEAKREF_FLAGS;
         }
 
+        let tp_name = c_static_type_name(&attributes, name.as_str(), vm);
         let (slots, heaptype_ext) = {
             let slots = PyTypeSlots {
                 flags: crate::types::AtomicPyTypeFlags::from_plain(flags),
@@ -2088,6 +2131,7 @@ impl Constructor for PyType {
                 name: PyRwLock::new(name),
                 qualname: PyRwLock::new(qualname),
                 slots: heaptype_slots.clone(),
+                tp_name,
                 type_data: PyRwLock::new(None),
                 specialization_cache: TypeSpecializationCache::new(),
                 interpreter_id: HeapTypeExt::creating_interpreter_id(),

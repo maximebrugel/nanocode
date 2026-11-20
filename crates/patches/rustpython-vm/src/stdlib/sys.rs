@@ -1116,6 +1116,7 @@ pub mod sys {
 
         // Print traceback (using actual exc_traceback, not current stack)
         if !vm.is_none(&unraisable.exc_traceback) {
+            writeln!(stderr, "Traceback (most recent call last):");
             let tb_module = vm.import("traceback", 0)?;
             let print_tb = tb_module.get_attr("print_tb", vm)?;
             let stderr_obj = super::get_stderr(vm)?;

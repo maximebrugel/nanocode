@@ -1,6 +1,6 @@
 use std::sync::{Arc, LazyLock};
 
-use nanocode_tool_host::{CodeModeToolPolicy, WorkspaceToolRouting};
+use nanocode_tool_host::{CodeModeToolPolicy, FileAccess, WorkspaceToolRouting};
 use serde_json::Value;
 
 use crate::tools::bash::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS};
@@ -25,8 +25,16 @@ impl CodeModeToolPolicy for ClaudeToolPolicy {
             .then_some(WorkspaceToolRouting::File)
     }
 
-    fn exclusive(&self, name: &str) -> bool {
-        ["Write", "Edit"].contains(&name)
+    fn file_access(&self, name: &str, input: &Value) -> Vec<FileAccess> {
+        let Some(path) = input.get("file_path").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let path = path.to_owned();
+        match name {
+            "Read" => vec![FileAccess::Read(path)],
+            "Write" | "Edit" => vec![FileAccess::Write(path)],
+            _ => Vec::new(),
+        }
     }
 
     fn hidden_host_tool(&self, name: &str) -> bool {

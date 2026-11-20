@@ -3091,9 +3091,12 @@ fn board_status(board: &crate::board::BoardAgents, id: AgentId, status: &mut Age
     if matches!(
         status,
         AgentStatus::Completed { .. } | AgentStatus::Failed { .. }
-    ) && let Some(Some(finished)) = board.get(&id)
-    {
-        finished.clone_into(status);
+    ) {
+        match board.get(&id) {
+            Some(Some(AgentStatus::Closed)) | None => {}
+            Some(Some(finished)) => finished.clone_into(status),
+            Some(None) => *status = AgentStatus::Running,
+        }
     }
 }
 
@@ -3105,6 +3108,13 @@ fn wait_mark(status: &AgentStatus, revision: u64) -> u64 {
         .unwrap_or_default()
         .hash(&mut hasher);
     hasher.finish()
+}
+
+fn steerable(state: &RegistryState, root: &str, id: AgentId) -> Option<String> {
+    let scope = state.scopes.get(root)?;
+    let session = scope.sessions.get(&id)?;
+    (scope.paused == 0 && !scope.life.closing() && session.status == AgentStatus::Running)
+        .then(|| session.descriptor.session_id.clone())
 }
 
 impl Registry {
@@ -3171,12 +3181,80 @@ impl Registry {
     }
 
     pub fn set_coordination(&self, coordination: Option<Arc<dyn crate::board::Coordination>>) {
-        self.coordination.set(coordination);
+        if let (Some(next), Some(this)) = (&coordination, self.this.get()) {
+            next.attach(Weak::clone(this));
+        }
+        let next = coordination
+            .as_ref()
+            .map(|next| Arc::as_ptr(next).cast::<()>());
+        let previous = Option::clone(&self.coordination.set(coordination));
+        if let Some(previous) = previous
+            && Some(Arc::as_ptr(&previous).cast::<()>()) != next
+        {
+            previous.detach();
+        }
     }
 
     pub(super) fn coordinate(&self, root_session_id: &str, update: &AgentUpdate) {
         if let Some(coordination) = Option::clone(&self.coordination.get()) {
             coordination.observe(root_session_id, update);
+        }
+    }
+
+    pub(super) async fn board_steers(
+        self: &Arc<Self>,
+        root_session_id: &str,
+        id: AgentId,
+        priority: MessagePriority,
+    ) {
+        let Some(coordination) = Option::clone(&self.coordination.get()) else {
+            return;
+        };
+        let root = root_session_id.to_owned();
+        let session = self
+            .state
+            .call(move |state| steerable(state, &root, id))
+            .await;
+        let Some(session) = session else {
+            return;
+        };
+        let Ok(steers) = coordination.steers(&session).await else {
+            return;
+        };
+        let locks = self.session_locks(root_session_id).await;
+        let _closing = locks.closing.enter().await;
+        for body in steers {
+            let root = root_session_id.to_owned();
+            if self
+                .state
+                .call(move |state| steerable(state, &root, id))
+                .await
+                .is_none()
+            {
+                return;
+            }
+            let _ = self
+                .deliver_message(
+                    root_session_id,
+                    None,
+                    id,
+                    priority,
+                    MessagePurpose::Coordinate,
+                    None,
+                    body,
+                    false,
+                )
+                .await;
+        }
+    }
+
+    pub(super) async fn briefed(&self, session_id: &str, task: &str) -> std::io::Result<String> {
+        let Some(coordination) = Option::clone(&self.coordination.get()) else {
+            return Ok(task.to_owned());
+        };
+        match coordination.brief(session_id).await {
+            Ok(brief) => Ok(brief.unwrap_or_else(|| task.to_owned())),
+            Err(error) => Err(std::io::Error::other(error)),
         }
     }
 
@@ -3379,6 +3457,7 @@ impl Registry {
                         .await;
                 }
             }
+            registry.reconcile_board(&root).await;
             let work = RestoredWork {
                 messages: pending,
                 unstarted,
@@ -5163,6 +5242,44 @@ impl Registry {
                 );
             }
         }));
+    }
+
+    async fn reconcile_board(&self, root_session_id: &str) {
+        let Some(coordination) = Option::clone(&self.coordination.get()) else {
+            return;
+        };
+        let root = root_session_id.to_owned();
+        let finished = self
+            .state
+            .call(move |state| {
+                let mut finished = state
+                    .scopes
+                    .get(&root)
+                    .map(|scope| {
+                        scope
+                            .sessions
+                            .sessions
+                            .iter()
+                            .filter(|(_, session)| {
+                                session.turn.is_none()
+                                    && matches!(
+                                        session.status,
+                                        AgentStatus::Completed { .. } | AgentStatus::Failed { .. }
+                                    )
+                            })
+                            .map(|(id, session)| {
+                                (*id, session.status.clone(), session.completion.revision())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                finished.sort_by_key(|(id, _, _)| *id);
+                finished
+            })
+            .await;
+        if !finished.is_empty() {
+            coordination.reconcile(root_session_id, finished);
+        }
     }
 
     async fn announce_cold_completions(&self, root_session_id: &str) {
@@ -7744,6 +7861,9 @@ impl Registry {
             self.session_handles.update(|handles| {
                 handles.remove(&root);
             });
+            if let Some(coordination) = Option::clone(&self.coordination.get()) {
+                coordination.release_root(&root);
+            }
         }
         let summaries = result?;
         journal_result?;
@@ -8401,9 +8521,11 @@ pub(super) fn forward_events(
             let mut tracked = Vec::new();
             let mut progress = false;
             let mut completed_tool = false;
+            let mut started = false;
             let mut next = Some(first);
             while let Some(event) = next {
                 let kind = event.kind;
+                started |= kind == AgentEventKind::ModelCallStarted;
                 let boundary = matches!(
                     kind,
                     AgentEventKind::ModelCallStarted | AgentEventKind::ModelCallCompleted
@@ -8434,6 +8556,15 @@ pub(super) fn forward_events(
                 }
                 if progress {
                     registry.capture_progress(&root_session_id, id, &marks);
+                }
+                if started {
+                    let registry = Arc::clone(&registry);
+                    let root = root_session_id.clone();
+                    drop(platform::spawn(async move {
+                        registry
+                            .board_steers(&root, id, MessagePriority::Urgent)
+                            .await;
+                    }));
                 }
             }
         }

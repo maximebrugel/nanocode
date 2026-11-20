@@ -181,12 +181,12 @@ pub fn int_str(n: f64) -> String {
     }
 }
 
-/// `nan` and `inf` as gawk prints them: with a sign always.
+/// `nan` and `inf` as awk prints them: with a sign only when negative.
 pub fn special_str(n: f64) -> &'static str {
     if n.is_nan() {
-        if n.is_sign_negative() { "-nan" } else { "+nan" }
+        if n.is_sign_negative() { "-nan" } else { "nan" }
     } else if n > 0.0 {
-        "+inf"
+        "inf"
     } else {
         "-inf"
     }

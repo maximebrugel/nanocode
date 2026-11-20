@@ -216,7 +216,20 @@ pub fn commit(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     }
     let repo = &git.repo;
     let root = git.work_tree()?.to_vec();
-    super::status::in_progress(git)?;
+    // A merge, cherry-pick or revert that stopped on conflicts: the commit ends it.
+    let pending = |name: &[u8]| -> Res<Option<Oid>> {
+        Ok(match repo.fs.read_opt(&join(&repo.git_dir, name))? {
+            Some(text) => Oid::from_hex(text.trim_ascii()),
+            None => None,
+        })
+    };
+    let merge_head = pending(b"MERGE_HEAD")?;
+    let stopped = merge_head.is_some()
+        || pending(b"CHERRY_PICK_HEAD")?.is_some()
+        || pending(b"REVERT_HEAD")?.is_some();
+    if !stopped {
+        super::status::in_progress(git)?;
+    }
     if repo.config.bool("commit.gpgsign") == Some(true) {
         return Err(Error::Lacks(
             "this repository signs its commits".to_string(),
@@ -230,6 +243,12 @@ pub fn commit(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
     }
     git.hooks(&hooks)?;
     let work = Work::new(repo, &root)?;
+    if stopped && work.index.entries.iter().any(|e| e.stage != 0) {
+        return Err(Error::Says(
+            "error: Committing is not possible because you have unmerged files.\nhint: Fix them up in the work tree, and then use 'git add/rm <file>'\nhint: as appropriate to mark resolution and make a commit.\nfatal: Exiting because of an unresolved conflict.\n".to_string(),
+            128,
+        ));
+    }
     let mut index = edit(&work)?;
     if all {
         update_tracked(
@@ -253,6 +272,10 @@ pub fn commit(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         (Some(head), false) => vec![head.id],
         (None, _) => Vec::new(),
     };
+    let mut parents = parents;
+    if let (Some(theirs), false) = (merge_head, amend) {
+        parents.push(theirs);
+    }
     let entries: Vec<&IndexEntry> = index.entries.iter().filter(|e| !e.intent_to_add).collect();
     let written = write_tree(repo, &entries, 0, b"", index.tree.as_ref())?;
     let tree = written.oid;
@@ -260,7 +283,7 @@ pub fn commit(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         Some(parent) => Some(repo.commit(parent)?.tree),
         None => None,
     };
-    if !allow_empty {
+    if !allow_empty && merge_head.is_none() {
         let unchanged = match parent_tree {
             Some(parent) => parent == tree,
             None => entries.is_empty() && !amend,
@@ -317,6 +340,15 @@ pub fn commit(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         String::from_utf8_lossy(commit.message()).into_owned()
     } else if let (true, true, Some(head)) = (amend, no_edit, &head) {
         String::from_utf8_lossy(head.message()).into_owned()
+    } else if let (true, Some(text)) = (
+        stopped,
+        repo.fs.read_opt(&join(&repo.git_dir, b"MERGE_MSG"))?,
+    ) {
+        String::from_utf8_lossy(&text)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         return Err(Error::Lacks(
             "'commit' without a message opens an editor".to_string(),
@@ -378,7 +410,13 @@ pub fn commit(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         &message,
     )?;
     let first = message.lines().next().unwrap_or_default();
+    if stopped {
+        for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+            git.op(Op::Remove(join(&repo.git_dir, name.as_bytes())));
+        }
+    }
     let kind = match (amend, &head) {
+        _ if merge_head.is_some() && !amend => "commit (merge)",
         (true, _) => "commit (amend)",
         (false, None) => "commit (initial)",
         (false, Some(_)) => "commit",

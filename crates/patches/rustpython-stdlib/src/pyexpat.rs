@@ -167,7 +167,7 @@ macro_rules! create_bool_property {
 
 #[pymodule(name = "pyexpat")]
 mod _pyexpat {
-    use super::reader::{EventReader, QualifiedName, TextPosition, XmlEvent};
+    use super::reader::{EventReader, QualifiedName, ReaderError, TextPosition, XmlEvent};
     use crate::vm::{
         AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
         VirtualMachine,
@@ -190,6 +190,17 @@ mod _pyexpat {
         let model = super::_model::module_def(&vm.ctx).create_module(vm)?;
         let errors = super::_errors::module_def(&vm.ctx).create_module(vm)?;
 
+        let codes = vm.ctx.new_dict();
+        let messages = vm.ctx.new_dict();
+        for (code, (name, message)) in ERRORS.iter().enumerate().skip(1) {
+            let message = vm.ctx.new_str(*message);
+            errors.set_attr(*name, message.clone(), vm)?;
+            codes.set_item(message.as_object(), vm.ctx.new_int(code).into(), vm)?;
+            messages.set_item(vm.ctx.new_int(code).as_object(), message.into(), vm)?;
+        }
+        errors.set_attr("codes", codes, vm)?;
+        errors.set_attr("messages", messages, vm)?;
+
         extend_module!(vm, module, {
             "model" => model,
             "errors" => errors,
@@ -202,6 +213,103 @@ mod _pyexpat {
 
     #[pyattr(name = "version_info")]
     pub(super) const VERSION_INFO: (u32, u32, u32) = (2, 7, 1);
+
+    #[pyattr(name = "EXPAT_VERSION")]
+    const EXPAT_VERSION: &str = "expat_2.7.1";
+
+    #[pyattr(name = "native_encoding")]
+    const NATIVE_ENCODING: &str = "UTF-8";
+
+    /// libexpat's `enum XML_Error`, indexed by code: the `errors` submodule
+    /// constant name and the `XML_ErrorString` text.
+    const ERRORS: [(&str, &str); 44] = [
+        ("XML_ERROR_NONE", ""),
+        ("XML_ERROR_NO_MEMORY", "out of memory"),
+        ("XML_ERROR_SYNTAX", "syntax error"),
+        ("XML_ERROR_NO_ELEMENTS", "no element found"),
+        ("XML_ERROR_INVALID_TOKEN", "not well-formed (invalid token)"),
+        ("XML_ERROR_UNCLOSED_TOKEN", "unclosed token"),
+        ("XML_ERROR_PARTIAL_CHAR", "partial character"),
+        ("XML_ERROR_TAG_MISMATCH", "mismatched tag"),
+        ("XML_ERROR_DUPLICATE_ATTRIBUTE", "duplicate attribute"),
+        ("XML_ERROR_JUNK_AFTER_DOC_ELEMENT", "junk after document element"),
+        ("XML_ERROR_PARAM_ENTITY_REF", "illegal parameter entity reference"),
+        ("XML_ERROR_UNDEFINED_ENTITY", "undefined entity"),
+        ("XML_ERROR_RECURSIVE_ENTITY_REF", "recursive entity reference"),
+        ("XML_ERROR_ASYNC_ENTITY", "asynchronous entity"),
+        ("XML_ERROR_BAD_CHAR_REF", "reference to invalid character number"),
+        ("XML_ERROR_BINARY_ENTITY_REF", "reference to binary entity"),
+        ("XML_ERROR_ATTRIBUTE_EXTERNAL_ENTITY_REF", "reference to external entity in attribute"),
+        ("XML_ERROR_MISPLACED_XML_PI", "XML or text declaration not at start of entity"),
+        ("XML_ERROR_UNKNOWN_ENCODING", "unknown encoding"),
+        ("XML_ERROR_INCORRECT_ENCODING", "encoding specified in XML declaration is incorrect"),
+        ("XML_ERROR_UNCLOSED_CDATA_SECTION", "unclosed CDATA section"),
+        ("XML_ERROR_EXTERNAL_ENTITY_HANDLING", "error in processing external entity reference"),
+        ("XML_ERROR_NOT_STANDALONE", "document is not standalone"),
+        ("XML_ERROR_UNEXPECTED_STATE", "unexpected parser state - please send a bug report"),
+        ("XML_ERROR_ENTITY_DECLARED_IN_PE", "entity declared in parameter entity"),
+        ("XML_ERROR_FEATURE_REQUIRES_XML_DTD", "requested feature requires XML_DTD support in Expat"),
+        ("XML_ERROR_CANT_CHANGE_FEATURE_ONCE_PARSING", "cannot change setting once parsing has begun"),
+        ("XML_ERROR_UNBOUND_PREFIX", "unbound prefix"),
+        ("XML_ERROR_UNDECLARING_PREFIX", "must not undeclare prefix"),
+        ("XML_ERROR_INCOMPLETE_PE", "incomplete markup in parameter entity"),
+        ("XML_ERROR_XML_DECL", "XML declaration not well-formed"),
+        ("XML_ERROR_TEXT_DECL", "text declaration not well-formed"),
+        ("XML_ERROR_PUBLICID", "illegal character(s) in public id"),
+        ("XML_ERROR_SUSPENDED", "parser suspended"),
+        ("XML_ERROR_NOT_SUSPENDED", "parser not suspended"),
+        ("XML_ERROR_ABORTED", "parsing aborted"),
+        ("XML_ERROR_FINISHED", "parsing finished"),
+        ("XML_ERROR_SUSPEND_PE", "cannot suspend in external parameter entity"),
+        ("XML_ERROR_RESERVED_PREFIX_XML", "reserved prefix (xml) must not be undeclared or bound to another namespace name"),
+        ("XML_ERROR_RESERVED_PREFIX_XMLNS", "reserved prefix (xmlns) must not be declared or undeclared"),
+        ("XML_ERROR_RESERVED_NAMESPACE_URI", "prefix must not be bound to one of the reserved namespace names"),
+        ("XML_ERROR_INVALID_ARGUMENT", "invalid argument"),
+        ("XML_ERROR_NO_BUFFER", "a successful prior call to function XML_GetBuffer is required"),
+        ("XML_ERROR_AMPLIFICATION_LIMIT_BREACH", "limit on input amplification factor (from DTD and entities) breached"),
+    ];
+
+    /// The libexpat error code closest to a reader error.
+    fn expat_code(error: ReaderError) -> usize {
+        match error {
+            ReaderError::Io | ReaderError::LimitExceeded => 1,
+            ReaderError::NoRootElement
+            | ReaderError::UnexpectedEndOfDocument
+            | ReaderError::UnbalancedRootElement => 3,
+            ReaderError::UnterminatedMarkup => 5,
+            ReaderError::TruncatedCharacter => 6,
+            ReaderError::MismatchedClosingTag => 7,
+            ReaderError::RedefinedAttribute => 8,
+            ReaderError::UnexpectedTokenOutsideRoot | ReaderError::UnexpectedOpeningTag => 9,
+            ReaderError::UndefinedEntity => 11,
+            ReaderError::InvalidCharacterReference => 14,
+            ReaderError::UnsupportedEncoding => 18,
+            ReaderError::ConflictingEncoding => 19,
+            ReaderError::UnclosedCData => 20,
+            ReaderError::UnboundPrefix => 27,
+            ReaderError::InvalidVersion | ReaderError::InvalidStandalone => 30,
+            ReaderError::InvalidNamespaceDeclaration => 40,
+            ReaderError::EntityTooBig => 43,
+            ReaderError::Decode
+            | ReaderError::UnexpectedMarkup
+            | ReaderError::InvalidCharacter
+            | ReaderError::UnexpectedToken
+            | ReaderError::InvalidQualifiedName
+            | ReaderError::InvalidNamePrefix
+            | ReaderError::EmptyEntity
+            | ReaderError::InvalidProcessingInstruction
+            | ReaderError::UnknownMarkupDeclaration => 4,
+        }
+    }
+
+    #[pyfunction(name = "ErrorString")]
+    fn error_string(code: i64) -> Option<&'static str> {
+        usize::try_from(code)
+            .ok()
+            .filter(|&c| c > 0)
+            .and_then(|c| ERRORS.get(c))
+            .map(|(_, message)| *message)
+    }
 
     #[pyattr]
     const XML_PARAM_ENTITY_PARSING_NEVER: i32 = 0;
@@ -228,6 +336,19 @@ mod _pyexpat {
         current_column: PyRwLock<i64>,
         #[pytraverse(skip)]
         current_byte_index: PyRwLock<i64>,
+        // The first parse error (libexpat's XML_GetErrorCode and the
+        // position it was found at), exposed as ErrorCode / ErrorLineNumber /
+        // ErrorColumnNumber / ErrorByteIndex.
+        #[pytraverse(skip)]
+        error_code: PyRwLock<i64>,
+        // Character data held back while buffer_text is on, and the
+        // running total of bytes fed by each Parse() call (libexpat reports
+        // the data of each call as its own chunk).
+        #[pytraverse(skip)]
+        text_buffer: PyRwLock<String>,
+        #[pytraverse(skip)]
+        fed_offsets: PyRwLock<Vec<usize>>,
+        buffer_size: MutableObject,
         // Incremental-parsing state: Parse()/ParseFile() may be called
         // multiple times with successive chunks of the same document (e.g.
         // xml.etree.ElementTree and genshi both feed input in ~64KB chunks).
@@ -548,10 +669,10 @@ mod _pyexpat {
         Event(PreparedEvent),
         /// `EndDocument` was reached; the parser thread has exited.
         Finished,
-        /// The reader reported a parse error. Mirrors the previous
-        /// whole-buffer implementation, which silently stopped dispatching
-        /// on the first parse error rather than raising `ExpatError`.
-        Error,
+        /// The reader reported a parse error at the given line, column and
+        /// byte index; the parser thread has exited. Raised as `ExpatError`
+        /// once every event before it has been dispatched.
+        Error(ReaderError, i64, i64, i64),
     }
 
     /// Set, once and permanently, by a `pthread_atfork` child hook the
@@ -707,6 +828,16 @@ mod _pyexpat {
         loop {
             match parser.next() {
                 Ok(XmlEvent::EndDocument) => {
+                    // Report where the document ended (libexpat's position
+                    // once parsing finished).
+                    let pos = parser.position();
+                    let byte_index = tracker.borrow_mut().byte_index_for(pos);
+                    let _ = tx.send(ParserMsg::Event(PreparedEvent {
+                        event: XmlEvent::EndDocument,
+                        line: pos.row() as i64 + 1,
+                        column: pos.column() as i64,
+                        byte_index,
+                    }));
                     let _ = tx.send(ParserMsg::Finished);
                     break;
                 }
@@ -723,8 +854,15 @@ mod _pyexpat {
                         break;
                     }
                 }
-                Err(_) => {
-                    let _ = tx.send(ParserMsg::Error);
+                Err(error) => {
+                    let pos = parser.position();
+                    let byte_index = tracker.borrow_mut().byte_index_for(pos);
+                    let _ = tx.send(ParserMsg::Error(
+                        error,
+                        pos.row() as i64 + 1,
+                        pos.column() as i64,
+                        byte_index,
+                    ));
                     break;
                 }
             }
@@ -818,6 +956,10 @@ mod _pyexpat {
                 current_line: PyRwLock::new(1),
                 current_column: PyRwLock::new(0),
                 current_byte_index: PyRwLock::new(-1),
+                error_code: PyRwLock::new(0),
+                text_buffer: PyRwLock::new(String::new()),
+                fed_offsets: PyRwLock::new(Vec::new()),
+                buffer_size: MutableObject::new(vm.ctx.new_int(8192).into()),
                 backend: PyRwLock::new(None),
                 busy: AtomicBool::new(false),
                 finished: AtomicBool::new(false),
@@ -910,6 +1052,23 @@ mod _pyexpat {
                 class,
                 current_byte_index
             );
+            create_readonly_int_property!(ctx, attributes, "ErrorCode", class, error_code);
+            create_readonly_int_property!(ctx, attributes, "ErrorLineNumber", class, current_line);
+            create_readonly_int_property!(
+                ctx,
+                attributes,
+                "ErrorColumnNumber",
+                class,
+                current_column
+            );
+            create_readonly_int_property!(
+                ctx,
+                attributes,
+                "ErrorByteIndex",
+                class,
+                current_byte_index
+            );
+            create_property!(ctx, attributes, "buffer_size", class, buffer_size);
             // Additional handlers (stubs for compatibility)
             create_property!(
                 ctx,
@@ -1038,9 +1197,19 @@ mod _pyexpat {
         }
 
         /// Construct element name with namespace if separator is set
-        fn make_name(&self, name: &QualifiedName) -> String {
+        fn make_name(&self, vm: &VirtualMachine, name: &QualifiedName) -> String {
             match (&self.namespace_separator, &name.namespace) {
-                (Some(sep), Some(ns)) => format!("{}{}{}", ns, sep, name.local_name),
+                (Some(sep), Some(ns)) => {
+                    // With namespace_prefixes on, libexpat appends the
+                    // prefix as a third part: "uri local prefix".
+                    let with_prefix = name.prefix.as_deref().filter(|prefix| !prefix.is_empty()).filter(|_| {
+                        self.namespace_prefixes.read().clone().is_true(vm).unwrap_or(false)
+                    });
+                    match with_prefix {
+                        Some(prefix) => format!("{ns}{sep}{}{sep}{prefix}", name.local_name),
+                        None => format!("{}{}{}", ns, sep, name.local_name),
+                    }
+                }
                 _ => name.local_name.clone(),
             }
         }
@@ -1074,6 +1243,22 @@ mod _pyexpat {
         /// Dispatch a single parser event to the registered handlers. Runs on
         /// the calling thread only -- see the module doc comment.
         fn dispatch(&self, vm: &VirtualMachine, event: XmlEvent) -> PyResult<()> {
+            // Like CPython, buffered character data is delivered before any
+            // other handler that is set runs.
+            let next_handler = match &event {
+                XmlEvent::StartElement { .. } => Some(&self.start_element),
+                XmlEvent::EndElement { .. } => Some(&self.end_element),
+                XmlEvent::ProcessingInstruction { .. } => Some(&self.processing_instruction),
+                XmlEvent::Comment(_) => Some(&self.comment),
+                XmlEvent::XmlDecl { .. } => Some(&self.xml_decl),
+                XmlEvent::Doctype { .. } => Some(&self.start_doctype_decl),
+                XmlEvent::StartNamespace { .. } => Some(&self.start_namespace_decl),
+                XmlEvent::EndNamespace { .. } => Some(&self.end_namespace_decl),
+                _ => None,
+            };
+            if let Some(handler) = next_handler {
+                self.flush_for(vm, handler)?;
+            }
             match event {
                 XmlEvent::StartElement {
                     name, attributes, ..
@@ -1083,7 +1268,7 @@ mod _pyexpat {
                     let attrs: PyObjectRef = if ordered {
                         let mut items = Vec::with_capacity(attributes.len() * 2);
                         for attribute in attributes {
-                            let key = self.intern_name(vm, self.make_name(&attribute.name));
+                            let key = self.intern_name(vm, self.make_name(vm, &attribute.name));
                             items.push(key.into());
                             items.push(vm.ctx.new_str(attribute.value).into());
                         }
@@ -1091,7 +1276,7 @@ mod _pyexpat {
                     } else {
                         let dict = vm.ctx.new_dict();
                         for attribute in attributes {
-                            let key = self.intern_name(vm, self.make_name(&attribute.name));
+                            let key = self.intern_name(vm, self.make_name(vm, &attribute.name));
                             dict.set_item(
                                 AsRef::<str>::as_ref(&key),
                                 vm.ctx.new_str(attribute.value).into(),
@@ -1102,16 +1287,16 @@ mod _pyexpat {
                         dict.into()
                     };
 
-                    let name_str = self.intern_name(vm, self.make_name(&name));
+                    let name_str = self.intern_name(vm, self.make_name(vm, &name));
                     invoke_handler(vm, &self.start_element, (name_str, attrs))
                 }
                 XmlEvent::EndElement { name, .. } => {
-                    let name_str = self.intern_name(vm, self.make_name(&name));
+                    let name_str = self.intern_name(vm, self.make_name(vm, &name));
                     invoke_handler(vm, &self.end_element, (name_str,))
                 }
                 XmlEvent::Characters(chars) => {
-                    let str = PyStr::from(chars).into_ref(&vm.ctx);
-                    invoke_handler(vm, &self.character_data, (str,))
+                    let start = *self.current_byte_index.read();
+                    self.character_run(vm, &chars, usize::try_from(start).ok())
                 }
                 XmlEvent::ProcessingInstruction { name, data } => {
                     let name = PyStr::from(name).into_ref(&vm.ctx);
@@ -1122,14 +1307,146 @@ mod _pyexpat {
                     let comment = PyStr::from(comment).into_ref(&vm.ctx);
                     invoke_handler(vm, &self.comment, (comment,))
                 }
+                XmlEvent::XmlDecl {
+                    version,
+                    encoding,
+                    standalone,
+                } => {
+                    let encoding: PyObjectRef =
+                        encoding.map_or_else(|| vm.ctx.none(), |e| vm.ctx.new_str(e).into());
+                    let standalone: i32 = match standalone {
+                        None => -1,
+                        Some(true) => 1,
+                        Some(false) => 0,
+                    };
+                    invoke_handler(
+                        vm,
+                        &self.xml_decl,
+                        (vm.ctx.new_str(version), encoding, vm.ctx.new_int(standalone)),
+                    )
+                }
+                XmlEvent::Doctype {
+                    name,
+                    system_id,
+                    public_id,
+                    has_internal_subset,
+                } => {
+                    let text = |value: Option<String>| -> PyObjectRef {
+                        value.map_or_else(|| vm.ctx.none(), |v| vm.ctx.new_str(v).into())
+                    };
+                    invoke_handler(
+                        vm,
+                        &self.start_doctype_decl,
+                        (
+                            vm.ctx.new_str(name),
+                            text(system_id),
+                            text(public_id),
+                            vm.ctx.new_int(i32::from(has_internal_subset)),
+                        ),
+                    )?;
+                    invoke_handler(vm, &self.end_doctype_decl, ())
+                }
+                // libexpat reports namespace declarations only when namespace
+                // processing is on (a namespace_separator was given).
+                XmlEvent::StartNamespace { prefix, uri } if self.namespace_separator.is_some() => {
+                    let prefix: PyObjectRef = if prefix.is_empty() {
+                        vm.ctx.none()
+                    } else {
+                        vm.ctx.new_str(prefix).into()
+                    };
+                    invoke_handler(vm, &self.start_namespace_decl, (prefix, vm.ctx.new_str(uri)))
+                }
+                XmlEvent::EndNamespace { prefix } if self.namespace_separator.is_some() => {
+                    let prefix: PyObjectRef = if prefix.is_empty() {
+                        vm.ctx.none()
+                    } else {
+                        vm.ctx.new_str(prefix).into()
+                    };
+                    invoke_handler(vm, &self.end_namespace_decl, (prefix,))
+                }
                 XmlEvent::CData(chars) => {
+                    self.flush_for(vm, &self.start_cdata_section)?;
                     invoke_handler(vm, &self.start_cdata_section, ())?;
-                    let str = PyStr::from(chars).into_ref(&vm.ctx);
-                    invoke_handler(vm, &self.character_data, (str,))?;
+                    self.character_run(vm, &chars, None)?;
+                    self.flush_for(vm, &self.end_cdata_section)?;
                     invoke_handler(vm, &self.end_cdata_section, ())
                 }
                 _ => Ok(()),
             }
+        }
+
+        /// Deliver a run of character data the way libexpat chunks it: each
+        /// newline on its own, and the data of each Parse() call apart
+        /// (start is the run's byte offset in the input, when known).
+        fn character_run(&self, vm: &VirtualMachine, chars: &str, start: Option<usize>) -> PyResult<()> {
+            let offsets = self.fed_offsets.read().clone();
+            let mut piece = String::new();
+            let mut at = start;
+            for character in chars.chars() {
+                if let Some(offset) = at
+                    && Some(offset) != start
+                    && offsets.binary_search(&offset).is_ok()
+                {
+                    if !piece.is_empty() {
+                        self.char_data(vm, core::mem::take(&mut piece))?;
+                    }
+                    self.flush_text(vm)?;
+                }
+                if character == '\n' {
+                    if !piece.is_empty() {
+                        self.char_data(vm, core::mem::take(&mut piece))?;
+                    }
+                    self.char_data(vm, "\n".to_owned())?;
+                } else {
+                    piece.push(character);
+                }
+                at = at.map(|offset| offset + character.len_utf8());
+            }
+            if !piece.is_empty() {
+                self.char_data(vm, piece)?;
+            }
+            Ok(())
+        }
+
+        /// CPython's character data handler: call it at once, or with
+        /// buffer_text on, gather data up to buffer_size bytes.
+        fn char_data(&self, vm: &VirtualMachine, data: String) -> PyResult<()> {
+            let buffered = self.buffer_text.read().clone().is_true(vm)?;
+            if !buffered {
+                let data = PyStr::from(data).into_ref(&vm.ctx);
+                return invoke_handler(vm, &self.character_data, (data,));
+            }
+            if vm.is_none(&self.character_data.read().clone()) {
+                return Ok(());
+            }
+            let size = usize::try_from_object(vm, self.buffer_size.read().clone()).unwrap_or(8192);
+            let overflow = self.text_buffer.read().len() + data.len() > size;
+            if overflow {
+                self.flush_text(vm)?;
+            }
+            if data.len() > size {
+                let data = PyStr::from(data).into_ref(&vm.ctx);
+                return invoke_handler(vm, &self.character_data, (data,));
+            }
+            self.text_buffer.write().push_str(&data);
+            Ok(())
+        }
+
+        fn flush_text(&self, vm: &VirtualMachine) -> PyResult<()> {
+            let data = core::mem::take(&mut *self.text_buffer.write());
+            if data.is_empty() {
+                return Ok(());
+            }
+            let data = PyStr::from(data).into_ref(&vm.ctx);
+            invoke_handler(vm, &self.character_data, (data,))
+        }
+
+        /// Flush buffered data before handler runs, if it is set.
+        fn flush_for(&self, vm: &VirtualMachine, handler: &MutableObject) -> PyResult<()> {
+            if vm.is_none(&handler.read().clone()) {
+                return Ok(());
+            }
+            self.flush_text(vm)
         }
 
         /// Tear down the current backend (if any). For `Backend::Threaded`
@@ -1137,6 +1454,41 @@ mod _pyexpat {
         /// simply drops the accumulated buffer. Called once the document is
         /// finished, or (for the threaded backend) a handler raised and we
         /// choose not to keep the stream around (see `pump`).
+        /// Record a parse error like libexpat (ErrorCode and its position)
+        /// and build the `ExpatError` CPython raises for it: the message
+        /// "<text>: line L, column C" with `code`, `lineno` and `offset`.
+        fn parse_error(
+            &self,
+            vm: &VirtualMachine,
+            error: ReaderError,
+            line: i64,
+            column: i64,
+            byte_index: i64,
+        ) -> crate::vm::builtins::PyBaseExceptionRef {
+            let code = expat_code(error);
+            // The reader stops at the start of a mismatched `</name>`;
+            // libexpat reports the name itself.
+            let column = if matches!(error, ReaderError::MismatchedClosingTag) {
+                column + 2
+            } else {
+                column
+            };
+            *self.error_code.write() = code as i64;
+            *self.current_line.write() = line;
+            *self.current_column.write() = column;
+            *self.current_byte_index.write() = byte_index;
+            let message = format!("{}: line {line}, column {column}", ERRORS[code].1);
+            let exc = vm.new_exception_msg(
+                PyExpatError::class(&vm.ctx).to_owned(),
+                message.into(),
+            );
+            let obj = exc.as_object();
+            let _ = obj.set_attr("code", vm.ctx.new_int(code), vm);
+            let _ = obj.set_attr("lineno", vm.ctx.new_int(line), vm);
+            let _ = obj.set_attr("offset", vm.ctx.new_int(column), vm);
+            exc
+        }
+
         fn teardown_backend(&self) {
             let mut guard = self.backend.write();
             *guard = None;
@@ -1191,9 +1543,10 @@ mod _pyexpat {
                         self.teardown_backend();
                         return Ok(());
                     }
-                    ParserMsg::Error => {
+                    ParserMsg::Error(error, line, column, byte_index) => {
+                        self.finished.store(true, Ordering::SeqCst);
                         self.teardown_backend();
-                        return Ok(());
+                        return Err(self.parse_error(vm, error, line, column, byte_index));
                     }
                     ParserMsg::Event(ev) => {
                         *self.current_line.write() = ev.line;
@@ -1260,7 +1613,14 @@ mod _pyexpat {
                     // never move to an earlier index across reparses (the
                     // bytes producing them are unchanged), so leaving
                     // `EndDocument` uncounted is always safe.
-                    Ok(XmlEvent::EndDocument) => break Ok(()),
+                    Ok(XmlEvent::EndDocument) => {
+                        let pos = parser.position();
+                        let byte_index = tracker.borrow_mut().byte_index_for(pos);
+                        *self.current_line.write() = pos.row() as i64 + 1;
+                        *self.current_column.write() = pos.column() as i64;
+                        *self.current_byte_index.write() = byte_index;
+                        break Ok(());
+                    }
                     Ok(event) => {
                         let this_index = index;
                         index += 1;
@@ -1288,6 +1648,17 @@ mod _pyexpat {
                     // mirrors `ParserMsg::Error`, which is silently
                     // swallowed for compatibility rather than raising
                     // `ExpatError`.
+                    Err(error) if isfinal => {
+                        let pos = parser.position();
+                        let byte_index = tracker.borrow_mut().byte_index_for(pos);
+                        break Err(self.parse_error(
+                            vm,
+                            error,
+                            pos.row() as i64 + 1,
+                            pos.column() as i64,
+                            byte_index,
+                        ));
+                    }
                     Err(_) => break Ok(()),
                 }
             };
@@ -1324,7 +1695,9 @@ mod _pyexpat {
                 // corrupt state, so reject it instead, mirroring CPython.
                 return Err(vm.new_runtime_error("Parse() called before Parse() returned"));
             }
-            let result = self.feed_inner(vm, chunk, isfinal);
+            let result = self
+                .feed_inner(vm, chunk, isfinal)
+                .and_then(|()| self.flush_text(vm));
             self.busy.store(false, Ordering::SeqCst);
             result
         }
@@ -1334,6 +1707,11 @@ mod _pyexpat {
                 // The document already ended; further data is ignored, same
                 // as libexpat happily no-oping once XML_Parse has seen EOF.
                 return Ok(());
+            }
+            if !chunk.is_empty() {
+                let mut offsets = self.fed_offsets.write();
+                let total = offsets.last().copied().unwrap_or(0) + chunk.len();
+                offsets.push(total);
             }
             {
                 let mut guard = self.backend.write();

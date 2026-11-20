@@ -1,0 +1,29 @@
+[package]
+name = "nanocode-live"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Live views over a partitioned log: follow, fold once per view, fan encoded diffs out to sockets"
+
+[dependencies]
+nanocode-durability-core.workspace = true
+nanocode-live-fold.workspace = true
+nanocode-sync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+nanocode-io.workspace = true
+nanocode-websocket.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false

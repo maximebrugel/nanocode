@@ -47,11 +47,16 @@ function NumberPrototypeToString(this: Value, radix?: Value): Str {
 }
 
 /**
- * Number.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] ), 21.1.3.4.
+ * Number.prototype.toLocaleString ( [ locales [ , options ] ] ), ECMA-402 20.1.1.
  * @builtin Number.prototype.toLocaleString
+ * @length 0
  */
-function NumberPrototypeToLocaleString(this: Value): Str {
-  return NumberToString(ThisNumberValue(this), 10);
+function NumberPrototypeToLocaleString(this: Value, locales?: Value, options?: Value): Str {
+  const x: f64 = ThisNumberValue(this);
+  if (IntlEnabled()) {
+    return IntlNumberToLocaleString(x, locales, options);
+  }
+  return NumberToString(x, 10);
 }
 
 /**

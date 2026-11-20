@@ -797,54 +797,75 @@ async fn declare_one(
         }
     }
     let _ = existed;
-    match a {
-        DeclArg::Word(_) => {}
-        DeclArg::Assign {
-            index: None,
-            append,
-            value,
-            ..
-        } => {
-            let is_array = vp.vars.get(&target).is_some_and(|v| v.is_array());
-            if o.nameref == Some(true) {
-                vp.vars.entry(&target).set(value.clone());
-            } else if let Some(sub) = &elem {
-                vp.assign_elem(&target, sub, value.clone(), *append)?;
-            } else if is_array
-                && value.first() == Some(&b'(')
-                && value.last() == Some(&b')')
-                && let Some(items) = reparse_compound(vp, value).await?
-            {
-                vp.assign_array(&target, items, *append)?;
-            } else {
-                let v = vp.prepare_value(&target, value.clone(), *append)?;
-                vp.vars.entry(&target).set(v);
+    // An arithmetic error assigning to an integer variable abandons the command
+    // line, as an expansion error does (bash).
+    let integer = vp.vars.get(&target).is_some_and(|v| v.integer);
+    let r: Result<(), DeclError> = async {
+        match a {
+            DeclArg::Word(_) => {}
+            DeclArg::Assign {
+                index: None,
+                append,
+                value,
+                ..
+            } => {
+                let is_array = vp.vars.get(&target).is_some_and(|v| v.is_array());
+                if o.nameref == Some(true) {
+                    vp.vars.entry(&target).set(value.clone());
+                } else if let Some(sub) = &elem {
+                    vp.assign_elem(&target, sub, value.clone(), *append)?;
+                } else if is_array
+                    && value.first() == Some(&b'(')
+                    && value.last() == Some(&b')')
+                    && let Some(items) = reparse_compound(vp, value).await?
+                {
+                    vp.assign_array(&target, items, *append)?;
+                } else {
+                    let v = vp.prepare_value(&target, value.clone(), *append)?;
+                    vp.vars.entry(&target).set(v);
+                }
+            }
+            DeclArg::Assign {
+                index: Some(i),
+                append,
+                value,
+                ..
+            } => {
+                let is_array = vp.vars.get(&target).is_some_and(|v| v.is_array());
+                if is_array
+                    && value.first() == Some(&b'(')
+                    && value.last() == Some(&b')')
+                    && let Some(items) = reparse_compound(vp, value).await?
+                {
+                    vp.assign_array(&target, items, *append)?;
+                } else {
+                    let i = crate::expand::expand_sub_text(vp, i)
+                        .await
+                        .map_err(DeclError::Unwind)?;
+                    vp.assign_elem(&target, &i, value.clone(), *append)?;
+                }
+            }
+            DeclArg::Array { append, items, .. } => {
+                vp.assign_array(&target, items.clone(), *append)?;
             }
         }
-        DeclArg::Assign {
-            index: Some(i),
-            append,
-            value,
-            ..
-        } => {
-            let is_array = vp.vars.get(&target).is_some_and(|v| v.is_array());
-            if is_array
-                && value.first() == Some(&b'(')
-                && value.last() == Some(&b')')
-                && let Some(items) = reparse_compound(vp, value).await?
-            {
-                vp.assign_array(&target, items, *append)?;
-            } else {
-                let i = crate::expand::expand_sub_text(vp, i)
-                    .await
-                    .map_err(DeclError::Unwind)?;
-                vp.assign_elem(&target, &i, value.clone(), *append)?;
-            }
-        }
-        DeclArg::Array { append, items, .. } => {
-            vp.assign_array(&target, items.clone(), *append)?;
-        }
+        Ok(())
     }
+    .await;
+    // Elements a compound assignment skipped, with their warnings.
+    if !vp.arith_notes.is_empty() {
+        crate::arith::notes(vp).await;
+    }
+    if let Err(DeclError::Msg(m)) = &r
+        && integer
+        && !m.ends_with(": readonly variable")
+        && !m.ends_with("bad array subscript")
+        && !m.ends_with("not a valid identifier")
+    {
+        vp.error(&format!("{bname}: {m}")).await;
+        return Err(DeclError::Unwind(crate::state::Unwind::Abort(1)));
+    }
+    r?;
     // `set -a`: a declaration that gives a value exports it, as an assignment does.
     if !matches!(a, DeclArg::Word(_))
         && !o.unexport
@@ -876,6 +897,9 @@ async fn functions(
         };
         if names_only && print_flag {
             buf.extend_from_slice(b"declare -f");
+            if vp.readonly_funcs.iter().any(|n| n == name) {
+                buf.push(b'r');
+            }
             if vp.traced_funcs.iter().any(|n| n == name) {
                 buf.push(b't');
             }
@@ -903,11 +927,18 @@ async fn functions(
         for n in all {
             let traced = vp.traced_funcs.contains(n);
             let exported = vp.exported_funcs.contains(n);
-            if (filter.contains(&b't') && !traced) || (filter.contains(&b'x') && !exported) {
+            let readonly = vp.readonly_funcs.contains(n);
+            if (filter.contains(&b't') && !traced)
+                || (filter.contains(&b'x') && !exported)
+                || (filter.contains(&b'r') && !readonly)
+            {
                 continue;
             }
             if names_only {
                 buf.extend_from_slice(b"declare -f");
+                if readonly {
+                    buf.push(b'r');
+                }
                 if traced {
                     buf.push(b't');
                 }
@@ -1105,7 +1136,7 @@ pub(crate) fn value_quote(v: &[u8], utf8: bool) -> Vec<u8> {
 }
 
 /// An associative key: bare when it has no special chars, else like a value.
-fn key_quote(k: &[u8], utf8: bool) -> Vec<u8> {
+pub(crate) fn key_quote(k: &[u8], utf8: bool) -> Vec<u8> {
     let plain = !k.is_empty()
         && k.iter().all(|&b| {
             !b.is_ascii_control()

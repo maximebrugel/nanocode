@@ -228,6 +228,9 @@ pub fn client() -> crate::Client {
 }
 
 pub fn decode_flate_response(response: crate::Response) -> crate::Response {
+    if stacked(response.headers()) {
+        return undecodable(response);
+    }
     match FlateCoding::from_headers(response.headers()) {
         Some(coding) => replace_body(response, |body| {
             Box::pin(decoded(flate::stream(coding, body)))
@@ -239,16 +242,15 @@ pub fn decode_flate_response(response: crate::Response) -> crate::Response {
 pub fn decode_response(response: crate::Response) -> crate::Response {
     use crate::types::header::{CONTENT_ENCODING, CONTENT_LENGTH};
 
+    if stacked(response.headers()) {
+        return undecodable(response);
+    }
     if FlateCoding::from_headers(response.headers()).is_some() {
         return decode_flate_response(response);
     }
-    let mut encodings = response.headers().get_all(CONTENT_ENCODING).iter();
-    let Some(encoding) = encodings.next() else {
+    let Some(encoding) = response.headers().get(CONTENT_ENCODING) else {
         return response;
     };
-    if encodings.next().is_some() {
-        return response;
-    }
     let zstd = match encoding.to_str().map(str::trim) {
         Ok(value) if value.eq_ignore_ascii_case("zstd") => true,
         Ok(value) if value.eq_ignore_ascii_case("br") => false,
@@ -267,6 +269,27 @@ pub fn decode_response(response: crate::Response) -> crate::Response {
         } else {
             Box::pin(decoded(brotli::stream(body)))
         }
+    })
+}
+
+fn stacked(headers: &crate::types::HeaderMap) -> bool {
+    headers
+        .get_all(crate::types::header::CONTENT_ENCODING)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .filter(|coding| !coding.trim_ascii().is_empty())
+        .nth(1)
+        .is_some()
+}
+
+fn undecodable(response: crate::Response) -> crate::Response {
+    replace_body(response, |_| {
+        Box::pin(decoded(stream::once(async {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "response body with more than one content-coding",
+            ))
+        })))
     })
 }
 

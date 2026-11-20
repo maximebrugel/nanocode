@@ -106,7 +106,14 @@ impl Counter {
                 }
                 continue;
             }
-            let (ch, len) = if utf8 && b >= 0x80 {
+            if !utf8 {
+                // A byte past ASCII outside a UTF-8 locale is a character that is not
+                // printable: it has no width and neither starts nor ends a word (GNU wc).
+                i += 1;
+                self.c.chars += 1;
+                continue;
+            }
+            let (ch, len) = {
                 let len = match b {
                     0xc2..=0xdf => 2,
                     0xe0..=0xef => 3,
@@ -122,8 +129,6 @@ impl Counter {
                     Ok(s) => (s.chars().next(), len),
                     Err(_) => (None, 1),
                 }
-            } else {
-                (Some(b as char), 1)
             };
             i += len;
             if let Some(ch) = ch {
@@ -145,7 +150,7 @@ impl Counter {
                 }
                 if space {
                     self.in_word = false;
-                } else if !self.in_word && (ch as u32 >= 0x20 || !utf8) && !ch.is_control() {
+                } else if !self.in_word && !ch.is_control() {
                     self.in_word = true;
                     self.c.words += 1;
                 }
@@ -194,70 +199,34 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
     let utf8 = ctx.utf8();
     let lines_only = !(w || m || big_l);
     let files = common::operands_or_stdin(&p);
-    let mut results: Vec<(Option<Counts>, Vec<u8>)> = Vec::new();
-    let mut status = 0;
-    // GNU's width: the digits of the total size of regular files, at least 7 when an
-    // input is not a regular file, and no padding for one count of one input.
-    let mut total_size: u64 = 0;
-    let mut irregular = false;
-    let mut buf = vec![0u8; 64 * 1024];
-    for name in &files {
-        let regular = if name == b"-" {
-            false
-        } else {
-            match ctx.stat(name, true).await {
-                Ok(md) if md.kind == FileKind::File => {
-                    total_size += md.size;
-                    true
-                }
-                _ => false,
-            }
-        };
-        let input = match Input::open(ctx, name).await {
-            Ok(i) => i,
-            Err(e) => {
-                common::file_error(ctx, name, &e).await;
-                status = 1;
-                results.push((None, name.clone()));
-                continue;
-            }
-        };
-        if !regular {
-            irregular = true;
-        }
-        let mut counter = Counter::default();
-        let mut failed = false;
-        loop {
-            match input.read(ctx, &mut buf).await {
-                Ok(0) => break,
-                Ok(n) if lines_only => counter.feed_lines(&buf[..n]),
-                Ok(n) => counter.feed(&buf[..n], utf8),
-                Err(e) => {
-                    common::file_error(ctx, name, &e).await;
-                    status = 1;
-                    failed = true;
-                    break;
-                }
-            }
-            ctx.check().await;
-        }
-        let shown = if p.operands.is_empty() {
-            Vec::new()
-        } else {
-            name.clone()
-        };
-        results.push(((!failed).then(|| counter.finish()), shown));
-    }
     let ncounts = [l, w, m, c, big_l].iter().filter(|&&b| b).count();
-    // `--total=only` prints its one line unpadded.
+    // GNU stats every input before reading any, for the width: the digits of the total
+    // size of regular files, at least 7 when an input is not a regular file, 1 when the
+    // first input can't be stat'd, and no padding for one count of one input.
     let width = if (ncounts == 1 && files.len() == 1) || total_mode == "only" {
         1
     } else {
-        let digits = total_size.max(1).to_string().len();
-        if irregular { digits.max(7) } else { digits }
+        let mut total_size: u64 = 0;
+        let mut irregular = false;
+        let mut first_failed = false;
+        for (i, name) in files.iter().enumerate() {
+            if name == b"-" {
+                irregular = true;
+                continue;
+            }
+            match ctx.stat(name, true).await {
+                Ok(md) if md.kind == FileKind::File => total_size += md.size,
+                Ok(_) => irregular = true,
+                Err(_) => first_failed |= i == 0,
+            }
+        }
+        if first_failed {
+            1
+        } else {
+            let digits = total_size.max(1).to_string().len();
+            if irregular { digits.max(7) } else { digits }
+        }
     };
-    let mut total = Counts::default();
-    let mut out = Vec::new();
     let line = |counts: &Counts, name: &[u8], out: &mut Vec<u8>| {
         let mut fields = Vec::new();
         for (on, v) in [
@@ -278,11 +247,47 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         }
         out.push(b'\n');
     };
-    for (counts, name) in &results {
-        if let Some(counts) = counts {
-            total.add(counts);
-            if total_mode != "only" {
-                line(counts, name, &mut out);
+    let mut status = 0;
+    let mut total = Counts::default();
+    let mut buf = vec![0u8; 64 * 1024];
+    // Each input's line is written as soon as it is counted, so its errors on stderr
+    // interleave with the counts in input order, as GNU's do.
+    for name in &files {
+        let input = match Input::open(ctx, name).await {
+            Ok(i) => i,
+            Err(e) => {
+                common::file_error(ctx, name, &e).await;
+                status = 1;
+                continue;
+            }
+        };
+        let mut counter = Counter::default();
+        let mut failed = false;
+        loop {
+            match input.read(ctx, &mut buf).await {
+                Ok(0) => break,
+                Ok(n) if lines_only => counter.feed_lines(&buf[..n]),
+                Ok(n) => counter.feed(&buf[..n], utf8),
+                Err(e) => {
+                    common::file_error(ctx, name, &e).await;
+                    status = 1;
+                    failed = true;
+                    break;
+                }
+            }
+            ctx.check().await;
+        }
+        if failed {
+            continue;
+        }
+        let counts = counter.finish();
+        total.add(&counts);
+        if total_mode != "only" {
+            let shown: &[u8] = if p.operands.is_empty() { b"" } else { name };
+            let mut out = Vec::new();
+            line(&counts, shown, &mut out);
+            if let Err(e) = ctx.write(&out).await {
+                return common::write_failed(ctx, &e).await;
             }
         }
     }
@@ -292,14 +297,36 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         _ => files.len() > 1,
     };
     if show_total {
+        let mut out = Vec::new();
         line(
             &total,
             if total_mode == "only" { b"" } else { b"total" },
             &mut out,
         );
-    }
-    if let Err(e) = ctx.write(&out).await {
-        return common::write_failed(ctx, &e).await;
+        if let Err(e) = ctx.write(&out).await {
+            return common::write_failed(ctx, &e).await;
+        }
     }
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Counter;
+
+    fn words(data: &[u8], utf8: bool) -> u64 {
+        let mut c = Counter::default();
+        c.feed(data, utf8);
+        c.finish().words
+    }
+
+    #[test]
+    fn bytes_past_ascii_start_no_word_outside_utf8() {
+        // GNU wc in the C locale: they are not printable, so they neither start nor end
+        // a word.
+        assert_eq!(words(b"\xc3\xa9\n", false), 0);
+        assert_eq!(words(b"t\xc3\xa9\n", false), 1);
+        assert_eq!(words(b"\xa9a \xa9 b\n", false), 2);
+        assert_eq!(words("é\n".as_bytes(), true), 1);
+    }
 }

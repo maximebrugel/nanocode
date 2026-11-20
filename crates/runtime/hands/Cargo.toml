@@ -18,6 +18,7 @@ nanocode-digest.workspace = true
 nanocode-platform.workspace = true
 nanocode-sync.workspace = true
 nanocode-tool-contracts.workspace = true
+psh-classify.workspace = true
 serde_json.workspace = true
 
 [lints]

@@ -1581,6 +1581,35 @@ fn builtin_pointer(vm: &VirtualMachine, class: &Py<PyType>) -> Option<*mut Type>
     .find_map(|(builtin, pointer)| class.is(builtin).then_some(pointer))
 }
 
+/// Modules CPython implements in C whose classes nanocode defines in Python
+/// (decimal is _pydecimal, datetime _pydatetime, zoneinfo _pyzoneinfo): their
+/// classes are static types in CPython.
+const C_ACCELERATED_MODULES: &[&str] = &["datetime", "decimal", "zoneinfo"];
+
+/// The tp_name CPython gives the class: a static type's dotted "module.name"
+/// (builtins drop the module), a heap type's bare __name__. RustPython's native
+/// types are static; so are the Python stand-ins for C accelerator modules, so
+/// messages built from tp_name read "decimal.Decimal" and "datetime.date" as
+/// they do in CPython.
+fn type_name(vm: &VirtualMachine, class: &Py<PyType>) -> String {
+    if !class.slots.flags.has_feature(PyTypeFlags::HEAPTYPE) {
+        return class.slot_name().to_string();
+    }
+    let name = class.name().to_string();
+    let module = class
+        .as_object()
+        .get_attr("__module__", vm)
+        .ok()
+        .and_then(|module| module.downcast::<PyStr>().ok())
+        .map(|module| module.to_string_lossy().into_owned());
+    match module {
+        Some(module) if C_ACCELERATED_MODULES.contains(&module.as_str()) => {
+            format!("{module}.{name}")
+        }
+        _ => name,
+    }
+}
+
 pub fn type_pointer(vm: &VirtualMachine, class: &Py<PyType>) -> *mut Type {
     ready(vm);
     if let Some(pointer) = builtin_pointer(vm, class) {
@@ -1602,7 +1631,7 @@ pub fn type_pointer(vm: &VirtualMachine, class: &Py<PyType>) -> *mut Type {
             }
         }
     }
-    let name = CString::new(class.name().to_string())
+    let name = CString::new(type_name(vm, class))
         .unwrap_or_default()
         .into_raw();
     let pointer = heap::allocate(size_of::<Type>(), true).cast::<Type>();

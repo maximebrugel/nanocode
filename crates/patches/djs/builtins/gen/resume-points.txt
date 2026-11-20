@@ -390,13 +390,13 @@ ToIndex: reentrant
 ThisArrayBuffer: leaf
 
 AllocateArrayBuffer: reentrant
-  builtins/arraybuffer.ts:24:22  GetPrototypeFromConstructor (builtin)
+  builtins/arraybuffer.ts:26:22  GetPrototypeFromConstructor (builtin)
 
 ArrayBufferConstructor: reentrant (constructor ArrayBuffer)
-  builtins/arraybuffer.ts:37:27  ToIndex (builtin)
-  builtins/arraybuffer.ts:40:22  Get (intrinsic)
-  builtins/arraybuffer.ts:42:13  ToIndex (builtin)
-  builtins/arraybuffer.ts:45:10  AllocateArrayBuffer (builtin)
+  builtins/arraybuffer.ts:39:27  ToIndex (builtin)
+  builtins/arraybuffer.ts:42:22  Get (intrinsic)
+  builtins/arraybuffer.ts:44:13  ToIndex (builtin)
+  builtins/arraybuffer.ts:47:10  AllocateArrayBuffer (builtin)
 
 ArrayBufferIsView: leaf (ArrayBuffer.isView)
 
@@ -419,29 +419,29 @@ IsDetached: leaf
 BufferLength: leaf
 
 ArrayBufferPrototypeResize: reentrant (ArrayBuffer.prototype.resize)
-  builtins/arraybuffer.ts:128:30  ToIndex (builtin)
+  builtins/arraybuffer.ts:130:30  ToIndex (builtin)
 
 ArrayBufferPrototypeSlice: reentrant (ArrayBuffer.prototype.slice)
-  builtins/arraybuffer.ts:148:22  RelativeIndex (builtin)
-  builtins/arraybuffer.ts:149:20  RelativeIndex (builtin)
-  builtins/arraybuffer.ts:151:23  SpeciesConstructor (builtin)
-  builtins/arraybuffer.ts:152:24  Construct (intrinsic)
+  builtins/arraybuffer.ts:150:22  RelativeIndex (builtin)
+  builtins/arraybuffer.ts:151:20  RelativeIndex (builtin)
+  builtins/arraybuffer.ts:153:23  SpeciesConstructor (builtin)
+  builtins/arraybuffer.ts:154:24  Construct (intrinsic)
 
 ArrayBufferCopyAndDetach: reentrant
-  builtins/arraybuffer.ts:187:21  ToIndex (builtin)
+  builtins/arraybuffer.ts:189:21  ToIndex (builtin)
 
 ArrayBufferPrototypeTransfer: reentrant (ArrayBuffer.prototype.transfer)
-  builtins/arraybuffer.ts:214:10  ArrayBufferCopyAndDetach (builtin)
+  builtins/arraybuffer.ts:216:10  ArrayBufferCopyAndDetach (builtin)
 
 ArrayBufferPrototypeTransferToFixedLength: reentrant (ArrayBuffer.prototype.transferToFixedLength)
-  builtins/arraybuffer.ts:222:10  ArrayBufferCopyAndDetach (builtin)
+  builtins/arraybuffer.ts:224:10  ArrayBufferCopyAndDetach (builtin)
 
 ArrayBufferPrototypeTransferToImmutable: reentrant (ArrayBuffer.prototype.transferToImmutable)
-  builtins/arraybuffer.ts:230:10  ArrayBufferCopyAndDetach (builtin)
+  builtins/arraybuffer.ts:232:10  ArrayBufferCopyAndDetach (builtin)
 
 ArrayBufferPrototypeSliceToImmutable: reentrant (ArrayBuffer.prototype.sliceToImmutable)
-  builtins/arraybuffer.ts:244:22  RelativeIndex (builtin)
-  builtins/arraybuffer.ts:245:20  RelativeIndex (builtin)
+  builtins/arraybuffer.ts:246:22  RelativeIndex (builtin)
+  builtins/arraybuffer.ts:247:20  RelativeIndex (builtin)
 
 ArrayBufferPrototypeToStringTag: leaf (value ArrayBuffer.prototype[Symbol.toStringTag])
 
@@ -533,6 +533,90 @@ AsyncFromSyncIteratorThrow: reentrant (%AsyncFromSyncIteratorPrototype%.throw)
   builtins/asyncgen.ts:357:14  CallWithArray (intrinsic)
   builtins/asyncgen.ts:365:10  AsyncFromSyncIteratorContinuation (builtin)
 
+AtomicsObject: leaf (value Atomics)
+
+AtomicsToStringTag: leaf (value Atomics[Symbol.toStringTag])
+
+ValidateIntegerTypedArray: leaf
+
+ValidateAtomicAccess: reentrant
+  builtins/atomics.ts:44:18  ToIndex (builtin)
+
+AtomicOperand: reentrant
+  builtins/atomics.ts:54:12  ToBigInt (builtin)
+  builtins/atomics.ts:56:10  ToIntegerOrInfinity (builtin)
+
+RevalidateAtomicAccess: leaf
+
+AtomicReadModifyWrite: reentrant
+  builtins/atomics.ts:69:18  ValidateAtomicAccess (builtin)
+  builtins/atomics.ts:70:20  AtomicOperand (builtin)
+
+AtomicsAdd: reentrant (Atomics.add)
+  builtins/atomics.ts:80:10  AtomicReadModifyWrite (builtin)
+
+AtomicsAnd: reentrant (Atomics.and)
+  builtins/atomics.ts:88:10  AtomicReadModifyWrite (builtin)
+
+AtomicsCompareExchange: reentrant (Atomics.compareExchange)
+  builtins/atomics.ts:97:18  ValidateAtomicAccess (builtin)
+  builtins/atomics.ts:98:20  AtomicOperand (builtin)
+  builtins/atomics.ts:99:20  AtomicOperand (builtin)
+
+AtomicsExchange: reentrant (Atomics.exchange)
+  builtins/atomics.ts:109:10  AtomicReadModifyWrite (builtin)
+
+AtomicsIsLockFree: reentrant (Atomics.isLockFree)
+  builtins/atomics.ts:117:18  ToIntegerOrInfinity (builtin)
+
+AtomicsLoad: reentrant (Atomics.load)
+  builtins/atomics.ts:127:18  ValidateAtomicAccess (builtin)
+
+AtomicsOr: reentrant (Atomics.or)
+  builtins/atomics.ts:137:10  AtomicReadModifyWrite (builtin)
+
+AtomicsStore: reentrant (Atomics.store)
+  builtins/atomics.ts:146:18  ValidateAtomicAccess (builtin)
+  builtins/atomics.ts:147:18  AtomicOperand (builtin)
+
+AtomicsSub: reentrant (Atomics.sub)
+  builtins/atomics.ts:161:10  AtomicReadModifyWrite (builtin)
+
+AtomicsXor: reentrant (Atomics.xor)
+  builtins/atomics.ts:169:10  AtomicReadModifyWrite (builtin)
+
+DoWaitCheck: reentrant
+  builtins/atomics.ts:183:18  ValidateAtomicAccess (builtin)
+  builtins/atomics.ts:186:9  ToBigInt (builtin)
+  builtins/atomics.ts:188:9  ToIntegerOrInfinity (builtin)
+  builtins/atomics.ts:190:18  ToNumber (builtin)
+
+AtomicsWait: reentrant (Atomics.wait)
+  builtins/atomics.ts:219:18  DoWaitCheck (builtin)
+
+WaitAsyncResult: reentrant
+  builtins/atomics.ts:233:3  CreateDataPropertyOrThrow (intrinsic)
+  builtins/atomics.ts:234:3  CreateDataPropertyOrThrow (intrinsic)
+
+AtomicsWaitAsync: reentrant (Atomics.waitAsync)
+  builtins/atomics.ts:245:18  DoWaitCheck (builtin)
+  builtins/atomics.ts:248:12  WaitAsyncResult (builtin)
+  builtins/atomics.ts:260:31  Get (intrinsic)
+  builtins/atomics.ts:265:7  Call (intrinsic)
+  builtins/atomics.ts:268:10  WaitAsyncResult (builtin)
+
+AppendWaiter: leaf
+
+RemoveWaiter: leaf
+
+AtomicsWaitTimeout: reentrant (%AtomicsWaitTimeout)
+  builtins/atomics.ts:316:3  ResolvePromise (builtin)
+
+AtomicsNotify: reentrant (Atomics.notify)
+  builtins/atomics.ts:326:18  ValidateAtomicAccess (builtin)
+  builtins/atomics.ts:329:9  ToIntegerOrInfinity (builtin)
+  builtins/atomics.ts:347:7  ResolvePromise (builtin)
+
 ToBigInt: reentrant (%ToBigInt)
   builtins/bigint.ts:9:28  ToPrimitive (builtin)
 
@@ -552,7 +636,8 @@ ThisBigIntValue: leaf
 BigIntPrototypeToString: reentrant (BigInt.prototype.toString)
   builtins/bigint.ts:66:9  ToIntegerOrInfinity (builtin)
 
-BigIntPrototypeToLocaleString: leaf (BigInt.prototype.toLocaleString)
+BigIntPrototypeToLocaleString: reentrant (BigInt.prototype.toLocaleString)
+  builtins/bigint.ts:83:12  IntlNumberToLocaleString (builtin)
 
 BigIntPrototypeValueOf: leaf (BigInt.prototype.valueOf)
 
@@ -828,29 +913,32 @@ DatePrototypeToTimeString: leaf (Date.prototype.toTimeString)
 
 DatePrototypeToISOString: leaf (Date.prototype.toISOString, %DatePrototypeToISOString)
 
-DatePrototypeToLocaleString: leaf (Date.prototype.toLocaleString)
+DatePrototypeToLocaleString: reentrant (Date.prototype.toLocaleString)
+  builtins/date.ts:444:12  IntlDateToLocaleString (builtin)
 
-DatePrototypeToLocaleDateString: leaf (Date.prototype.toLocaleDateString)
+DatePrototypeToLocaleDateString: reentrant (Date.prototype.toLocaleDateString)
+  builtins/date.ts:457:12  IntlDateToLocaleString (builtin)
 
-DatePrototypeToLocaleTimeString: leaf (Date.prototype.toLocaleTimeString)
+DatePrototypeToLocaleTimeString: reentrant (Date.prototype.toLocaleTimeString)
+  builtins/date.ts:470:12  IntlDateToLocaleString (builtin)
 
 DatePrototypeToUTCString: leaf (Date.prototype.toUTCString, Date.prototype.toGMTString)
 
 DatePrototypeGetYear: leaf (Date.prototype.getYear)
 
 DatePrototypeSetYear: reentrant (Date.prototype.setYear)
-  builtins/date.ts:484:16  ToNumber (builtin)
-  builtins/date.ts:486:21  ToIntegerOrInfinity (builtin)
-  builtins/date.ts:492:3  CreateDataPropertyOrThrow (intrinsic)
+  builtins/date.ts:499:16  ToNumber (builtin)
+  builtins/date.ts:501:21  ToIntegerOrInfinity (builtin)
+  builtins/date.ts:507:3  CreateDataPropertyOrThrow (intrinsic)
 
 DatePrototypeToJSON: reentrant (Date.prototype.toJSON, %DatePrototypeToJSON)
-  builtins/date.ts:503:21  ToPrimitive (builtin)
-  builtins/date.ts:510:15  Get (intrinsic)
-  builtins/date.ts:510:10  Call (intrinsic)
+  builtins/date.ts:518:21  ToPrimitive (builtin)
+  builtins/date.ts:525:15  Get (intrinsic)
+  builtins/date.ts:525:10  Call (intrinsic)
 
 DatePrototypeToPrimitive: reentrant (Date.prototype[Symbol.toPrimitive], %DatePrototypeToPrimitive)
-  builtins/date.ts:524:12  OrdinaryToPrimitive (builtin)
-  builtins/date.ts:527:12  OrdinaryToPrimitive (builtin)
+  builtins/date.ts:539:12  OrdinaryToPrimitive (builtin)
+  builtins/date.ts:542:12  OrdinaryToPrimitive (builtin)
 
 DecoratorKindName: leaf
 
@@ -1442,6 +1530,465 @@ DynamicImport: reentrant (%DynamicImport)
   builtins/import.ts:25:24  LengthOfArrayLike (builtin)
   builtins/import.ts:27:25  Get (intrinsic)
   builtins/import.ts:36:26  PromiseResolve (builtin)
+
+IntlLocaleTags: reentrant
+  builtins/intl.ts:29:20  LengthOfArrayLike (builtin)
+  builtins/intl.ts:33:9  HasProperty (intrinsic)
+  builtins/intl.ts:34:24  Get (intrinsic)
+  builtins/intl.ts:39:55  ToString (builtin)
+
+IntlSplit: leaf
+
+IntlNoNull: reentrant
+  builtins/intl.ts:75:17  IntlLocaleTags (builtin)
+
+IntlReadOptions: reentrant
+  builtins/intl.ts:97:22  Get (intrinsic)
+  builtins/intl.ts:105:22  ToNumber (builtin)
+  builtins/intl.ts:116:13  ToString (builtin)
+  builtins/intl.ts:122:11  ToString (builtin)
+
+IntlWith: leaf
+
+IntlValue: reentrant
+  builtins/intl.ts:144:12  ToNumber (builtin)
+
+IntlResolvedObject: reentrant
+  builtins/intl.ts:165:42  IntlValue (builtin)
+  builtins/intl.ts:165:7  CreateDataPropertyOrThrow (intrinsic)
+
+IntlParts: reentrant
+  builtins/intl.ts:193:5  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:194:5  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:196:7  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:199:7  CreateDataPropertyOrThrow (intrinsic)
+
+IntlThis: reentrant
+  builtins/intl.ts:213:42  ToString (builtin)
+
+IntlConstructor: reentrant
+  builtins/intl.ts:222:26  Get (intrinsic)
+  builtins/intl.ts:222:16  Get (intrinsic)
+
+IntlRequested: reentrant
+  builtins/intl.ts:230:21  IntlLocaleTags (builtin)
+
+IntlConstruct: reentrant
+  builtins/intl.ts:237:21  IntlConstructor (builtin)
+  builtins/intl.ts:238:22  Get (intrinsic)
+  builtins/intl.ts:240:13  Get (intrinsic)
+
+IntlRequireNew: leaf
+
+IntlBoundFormat: reentrant (%IntlBoundFormat)
+  builtins/intl.ts:259:45  IntlNumeric (builtin)
+  builtins/intl.ts:261:56  IntlDateValue (builtin)
+
+IntlBoundCompare: reentrant (%IntlBoundCompare)
+  builtins/intl.ts:269:59  ToString (builtin)
+  builtins/intl.ts:269:72  ToString (builtin)
+
+IntlBoundFunction: leaf
+
+IntlNfOptions: leaf
+
+IntlDtfOptions: leaf
+
+IntlCollatorOptions: leaf
+
+IntlPluralOptions: leaf
+
+IntlObject: leaf (value Intl)
+
+IntlToStringTag: leaf (value Intl[Symbol.toStringTag])
+
+IntlCaseMode: reentrant
+  builtins/intl.ts:324:33  IntlLocaleTags (builtin)
+
+IntlGetCanonicalLocales: reentrant (Intl.getCanonicalLocales)
+  builtins/intl.ts:347:32  IntlLocaleTags (builtin)
+
+IntlSupportedLocales: reentrant
+  builtins/intl.ts:352:33  IntlLocaleTags (builtin)
+  builtins/intl.ts:357:22  Get (intrinsic)
+  builtins/intl.ts:359:22  ToString (builtin)
+
+IntlNewNumberFormat: reentrant
+  builtins/intl.ts:372:21  IntlRequested (builtin)
+  builtins/intl.ts:373:76  IntlNoNull (builtin)
+  builtins/intl.ts:373:60  IntlReadOptions (builtin)
+  builtins/intl.ts:373:10  IntlConstruct (builtin)
+
+IntlNumberFormatConstructor: reentrant (constructor Intl.NumberFormat)
+  builtins/intl.ts:382:10  IntlNewNumberFormat (builtin)
+
+IntlNumberFormatSupportedLocalesOf: reentrant (Intl.NumberFormat.supportedLocalesOf)
+  builtins/intl.ts:391:10  IntlSupportedLocales (builtin)
+
+IntlNumeric: reentrant
+  builtins/intl.ts:396:20  ToPrimitive (builtin)
+  builtins/intl.ts:403:10  ToNumber (builtin)
+
+IntlNumberFormatPrototypeFormat: reentrant (get Intl.NumberFormat.prototype.format)
+  builtins/intl.ts:411:3  IntlThis (builtin)
+
+IntlNumberFormatPrototypeFormatToParts: reentrant (Intl.NumberFormat.prototype.formatToParts)
+  builtins/intl.ts:420:21  IntlThis (builtin)
+  builtins/intl.ts:421:40  IntlNumeric (builtin)
+  builtins/intl.ts:421:10  IntlParts (builtin)
+
+IntlRangeValue: reentrant
+  builtins/intl.ts:429:20  IntlNumeric (builtin)
+
+IntlNumberFormatPrototypeFormatRange: reentrant (Intl.NumberFormat.prototype.formatRange)
+  builtins/intl.ts:443:21  IntlThis (builtin)
+  builtins/intl.ts:445:5  IntlRangeValue (builtin)
+  builtins/intl.ts:446:5  IntlRangeValue (builtin)
+  builtins/intl.ts:448:20  IntlRangeValue (builtin)
+  builtins/intl.ts:449:39  IntlRangeValue (builtin)
+
+IntlNumberFormatPrototypeFormatRangeToParts: reentrant (Intl.NumberFormat.prototype.formatRangeToParts)
+  builtins/intl.ts:458:21  IntlThis (builtin)
+  builtins/intl.ts:460:5  IntlRangeValue (builtin)
+  builtins/intl.ts:461:5  IntlRangeValue (builtin)
+  builtins/intl.ts:463:20  IntlRangeValue (builtin)
+  builtins/intl.ts:464:43  IntlRangeValue (builtin)
+  builtins/intl.ts:464:10  IntlParts (builtin)
+
+IntlNumberFormatPrototypeResolvedOptions: reentrant (Intl.NumberFormat.prototype.resolvedOptions)
+  builtins/intl.ts:472:29  IntlThis (builtin)
+  builtins/intl.ts:472:10  IntlResolvedObject (builtin)
+
+IntlNumberFormatToStringTag: leaf (value Intl.NumberFormat.prototype[Symbol.toStringTag])
+
+IntlNewDateTimeFormat: reentrant
+  builtins/intl.ts:491:21  IntlRequested (builtin)
+  builtins/intl.ts:492:18  IntlReadOptions (builtin)
+  builtins/intl.ts:496:10  IntlConstruct (builtin)
+
+IntlDateTimeFormatConstructor: reentrant (constructor Intl.DateTimeFormat)
+  builtins/intl.ts:505:10  IntlNewDateTimeFormat (builtin)
+
+IntlDateTimeFormatSupportedLocalesOf: reentrant (Intl.DateTimeFormat.supportedLocalesOf)
+  builtins/intl.ts:514:10  IntlSupportedLocales (builtin)
+
+IntlDateValue: reentrant
+  builtins/intl.ts:522:10  ToNumber (builtin)
+
+IntlDateTimeFormatPrototypeFormat: reentrant (get Intl.DateTimeFormat.prototype.format)
+  builtins/intl.ts:530:3  IntlThis (builtin)
+
+IntlDateTimeFormatPrototypeFormatToParts: reentrant (Intl.DateTimeFormat.prototype.formatToParts)
+  builtins/intl.ts:539:21  IntlThis (builtin)
+  builtins/intl.ts:540:40  IntlDateValue (builtin)
+  builtins/intl.ts:540:10  IntlParts (builtin)
+
+IntlDateRange: reentrant
+  builtins/intl.ts:548:10  IntlRangeNumber (builtin)
+
+IntlRangeNumber: reentrant
+  builtins/intl.ts:559:10  ToNumber (builtin)
+
+IntlDateTimeFormatPrototypeFormatRange: reentrant (Intl.DateTimeFormat.prototype.formatRange)
+  builtins/intl.ts:568:21  IntlThis (builtin)
+  builtins/intl.ts:569:18  IntlDateRange (builtin)
+  builtins/intl.ts:570:39  IntlRangeNumber (builtin)
+
+IntlDateTimeFormatPrototypeFormatRangeToParts: reentrant (Intl.DateTimeFormat.prototype.formatRangeToParts)
+  builtins/intl.ts:579:21  IntlThis (builtin)
+  builtins/intl.ts:580:18  IntlDateRange (builtin)
+  builtins/intl.ts:581:43  IntlRangeNumber (builtin)
+  builtins/intl.ts:581:10  IntlParts (builtin)
+
+IntlDateTimeFormatPrototypeResolvedOptions: reentrant (Intl.DateTimeFormat.prototype.resolvedOptions)
+  builtins/intl.ts:590:29  IntlThis (builtin)
+  builtins/intl.ts:590:10  IntlResolvedObject (builtin)
+
+IntlDateTimeFormatToStringTag: leaf (value Intl.DateTimeFormat.prototype[Symbol.toStringTag])
+
+IntlNewCollator: reentrant
+  builtins/intl.ts:606:21  IntlRequested (builtin)
+  builtins/intl.ts:607:56  IntlReadOptions (builtin)
+  builtins/intl.ts:607:10  IntlConstruct (builtin)
+
+IntlCollatorConstructor: reentrant (constructor Intl.Collator)
+  builtins/intl.ts:616:10  IntlNewCollator (builtin)
+
+IntlCollatorSupportedLocalesOf: reentrant (Intl.Collator.supportedLocalesOf)
+  builtins/intl.ts:625:10  IntlSupportedLocales (builtin)
+
+IntlCollatorPrototypeCompare: reentrant (get Intl.Collator.prototype.compare)
+  builtins/intl.ts:633:3  IntlThis (builtin)
+
+IntlCollatorPrototypeResolvedOptions: reentrant (Intl.Collator.prototype.resolvedOptions)
+  builtins/intl.ts:642:29  IntlThis (builtin)
+  builtins/intl.ts:642:10  IntlResolvedObject (builtin)
+
+IntlCollatorToStringTag: leaf (value Intl.Collator.prototype[Symbol.toStringTag])
+
+IntlPluralRulesConstructor: reentrant (constructor Intl.PluralRules)
+  builtins/intl.ts:663:21  IntlRequested (builtin)
+  builtins/intl.ts:664:76  IntlNoNull (builtin)
+  builtins/intl.ts:664:60  IntlReadOptions (builtin)
+  builtins/intl.ts:664:10  IntlConstruct (builtin)
+
+IntlPluralRulesSupportedLocalesOf: reentrant (Intl.PluralRules.supportedLocalesOf)
+  builtins/intl.ts:673:10  IntlSupportedLocales (builtin)
+
+IntlPluralRulesPrototypeSelect: reentrant (Intl.PluralRules.prototype.select)
+  builtins/intl.ts:681:21  IntlThis (builtin)
+  builtins/intl.ts:682:36  ToNumber (builtin)
+
+IntlPluralRulesPrototypeSelectRange: reentrant (Intl.PluralRules.prototype.selectRange)
+  builtins/intl.ts:691:21  IntlThis (builtin)
+  builtins/intl.ts:698:18  ToNumber (builtin)
+  builtins/intl.ts:699:18  ToNumber (builtin)
+
+IntlPluralRulesPrototypeResolvedOptions: reentrant (Intl.PluralRules.prototype.resolvedOptions)
+  builtins/intl.ts:715:29  IntlThis (builtin)
+  builtins/intl.ts:715:10  IntlResolvedObject (builtin)
+
+IntlPluralRulesToStringTag: leaf (value Intl.PluralRules.prototype[Symbol.toStringTag])
+
+IntlListFormatConstructor: reentrant (constructor Intl.ListFormat)
+  builtins/intl.ts:736:21  IntlRequested (builtin)
+  builtins/intl.ts:737:75  IntlNoNull (builtin)
+  builtins/intl.ts:737:59  IntlReadOptions (builtin)
+  builtins/intl.ts:737:10  IntlConstruct (builtin)
+
+IntlListFormatSupportedLocalesOf: reentrant (Intl.ListFormat.supportedLocalesOf)
+  builtins/intl.ts:746:10  IntlSupportedLocales (builtin)
+
+IntlStringList: reentrant
+  builtins/intl.ts:754:21  IterableToList (builtin)
+  builtins/intl.ts:755:20  LengthOfArrayLike (builtin)
+  builtins/intl.ts:759:22  Get (intrinsic)
+  builtins/intl.ts:761:76  ToString (builtin)
+
+IntlListFormatPrototypeFormat: reentrant (Intl.ListFormat.prototype.format)
+  builtins/intl.ts:774:21  IntlThis (builtin)
+  builtins/intl.ts:775:36  IntlStringList (builtin)
+
+IntlListFormatPrototypeFormatToParts: reentrant (Intl.ListFormat.prototype.formatToParts)
+  builtins/intl.ts:783:21  IntlThis (builtin)
+  builtins/intl.ts:784:40  IntlStringList (builtin)
+  builtins/intl.ts:784:10  IntlParts (builtin)
+
+IntlListFormatPrototypeResolvedOptions: reentrant (Intl.ListFormat.prototype.resolvedOptions)
+  builtins/intl.ts:792:29  IntlThis (builtin)
+  builtins/intl.ts:792:10  IntlResolvedObject (builtin)
+
+IntlListFormatToStringTag: leaf (value Intl.ListFormat.prototype[Symbol.toStringTag])
+
+IntlRelativeTimeFormatConstructor: reentrant (constructor Intl.RelativeTimeFormat)
+  builtins/intl.ts:813:21  IntlRequested (builtin)
+  builtins/intl.ts:814:36  IntlNoNull (builtin)
+  builtins/intl.ts:814:20  IntlReadOptions (builtin)
+  builtins/intl.ts:815:10  IntlConstruct (builtin)
+
+IntlRelativeTimeFormatSupportedLocalesOf: reentrant (Intl.RelativeTimeFormat.supportedLocalesOf)
+  builtins/intl.ts:824:10  IntlSupportedLocales (builtin)
+
+IntlRelativeTimeFormatPrototypeFormat: reentrant (Intl.RelativeTimeFormat.prototype.format)
+  builtins/intl.ts:832:21  IntlThis (builtin)
+  builtins/intl.ts:833:36  ToNumber (builtin)
+  builtins/intl.ts:833:53  ToString (builtin)
+
+IntlRelativeTimeFormatPrototypeFormatToParts: reentrant (Intl.RelativeTimeFormat.prototype.formatToParts)
+  builtins/intl.ts:841:21  IntlThis (builtin)
+  builtins/intl.ts:842:18  ToString (builtin)
+  builtins/intl.ts:843:44  ToNumber (builtin)
+  builtins/intl.ts:845:10  IntlParts (builtin)
+
+IntlRelativeTimeFormatPrototypeResolvedOptions: reentrant (Intl.RelativeTimeFormat.prototype.resolvedOptions)
+  builtins/intl.ts:853:29  IntlThis (builtin)
+  builtins/intl.ts:853:10  IntlResolvedObject (builtin)
+
+IntlRelativeTimeFormatToStringTag: leaf (value Intl.RelativeTimeFormat.prototype[Symbol.toStringTag])
+
+IntlLocaleConstructor: reentrant (constructor Intl.Locale)
+  builtins/intl.ts:880:51  ToString (builtin)
+  builtins/intl.ts:887:20  IntlReadOptions (builtin)
+  builtins/intl.ts:888:10  IntlConstruct (builtin)
+
+IntlLocaleGet: reentrant
+  builtins/intl.ts:893:21  IntlThis (builtin)
+
+IntlNewLocale: reentrant
+  builtins/intl.ts:913:31  IntlConstructor (builtin)
+  builtins/intl.ts:913:27  Get (intrinsic)
+
+IntlLocalePrototypeMaximize: reentrant (Intl.Locale.prototype.maximize)
+  builtins/intl.ts:921:30  IntlLocaleGet (builtin)
+  builtins/intl.ts:921:10  IntlNewLocale (builtin)
+
+IntlLocalePrototypeMinimize: reentrant (Intl.Locale.prototype.minimize)
+  builtins/intl.ts:929:30  IntlLocaleGet (builtin)
+  builtins/intl.ts:929:10  IntlNewLocale (builtin)
+
+IntlLocalePrototypeToString: reentrant (Intl.Locale.prototype.toString)
+  builtins/intl.ts:937:10  IntlThis (builtin)
+
+IntlLocalePrototypeBaseName: reentrant (get Intl.Locale.prototype.baseName)
+  builtins/intl.ts:945:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeCalendar: reentrant (get Intl.Locale.prototype.calendar)
+  builtins/intl.ts:953:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeCaseFirst: reentrant (get Intl.Locale.prototype.caseFirst)
+  builtins/intl.ts:961:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeCollation: reentrant (get Intl.Locale.prototype.collation)
+  builtins/intl.ts:969:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeHourCycle: reentrant (get Intl.Locale.prototype.hourCycle)
+  builtins/intl.ts:977:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeNumeric: reentrant (get Intl.Locale.prototype.numeric)
+  builtins/intl.ts:985:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeNumberingSystem: reentrant (get Intl.Locale.prototype.numberingSystem)
+  builtins/intl.ts:993:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeLanguage: reentrant (get Intl.Locale.prototype.language)
+  builtins/intl.ts:1001:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeScript: reentrant (get Intl.Locale.prototype.script)
+  builtins/intl.ts:1009:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeRegion: reentrant (get Intl.Locale.prototype.region)
+  builtins/intl.ts:1017:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeCalendars: reentrant (get Intl.Locale.prototype.calendars)
+  builtins/intl.ts:1025:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeCollations: reentrant (get Intl.Locale.prototype.collations)
+  builtins/intl.ts:1033:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeHourCycles: reentrant (get Intl.Locale.prototype.hourCycles)
+  builtins/intl.ts:1041:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeNumberingSystems: reentrant (get Intl.Locale.prototype.numberingSystems)
+  builtins/intl.ts:1049:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeTimeZones: reentrant (get Intl.Locale.prototype.timeZones)
+  builtins/intl.ts:1057:10  IntlLocaleGet (builtin)
+
+IntlLocalePrototypeTextInfo: reentrant (get Intl.Locale.prototype.textInfo)
+  builtins/intl.ts:1065:20  IntlLocaleGet (builtin)
+  builtins/intl.ts:1067:3  CreateDataPropertyOrThrow (intrinsic)
+
+IntlLocalePrototypeWeekInfo: reentrant (get Intl.Locale.prototype.weekInfo)
+  builtins/intl.ts:1077:24  IntlLocaleGet (builtin)
+  builtins/intl.ts:1081:44  ToNumber (builtin)
+  builtins/intl.ts:1081:3  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:1085:18  LengthOfArrayLike (builtin)
+  builtins/intl.ts:1087:38  Get (intrinsic)
+  builtins/intl.ts:1087:29  ToNumber (builtin)
+  builtins/intl.ts:1090:3  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:1091:47  ToNumber (builtin)
+  builtins/intl.ts:1091:3  CreateDataPropertyOrThrow (intrinsic)
+
+IntlLocaleToStringTag: leaf (value Intl.Locale.prototype[Symbol.toStringTag])
+
+IntlSupportedValuesOf: reentrant (Intl.supportedValuesOf)
+  builtins/intl.ts:1110:41  ToString (builtin)
+
+IntlDisplayNamesConstructor: reentrant (constructor Intl.DisplayNames)
+  builtins/intl.ts:1124:21  IntlRequested (builtin)
+  builtins/intl.ts:1128:62  IntlReadOptions (builtin)
+  builtins/intl.ts:1128:10  IntlConstruct (builtin)
+
+IntlDisplayNamesSupportedLocalesOf: reentrant (Intl.DisplayNames.supportedLocalesOf)
+  builtins/intl.ts:1137:10  IntlSupportedLocales (builtin)
+
+IntlDisplayNamesPrototypeResolvedOptions: reentrant (Intl.DisplayNames.prototype.resolvedOptions)
+  builtins/intl.ts:1145:29  IntlThis (builtin)
+  builtins/intl.ts:1145:10  IntlResolvedObject (builtin)
+
+IntlDisplayNamesPrototypeOf: reentrant (Intl.DisplayNames.prototype.of)
+  builtins/intl.ts:1153:21  IntlThis (builtin)
+  builtins/intl.ts:1154:31  ToString (builtin)
+
+IntlDisplayNamesToStringTag: leaf (value Intl.DisplayNames.prototype[Symbol.toStringTag])
+
+IntlSegmenterConstructor: reentrant (constructor Intl.Segmenter)
+  builtins/intl.ts:1177:21  IntlRequested (builtin)
+  builtins/intl.ts:1181:59  IntlReadOptions (builtin)
+  builtins/intl.ts:1181:10  IntlConstruct (builtin)
+
+IntlSegmenterSupportedLocalesOf: reentrant (Intl.Segmenter.supportedLocalesOf)
+  builtins/intl.ts:1190:10  IntlSupportedLocales (builtin)
+
+IntlSegmenterPrototypeResolvedOptions: reentrant (Intl.Segmenter.prototype.resolvedOptions)
+  builtins/intl.ts:1198:29  IntlThis (builtin)
+  builtins/intl.ts:1198:10  IntlResolvedObject (builtin)
+
+IntlSegmenterPrototypeSegment: reentrant (Intl.Segmenter.prototype.segment)
+  builtins/intl.ts:1206:21  IntlThis (builtin)
+  builtins/intl.ts:1207:18  ToString (builtin)
+
+IntlSegmenterToStringTag: leaf (value Intl.Segmenter.prototype[Symbol.toStringTag])
+
+IntlSegmentStarts: reentrant
+  builtins/intl.ts:1229:23  Get (intrinsic)
+  builtins/intl.ts:1233:47  Get (intrinsic)
+  builtins/intl.ts:1239:18  LengthOfArrayLike (builtin)
+  builtins/intl.ts:1241:37  Get (intrinsic)
+  builtins/intl.ts:1241:28  ToNumber (builtin)
+  builtins/intl.ts:1244:3  Set (intrinsic)
+  builtins/intl.ts:1246:5  Set (intrinsic)
+
+IntlSegmentData: reentrant
+  builtins/intl.ts:1253:23  IntlSegmentStarts (builtin)
+  builtins/intl.ts:1254:24  Get (intrinsic)
+  builtins/intl.ts:1255:27  Get (intrinsic)
+  builtins/intl.ts:1255:18  ToNumber (builtin)
+  builtins/intl.ts:1256:27  Get (intrinsic)
+  builtins/intl.ts:1256:18  ToNumber (builtin)
+  builtins/intl.ts:1258:3  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:1259:3  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:1260:3  CreateDataPropertyOrThrow (intrinsic)
+  builtins/intl.ts:1261:24  Get (intrinsic)
+  builtins/intl.ts:1263:5  CreateDataPropertyOrThrow (intrinsic)
+
+IntlSegmentsPrototypeContaining: reentrant (%IntlSegmentsPrototype%.containing)
+  builtins/intl.ts:1273:21  IntlThis (builtin)
+  builtins/intl.ts:1275:24  Get (intrinsic)
+  builtins/intl.ts:1276:18  ToIntegerOrInfinity (builtin)
+  builtins/intl.ts:1281:23  IntlSegmentStarts (builtin)
+  builtins/intl.ts:1283:17  LengthOfArrayLike (builtin)
+  builtins/intl.ts:1285:22  MathFloor (builtin)
+  builtins/intl.ts:1286:18  Get (intrinsic)
+  builtins/intl.ts:1286:9  ToNumber (builtin)
+  builtins/intl.ts:1292:10  IntlSegmentData (builtin)
+
+IntlSegmentsPrototypeIterator: reentrant (%IntlSegmentsPrototype%[Symbol.iterator])
+  builtins/intl.ts:1300:21  IntlThis (builtin)
+  builtins/intl.ts:1304:23  Get (intrinsic)
+  builtins/intl.ts:1305:23  Get (intrinsic)
+  builtins/intl.ts:1306:23  Get (intrinsic)
+
+IntlSegmentIteratorPrototypeNext: reentrant (%IntlSegmentIteratorPrototype%.next)
+  builtins/intl.ts:1317:21  IntlThis (builtin)
+  builtins/intl.ts:1319:23  IntlSegmentStarts (builtin)
+  builtins/intl.ts:1320:27  Get (intrinsic)
+  builtins/intl.ts:1320:18  ToNumber (builtin)
+  builtins/intl.ts:1321:16  LengthOfArrayLike (builtin)
+  builtins/intl.ts:1324:3  Set (intrinsic)
+  builtins/intl.ts:1325:33  IntlSegmentData (builtin)
+
+IntlSegmentIteratorToStringTag: leaf (value %IntlSegmentIteratorPrototype%[Symbol.toStringTag])
+
+IntlNumberToLocaleString: reentrant
+  builtins/intl.ts:1341:19  IntlNewNumberFormat (builtin)
+  builtins/intl.ts:1342:54  IntlNumeric (builtin)
+
+IntlDateToLocaleString: reentrant
+  builtins/intl.ts:1350:20  IntlNewDateTimeFormat (builtin)
+
+IntlLocaleCompare: reentrant
+  builtins/intl.ts:1356:18  IntlNewCollator (builtin)
 
 GetIterator: reentrant (%GetIterator)
   builtins/iter.ts:11:25  GetV (intrinsic)
@@ -2242,18 +2789,19 @@ ThisNumberValue: leaf
 NumberPrototypeToString: reentrant (Number.prototype.toString)
   builtins/number.ts:44:9  ToIntegerOrInfinity (builtin)
 
-NumberPrototypeToLocaleString: leaf (Number.prototype.toLocaleString)
+NumberPrototypeToLocaleString: reentrant (Number.prototype.toLocaleString)
+  builtins/number.ts:57:12  IntlNumberToLocaleString (builtin)
 
 NumberPrototypeValueOf: leaf (Number.prototype.valueOf)
 
 NumberPrototypeToFixed: reentrant (Number.prototype.toFixed)
-  builtins/number.ts:72:27  ToIntegerOrInfinity (builtin)
+  builtins/number.ts:77:27  ToIntegerOrInfinity (builtin)
 
 NumberPrototypeToExponential: reentrant (Number.prototype.toExponential)
-  builtins/number.ts:81:18  ToIntegerOrInfinity (builtin)
+  builtins/number.ts:86:18  ToIntegerOrInfinity (builtin)
 
 NumberPrototypeToPrecision: reentrant (Number.prototype.toPrecision)
-  builtins/number.ts:97:31  ToIntegerOrInfinity (builtin)
+  builtins/number.ts:102:31  ToIntegerOrInfinity (builtin)
 
 IsFiniteNumber: leaf
 
@@ -2282,17 +2830,17 @@ NumberNegativeInfinity: leaf (value Number.NEGATIVE_INFINITY)
 NumberPositiveInfinity: leaf (value Number.POSITIVE_INFINITY)
 
 GlobalParseFloat: reentrant (parseFloat, Number.parseFloat)
-  builtins/number.ts:223:27  ToString (builtin)
+  builtins/number.ts:228:27  ToString (builtin)
 
 GlobalParseInt: reentrant (parseInt, Number.parseInt)
-  builtins/number.ts:233:18  ToString (builtin)
-  builtins/number.ts:234:42  ToNumber (builtin)
+  builtins/number.ts:238:18  ToString (builtin)
+  builtins/number.ts:239:42  ToNumber (builtin)
 
 GlobalIsNaN: reentrant (isNaN)
-  builtins/number.ts:243:18  ToNumber (builtin)
+  builtins/number.ts:248:18  ToNumber (builtin)
 
 GlobalIsFinite: reentrant (isFinite)
-  builtins/number.ts:253:25  ToNumber (builtin)
+  builtins/number.ts:258:25  ToNumber (builtin)
 
 ObjectConstructor: reentrant (constructor Object)
   builtins/object.ts:11:25  GetPrototypeFromConstructor (builtin)
@@ -3433,6 +3981,36 @@ SetPrototypeIsDisjointFrom: reentrant (Set.prototype.isDisjointFrom)
   builtins/set.ts:405:26  Get (intrinsic)
   builtins/set.ts:406:7  IteratorClose (builtin)
 
+ThisSharedArrayBuffer: leaf
+
+AllocateSharedArrayBuffer: reentrant
+  builtins/sharedarraybuffer.ts:19:22  GetPrototypeFromConstructor (builtin)
+
+SharedArrayBufferConstructor: reentrant (constructor SharedArrayBuffer)
+  builtins/sharedarraybuffer.ts:34:27  ToIndex (builtin)
+  builtins/sharedarraybuffer.ts:37:22  Get (intrinsic)
+  builtins/sharedarraybuffer.ts:39:13  ToIndex (builtin)
+  builtins/sharedarraybuffer.ts:42:10  AllocateSharedArrayBuffer (builtin)
+
+SharedArrayBufferSpecies: leaf (get SharedArrayBuffer[Symbol.species])
+
+SharedArrayBufferPrototypeByteLength: leaf (get SharedArrayBuffer.prototype.byteLength)
+
+SharedArrayBufferPrototypeGrow: reentrant (SharedArrayBuffer.prototype.grow)
+  builtins/sharedarraybuffer.ts:70:30  ToIndex (builtin)
+
+SharedArrayBufferPrototypeGrowable: leaf (get SharedArrayBuffer.prototype.growable)
+
+SharedArrayBufferPrototypeMaxByteLength: leaf (get SharedArrayBuffer.prototype.maxByteLength)
+
+SharedArrayBufferPrototypeSlice: reentrant (SharedArrayBuffer.prototype.slice)
+  builtins/sharedarraybuffer.ts:103:22  RelativeIndex (builtin)
+  builtins/sharedarraybuffer.ts:104:20  RelativeIndex (builtin)
+  builtins/sharedarraybuffer.ts:106:23  SpeciesConstructor (builtin)
+  builtins/sharedarraybuffer.ts:107:24  Construct (intrinsic)
+
+SharedArrayBufferPrototypeToStringTag: leaf (value SharedArrayBuffer.prototype[Symbol.toStringTag])
+
 ArraySpread: reentrant (%ArraySpread)
   builtins/spread.ts:10:25  GetIterator (builtin)
   builtins/spread.ts:11:23  Get (intrinsic)
@@ -3599,137 +4177,140 @@ StringPrototypeEndsWith: reentrant (String.prototype.endsWith)
   builtins/string.ts:226:54  ClampPosition (builtin)
 
 StringPrototypeLocaleCompare: reentrant (String.prototype.localeCompare)
-  builtins/string.ts:240:18  ThisToString (builtin)
-  builtins/string.ts:241:30  ToString (builtin)
+  builtins/string.ts:243:18  ThisToString (builtin)
+  builtins/string.ts:244:18  ToString (builtin)
+  builtins/string.ts:246:12  IntlLocaleCompare (builtin)
 
 StringPrototypeSlice: reentrant (String.prototype.slice)
-  builtins/string.ts:252:18  ThisToString (builtin)
-  builtins/string.ts:254:21  RelativeIndex (builtin)
-  builtins/string.ts:255:19  RelativeIndex (builtin)
+  builtins/string.ts:259:18  ThisToString (builtin)
+  builtins/string.ts:261:21  RelativeIndex (builtin)
+  builtins/string.ts:262:19  RelativeIndex (builtin)
 
 StringPrototypeSubstring: reentrant (String.prototype.substring)
-  builtins/string.ts:268:18  ThisToString (builtin)
-  builtins/string.ts:270:18  ClampPosition (builtin)
-  builtins/string.ts:271:44  ClampPosition (builtin)
+  builtins/string.ts:275:18  ThisToString (builtin)
+  builtins/string.ts:277:18  ClampPosition (builtin)
+  builtins/string.ts:278:44  ClampPosition (builtin)
 
 StringPrototypeSubstr: reentrant (String.prototype.substr)
-  builtins/string.ts:281:18  ThisToString (builtin)
-  builtins/string.ts:283:25  RelativeIndex (builtin)
-  builtins/string.ts:286:17  ToIntegerOrInfinity (builtin)
+  builtins/string.ts:288:18  ThisToString (builtin)
+  builtins/string.ts:290:25  RelativeIndex (builtin)
+  builtins/string.ts:293:17  ToIntegerOrInfinity (builtin)
 
 CreateHTML: reentrant
-  builtins/string.ts:302:18  ThisToString (builtin)
-  builtins/string.ts:305:20  ToString (builtin)
+  builtins/string.ts:309:18  ThisToString (builtin)
+  builtins/string.ts:312:20  ToString (builtin)
 
 StringPrototypeAnchor: reentrant (String.prototype.anchor)
-  builtins/string.ts:325:10  CreateHTML (builtin)
+  builtins/string.ts:332:10  CreateHTML (builtin)
 
 StringPrototypeBig: reentrant (String.prototype.big)
-  builtins/string.ts:333:10  CreateHTML (builtin)
+  builtins/string.ts:340:10  CreateHTML (builtin)
 
 StringPrototypeBlink: reentrant (String.prototype.blink)
-  builtins/string.ts:341:10  CreateHTML (builtin)
+  builtins/string.ts:348:10  CreateHTML (builtin)
 
 StringPrototypeBold: reentrant (String.prototype.bold)
-  builtins/string.ts:349:10  CreateHTML (builtin)
+  builtins/string.ts:356:10  CreateHTML (builtin)
 
 StringPrototypeFixed: reentrant (String.prototype.fixed)
-  builtins/string.ts:357:10  CreateHTML (builtin)
+  builtins/string.ts:364:10  CreateHTML (builtin)
 
 StringPrototypeFontcolor: reentrant (String.prototype.fontcolor)
-  builtins/string.ts:365:10  CreateHTML (builtin)
+  builtins/string.ts:372:10  CreateHTML (builtin)
 
 StringPrototypeFontsize: reentrant (String.prototype.fontsize)
-  builtins/string.ts:373:10  CreateHTML (builtin)
+  builtins/string.ts:380:10  CreateHTML (builtin)
 
 StringPrototypeItalics: reentrant (String.prototype.italics)
-  builtins/string.ts:381:10  CreateHTML (builtin)
+  builtins/string.ts:388:10  CreateHTML (builtin)
 
 StringPrototypeLink: reentrant (String.prototype.link)
-  builtins/string.ts:389:10  CreateHTML (builtin)
+  builtins/string.ts:396:10  CreateHTML (builtin)
 
 StringPrototypeSmall: reentrant (String.prototype.small)
-  builtins/string.ts:397:10  CreateHTML (builtin)
+  builtins/string.ts:404:10  CreateHTML (builtin)
 
 StringPrototypeStrike: reentrant (String.prototype.strike)
-  builtins/string.ts:405:10  CreateHTML (builtin)
+  builtins/string.ts:412:10  CreateHTML (builtin)
 
 StringPrototypeSub: reentrant (String.prototype.sub)
-  builtins/string.ts:413:10  CreateHTML (builtin)
+  builtins/string.ts:420:10  CreateHTML (builtin)
 
 StringPrototypeSup: reentrant (String.prototype.sup)
-  builtins/string.ts:421:10  CreateHTML (builtin)
+  builtins/string.ts:428:10  CreateHTML (builtin)
 
 StringPrototypeConcat: reentrant (String.prototype.concat)
-  builtins/string.ts:431:16  ThisToString (builtin)
-  builtins/string.ts:432:18  LengthOfArrayLike (builtin)
-  builtins/string.ts:434:19  Get (intrinsic)
-  builtins/string.ts:434:10  ToString (builtin)
+  builtins/string.ts:438:16  ThisToString (builtin)
+  builtins/string.ts:439:18  LengthOfArrayLike (builtin)
+  builtins/string.ts:441:19  Get (intrinsic)
+  builtins/string.ts:441:10  ToString (builtin)
 
 StringPrototypeRepeat: reentrant (String.prototype.repeat)
-  builtins/string.ts:445:18  ThisToString (builtin)
-  builtins/string.ts:446:18  ToIntegerOrInfinity (builtin)
+  builtins/string.ts:452:18  ThisToString (builtin)
+  builtins/string.ts:453:18  ToIntegerOrInfinity (builtin)
 
 StringPad: reentrant
-  builtins/string.ts:458:29  ToLength (builtin)
-  builtins/string.ts:463:56  ToString (builtin)
+  builtins/string.ts:465:29  ToLength (builtin)
+  builtins/string.ts:470:56  ToString (builtin)
 
 StringPrototypePadEnd: reentrant (String.prototype.padEnd)
-  builtins/string.ts:479:20  ThisToString (builtin)
-  builtins/string.ts:479:10  StringPad (builtin)
+  builtins/string.ts:486:20  ThisToString (builtin)
+  builtins/string.ts:486:10  StringPad (builtin)
 
 StringPrototypePadStart: reentrant (String.prototype.padStart)
-  builtins/string.ts:488:20  ThisToString (builtin)
-  builtins/string.ts:488:10  StringPad (builtin)
+  builtins/string.ts:495:20  ThisToString (builtin)
+  builtins/string.ts:495:10  StringPad (builtin)
 
 StringPrototypeToLowerCase: reentrant (String.prototype.toLowerCase)
-  builtins/string.ts:499:20  ThisToString (builtin)
+  builtins/string.ts:506:20  ThisToString (builtin)
 
 StringPrototypeToUpperCase: reentrant (String.prototype.toUpperCase)
-  builtins/string.ts:508:20  ThisToString (builtin)
+  builtins/string.ts:515:20  ThisToString (builtin)
 
 StringPrototypeToLocaleLowerCase: reentrant (String.prototype.toLocaleLowerCase)
-  builtins/string.ts:517:20  ThisToString (builtin)
+  builtins/string.ts:525:18  ThisToString (builtin)
+  builtins/string.ts:526:23  IntlCaseMode (builtin)
 
 StringPrototypeToLocaleUpperCase: reentrant (String.prototype.toLocaleUpperCase)
-  builtins/string.ts:526:20  ThisToString (builtin)
+  builtins/string.ts:536:18  ThisToString (builtin)
+  builtins/string.ts:537:23  IntlCaseMode (builtin)
 
 StringPrototypeTrim: reentrant (String.prototype.trim)
-  builtins/string.ts:535:18  ThisToString (builtin)
+  builtins/string.ts:546:18  ThisToString (builtin)
 
 StringPrototypeTrimStart: reentrant (String.prototype.trimStart, String.prototype.trimLeft)
-  builtins/string.ts:545:18  ThisToString (builtin)
+  builtins/string.ts:556:18  ThisToString (builtin)
 
 StringPrototypeTrimEnd: reentrant (String.prototype.trimEnd, String.prototype.trimRight)
-  builtins/string.ts:555:18  ThisToString (builtin)
+  builtins/string.ts:566:18  ThisToString (builtin)
 
 StringPrototypeIsWellFormed: reentrant (String.prototype.isWellFormed)
-  builtins/string.ts:563:26  ThisToString (builtin)
+  builtins/string.ts:574:26  ThisToString (builtin)
 
 StringPrototypeToWellFormed: reentrant (String.prototype.toWellFormed)
-  builtins/string.ts:571:26  ThisToString (builtin)
+  builtins/string.ts:582:26  ThisToString (builtin)
 
 StringPrototypeNormalize: reentrant (String.prototype.normalize)
-  builtins/string.ts:580:18  ThisToString (builtin)
-  builtins/string.ts:583:9  ToString (builtin)
+  builtins/string.ts:591:18  ThisToString (builtin)
+  builtins/string.ts:594:9  ToString (builtin)
 
 StringFromCharCode: reentrant (String.fromCharCode)
-  builtins/string.ts:613:3  CoerceNumbers (builtin)
+  builtins/string.ts:624:3  CoerceNumbers (builtin)
 
 StringFromCodePoint: reentrant (String.fromCodePoint)
-  builtins/string.ts:626:18  LengthOfArrayLike (builtin)
-  builtins/string.ts:628:25  Get (intrinsic)
-  builtins/string.ts:629:55  ToNumber (builtin)
-  builtins/string.ts:633:5  CreateDataPropertyOrThrow (intrinsic)
+  builtins/string.ts:637:18  LengthOfArrayLike (builtin)
+  builtins/string.ts:639:25  Get (intrinsic)
+  builtins/string.ts:640:55  ToNumber (builtin)
+  builtins/string.ts:644:5  CreateDataPropertyOrThrow (intrinsic)
 
 StringRaw: reentrant (String.raw)
-  builtins/string.ts:645:34  Get (intrinsic)
-  builtins/string.ts:646:29  LengthOfArrayLike (builtin)
-  builtins/string.ts:650:25  LengthOfArrayLike (builtin)
-  builtins/string.ts:653:19  Get (intrinsic)
-  builtins/string.ts:653:10  ToString (builtin)
-  builtins/string.ts:658:21  Get (intrinsic)
-  builtins/string.ts:658:12  ToString (builtin)
+  builtins/string.ts:656:34  Get (intrinsic)
+  builtins/string.ts:657:29  LengthOfArrayLike (builtin)
+  builtins/string.ts:661:25  LengthOfArrayLike (builtin)
+  builtins/string.ts:664:19  Get (intrinsic)
+  builtins/string.ts:664:10  ToString (builtin)
+  builtins/string.ts:669:21  Get (intrinsic)
+  builtins/string.ts:669:12  ToString (builtin)
 
 SymbolConstructor: reentrant (constructor Symbol)
   builtins/symbol.ts:14:20  ToString (builtin)
@@ -4254,3 +4835,12 @@ GlobalAtob: reentrant (atob)
   builtins/web.ts:129:34  Get (intrinsic)
   builtins/web.ts:129:25  ToString (builtin)
   builtins/web.ts:131:11  NewDOMException (builtin)
+
+WebAssemblyObject: leaf (value WebAssembly)
+
+WebAssemblyToStringTag: reentrant (value WebAssembly[Symbol.toStringTag])
+  builtins/webassembly.ts:23:21  Get (intrinsic)
+  builtins/webassembly.ts:25:23  Call (intrinsic)
+  builtins/webassembly.ts:26:3  Call (intrinsic)
+
+WebAssemblyRuntimeSource: leaf

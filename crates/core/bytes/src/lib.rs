@@ -5,11 +5,14 @@ use std::{
     sync::Arc,
 };
 
+use nanocode_sys::Grow;
+
 #[derive(Clone)]
 enum Storage {
     Static(&'static [u8]),
     Vec(Arc<Vec<u8>>),
     Owner(Arc<dyn AsRef<[u8]> + Send + Sync>),
+    Grow(Arc<Grow>),
 }
 
 impl Storage {
@@ -18,6 +21,7 @@ impl Storage {
             Self::Static(bytes) => bytes,
             Self::Vec(bytes) => bytes,
             Self::Owner(owner) => owner.as_ref().as_ref(),
+            Self::Grow(buffer) => buffer.as_slice(),
         }
     }
 }
@@ -134,6 +138,35 @@ impl Bytes {
 
     pub fn clear(&mut self) {
         self.truncate(0);
+    }
+
+    /// These bytes followed by `more`. Appending to what this returned writes `more` in
+    /// place past it while its buffer has room and nothing was appended there before;
+    /// else it copies both into a new buffer with half as much room again, so a run of
+    /// appends copies each byte a bounded number of times.
+    #[must_use]
+    pub fn appended(&self, more: &[u8]) -> Self {
+        if let Storage::Grow(buffer) = &self.storage
+            && buffer.append(self.end, more)
+        {
+            return Self {
+                storage: self.storage.clone(),
+                start: self.start,
+                end: self.end + more.len(),
+            };
+        }
+        let length = self.len() + more.len();
+        if length == 0 {
+            return Self::new();
+        }
+        let buffer = Grow::with_capacity(self.as_slice(), length.saturating_add(length / 2));
+        let wrote = buffer.append(self.len(), more);
+        debug_assert!(wrote, "a new buffer has room for what it was made for");
+        Self {
+            storage: Storage::Grow(Arc::new(buffer)),
+            start: 0,
+            end: length,
+        }
     }
 
     pub fn try_into_mut(self) -> Result<BytesMut, Self> {

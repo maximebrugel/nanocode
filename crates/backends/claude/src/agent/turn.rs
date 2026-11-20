@@ -289,7 +289,7 @@ pub(super) fn summarize_locked<'a>(
                 .or_else(|| {
                     messages
                         .iter()
-                        .rposition(|message| message.role == Role::Assistant)
+                        .rposition(|message| message.role() == Role::Assistant)
                 })
                 .unwrap_or(messages.len());
             messages.split_off(start)

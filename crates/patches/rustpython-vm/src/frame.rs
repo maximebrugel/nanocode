@@ -1560,29 +1560,14 @@ impl PyPayload for FrameObject {
     #[inline]
     unsafe fn freelist_push(obj: *mut PyObject) -> bool {
         FRAME_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let stored = if list.len() < Self::MAX_FREELIST {
-                    list.push(obj);
-                    true
-                } else {
-                    false
-                };
-                fl.set(list);
-                stored
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::push_in(fl, obj, Self::MAX_FREELIST) })
             .unwrap_or(false)
     }
 
     #[inline]
     unsafe fn freelist_pop(_payload: &Self) -> Option<NonNull<PyObject>> {
         FRAME_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let result = list.pop().map(|p| unsafe { NonNull::new_unchecked(p) });
-                fl.set(list);
-                result
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::pop_in(fl) })
             .ok()
             .flatten()
     }
@@ -5043,7 +5028,30 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             Instruction::LoadName { namei: idx } => {
-                let name = self.code.names[idx.get(arg) as usize];
+                let index = idx.get(arg) as usize;
+                let name = self.code.names[index];
+                // An exact dict is read directly: the mapping protocol would
+                // go through the object hash and raise a KeyError to say a
+                // name lives in the globals instead.
+                if let Some(dict) = self
+                    .locals
+                    .get_or_create(vm)
+                    .obj()
+                    .downcast_ref_if_exact::<PyDict>(vm)
+                {
+                    let hint = self.code.name_hint(index);
+                    let value = match dict.get_item_opt_refresh_hint(name, hint, vm)? {
+                        Some((value, new_hint)) => {
+                            if let Some(new_hint) = new_hint {
+                                self.code.set_name_hint(index, new_hint);
+                            }
+                            value
+                        }
+                        None => self.load_global_or_builtin(name, vm)?,
+                    };
+                    self.push_value(value);
+                    return Ok(None);
+                }
                 let result = self.locals.mapping(vm).subscript(name, vm);
                 match result {
                     Ok(x) => self.push_value(x),
@@ -5497,10 +5505,7 @@ impl ExecutingFrame<'_> {
                     // SAFETY: compiler guarantees correct type
                     obj.downcast_unchecked_ref()
                 };
-                let iter = PyIter::try_from_object(vm, iterable)?;
-                while let PyIterReturn::Return(item) = iter.next(vm)? {
-                    set.add(item, vm)?;
-                }
+                set.update_from(iterable, vm)?;
                 Ok(None)
             }
             Instruction::PushExcInfo => {
@@ -5624,8 +5629,20 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             Instruction::StoreName { namei: idx } => {
-                let name = self.code.names[idx.get(arg) as usize];
+                let index = idx.get(arg) as usize;
+                let name = self.code.names[index];
                 let value = self.pop_value();
+                let locals = self.locals.get_or_create(vm).obj();
+                if let Some(dict) = locals.downcast_ref_if_exact::<PyDict>(vm) {
+                    let hint = self.code.name_hint(index);
+                    if let Some(new_hint) = dict.set_item_with_hint(name, hint, value, vm)? {
+                        self.code.set_name_hint(index, new_hint);
+                    }
+                    if vm.is_builtins_dict(locals) {
+                        crate::stdlib::_testinternalcapi::note_builtin_dict();
+                    }
+                    return Ok(None);
+                }
                 self.locals
                     .mapping(vm)
                     .ass_subscript(name, Some(value), vm)?;
@@ -9487,7 +9504,7 @@ impl ExecutingFrame<'_> {
         if let (Some(av), Some(bv)) = (a.try_to_i64_fast(), b.try_to_i64_fast())
             && let Some(result) = checked(av, bv)
         {
-            return vm.ctx.new_int(result).into();
+            return vm.ctx.new_int_i64(result).into();
         }
         vm.ctx
             .new_int(fallback(a.as_bigint(), b.as_bigint()))
@@ -9526,7 +9543,7 @@ impl ExecutingFrame<'_> {
     ) -> Option<PyObjectRef> {
         use nanocode_numeric::ToPrimitive;
         let (av, bv) = (a.to_i64()?, b.to_i64()?);
-        compute(av, bv).map(|r| vm.ctx.new_int(r).into())
+        compute(av, bv).map(|r| vm.ctx.new_int_i64(r).into())
     }
 
     /// Floor division of two i64 values with floor (toward negative infinity)
@@ -9643,22 +9660,9 @@ impl ExecutingFrame<'_> {
         // Check that the iterator is exhausted.
         match iter.next(vm)? {
             PyIterReturn::Return(_) => {
-                // For exact dict types, show "got N" using the container's
-                // size (PyDict_Size). Exact tuple/list are handled by the
-                // fast path above and never reach here.
-                let msg = if value.class().is(vm.ctx.types.dict_type) {
-                    if let Ok(got) = value.length(vm) {
-                        if got > size {
-                            format!("too many values to unpack (expected {size}, got {got})")
-                        } else {
-                            format!("too many values to unpack (expected {size})")
-                        }
-                    } else {
-                        format!("too many values to unpack (expected {size})")
-                    }
-                } else {
-                    format!("too many values to unpack (expected {size})")
-                };
+                // CPython 3.12 text: "too many" never reports a count ("got N"
+                // is 3.14+).
+                let msg = format!("too many values to unpack (expected {size})");
                 Err(vm.new_value_error(msg))
             }
             PyIterReturn::StopIteration(_) => {
@@ -9687,8 +9691,7 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             core::cmp::Ordering::Greater => Err(vm.new_value_error(format!(
-                "too many values to unpack (expected {size}, got {})",
-                elements.len()
+                "too many values to unpack (expected {size})"
             ))),
             core::cmp::Ordering::Less => Err(vm.new_value_error(format!(
                 "not enough values to unpack (expected {size}, got {})",

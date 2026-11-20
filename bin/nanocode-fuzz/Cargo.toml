@@ -1,0 +1,33 @@
+[package]
+name = "nanocode-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Seeded structured fuzzing of nanocode's board, live and partition folds"
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "nanocode-fuzz"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+nanocode-board.workspace = true
+nanocode-board-sync.workspace = true
+nanocode-live-fold.workspace = true
+nanocode-partitions.workspace = true
+nanocode-sync.workspace = true
+nanocode-turnlog.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nanocode-sys.workspace = true
+
+[lints]
+workspace = true

@@ -34,6 +34,12 @@ pub fn backtick_body(text: &str, in_double_quotes: bool) -> String {
 /// `\uHHHH`, `\UHHHHHHHH` (encoded as UTF-8, also for values that are not chars, as bash
 /// does) and `\cX` (control characters). Unknown escapes stay as written.
 pub fn decode_ansi_c(raw: &[u8]) -> Vec<u8> {
+    decode_ansi_c_in(raw, true)
+}
+
+/// [`decode_ansi_c`] in a locale that may not be UTF-8: there, as in bash's C locale, a
+/// `\u` or `\U` past ASCII stays as the escape `\uHHHH` or `\UHHHHHHHH` (upper-case hex).
+pub fn decode_ansi_c_in(raw: &[u8], utf8: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
     let hex = |c: u8| (c as char).to_digit(16);
@@ -105,8 +111,12 @@ pub fn decode_ansi_c(raw: &[u8]) -> Vec<u8> {
                     out.push(e);
                 } else if e == b'x' {
                     out.push(v as u8);
-                } else {
+                } else if utf8 || v < 0x80 {
                     push_utf8(&mut out, v);
+                } else if v < 0x1_0000 {
+                    out.extend_from_slice(alloc::format!("\\u{v:04X}").as_bytes());
+                } else {
+                    out.extend_from_slice(alloc::format!("\\U{v:08X}").as_bytes());
                 }
             }
             b'c' if i < raw.len() => {

@@ -12,7 +12,7 @@ use nanocode_compression::deflate::{
 use rustpython_compiler::{CompileOpts, Mode, compile};
 use rustpython_compiler_core::frozen::FrozenCodeObject;
 
-const DATA: &[&str] = &["matplotlib/mpl-data"];
+const DATA: &[&str] = &["matplotlib/mpl-data", "tzdata"];
 
 // Site packages compiled at optimize 2 (no docstrings, no asserts), as
 // CPython's -OO would: their docstrings are a third of their code.

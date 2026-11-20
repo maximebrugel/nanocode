@@ -56,6 +56,12 @@ pub enum ArithKind {
         op: Option<BinOp>,
         value: Box<ArithExpr>,
     },
+    /// `expr`, then `error`: `--n++` decrements n before bash's lexer rejects the
+    /// `++` after it.
+    Fail {
+        expr: Box<ArithExpr>,
+        error: ArithError,
+    },
 }
 
 /// Something that can be assigned: `name` or `name[subscript]`.
@@ -152,6 +158,9 @@ pub enum ArithErrorKind {
     RecursionLevel,
     DivisionByZero,
     NegativeExponent,
+    /// `++` or `--` right after `--x` or `++x`.
+    IncRequiresLvalue,
+    DecRequiresLvalue,
 }
 
 /// An arithmetic error. Bash prints it as `PREFIX: MESSAGE (error token is "TOKEN")`,
@@ -178,11 +187,11 @@ impl ArithError {
 
     pub fn message(&self) -> &'static str {
         match self.kind {
-            ArithErrorKind::OperandExpected => "arithmetic syntax error: operand expected",
+            ArithErrorKind::OperandExpected => "syntax error: operand expected",
             ArithErrorKind::InvalidOperator => {
-                "arithmetic syntax error: invalid arithmetic operator"
+                "syntax error: invalid arithmetic operator"
             }
-            ArithErrorKind::SyntaxError => "arithmetic syntax error in expression",
+            ArithErrorKind::SyntaxError => "syntax error in expression",
             ArithErrorKind::MissingParen => "missing `)'",
             ArithErrorKind::ColonExpected => "`:' expected for conditional expression",
             ArithErrorKind::ExpressionExpected => "expression expected",
@@ -195,6 +204,8 @@ impl ArithError {
             ArithErrorKind::RecursionLevel => "expression recursion level exceeded",
             ArithErrorKind::DivisionByZero => "division by 0",
             ArithErrorKind::NegativeExponent => "exponent less than 0",
+            ArithErrorKind::IncRequiresLvalue => "++: assignment requires lvalue",
+            ArithErrorKind::DecRequiresLvalue => "--: assignment requires lvalue",
         }
     }
 
@@ -239,12 +250,17 @@ pub fn parse_arith(text: &[u8]) -> Result<Option<ArithExpr>, ArithError> {
         },
         prev_start: 0,
         depth: 0,
+        fail: None,
     };
     p.bump(0)?;
     if p.tok.kind == TK::Eof {
         return Ok(None);
     }
-    let e = p.comma()?;
+    let e = p.comma();
+    if let Some(fail) = p.fail {
+        return Ok(Some(fail));
+    }
+    let e = e?;
     if p.tok.kind != TK::Eof {
         return Err(p.err(ArithErrorKind::SyntaxError));
     }
@@ -291,6 +307,8 @@ struct ArithParser<'a> {
     /// Start of the token before `tok`: an error at the end names it.
     prev_start: u32,
     depth: u32,
+    /// A `--x++`: what runs before bash's lexer stops the whole expression.
+    fail: Option<ArithExpr>,
 }
 
 fn digit_value(c: u8, base: u32) -> Option<u32> {
@@ -669,7 +687,7 @@ impl ArithParser<'_> {
                     let lv = self.lvalue(name_end, index);
                     let last = self.tok.start;
                     self.next()?;
-                    return Ok(self.node(
+                    let node = self.node(
                         start,
                         lv.span.end,
                         last,
@@ -678,7 +696,26 @@ impl ArithParser<'_> {
                             inc,
                             post: false,
                         },
-                    ));
+                    );
+                    // `--x++`: bash changes x, then fails on the second operator.
+                    if let TK::Inc | TK::Dec = self.tok.kind {
+                        let kind = match self.tok.kind {
+                            TK::Inc => ArithErrorKind::IncRequiresLvalue,
+                            _ => ArithErrorKind::DecRequiresLvalue,
+                        };
+                        let error = ArithError::new(kind, self.tok.start, None);
+                        let (span, last) = (node.span, node.last);
+                        self.fail = Some(ArithExpr {
+                            kind: ArithKind::Fail {
+                                expr: Box::new(node),
+                                error: error.clone(),
+                            },
+                            span,
+                            last,
+                        });
+                        return Err(error);
+                    }
+                    return Ok(node);
                 }
                 (self.tok, self.prev_start) = save;
                 // Re-read the second char alone.
@@ -845,5 +882,6 @@ fn dump_into(text: &[u8], e: &ArithExpr, out: &mut String) {
             dump_into(text, value, out);
             out.push(')');
         }
+        ArithKind::Fail { expr, .. } => dump_into(text, expr, out),
     }
 }

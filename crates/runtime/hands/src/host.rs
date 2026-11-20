@@ -49,6 +49,10 @@ pub trait HandHost: Send + Sync + 'static {
 pub trait Workspace: Send + Sync + 'static {
     fn runs(&self, tool: &str) -> bool;
 
+    fn has(&self, _command: &str) -> bool {
+        false
+    }
+
     fn run<'a>(
         &'a self,
         session: &'a str,

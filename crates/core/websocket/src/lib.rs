@@ -15,9 +15,10 @@ pub use error::{
     CapacityError, Error, ProtocolError, Result, SubProtocolError, TlsError, UrlError,
 };
 pub use frame::{CloseCode, CloseFrame, Frame, FrameHeader, OpCode};
-pub use handshake::{IntoClientRequest, client, server};
+pub use handshake::{IntoClientRequest, client, derive_accept_key, server};
 pub use message::{Message, Utf8Bytes};
 pub use protocol::{READ_BUFFER_BYTES, WebSocketConfig};
 pub use stream::{
-    WebSocketStream, accept_hdr_async, accept_hdr_async_with_config, client_async_with_config,
+    WebSocketStream, accept_hdr_async, accept_hdr_async_with_config, accept_upgraded,
+    client_async_with_config,
 };

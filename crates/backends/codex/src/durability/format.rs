@@ -5,8 +5,8 @@ use nanocode_agent_core::{
     session::{ToolOutcome, TranscriptItem},
 };
 use nanocode_durability::{
-    AdmittedTurn, Advanced, CheckpointFormat, EncodedPayload, Error, FormatFuture, Hydrated,
-    PayloadReader, Previous, Result, SessionRecord,
+    AdmittedTurn, Advanced, Checkpoint, CheckpointFormat, EncodedPayload, Error, FormatFuture,
+    Hydrated, PayloadReader, Previous, RenderCheckpoint, Result, SessionRecord,
 };
 use serde::Deserialize as _;
 use serde_json::Value;
@@ -46,14 +46,14 @@ impl CheckpointFormat for CodexCheckpointFormat {
         reader: PayloadReader<'a>,
         stored: Value,
         read: &'a mut HashSet<String>,
-    ) -> FormatFuture<'a, Result<(Value, Option<Hydrated>)>> {
+    ) -> FormatFuture<'a, Result<(Checkpoint, Option<Hydrated>)>> {
         Box::pin(async move {
             let saved: context::Snapshot =
                 serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
             let (hydrated, keys) = context::load_hydrated_with_keys(reader, saved).await?;
             read.extend(keys);
-            let value = serde_json::to_value(&hydrated.snapshot).map_err(Error::InvalidPayload)?;
-            Ok((value, Some(Hydrated::new(hydrated))))
+            let (checkpoint, hydrated) = typed(hydrated)?;
+            Ok((checkpoint, Some(hydrated)))
         })
     }
 
@@ -113,64 +113,88 @@ impl CheckpointFormat for CodexCheckpointFormat {
     fn transcript(&self, checkpoint: &Value, _turns: &[AdmittedTurn<'_>]) -> Vec<TranscriptItem> {
         let mut items = Vec::new();
         for item in checkpoint["history"].as_array().into_iter().flatten() {
-            match item["type"].as_str() {
-                Some("message") => {
-                    let role = item["role"].as_str();
-                    for content in item["content"].as_array().into_iter().flatten() {
-                        let Some(text) = content["text"].as_str().filter(|text| !text.is_empty())
-                        else {
-                            continue;
-                        };
-                        match (role, content["type"].as_str()) {
-                            (Some("user"), Some("input_text")) if !is_injected_context(text) => {
-                                items.push(TranscriptItem::User(text.into()));
-                            }
-                            (Some("assistant"), _) => {
-                                items.push(TranscriptItem::Assistant(text.into()));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Some("reasoning") => {
-                    for summary in item["summary"].as_array().into_iter().flatten() {
-                        if let Some(text) = summary["text"].as_str().filter(|text| !text.is_empty())
-                        {
-                            items.push(TranscriptItem::Reasoning(text.into()));
-                        }
-                    }
-                }
-                Some("function_call") => items.push(TranscriptItem::Tool {
-                    call_id: item["call_id"].as_str().unwrap_or_default().into(),
-                    name: item["name"].as_str().unwrap_or_default().into(),
-                    arguments: item["arguments"].as_str().unwrap_or_default().into(),
-                    parent_call_id: None,
-                }),
-                Some("custom_tool_call") => items.push(TranscriptItem::Tool {
-                    call_id: item["call_id"].as_str().unwrap_or_default().into(),
-                    name: item["name"].as_str().unwrap_or_default().into(),
-                    arguments: item["input"].as_str().unwrap_or_default().into(),
-                    parent_call_id: None,
-                }),
-                Some("function_call_output" | "custom_tool_call_output") => {
-                    let output = item["output"]
-                        .as_str()
-                        .map_or_else(|| item["output"].to_string(), str::to_owned);
-                    let outcome = if output.contains("outcome unknown") {
-                        ToolOutcome::Unknown
-                    } else {
-                        ToolOutcome::Completed
-                    };
-                    items.push(TranscriptItem::tool_result(
-                        item["call_id"].as_str().unwrap_or_default(),
-                        &output,
-                        outcome,
-                    ));
-                }
-                _ => {}
-            }
+            transcript_item(item, &mut items);
         }
         items
+    }
+
+    fn thinking_typed(
+        &self,
+        record: &SessionRecord,
+        head: &Value,
+        _hydrated: &Hydrated,
+    ) -> Option<Result<Thinking>> {
+        Some(self.thinking(record, head))
+    }
+
+    fn transcript_typed(
+        &self,
+        hydrated: &Hydrated,
+        _turns: &[AdmittedTurn<'_>],
+    ) -> Option<Vec<TranscriptItem>> {
+        let hydrated = hydrated.get::<context::HydratedSnapshot>()?;
+        let mut items = Vec::new();
+        for item in hydrated.snapshot.history_from(0) {
+            transcript_item(&serde_json::to_value(item).ok()?, &mut items);
+        }
+        Some(items)
+    }
+}
+
+fn transcript_item(item: &Value, items: &mut Vec<TranscriptItem>) {
+    match item["type"].as_str() {
+        Some("message") => {
+            let role = item["role"].as_str();
+            for content in item["content"].as_array().into_iter().flatten() {
+                let Some(text) = content["text"].as_str().filter(|text| !text.is_empty()) else {
+                    continue;
+                };
+                match (role, content["type"].as_str()) {
+                    (Some("user"), Some("input_text")) if !is_injected_context(text) => {
+                        items.push(TranscriptItem::User(text.into()));
+                    }
+                    (Some("assistant"), _) => {
+                        items.push(TranscriptItem::Assistant(text.into()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some("reasoning") => {
+            for summary in item["summary"].as_array().into_iter().flatten() {
+                if let Some(text) = summary["text"].as_str().filter(|text| !text.is_empty()) {
+                    items.push(TranscriptItem::Reasoning(text.into()));
+                }
+            }
+        }
+        Some("function_call") => items.push(TranscriptItem::Tool {
+            call_id: item["call_id"].as_str().unwrap_or_default().into(),
+            name: item["name"].as_str().unwrap_or_default().into(),
+            arguments: item["arguments"].as_str().unwrap_or_default().into(),
+            parent_call_id: None,
+        }),
+        Some("custom_tool_call") => items.push(TranscriptItem::Tool {
+            call_id: item["call_id"].as_str().unwrap_or_default().into(),
+            name: item["name"].as_str().unwrap_or_default().into(),
+            arguments: item["input"].as_str().unwrap_or_default().into(),
+            parent_call_id: None,
+        }),
+        Some("function_call_output" | "custom_tool_call_output") => {
+            let output = item["output"]
+                .as_str()
+                .map_or_else(|| item["output"].to_string(), str::to_owned);
+            let outcome = if output.contains("outcome unknown") {
+                ToolOutcome::Unknown
+            } else {
+                ToolOutcome::Completed
+            };
+            items.push(TranscriptItem::tool_result(
+                item["call_id"].as_str().unwrap_or_default(),
+                &output,
+                outcome,
+            ));
+        }
+        _ => {}
     }
 }
 
@@ -200,59 +224,44 @@ async fn advance(
     previous: Previous,
 ) -> Result<Advanced> {
     let Previous {
-        checkpoint: mut value,
+        checkpoint,
         hydrated,
     } = previous;
+    let hydrated = hydrated.or_else(|| checkpoint.hydrated().cloned());
+    drop(checkpoint);
     let earlier = hydrated.and_then(Hydrated::take::<context::HydratedSnapshot>);
-    let values = match value.get_mut("history").map(Value::take) {
-        Some(Value::Array(values)) => Some(values),
-        _ => None,
-    };
-    let (Some(earlier), Some(mut values)) = (earlier, values) else {
-        let saved: context::Snapshot =
-            serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let saved: context::Snapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let Some(earlier) = earlier else {
         let (hydrated, keys) = context::load_hydrated_with_keys(reader, saved).await?;
         read.extend(keys);
-        let value = serde_json::to_value(&hydrated.snapshot).map_err(Error::InvalidPayload)?;
-        return Ok(Advanced::whole(value, Some(Hydrated::new(hydrated))));
+        let (checkpoint, hydrated) = typed(hydrated)?;
+        return Ok(Advanced::whole(checkpoint, Some(hydrated)));
     };
-    let converted = if values.len() == earlier.snapshot.history_len() {
-        values.len()
-    } else {
-        0
-    };
-    let earlier_prefix = value.get_mut("request_prefix").map(Value::take);
-    let saved: context::Snapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
     let advanced = context::advance_snapshot(reader, saved, earlier).await?;
     read.extend(advanced.keys);
-    let snapshot = &advanced.hydrated.snapshot;
-    let reused = advanced.reused.min(converted);
-    values.truncate(reused);
-    for item in snapshot.history_from(reused) {
-        values.push(serde_json::to_value(item).map_err(Error::InvalidPayload)?);
-    }
-    let mut value =
-        serde_json::to_value(snapshot.without_context()).map_err(Error::InvalidPayload)?;
-    let Some(object) = value.as_object_mut() else {
-        return Err(Error::InvalidPayload(
-            <serde_json::Error as serde::de::Error>::custom("a Codex checkpoint is an object"),
-        ));
-    };
-    *object.entry("history").or_insert(Value::Null) = Value::Array(values);
-    if let Some(prefix) = snapshot.request_prefix() {
-        let prefix = match earlier_prefix {
-            Some(kept) if advanced.prefix_kept && !kept.is_null() => kept,
-            _ => serde_json::to_value(prefix).map_err(Error::InvalidPayload)?,
-        };
-        *object.entry("request_prefix").or_insert(Value::Null) = prefix;
-    }
+    let (checkpoint, hydrated) = typed(advanced.hydrated)?;
     Ok(Advanced {
-        checkpoint: value,
-        hydrated: Some(Hydrated::new(advanced.hydrated)),
+        checkpoint,
+        hydrated: Some(hydrated),
         whole: false,
         reused: advanced.reused,
         decoded: advanced.decoded,
     })
+}
+
+/// The typed checkpoint of a hydrated snapshot: its JSON head and the
+/// snapshot itself, whose whole JSON form is rendered only on demand.
+fn typed(hydrated: context::HydratedSnapshot) -> Result<(Checkpoint, Hydrated)> {
+    let head =
+        serde_json::to_value(hydrated.snapshot.without_context()).map_err(Error::InvalidPayload)?;
+    let hydrated = Hydrated::rendering(hydrated);
+    Ok((Checkpoint::typed(head, hydrated.clone()), hydrated))
+}
+
+impl RenderCheckpoint for context::HydratedSnapshot {
+    fn render(&self) -> Result<Value> {
+        serde_json::to_value(&self.snapshot).map_err(Error::InvalidPayload)
+    }
 }
 
 fn is_injected_context(text: &str) -> bool {

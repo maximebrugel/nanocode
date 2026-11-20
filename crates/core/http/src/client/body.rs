@@ -57,6 +57,14 @@ impl Body {
     }
 
     #[must_use]
+    pub fn bytes(&self) -> Option<Bytes> {
+        match &self.0 {
+            Kind::Bytes(bytes) => Some(bytes.clone()),
+            Kind::Stream(..) => None,
+        }
+    }
+
+    #[must_use]
     pub fn try_clone(&self) -> Option<Self> {
         match &self.0 {
             Kind::Bytes(bytes) => Some(Self(Kind::Bytes(bytes.clone()))),

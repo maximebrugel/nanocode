@@ -1,19 +1,22 @@
-"""Drop-in replacement for the thread module.
+"""Cooperative _thread for interpreters built without OS threads.
 
-Meant to be used as a brain-dead substitute so that threaded code does
-not need to be rewritten for when the thread module is not present.
+There is one OS thread, so Python threads take turns.  A started thread does
+not run at once: it waits in a queue until the running thread blocks (on a
+held lock, a Condition, an Event or Queue, or join()) or the interpreter shuts
+down; then queued threads run, one at a time, each to its end or until the
+thing it waits for is free.  A thread cannot be suspended halfway, so a thread
+that blocks while nothing else can run is stuck:
 
-Suggested usage is::
+* a timed wait sleeps out its timeout and fails, as CPython's would;
+* an untimed wait in a started thread ends that thread quietly (it raises
+  _ThreadParked, a SystemExit, which threading's excepthook ignores), much as
+  CPython leaves such a thread blocked forever;
+* an untimed wait in the main thread raises RuntimeError instead of hanging.
 
-    try:
-        import _thread
-    except ImportError:
-        import _dummy_thread as _thread
-
+Locks are real: a held lock cannot be acquired again, and RLock tracks its
+owner by thread ident.
 """
 
-# Exports only things specified by thread documentation;
-# skipping obsolete synonyms allocate(), start_new(), exit_thread().
 __all__ = [
     "error",
     "start_new_thread",
@@ -32,65 +35,41 @@ __all__ = [
     "_get_main_thread_ident",
     "_is_main_interpreter",
     "_local",
+    "_yield",
 ]
 
-# A dummy value
 TIMEOUT_MAX = 2**31
 
-# Main thread ident for dummy implementation
-_MAIN_THREAD_IDENT = -1
+# Marks this module as the cooperative implementation (threading checks it).
+_COOPERATIVE = True
 
-# NOTE: this module can be imported early in the extension building process,
-# and so top level imports of other modules should be avoided.  Instead, all
-# imports are done when needed on a function-by-function basis.  Since threads
-# are disabled, the import lock should not be an issue anyway (??).
+_MAIN_THREAD_IDENT = -1
+_current_ident = _MAIN_THREAD_IDENT
+_current_daemon = False
+_next_ident = 1
+# Started threads that have not run yet, oldest first: [handle, function, daemon].
+_pending = []
 
 error = RuntimeError
 
 
-def start_new_thread(function, args, kwargs={}):
-    """Dummy implementation of _thread.start_new_thread().
-
-    Compatibility is maintained by making sure that ``args`` is a
-    tuple and ``kwargs`` is a dictionary.  If an exception is raised
-    and it is SystemExit (which can be done by _thread.exit()) it is
-    caught and nothing is done; all other exceptions are printed out
-    by using traceback.print_exc().
-
-    If the executed function calls interrupt_main the KeyboardInterrupt will be
-    raised when the function returns.
-
-    """
-    if type(args) != type(tuple()):
-        raise TypeError("2nd arg must be a tuple")
-    if type(kwargs) != type(dict()):
-        raise TypeError("3rd arg must be a dict")
-    global _main
-    _main = False
-    try:
-        function(*args, **kwargs)
-    except SystemExit:
-        pass
-    except:
-        import traceback
-
-        traceback.print_exc()
-    _main = True
-    global _interrupt
-    if _interrupt:
-        _interrupt = False
-        raise KeyboardInterrupt
+class _ThreadParked(SystemExit):
+    """Ends a thread that would block forever while no other thread can run."""
 
 
-def start_joinable_thread(function, handle=None, daemon=True):
-    """Dummy implementation of _thread.start_joinable_thread().
+def _new_ident():
+    global _next_ident
+    ident = _next_ident
+    _next_ident += 1
+    return ident
 
-    In dummy thread, we just run the function synchronously.
-    """
-    if daemon:
-        raise RuntimeError("daemon threads are not supported in this interpreter")
-    if handle is None:
-        handle = _ThreadHandle()
+
+def _run(handle, function, daemon):
+    global _current_ident, _current_daemon
+    previous = (_current_ident, _current_daemon)
+    _current_ident = handle._ident
+    _current_daemon = daemon
+    handle._running = True
     try:
         function()
     except SystemExit:
@@ -99,126 +78,191 @@ def start_joinable_thread(function, handle=None, daemon=True):
         import traceback
 
         traceback.print_exc()
-    handle._set_done()
+    finally:
+        _current_ident, _current_daemon = previous
+        handle._running = False
+        handle._set_done()
+
+
+def _run_next():
+    """Run the oldest queued thread; False when none is queued."""
+    if not _pending:
+        return False
+    handle, function, daemon = _pending.pop(0)
+    _run(handle, function, daemon)
+    return True
+
+
+def _yield():
+    """Run every queued thread: the running one is about to block outside
+    _thread (in select(), say), where a thread it waits for could not run.
+    Returns whether any thread ran."""
+    ran = False
+    while _run_next():
+        ran = True
+    return ran
+
+
+def _wait_for(ready, timeout):
+    """Block until ready() is true: let queued threads run first, then sleep out
+    a timeout (timeout < 0 means none).  Returns ready()."""
+    if ready():
+        return True
+    if timeout == 0:
+        return False
+    while _run_next():
+        if ready():
+            return True
+    if timeout > 0:
+        import time
+
+        time.sleep(timeout)
+        return ready()
+    if _current_ident == _MAIN_THREAD_IDENT:
+        raise RuntimeError(
+            "deadlock: the main thread would block forever, and no other thread "
+            "can run (threads run cooperatively in this interpreter)"
+        )
+    raise _ThreadParked()
+
+
+def _check_timeout(blocking, timeout):
+    if timeout is None:
+        timeout = -1
+    if not blocking and timeout != -1:
+        raise ValueError("can't specify a timeout for a non-blocking call")
+    if timeout < 0 and timeout != -1:
+        raise ValueError("timeout value must be a non-negative number")
+    if timeout > TIMEOUT_MAX:
+        raise OverflowError("timeout value is too large")
+    return timeout if blocking else 0
+
+
+def start_new_thread(function, args, kwargs={}):
+    """Queue function(*args, **kwargs) to run as a new thread; return its ident."""
+    if type(args) != type(tuple()):
+        raise TypeError("2nd arg must be a tuple")
+    if type(kwargs) != type(dict()):
+        raise TypeError("3rd arg must be a dict")
+    if not callable(function):
+        raise TypeError("first arg must be callable")
+
+    def bootstrap():
+        global _interrupt
+        try:
+            function(*args, **kwargs)
+        except SystemExit:
+            pass
+        except BaseException as e:
+            import sys
+
+            hook = getattr(sys, "unraisablehook", None)
+            import traceback
+
+            sys.stderr.write("Unhandled exception in thread started by %r\n" % (function,))
+            traceback.print_exc()
+
+    handle = _ThreadHandle()
+    handle._ident = _new_ident()
+    _pending.append([handle, bootstrap, True])
+    return handle._ident
+
+
+def start_joinable_thread(function, handle=None, daemon=True):
+    """Queue function to run as a new thread; return its handle."""
+    if handle is None:
+        handle = _ThreadHandle()
+    if handle._started:
+        raise RuntimeError("thread already started")
+    handle._started = True
+    handle._ident = _new_ident()
+    _pending.append([handle, function, daemon])
     return handle
 
 
 def daemon_threads_allowed():
-    """Dummy implementation of _thread.daemon_threads_allowed()."""
-    return False
+    return True
 
 
 def _shutdown():
-    """Dummy implementation of _thread._shutdown()."""
-    pass
+    """Run every queued non-daemon thread (threads they start included)."""
+    while True:
+        for i, entry in enumerate(_pending):
+            if not entry[2]:
+                del _pending[i]
+                _run(*entry)
+                break
+        else:
+            return
 
 
 def _make_thread_handle(ident):
-    """Dummy implementation of _thread._make_thread_handle()."""
     handle = _ThreadHandle()
     handle._ident = ident
+    handle._started = True
     return handle
 
 
 def _get_main_thread_ident():
-    """Dummy implementation of _thread._get_main_thread_ident()."""
     return _MAIN_THREAD_IDENT
 
 
 def _is_main_interpreter():
-    """Dummy implementation of _thread._is_main_interpreter()."""
     return True
 
 
 def exit():
-    """Dummy implementation of _thread.exit()."""
     raise SystemExit
 
 
 def get_ident():
-    """Dummy implementation of _thread.get_ident().
-
-    Since this module should only be used when _threadmodule is not
-    available, it is safe to assume that the current process is the
-    only thread.  Thus a constant can be safely returned.
-    """
-    return _MAIN_THREAD_IDENT
+    return _current_ident
 
 
 def allocate_lock():
-    """Dummy implementation of _thread.allocate_lock()."""
     return LockType()
 
 
 def stack_size(size=None):
-    """Dummy implementation of _thread.stack_size()."""
     if size is not None:
         raise error("setting thread stack size not supported")
     return 0
 
 
 def _set_sentinel():
-    """Dummy implementation of _thread._set_sentinel()."""
     return LockType()
 
 
 def _count():
-    """Dummy implementation of _thread._count()."""
-    return 0
+    return len(_pending)
 
 
 class LockType(object):
-    """Class implementing dummy implementation of _thread.LockType.
-
-    Compatibility is maintained by maintaining self.locked_status
-    which is a boolean that stores the state of the lock.  Pickling of
-    the lock, though, should not be done since if the _thread module is
-    then used with an unpickled ``lock()`` from here problems could
-    occur from this class not having atomic methods.
-
-    """
+    """A non-reentrant lock: acquiring it while held blocks (see the module doc)."""
 
     def __init__(self):
         self.locked_status = False
 
-    def acquire(self, waitflag=None, timeout=-1):
-        """Dummy implementation of acquire().
+    def acquire(self, blocking=True, timeout=-1):
+        timeout = _check_timeout(blocking, timeout)
+        if not _wait_for(self._free, timeout):
+            return False
+        self.locked_status = True
+        return True
 
-        For blocking calls, self.locked_status is automatically set to
-        True and returned appropriately based on value of
-        ``waitflag``.  If it is non-blocking, then the value is
-        actually checked and not set if it is already acquired.  This
-        is all done so that threading.Condition's assert statements
-        aren't triggered and throw a little fit.
+    def _free(self):
+        return not self.locked_status
 
-        """
-        if waitflag is None or waitflag:
-            self.locked_status = True
-            return True
-        else:
-            if not self.locked_status:
-                self.locked_status = True
-                return True
-            else:
-                if timeout > 0:
-                    import time
-
-                    time.sleep(timeout)
-                return False
-
-    __enter__ = acquire
+    def __enter__(self):
+        return self.acquire()
 
     def __exit__(self, typ, val, tb):
         self.release()
 
     def release(self):
-        """Release the dummy lock."""
-        # XXX Perhaps shouldn't actually bother to test?  Could lead
-        #     to problems for complex, threaded code.
         if not self.locked_status:
-            raise error
+            raise error("release unlocked lock")
         self.locked_status = False
-        return True
 
     def locked(self):
         return self.locked_status
@@ -236,11 +280,11 @@ class LockType(object):
 
 
 class _ThreadHandle:
-    """Dummy implementation of _thread._ThreadHandle."""
-
     def __init__(self):
         self._ident = _MAIN_THREAD_IDENT
         self._done = False
+        self._started = False
+        self._running = False
 
     @property
     def ident(self):
@@ -253,71 +297,144 @@ class _ThreadHandle:
         return self._done
 
     def join(self, timeout=None):
-        # In dummy thread, thread is always done
-        return
+        if self._ident == _current_ident and not self._done:
+            raise RuntimeError("Cannot join current thread")
+        for i, entry in enumerate(_pending):
+            if entry[0] is self:
+                del _pending[i]
+                _run(*entry)
+                return
+        if timeout is None:
+            timeout = -1
+        _wait_for(self.is_done, timeout)
 
     def __repr__(self):
         return f"<_ThreadHandle ident={self._ident}>"
 
 
-# Used to signal that interrupt_main was called in a "thread"
 _interrupt = False
-# True when not executing in a "thread"
-_main = True
 
 
-def interrupt_main():
-    """Set _interrupt flag to True to have start_new_thread raise
-    KeyboardInterrupt upon exiting."""
-    if _main:
+def interrupt_main(signum=2):
+    if _current_ident == _MAIN_THREAD_IDENT:
         raise KeyboardInterrupt
-    else:
-        global _interrupt
-        _interrupt = True
+    global _interrupt
+    _interrupt = True
 
 
 class RLock:
-    def __init__(self):
-        self.locked_count = 0
+    """A reentrant lock owned by the thread that holds it."""
 
-    def acquire(self, waitflag=None, timeout=-1):
-        self.locked_count += 1
+    def __init__(self):
+        self._owner = None
+        self._count = 0
+
+    def acquire(self, blocking=True, timeout=-1):
+        timeout = _check_timeout(blocking, timeout)
+        me = get_ident()
+        if self._owner == me:
+            self._count += 1
+            return True
+        if not _wait_for(self._free, timeout):
+            return False
+        self._owner = me
+        self._count = 1
         return True
 
-    __enter__ = acquire
+    def _free(self):
+        return self._owner is None
+
+    def __enter__(self):
+        return self.acquire()
 
     def __exit__(self, typ, val, tb):
         self.release()
 
     def release(self):
-        if not self.locked_count:
-            raise error
-        self.locked_count -= 1
-        return True
+        if self._owner != get_ident():
+            raise RuntimeError("cannot release un-acquired lock")
+        self._count -= 1
+        if not self._count:
+            self._owner = None
 
     def locked(self):
-        return self.locked_count != 0
+        return self._owner is not None
 
     def _is_owned(self):
-        # threading.Condition probes ownership with acquire(False), which
-        # always succeeds on this lock; with one thread, held means owned.
-        return self.locked_count != 0
+        return self._owner == get_ident()
+
+    def _recursion_count(self):
+        return self._count if self._owner == get_ident() else 0
+
+    def _release_save(self):
+        if self._owner != get_ident():
+            raise RuntimeError("cannot release un-acquired lock")
+        state = (self._count, self._owner)
+        self._count = 0
+        self._owner = None
+        return state
+
+    def _acquire_restore(self, state):
+        _wait_for(self._free, -1)
+        self._count, self._owner = state
+
+    def _at_fork_reinit(self):
+        self._owner = None
+        self._count = 0
 
     def __repr__(self):
         return "<%s %s.%s object owner=%s count=%s at %s>" % (
-            "locked" if self.locked_count else "unlocked",
+            "locked" if self._owner is not None else "unlocked",
             self.__class__.__module__,
             self.__class__.__qualname__,
-            get_ident() if self.locked_count else 0,
-            self.locked_count,
+            self._owner if self._owner is not None else 0,
+            self._count,
             hex(id(self)),
         )
 
 
 class _local:
-    """Dummy implementation of _thread._local (thread-local storage)."""
+    """Thread-local storage: each thread ident sees its own attributes."""
 
     def __new__(cls, *args, **kw):
         if (args or kw) and cls.__init__ is object.__init__:
             raise TypeError("Initialization arguments are not supported")
-        return object.__new__(cls)
+        self = object.__new__(cls)
+        object.__setattr__(self, "_local__args", (args, kw))
+        object.__setattr__(self, "_local__dicts", {get_ident(): object.__getattribute__(self, "__dict__")})
+        return self
+
+    def _local__switch(self):
+        dicts = object.__getattribute__(self, "_local__dicts")
+        me = get_ident()
+        d = dicts.get(me)
+        current = object.__getattribute__(self, "__dict__")
+        if d is None:
+            d = {
+                "_local__args": current["_local__args"],
+                "_local__dicts": dicts,
+            }
+            dicts[me] = d
+            object.__setattr__(self, "__dict__", d)
+            args, kw = d["_local__args"]
+            cls = type(self)
+            if cls.__init__ is not object.__init__:
+                cls.__init__(self, *args, **kw)
+        elif d is not current:
+            object.__setattr__(self, "__dict__", d)
+
+    def __getattribute__(self, name):
+        _local._local__switch(self)
+        return object.__getattribute__(self, name)
+
+    def __setattr__(self, name, value):
+        if name == "__dict__":
+            raise AttributeError("%r object attribute '__dict__' is read-only" % type(self).__name__)
+        _local._local__switch(self)
+        return object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        if name == "__dict__":
+            raise AttributeError("%r object attribute '__dict__' is read-only" % type(self).__name__)
+        _local._local__switch(self)
+        return object.__delattr__(self, name)

@@ -28,9 +28,14 @@ pub struct State {
     grace: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Which stream each held write went to, in order, as (fd, length) runs, so a
+    /// caller can replay stdout and stderr interleaved as the program wrote them.
+    pub order: Vec<(u8, usize)>,
     pub changes: Changes,
     pub refused: Option<Limit>,
     pub cancelled: bool,
+    /// The status os._exit ended the run with: like a cancel, nothing after it runs.
+    pub exited: Option<i32>,
     pub held_at_refusal: Held,
 }
 
@@ -55,9 +60,11 @@ impl State {
             grace: false,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            order: Vec::new(),
             changes: Changes::default(),
             refused: None,
             cancelled: false,
+            exited: None,
             held_at_refusal: Held::default(),
         }
     }
@@ -96,8 +103,19 @@ impl State {
             .written
             .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
         match (&self.stdio, fd) {
-            (Stdio::Held(_), 2) => self.stderr.extend_from_slice(data),
-            (Stdio::Held(_), _) => self.stdout.extend_from_slice(data),
+            (Stdio::Held(_), _) => {
+                let fd = if fd == 2 { 2 } else { 1 };
+                if fd == 2 {
+                    self.stderr.extend_from_slice(data);
+                } else {
+                    self.stdout.extend_from_slice(data);
+                }
+                match self.order.last_mut() {
+                    Some((last, len)) if *last == fd => *len += data.len(),
+                    _ if data.is_empty() => {}
+                    _ => self.order.push((fd, data.len())),
+                }
+            }
             (Stdio::Process, 2) => {
                 let mut stderr = io::stderr().lock();
                 stderr.write_all(data)?;
@@ -117,7 +135,7 @@ impl State {
     }
 
     const fn stopped(&self) -> bool {
-        self.refused.is_some() || self.cancelled
+        self.refused.is_some() || self.cancelled || self.exited.is_some()
     }
 
     fn used(&self) -> Option<u64> {
@@ -400,6 +418,8 @@ mod _host {
             io::ErrorKind::ReadOnlyFilesystem => (exceptions.os_error, "EROFS", 30),
             io::ErrorKind::InvalidInput => (exceptions.os_error, "EINVAL", 22),
             io::ErrorKind::Unsupported => (exceptions.os_error, "ENOTSUP", 95),
+            io::ErrorKind::ResourceBusy => (exceptions.os_error, "EBUSY", 16),
+            io::ErrorKind::CrossesDevices => (exceptions.os_error, "EXDEV", 18),
             _ => (exceptions.os_error, "EIO", 5),
         };
         let code = vm
@@ -465,17 +485,16 @@ mod _host {
         state(vm, |state| Ok(state.limits.file))
     }
 
-    #[pyfunction]
-    fn stat(path: ArgBytesLike, vm: &VirtualMachine) -> PyResult<(u8, u64, u32, i64)> {
-        let path = path.borrow_buf();
-        let site = |error: io::Error| match crate::sitedata::stat(&path) {
+    fn found(path: &[u8], follow: bool, vm: &VirtualMachine) -> PyResult<(u8, u64, u32, i64)> {
+        let site = |error: io::Error| match crate::sitedata::stat(path) {
             Some(stat) if error.kind() == io::ErrorKind::NotFound => Ok(stat),
             _ => Err(error),
         };
-        let found = crate::sitedata::stat(&path).filter(|stat| stat.kind == Kind::File);
+        let found = crate::sitedata::stat(path).filter(|stat| stat.kind == Kind::File);
         let stat = match found {
             Some(stat) => Ok(stat),
-            None => files(vm, &path, |state| state.files.stat(&path).or_else(site)),
+            None if follow => files(vm, path, |state| state.files.stat(path).or_else(site)),
+            None => files(vm, path, |state| state.files.lstat(path).or_else(site)),
         };
         stat.map(|stat| {
             let kind = match stat.kind {
@@ -485,6 +504,53 @@ mod _host {
             };
             (kind, stat.size, stat.mode, stat.mtime_ns)
         })
+    }
+
+    #[pyfunction]
+    fn stat(path: ArgBytesLike, vm: &VirtualMachine) -> PyResult<(u8, u64, u32, i64)> {
+        found(&path.borrow_buf(), true, vm)
+    }
+
+    #[pyfunction]
+    fn lstat(path: ArgBytesLike, vm: &VirtualMachine) -> PyResult<(u8, u64, u32, i64)> {
+        found(&path.borrow_buf(), false, vm)
+    }
+
+    #[pyfunction]
+    fn symlink(target: ArgBytesLike, link: ArgBytesLike, vm: &VirtualMachine) -> PyResult<()> {
+        let target = target.borrow_buf();
+        let link = link.borrow_buf();
+        files(vm, &link, |state| {
+            state.files.symlink(&target, &link)?;
+            state.changes.removed.remove(&*link);
+            state.changes.written.insert(link.to_vec());
+            Ok(())
+        })
+    }
+
+    #[pyfunction]
+    fn link(existing: ArgBytesLike, link: ArgBytesLike, vm: &VirtualMachine) -> PyResult<()> {
+        let existing = existing.borrow_buf();
+        let link = link.borrow_buf();
+        files(vm, &link, |state| {
+            state.files.hard_link(&existing, &link)?;
+            state.changes.removed.remove(&*link);
+            state.changes.written.insert(link.to_vec());
+            Ok(())
+        })
+    }
+
+    #[pyfunction]
+    fn links(path: ArgBytesLike, follow: bool, vm: &VirtualMachine) -> PyResult<Option<(u64, u64)>> {
+        let path = path.borrow_buf();
+        state(vm, |state| Ok(state.files.links(&path, follow)))
+    }
+
+    #[pyfunction]
+    fn readlink(path: ArgBytesLike, vm: &VirtualMachine) -> PyResult<PyBytesRef> {
+        let path = path.borrow_buf();
+        let target = files(vm, &path, |state| state.files.read_link(&path))?;
+        Ok(vm.ctx.new_bytes(target))
     }
 
     #[pyfunction]
@@ -602,6 +668,28 @@ mod _host {
     }
 
     #[pyfunction]
+    fn chmod(path: ArgBytesLike, mode: u32, vm: &VirtualMachine) -> PyResult<()> {
+        let path = path.borrow_buf();
+        files(vm, &path, |state| match state.files.set_mode(&path, mode) {
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                state.files.stat(&path).map(|_| ())
+            }
+            done => done,
+        })
+    }
+
+    #[pyfunction]
+    fn utime(path: ArgBytesLike, mtime_ns: i64, vm: &VirtualMachine) -> PyResult<()> {
+        let path = path.borrow_buf();
+        files(vm, &path, |state| match state.files.set_mtime(&path, mtime_ns) {
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                state.files.stat(&path).map(|_| ())
+            }
+            done => done,
+        })
+    }
+
+    #[pyfunction]
     fn rename(from: ArgBytesLike, to: ArgBytesLike, vm: &VirtualMachine) -> PyResult<()> {
         let from = from.borrow_buf();
         let to = to.borrow_buf();
@@ -610,6 +698,17 @@ mod _host {
             state.changes.moved.push((from.to_vec(), to.to_vec()));
             Ok(())
         })
+    }
+
+    /// os._exit: ends the run at once with status. The VM stops as it does at a
+    /// refused budget, so no except, finally, __exit__ or atexit runs after it.
+    #[pyfunction]
+    fn exit(status: i32, vm: &VirtualMachine) -> PyResult<()> {
+        state(vm, |state| {
+            state.exited.get_or_insert(status);
+            Ok(())
+        })?;
+        Err(halt(vm))
     }
 
     #[pyfunction]

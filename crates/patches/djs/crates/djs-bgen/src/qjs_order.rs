@@ -7,6 +7,131 @@
 //! keeps source order after the listed ones.
 
 const ORDER: &[(&str, &[&str])] = &[
+    (
+        "Intl",
+        &[
+            "getCanonicalLocales",
+            "supportedValuesOf",
+            "DateTimeFormat",
+            "NumberFormat",
+            "Collator",
+            "PluralRules",
+            "RelativeTimeFormat",
+            "ListFormat",
+            "Locale",
+            "DisplayNames",
+            "Segmenter",
+        ],
+    ),
+    // node's (V8's) order of the Intl prototypes: constructor first.
+    (
+        "Intl.Collator.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "compare",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.DateTimeFormat.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "formatToParts",
+            "format",
+            "formatRange",
+            "formatRangeToParts",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.DisplayNames.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "of",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.ListFormat.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "format",
+            "formatToParts",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.Locale.prototype",
+        &[
+            "constructor",
+            "toString",
+            "maximize",
+            "minimize",
+            "language",
+            "script",
+            "region",
+            "baseName",
+            "calendar",
+            "caseFirst",
+            "collation",
+            "hourCycle",
+            "numeric",
+            "numberingSystem",
+            "calendars",
+            "collations",
+            "hourCycles",
+            "numberingSystems",
+            "textInfo",
+            "timeZones",
+            "weekInfo",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.NumberFormat.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "formatToParts",
+            "format",
+            "formatRange",
+            "formatRangeToParts",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.PluralRules.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "select",
+            "selectRange",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.RelativeTimeFormat.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "format",
+            "formatToParts",
+            "[Symbol.toStringTag]",
+        ],
+    ),
+    (
+        "Intl.Segmenter.prototype",
+        &[
+            "constructor",
+            "resolvedOptions",
+            "segment",
+            "[Symbol.toStringTag]",
+        ],
+    ),
     ("Array", &["isArray", "from", "fromAsync", "of"]),
     ("BigInt", &["asUintN", "asIntN"]),
     ("Iterator", &["concat", "from", "zip", "zipKeyed"]),
@@ -659,4 +784,10 @@ pub fn reorder(items: &mut [(String, String, String)]) {
             items[slot] = item;
         }
     }
+}
+
+/// Whether the constructor at `path` gets its `prototype` before its statics, as V8
+/// installs them (node's order), rather than after them as qjs does (D2052).
+pub fn prototype_first(path: &str) -> bool {
+    path.starts_with("Intl.")
 }

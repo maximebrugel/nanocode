@@ -99,29 +99,14 @@ impl PyPayload for PyList {
     #[inline]
     unsafe fn freelist_push(obj: *mut PyObject) -> bool {
         LIST_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let stored = if list.len() < Self::MAX_FREELIST {
-                    list.push(obj);
-                    true
-                } else {
-                    false
-                };
-                fl.set(list);
-                stored
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::push_in(fl, obj, Self::MAX_FREELIST) })
             .unwrap_or(false)
     }
 
     #[inline]
     unsafe fn freelist_pop(_payload: &Self) -> Option<NonNull<PyObject>> {
         LIST_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let result = list.pop().map(|p| unsafe { NonNull::new_unchecked(p) });
-                fl.set(list);
-                result
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::pop_in(fl) })
             .ok()
             .flatten()
     }
@@ -552,7 +537,7 @@ impl Py<PyList> {
         if let Some(index) = index.into() {
             Ok(index)
         } else {
-            Err(vm.new_value_error(format!("'{}' is not in list", value.str(vm)?)))
+            Err(vm.new_value_error(format!("{} is not in list", value.repr(vm)?)))
         }
     }
 
@@ -585,7 +570,7 @@ impl Py<PyList> {
             drop(removed);
             Ok(())
         } else {
-            Err(vm.new_value_error(format!("'{}' is not in list", value.str(vm)?)))
+            Err(vm.new_value_error("list.remove(x): x not in list"))
         }
     }
 

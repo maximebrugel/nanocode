@@ -1,7 +1,4 @@
-use crate::{
-    Chunks, PutError, Sha256Digest, Stored,
-    sim::{self, Mutation},
-};
+use crate::{Chunks, PutError, Sha256Digest, Stored};
 
 pub async fn receive(
     chunks: &mut dyn Chunks,
@@ -20,18 +17,11 @@ pub async fn receive(
                 bytes.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(_) if sim::mutated(Mutation::CommitsPartial) => {
-                let stored = Stored {
-                    size_bytes: bytes.len() as u64,
-                    sha256: Sha256Digest(hasher.finalize()),
-                };
-                return Ok((bytes, stored));
-            }
             Err(error) => return Err(PutError::Source(error)),
         }
     }
     let actual = Sha256Digest(hasher.finalize());
-    if actual != sha256 && !sim::mutated(Mutation::ShaUnchecked) {
+    if actual != sha256 {
         return Err(PutError::ShaMismatch {
             expected: sha256,
             actual,

@@ -85,6 +85,8 @@ const OWN_PROPERTY_ATTRIBUTES: u16 = id("OwnPropertyAttributes");
 const OWN_PROPERTY_KEYS: u16 = id("OwnPropertyKeys");
 const CALL_WITH_ARRAY: u16 = id("CallWithArray");
 const ARRAY_BUFFER_CREATE: u16 = id("ArrayBufferCreate");
+const SHARED_ARRAY_BUFFER_CREATE: u16 = id("SharedArrayBufferCreate");
+const ATOMIC_OP: u16 = id("AtomicOp");
 const BUFFER_INFO: u16 = id("BufferInfo");
 const BUFFER_DETACH: u16 = id("BufferDetach");
 const BUFFER_RESIZE: u16 = id("BufferResize");
@@ -211,6 +213,9 @@ const DOM_EXCEPTION_CONSTANT: u16 = id("DOMExceptionConstant");
 const BTOA: u16 = id("Btoa");
 const TEXT_CODEC_CREATE: u16 = id("TextCodecCreate");
 const UTF8_DECODE: u16 = id("Utf8Decode");
+const INTL_ENABLED: u16 = id("IntlEnabled");
+const INTL_CREATE: u16 = id("IntlCreate");
+const INTL_LOCALES: u16 = id("IntlLocales");
 const ATOB: u16 = id("Atob");
 const F64_IMUL: u16 = id("F64Imul");
 const F64_LOG: u16 = id("F64Log");
@@ -367,7 +372,7 @@ pub(super) fn new_builtin_closure(
     Ok(Some(f))
 }
 
-const BUILTIN_CLOSURES: [u16; 25] = [
+const BUILTIN_CLOSURES: [u16; 28] = [
     id("PromiseResolveFunction"),
     id("PromiseRejectFunction"),
     id("GetCapabilitiesExecutor"),
@@ -393,6 +398,9 @@ const BUILTIN_CLOSURES: [u16; 25] = [
     id("DecoratorAccessSet"),
     id("DecoratorAccessHas"),
     id("DecoratorParamCall"),
+    id("IntlBoundFormat"),
+    id("IntlBoundCompare"),
+    id("AtomicsWaitTimeout"),
 ];
 
 #[cfg(djs_prelude)]
@@ -1399,6 +1407,23 @@ impl Exec<'_> {
                 }
                 Value::object(b)
             }
+            SHARED_ARRAY_BUFFER_CREATE if FULL => {
+                let (Some(proto), Some(waiters)) = (a0.as_object(), arg(self, 3).as_object()) else {
+                    return bad_argument(id);
+                };
+                let len = arg(self, 1).as_number().unwrap_or(f64::NAN);
+                let max = arg(self, 2).as_number();
+                Value::object(typed::shared_buffer_create(self.heap, proto, len, max, waiters)?)
+            }
+            ATOMIC_OP if FULL => {
+                let o = typed::as_typed_array(self.heap, a0)?;
+                let i = arg(self, 1).as_number().unwrap_or(-1.0);
+                if !(i >= 0.0 && i <= u32::MAX as f64) {
+                    return bad_argument(id);
+                }
+                let op = arg(self, 2).as_int().unwrap_or(-1);
+                typed::atomic_op(self.heap, o, i as u32, op, arg(self, 3), arg(self, 4))?
+            }
             BUFFER_INFO if FULL => {
                 let b = typed::as_buffer(self.heap, a0)?;
                 typed::buffer_info(self.heap, b, arg(self, 1).as_int().unwrap_or(0))
@@ -2010,6 +2035,15 @@ impl Exec<'_> {
                     None => return bad_argument(id),
                 }
             }
+            INTL_ENABLED => Value::bool(crate::EMBED),
+            // The six are consecutive (builtins/intrinsics.d.ts).
+            INTL_CREATE..=INTL_LOCALES if crate::EMBED => {
+                let args = [a0, arg(self, 1), arg(self, 2), arg(self, 3), arg(self, 4)];
+                match crate::builtins::intl::intrinsic(self.heap, id - INTL_CREATE, args)? {
+                    Some(v) => v,
+                    None => return bad_argument(id),
+                }
+            }
             BTOA | ATOB => {
                 let Some(s) = a0.as_string() else {
                     return bad_argument(id);
@@ -2212,7 +2246,11 @@ impl Exec<'_> {
                         )?)
                     }
                     STR_TO_CASE => {
-                        Value::string(string::to_case(self.heap, s, a1.as_bool() == Some(true))?)
+                        Value::string(string::to_case_mode(
+                            self.heap,
+                            s,
+                            a1.as_bool().map_or_else(|| a1.as_int().unwrap_or(0), i32::from),
+                        )?)
                     }
                     STR_TRIM => {
                         Value::string(string::trim(self.heap, s, a1.as_int().unwrap_or(0))?)
@@ -2778,6 +2816,8 @@ impl Exec<'_> {
             "%RegExpStringIteratorPrototype%" => Some(Intrinsic::RegExpStringIteratorProto),
             "%IteratorHelperPrototype%" => Some(Intrinsic::IteratorHelperProto),
             "%WrapForValidIteratorPrototype%" => Some(Intrinsic::WrapForValidIteratorProto),
+            "%IntlSegmentsPrototype%" => Some(Intrinsic::IntlSegmentsProto),
+            "%IntlSegmentIteratorPrototype%" => Some(Intrinsic::IntlSegmentIteratorProto),
             "%TypedArray%" => Some(Intrinsic::TypedArrayCtor),
             "%CallSitePrototype%" => Some(Intrinsic::CallSiteProto),
             // `X.prototype` of a constructor the prelude has not installed yet.

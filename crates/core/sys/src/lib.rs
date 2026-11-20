@@ -19,6 +19,7 @@ mod decimal;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub mod entry;
 mod exclusive;
+mod grow;
 mod inline;
 pub mod jpeg;
 #[cfg(windows)]
@@ -64,6 +65,7 @@ pub use atomic::{AtomicArc, AtomicBox, AtomicPinBox, AtomicStatic};
 pub use bilock::{BiLock, BiLockGuard};
 pub use decimal::DecimalText;
 pub use exclusive::Exclusive;
+pub use grow::Grow;
 pub use inline::{InlineVec, OwnedItems, new_arc_with};
 pub use pin::{Scope, Scoped};
 #[cfg(any(unix, windows))]

@@ -294,9 +294,9 @@ async fn run_decode(
         let n = input.read(ctx, &mut buf).await.map_err(Failure::Read)?;
         let mut bytes = Vec::with_capacity(n / 4 * 3 + 3);
         if n == 0 {
-            // A trailing group of two or three symbols decodes without padding; one
-            // symbol alone cannot.
-            let ok = d.len - d.pad != 1;
+            // A trailing group without its padding decodes what it can, then fails as
+            // GNU's does (`aGk` prints `hi`, status 1).
+            let ok = d.len == 0;
             if d.len > 0 {
                 d.flush(&mut bytes);
             }

@@ -198,6 +198,23 @@ pub(crate) fn build(patterns: &[Vec<u8>], o: MatchOptions) -> Result<Matchers, P
             }
             for p in patterns {
                 let s = std::str::from_utf8(p).map_err(|_| PatternError::Unsupported)?;
+                if let Some(look) = Look::split(s) {
+                    if o.word || o.line {
+                        return Err(PatternError::Unsupported);
+                    }
+                    let look = look.build(o).ok_or(PatternError::Unsupported)?;
+                    let pats = || Pats {
+                        pats: vec![Pat::Look(look.clone())],
+                        word: false,
+                        line: false,
+                        crlf: o.crlf && !o.null_data,
+                        utf8: o.utf8,
+                    };
+                    return Ok(Matchers {
+                        lines: LineMatcher::Each(pats()),
+                        spans: o.spans.then(pats),
+                    });
+                }
                 prepared.push(Prepared {
                     rust: Some(s.to_string()),
                     // Perl's semantics are leftmost-first, as Rust's.
@@ -380,6 +397,161 @@ enum Pat {
     /// With `-w`/`-x` built in.
     Rust(Regex),
     Posix(Posix),
+    /// A `-P` pattern with lookarounds at its ends.
+    Look(BuiltLook),
+}
+
+/// A `-P` pattern whose lookarounds the regex crate does not take, split where they
+/// are at its ends: lookbehinds before the body, `(?<=X)` and `(?<!X)`, and one
+/// positive lookahead after it, `(?=Z)`. A lookbehind only tests the position the
+/// body starts at, and a trailing lookahead matched as part of the regex (`(B)Z`)
+/// keeps Perl's backtracking order, so both match as PCRE does.
+#[derive(Debug, PartialEq, Eq)]
+struct Look<'p> {
+    /// `(X, negated)`.
+    behind: Vec<(&'p str, bool)>,
+    body: &'p str,
+    ahead: Option<&'p str>,
+}
+
+#[derive(Clone)]
+struct BuiltLook {
+    /// `(?:B)`, or `(B)(?:Z)` with a lookahead: the match is group 1.
+    body: Regex,
+    ahead: bool,
+    /// `(?:X)\z`, matched against the text before the body.
+    behind: Vec<(Regex, bool)>,
+}
+
+impl<'p> Look<'p> {
+    fn split(p: &'p str) -> Option<Self> {
+        let mut rest = p;
+        let mut behind = Vec::new();
+        loop {
+            let negated = if rest.starts_with("(?<=") {
+                false
+            } else if rest.starts_with("(?<!") {
+                true
+            } else {
+                break;
+            };
+            let close = group_end(rest)?;
+            behind.push((&rest[4..close], negated));
+            rest = &rest[close + 1..];
+        }
+        let mut ahead = None;
+        if rest.ends_with(')') {
+            let mut at = 0;
+            while at < rest.len() {
+                if rest[at..].starts_with("(?=") && group_end(&rest[at..]) == Some(rest.len() - at - 1)
+                {
+                    ahead = Some(&rest[at + 3..rest.len() - 1]);
+                    rest = &rest[..at];
+                    break;
+                }
+                at = next_token(rest, at)?;
+            }
+        }
+        if behind.is_empty() && ahead.is_none() {
+            return None;
+        }
+        Some(Self {
+            behind,
+            body: rest,
+            ahead,
+        })
+    }
+
+    fn build(&self, o: MatchOptions) -> Option<BuiltLook> {
+        let body = match self.ahead {
+            Some(z) => format!("({})(?:{z})", self.body),
+            None => format!("(?:{})", self.body),
+        };
+        let mut behind = Vec::with_capacity(self.behind.len());
+        for (x, negated) in &self.behind {
+            behind.push((rust_regex(&format!(r"(?:{x})\z"), o)?, *negated));
+        }
+        Some(BuiltLook {
+            body: rust_regex(&body, o)?,
+            ahead: self.ahead.is_some(),
+            behind,
+        })
+    }
+}
+
+impl BuiltLook {
+    fn find_at(&self, line: &[u8], at: usize, utf8: bool) -> Option<(usize, usize)> {
+        let mut caps = self.body.capture_locations();
+        let mut from = at;
+        loop {
+            self.body.captures_read_at(&mut caps, line, from)?;
+            let (s, e) = caps.get(usize::from(self.ahead))?;
+            let ok = self
+                .behind
+                .iter()
+                .all(|(re, negated)| re.is_match(&line[..s]) != *negated);
+            if ok {
+                return Some((s, e));
+            }
+            from = s + char_len(line, s, utf8);
+            if from > line.len() {
+                return None;
+            }
+        }
+    }
+}
+
+/// The index of the `)` closing the group that opens at `p[0]`.
+fn group_end(p: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < p.len() {
+        match p.as_bytes()[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i = next_token(p, i)?;
+    }
+    None
+}
+
+/// The index after the token at `p[i]`: an escape, a bracket expression or one
+/// character.
+fn next_token(p: &str, i: usize) -> Option<usize> {
+    let b = p.as_bytes();
+    match b[i] {
+        b'\\' => {
+            let c = p[i + 1..].chars().next()?;
+            Some(i + 1 + c.len_utf8())
+        }
+        b'[' => {
+            let mut j = i + 1;
+            if b.get(j) == Some(&b'^') {
+                j += 1;
+            }
+            if b.get(j) == Some(&b']') {
+                j += 1;
+            }
+            while j < b.len() {
+                match b[j] {
+                    b'\\' => j += 2,
+                    b'[' if b.get(j + 1) == Some(&b':') => {
+                        j = p[j + 2..].find(":]").map_or(j + 1, |k| j + 2 + k + 2);
+                    }
+                    b']' => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+        _ => Some(i + p[i..].chars().next()?.len_utf8()),
+    }
 }
 
 impl Pats {
@@ -394,6 +566,7 @@ impl Pats {
             let m = match p {
                 Pat::Rust(re) => re.find_at(line, at).map(|m| (m.start(), m.end())),
                 Pat::Posix(re) => self.posix_find(re, line, at),
+                Pat::Look(l) => l.find_at(line, at, self.utf8),
             };
             if let Some(m) = m {
                 best = match best {
@@ -512,5 +685,48 @@ impl Matcher for Pats {
 
     fn new_captures(&self) -> NoCaptures {
         NoCaptures
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(spans: bool) -> MatchOptions {
+        MatchOptions {
+            syntax: Syntax::Perl,
+            icase: false,
+            word: false,
+            line: false,
+            null_data: false,
+            crlf: false,
+            utf8: true,
+            spans,
+        }
+    }
+
+    fn all(p: &str, line: &str) -> Vec<String> {
+        let m = build(&[p.as_bytes().to_vec()], opts(true)).unwrap();
+        let pats = m.spans.unwrap();
+        let (mut out, mut at) = (Vec::new(), 0);
+        while let Some((s, e)) = pats.find_at(line.as_bytes(), at) {
+            out.push(line[s..e].to_string());
+            at = if e > s { e } else { e + 1 };
+        }
+        out
+    }
+
+    #[test]
+    fn perl_lookarounds_at_the_ends_match_as_pcre_does() {
+        assert_eq!(all(r"(?<=id=)\d+", "id=42 x=7"), ["42"]);
+        assert_eq!(all(r"(?<=a)a", "aaa"), ["a", "a"]);
+        assert_eq!(all(r"(?<!x)\d", "x1 2"), ["2"]);
+        assert_eq!(all(r"\w+(?=\d)", "abc1 de"), ["abc"]);
+        assert_eq!(all(r"(?<=\()[^)]+(?=\))", "f(a, b) g(c)"), ["a, b", "c"]);
+        assert_eq!(
+            Look::split(r"a(?=b)c"),
+            None,
+            "a lookahead inside stays with the regex crate"
+        );
     }
 }

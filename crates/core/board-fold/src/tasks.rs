@@ -1,4 +1,8 @@
-use std::collections::BTreeMap;
+use std::{
+    cmp::Ordering,
+    collections::BTreeMap,
+    hash::{DefaultHasher, Hash, Hasher},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +11,7 @@ use crate::{
     access::{Actor, Can},
     schedule::{Invalid, Recur, Retry},
     sim::{Mutation, mutated},
+    stage::Act,
 };
 
 pub const BATCH: usize = 100;
@@ -37,9 +42,45 @@ pub struct Terms {
     pub recur: Option<Recur>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<Retry>,
+    #[serde(default, skip_serializing_if = "crate::intent::Intent::is_task")]
+    pub intent: crate::intent::Intent,
 }
 
 impl Terms {
+    pub fn due(due_at_ms: u64) -> Self {
+        Self {
+            due_at_ms: Some(due_at_ms),
+            ..Self::default()
+        }
+    }
+
+    pub fn every(self, every_ms: u64) -> Self {
+        Self {
+            recur: Some(Recur::Every { every_ms }),
+            ..self
+        }
+    }
+
+    pub fn cron(self, cron: &str, offset_minutes: i16) -> Self {
+        Self {
+            recur: Some(Recur::Cron {
+                cron: cron.to_owned(),
+                offset_minutes,
+            }),
+            ..self
+        }
+    }
+
+    pub fn retry(self, max_attempts: u64, backoff_ms: u64) -> Self {
+        Self {
+            retry: Some(Retry {
+                max_attempts,
+                backoff_ms,
+            }),
+            ..self
+        }
+    }
+
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
@@ -209,6 +250,7 @@ impl Task {
                 .as_ref()
                 .and(spec.terms.due_at_ms)
                 .map(|slot| Occurrence { series, slot }),
+            cap: None,
         }
     }
 
@@ -270,21 +312,38 @@ impl Fold {
         labels: &BTreeMap<String, String>,
         at_ms: u64,
     ) -> Option<&TaskId> {
+        self.spread(actor, labels, at_ms, 1)
+    }
+
+    pub fn spread(
+        &self,
+        actor: &str,
+        labels: &BTreeMap<String, String>,
+        at_ms: u64,
+        width: usize,
+    ) -> Option<&TaskId> {
         let me = Actor::parse(actor).ok()?;
-        let mut best = None;
-        for entry in &self.entries {
-            if entry.change != Change::Posted {
-                continue;
-            }
-            let Some(task) = self.tasks.get(&entry.task) else {
+        let sets = labels
+            .iter()
+            .map(|(key, value)| self.labelled.get(key).and_then(|values| values.get(value)))
+            .collect::<Option<Vec<_>>>()?;
+        let candidates = sets
+            .into_iter()
+            .min_by_key(|ids| ids.len())
+            .unwrap_or(&self.live);
+        let mut tier = None;
+        let mut head: Vec<(usize, &TaskId)> = Vec::new();
+        for id in candidates {
+            let (Some(task), Some(posted)) = (self.tasks.get(id), self.posted.get(id)) else {
                 continue;
             };
             if !labels
                 .iter()
                 .all(|(key, value)| task.spec.labels.get(key) == Some(value))
-                || self.claimable(&entry.task, at_ms).is_err()
-                || self.admits(&entry.task, actor).is_err()
-                || !self.access.may(&me, &entry.task.0, Can::Label)
+                || task.spec.terms.intent.is_goal()
+                || self.claimable(id, at_ms).is_err()
+                || self.admits(id, actor).is_err()
+                || !self.access.may(&me, &id.0, Can::Label)
             {
                 continue;
             }
@@ -294,11 +353,33 @@ impl Fold {
                 rank,
                 task.assignee.is_none() && !mutated(Mutation::NextIgnoresAssignee),
             );
-            if best.as_ref().is_none_or(|(_, held)| key < *held) {
-                best = Some((&entry.task, key));
+            let key = if width > 1 && mutated(Mutation::SpreadIgnoresTier) {
+                (false, None, false)
+            } else {
+                key
+            };
+            match tier.as_ref().map(|held| key.cmp(held)) {
+                Some(Ordering::Greater) => continue,
+                Some(Ordering::Equal) => {}
+                _ => {
+                    tier = Some(key);
+                    head.clear();
+                }
+            }
+            let at = head.partition_point(|(held, _)| held < posted);
+            if at < width {
+                head.insert(at, (*posted, id));
+                head.truncate(width);
             }
         }
-        best.map(|(id, _)| id)
+        let salt = |id: &TaskId| {
+            let mut hasher = DefaultHasher::new();
+            (actor, id).hash(&mut hasher);
+            hasher.finish()
+        };
+        head.into_iter()
+            .map(|(_, id)| id)
+            .min_by_key(|id| if width > 1 { salt(id) } else { 0 })
     }
 
     pub(crate) fn check_tasks(&self, at_ms: u64, op: &TaskOp) -> Result<(), Rejection> {
@@ -307,33 +388,28 @@ impl Fold {
         }
         let task = self.tasks.get(op.task()).ok_or(Rejection::UnknownTask)?;
         match op {
-            TaskOp::Block { claim, .. } => match (&task.phase, claim) {
-                (Phase::Claimed { claim: held, .. }, Some(claim)) if held == claim => Ok(()),
-                (Phase::Open | Phase::Claimed { .. }, Some(_)) => Err(Rejection::NotHolder),
-                (
-                    Phase::Claimed {
-                        claim, until_ms, ..
-                    },
-                    None,
-                ) if *until_ms > self.now_ms.max(at_ms) => Err(Rejection::Held {
-                    claim: claim.clone(),
-                    until_ms: *until_ms,
-                }),
-                (Phase::Open | Phase::Claimed { .. }, None) => Ok(()),
-                (Phase::Blocked { .. }, _) => Err(Rejection::Tasks(Refusal::Blocked)),
-                _ => Err(Rejection::Terminal),
-            },
-            TaskOp::Unblock { .. } => match task.phase {
-                Phase::Blocked { .. } => Ok(()),
-                _ if mutated(Mutation::UnblockAnything) => Ok(()),
-                _ => Err(Rejection::Tasks(Refusal::NotBlocked)),
-            },
-            TaskOp::Reopen { .. } => match task.phase {
-                Phase::Failed { .. } if !task.finished() => Ok(()),
-                _ if mutated(Mutation::ReopenAnything) => Ok(()),
-                Phase::Failed { .. } => Err(Rejection::Terminal),
-                _ => Err(Rejection::Tasks(Refusal::NotFailed)),
-            },
+            TaskOp::Block { claim, .. } => {
+                let now = self.now_ms.max(at_ms);
+                task.may(Act::Block, now)?;
+                match (&task.phase, claim) {
+                    (Phase::Claimed { claim: held, .. }, Some(claim)) if held == claim => Ok(()),
+                    (_, Some(_)) => Err(Rejection::NotHolder),
+                    (
+                        Phase::Claimed {
+                            claim, until_ms, ..
+                        },
+                        None,
+                    ) if *until_ms > now => Err(Rejection::Held {
+                        claim: claim.clone(),
+                        until_ms: *until_ms,
+                    }),
+                    (_, None) => Ok(()),
+                }
+            }
+            TaskOp::Unblock { .. } if mutated(Mutation::UnblockAnything) => Ok(()),
+            TaskOp::Reopen { .. } if mutated(Mutation::ReopenAnything) => Ok(()),
+            TaskOp::Unblock { .. } => task.may(Act::Unblock, self.now_ms.max(at_ms)).map(drop),
+            TaskOp::Reopen { .. } => task.may(Act::Reopen, self.now_ms.max(at_ms)).map(drop),
             TaskOp::Assign { .. } if task.finished() => Err(Rejection::Terminal),
             TaskOp::Assign { .. } | TaskOp::Batch { .. } => Ok(()),
         }
@@ -478,6 +554,7 @@ impl Fold {
 
     pub(crate) fn steer(&mut self, seq: u64, event: &Event, op: &TaskOp) {
         let id = op.task().clone();
+        let now = self.now_ms;
         let change = match op {
             TaskOp::Batch { name, tasks } => {
                 assert!(tasks.len() <= BATCH, "a checked batch fits one write");
@@ -508,10 +585,14 @@ impl Fold {
                     Phase::Claimed { claim, .. } => Some(claim.clone()),
                     _ => None,
                 };
-                task.phase = Phase::Blocked {
+                let blocked = Phase::Blocked {
                     kind: kind.clone(),
                     reason: reason.clone(),
                 };
+                if let Err(illegal) = task.enter(blocked, now) {
+                    self.refused = Some(illegal);
+                    return;
+                }
                 Moved::Blocked {
                     kind: kind.clone(),
                     reason: reason.clone(),
@@ -519,8 +600,8 @@ impl Fold {
                 }
             }
             TaskOp::Unblock { .. } | TaskOp::Reopen { .. } => {
-                if let Some(task) = self.tasks.get_mut(&id) {
-                    task.phase = Phase::Open;
+                if !self.enter(&id, Phase::Open, None, now) {
+                    return;
                 }
                 if matches!(op, TaskOp::Reopen { .. }) {
                     Moved::Reopened

@@ -3891,14 +3891,14 @@ class Context(object):
         if traps is None:
             self.traps = dc.traps.copy()
         elif not isinstance(traps, dict):
-            self.traps = dict((s, int(s in traps)) for s in _signals + traps)
+            self.traps = dict((s, s in traps) for s in _signals + traps)
         else:
             self.traps = traps
 
         if flags is None:
-            self.flags = dict.fromkeys(_signals, 0)
+            self.flags = dict.fromkeys(_signals, False)
         elif not isinstance(flags, dict):
-            self.flags = dict((s, int(s in flags)) for s in _signals + flags)
+            self.flags = dict((s, s in flags) for s in _signals + flags)
         else:
             self.flags = flags
 
@@ -3979,12 +3979,12 @@ class Context(object):
     def clear_flags(self):
         """Reset all flags to zero"""
         for flag in self.flags:
-            self.flags[flag] = 0
+            self.flags[flag] = False
 
     def clear_traps(self):
         """Reset all traps to zero"""
         for flag in self.traps:
-            self.traps[flag] = 0
+            self.traps[flag] = False
 
     def _shallow_copy(self):
         """Returns a shallow copy from self."""
@@ -4015,14 +4015,16 @@ class Context(object):
             # Don't touch the flag
             return error().handle(self, *args)
 
-        self.flags[error] = 1
+        self.flags[error] = True
         if not self.traps[error]:
             # The errors define how to handle themselves.
             return condition().handle(self, *args)
 
         # Errors should only be risked on copies of the context
         # self._ignored_flags = []
-        raise error(explanation)
+        # CPython's C decimal raises a trapped signal with the list of the
+        # conditions that raised it, not an explanation string.
+        raise error([condition])
 
     def _ignore_all_flags(self):
         """Ignore all flags, if they are raised"""
@@ -6041,7 +6043,7 @@ def _convert_for_comparison(self, other, equality_op=False):
     if isinstance(other, float):
         context = getcontext()
         if equality_op:
-            context.flags[FloatOperation] = 1
+            context.flags[FloatOperation] = True
         else:
             context._raise_error(FloatOperation,
                 "strict semantics for mixing floats and Decimals are enabled")
@@ -6138,7 +6140,7 @@ _parse_format_specifier_regex = re.compile(r"""\A
 (?P<alt>\#)?
 (?P<zeropad>0)?
 (?P<minimumwidth>\d+)?
-(?P<thousands_sep>[,_])?
+(?P<thousands_sep>,)?
 (?:\.
     (?=[\d,_])  # lookahead for digit or separator
     (?P<precision>\d+)?
@@ -6179,7 +6181,8 @@ def _parse_format_specifier(format_spec, _localeconv=None):
     """
     m = _parse_format_specifier_regex.match(format_spec)
     if m is None:
-        raise ValueError("Invalid format specifier: " + format_spec)
+        # As CPython's C decimal module does, every malformed specifier gives one message.
+        raise ValueError("invalid format string")
 
     # get the dictionary
     format_dict = m.groupdict()
@@ -6191,11 +6194,9 @@ def _parse_format_specifier(format_spec, _localeconv=None):
     format_dict['zeropad'] = (format_dict['zeropad'] is not None)
     if format_dict['zeropad']:
         if fill is not None:
-            raise ValueError("Fill character conflicts with '0'"
-                             " in format specifier: " + format_spec)
+            raise ValueError("invalid format string")
         if align is not None:
-            raise ValueError("Alignment conflicts with '0' in "
-                             "format specifier: " + format_spec)
+            raise ValueError("invalid format string")
     format_dict['fill'] = fill or ' '
     # PEP 3101 originally specified that the default alignment should
     # be left;  it was later agreed that right-aligned makes more sense

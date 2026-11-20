@@ -5,8 +5,9 @@ use nanocode_agent_core::{
     session::{ToolOutcome, TranscriptItem},
 };
 use nanocode_durability::{
-    AdmittedTurn, Advanced, CheckpointFormat, EncodedPayload, Error, FormatFuture, Hydrated,
-    PayloadReader, Previous, Result, Sequence, SessionRecord, load_sequence, sequence_references,
+    AdmittedTurn, Advanced, Checkpoint, CheckpointFormat, EncodedPayload, Error, FormatFuture,
+    Hydrated, PayloadReader, Previous, Result, Sequence, SessionRecord, load_sequence,
+    sequence_references,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -72,6 +73,10 @@ struct Reuse {
     decoded: usize,
 }
 
+/// Pages decoded per load: each chunk's raw pages are dropped before the next
+/// loads, so the encoded and decoded history never sit side by side whole.
+const DECODE_CHUNK: usize = 16;
+
 async fn advance_sequence(
     reader: PayloadReader<'_>,
     sequence: Sequence,
@@ -95,8 +100,9 @@ async fn advance_sequence(
     let added = references[reused..].to_vec();
     reuse.reused += reused;
     reuse.decoded += added.len();
-    if !added.is_empty() {
-        for payload in reader.load_payloads(added).await? {
+    values.reserve(added.len());
+    for chunk in added.chunks(DECODE_CHUNK) {
+        for payload in reader.take_payloads(chunk.to_vec()).await? {
             values.push(payload.decode()?);
         }
     }
@@ -353,14 +359,17 @@ async fn advance_snapshot(
     Ok((snapshot, Some(hydrated), Some(reuse)))
 }
 
-pub(super) async fn hydrate_cursor(reader: PayloadReader<'_>, stored: Value) -> Result<Value> {
+pub(super) async fn hydrate_cursor(
+    reader: PayloadReader<'_>,
+    stored: Value,
+    read: &mut HashSet<String>,
+) -> Result<Value> {
     if !paged(&stored) {
         return Ok(stored);
     }
     let conversation: PagedConversation =
         serde_json::from_value(stored.clone()).map_err(Error::InvalidPayload)?;
     let paged: PagedCursor = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
-    let read = &mut HashSet::new();
     let pending = load_sequence(reader, paged.pending, read).await?;
     let prompt: serde_json::Map<String, Value> =
         reader.load_payload(paged.template).await?.decode()?;
@@ -448,10 +457,10 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         reader: PayloadReader<'a>,
         stored: Value,
         read: &'a mut HashSet<String>,
-    ) -> FormatFuture<'a, Result<(Value, Option<Hydrated>)>> {
+    ) -> FormatFuture<'a, Result<(Checkpoint, Option<Hydrated>)>> {
         Box::pin(async move {
             let (value, hydrated, _) = advance_snapshot(reader, stored, read, None).await?;
-            Ok((value, hydrated.map(Hydrated::new)))
+            Ok((value.into(), hydrated.map(Hydrated::new)))
         })
     }
 
@@ -463,12 +472,16 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         previous: Previous,
     ) -> FormatFuture<'a, Result<Advanced>> {
         Box::pin(async move {
-            let earlier = previous
+            let earlier = match previous
                 .hydrated
                 .and_then(Hydrated::take::<HydratedConversation>)
-                .map(|keys| (keys, previous.checkpoint));
+            {
+                Some(keys) => Some((keys, previous.checkpoint.into_value()?)),
+                None => None,
+            };
             let (checkpoint, hydrated, reuse) =
                 advance_snapshot(reader, stored, read, earlier).await?;
+            let checkpoint = Checkpoint::from(checkpoint);
             let hydrated = hydrated.map(Hydrated::new);
             Ok(match reuse {
                 Some(reuse) if reuse.reused > 0 => Advanced {
@@ -492,7 +505,11 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         reader: PayloadReader<'a>,
         continuation: Value,
     ) -> FormatFuture<'a, Result<Option<Value>>> {
-        Box::pin(async move { hydrate_cursor(reader, continuation).await.map(Some) })
+        Box::pin(async move {
+            hydrate_cursor(reader, continuation, &mut HashSet::new())
+                .await
+                .map(Some)
+        })
     }
 
     fn hydrate_continuation<'a>(
@@ -501,7 +518,8 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         continuation: Value,
     ) -> FormatFuture<'a, Result<Option<Value>>> {
         Box::pin(async move {
-            let mut continuation = hydrate_cursor(reader, continuation).await?;
+            let mut continuation =
+                hydrate_cursor(reader, continuation, &mut HashSet::new()).await?;
             let Some(mut snapshot) = continuation
                 .get_mut("snapshot")
                 .map(Value::take)
@@ -779,8 +797,7 @@ fn claude_transcript(checkpoint: &Value, prompts: &[AdmittedPrompt]) -> Vec<Tran
         .iter()
         .chain(conversation["messages"].as_array().into_iter().flatten())
         .filter(|message| summary_message(message).is_none())
-        .cloned()
-        .collect::<Vec<_>>();
+        .collect::<Vec<&Value>>();
     let messages = messages.as_slice();
     let receipt = |message: &Value| blocks(message).any(|block| block["type"] == "tool_result");
 
@@ -873,7 +890,7 @@ fn claude_transcript(checkpoint: &Value, prompts: &[AdmittedPrompt]) -> Vec<Tran
                 .get(next_prompt..)
                 .and_then(|rest| rest.iter().position(|prompt| prompt.parts == parts))
             else {
-                segment.push(message);
+                segment.push(*message);
                 continue;
             };
             match steers {

@@ -19,7 +19,7 @@ pub(super) fn load<'a>(
             };
         let record = match (state.session(), &checkpoint) {
             (Some(record), _) => record.clone(),
-            (None, Some(checkpoint)) => this.infer_record(id, checkpoint)?,
+            (None, Some(checkpoint)) => this.infer_record(id, checkpoint.head())?,
             (None, None) => {
                 return Err(Error::SessionNotFound {
                     session_id: id.to_owned(),
@@ -33,22 +33,17 @@ pub(super) fn load<'a>(
             (Some((_, view, steers)), _) => {
                 let mut transcript = this.transcript(view, record.family(), &admitted)?;
                 transcript.extend(steers.iter().cloned().map(TranscriptItem::User));
-                transcript
+                Transcript::Read(transcript)
             }
-            (None, Some(checkpoint)) => this.transcript(checkpoint, record.family(), &admitted)?,
-            (None, None) => Vec::new(),
+            (None, Some(_)) => Transcript::Checkpoint {
+                family: record.family(),
+                steers: admitted.iter().map(|turn| turn.steers).collect(),
+            },
+            (None, None) => Transcript::Read(Vec::new()),
         };
-        let preview = turns
-            .iter()
-            .find_map(|turn| turn.preview.clone())
-            .or_else(|| {
-                transcript.iter().find_map(|item| match item {
-                    TranscriptItem::User(text) => Some(text.clone()),
-                    _ => None,
-                })
-            });
-        Ok(StoredSession {
-            summary: SessionSummary { record, preview },
+        drop(admitted);
+        let mut stored = StoredSession {
+            summary: SessionSummary { record, preview: None },
             transcript,
             turns,
             in_progress: progress.map(|(operation, _, _)| operation),
@@ -64,7 +59,15 @@ pub(super) fn load<'a>(
                 hydrated,
                 record_inferred: state.session().is_none(),
             },
-        })
+        };
+        stored.summary.preview = match stored.turns.iter().find_map(|turn| turn.preview.clone()) {
+            Some(preview) => Some(preview),
+            None => stored.transcript()?.into_iter().find_map(|item| match item {
+                TranscriptItem::User(text) => Some(text),
+                _ => None,
+            }),
+        };
+        Ok(stored)
     })
 }
 
@@ -122,7 +125,7 @@ pub(super) fn advance<'a>(
         };
         let record = match (state.session(), &checkpoint) {
             (Some(record), _) => record.clone(),
-            (None, Some(checkpoint)) => this.infer_record(id, checkpoint)?,
+            (None, Some(checkpoint)) => this.infer_record(id, checkpoint.head())?,
             (None, None) => {
                 return Err(Error::SessionNotFound {
                     session_id: id.to_owned(),
@@ -137,7 +140,7 @@ pub(super) fn advance<'a>(
         Ok((
             StoredSession {
                 summary: SessionSummary { record, preview },
-                transcript: Vec::new(),
+                transcript: Transcript::Read(Vec::new()),
                 turns,
                 in_progress: None,
                 checkpoint,
@@ -174,7 +177,7 @@ pub(super) fn load_resumable<'a>(
             };
         let record = match (state.session(), &checkpoint) {
             (Some(record), _) => record.clone(),
-            (None, Some(checkpoint)) => this.infer_record(id, checkpoint)?,
+            (None, Some(checkpoint)) => this.infer_record(id, checkpoint.head())?,
             (None, None) => {
                 return Err(Error::SessionNotFound {
                     session_id: id.to_owned(),

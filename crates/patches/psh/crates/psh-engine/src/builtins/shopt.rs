@@ -121,10 +121,8 @@ pub(crate) async fn shopt(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             format!("set {}o {n}\n", if *on { '-' } else { '+' })
         } else if print {
             format!("shopt {} {n}\n", if *on { "-s" } else { "-u" })
-        } else if o && names.is_empty() {
-            format!("{n:<15}\t{}\n", if *on { "on" } else { "off" })
         } else {
-            format!("{n:<20}\t{}\n", if *on { "on" } else { "off" })
+            format!("{n:<15}\t{}\n", if *on { "on" } else { "off" })
         };
         buf.extend_from_slice(line.as_bytes());
     }

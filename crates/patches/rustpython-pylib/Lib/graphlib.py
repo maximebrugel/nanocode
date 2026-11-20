@@ -94,13 +94,12 @@ class TopologicalSorter:
         Raise ValueError if nodes have already been passed out of the sorter.
 
         """
-        if self._npassedout > 0:
-            raise ValueError("cannot prepare() after starting sort")
+        if self._ready_nodes is not None:
+            raise ValueError("cannot prepare() more than once")
 
-        if self._ready_nodes is None:
-            self._ready_nodes = [
-                i.node for i in self._node2info.values() if i.npredecessors == 0
-            ]
+        self._ready_nodes = [
+            i.node for i in self._node2info.values() if i.npredecessors == 0
+        ]
         # ready_nodes is set before we look for cycles on purpose:
         # if the user wants to catch the CycleError, that's fine,
         # they can continue using the instance to grab as many

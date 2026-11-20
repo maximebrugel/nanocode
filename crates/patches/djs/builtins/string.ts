@@ -232,13 +232,20 @@ function StringPrototypeEndsWith(this: Value, searchString: Value, endPosition?:
 }
 
 /**
- * String.prototype.localeCompare ( that ), 22.1.3.12: code point order (no Intl).
+ * String.prototype.localeCompare ( that [ , locales [ , options ] ] ), ECMA-402 19.1.1:
+ * the default collation, or Intl.Collator's for locales or options (code point order
+ * without Intl).
  * @builtin String.prototype.localeCompare
  * @fast
+ * @length 1
  */
-function StringPrototypeLocaleCompare(this: Value, that: Value): f64 {
+function StringPrototypeLocaleCompare(this: Value, that: Value, locales?: Value, options?: Value): f64 {
   const s: Str = ThisToString(this);
-  return StrLocaleCompare(s, ToString(that));
+  const t: Str = ToString(that);
+  if ((locales !== undefined || options !== undefined) && IntlEnabled()) {
+    return IntlLocaleCompare(s, t, locales, options);
+  }
+  return StrLocaleCompare(s, t);
 }
 
 // ---- Substrings -------------------------------------------------------------------------
@@ -496,7 +503,7 @@ function StringPrototypePadStart(this: Value, maxLength: Value, fillString?: Val
  * @fast
  */
 function StringPrototypeToLowerCase(this: Value): Str {
-  return StrToCase(ThisToString(this), false);
+  return StrToCase(ThisToString(this), 0);
 }
 
 /**
@@ -505,25 +512,29 @@ function StringPrototypeToLowerCase(this: Value): Str {
  * @fast
  */
 function StringPrototypeToUpperCase(this: Value): Str {
-  return StrToCase(ThisToString(this), true);
+  return StrToCase(ThisToString(this), 1);
 }
 
 /**
- * String.prototype.toLocaleLowerCase ( ), 22.1.3.26 (no locales: toLowerCase).
+ * String.prototype.toLocaleLowerCase ( [ locales ] ), ECMA-402 19.1.2.
  * @builtin String.prototype.toLocaleLowerCase
+ * @length 0
  * @fast
  */
-function StringPrototypeToLocaleLowerCase(this: Value): Str {
-  return StrToCase(ThisToString(this), false);
+function StringPrototypeToLocaleLowerCase(this: Value, locales?: Value): Str {
+  const s: Str = ThisToString(this);
+  return StrToCase(s, IntlCaseMode(locales, 0));
 }
 
 /**
- * String.prototype.toLocaleUpperCase ( ), 22.1.3.27 (no locales: toUpperCase).
+ * String.prototype.toLocaleUpperCase ( [ locales ] ), ECMA-402 19.1.3.
  * @builtin String.prototype.toLocaleUpperCase
+ * @length 0
  * @fast
  */
-function StringPrototypeToLocaleUpperCase(this: Value): Str {
-  return StrToCase(ThisToString(this), true);
+function StringPrototypeToLocaleUpperCase(this: Value, locales?: Value): Str {
+  const s: Str = ThisToString(this);
+  return StrToCase(s, IntlCaseMode(locales, 1));
 }
 
 /**

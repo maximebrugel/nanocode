@@ -40,6 +40,22 @@ pub struct PyDict {
 }
 pub type PyDictRef = PyRef<PyDict>;
 
+// `track_lazy_dict` finds the dict from its storage's address.
+const _: () = assert!(core::mem::offset_of!(PyDict, entries) == 0);
+
+/// Track the lazily untracked exact dict whose `entries` storage is at
+/// `entries`.
+///
+/// # Safety
+/// `entries` must point to the `entries` of a live `Py<PyDict>` that is not
+/// tracked.
+#[cold]
+pub(crate) unsafe fn track_lazy_dict(entries: *const ()) {
+    let dict = unsafe { &*Py::<PyDict>::from_payload_ptr(entries.cast::<PyDict>()) };
+    let obj = NonNull::from(dict.as_object());
+    unsafe { crate::gc_state::gc_state().track_object(obj, crate::gc_state::current_owner()) };
+}
+
 // SAFETY: Traverse properly visits all owned PyObjectRefs
 unsafe impl Traverse for PyDict {
     fn traverse(&self, traverse_fn: &mut TraverseFn<'_>) {
@@ -69,6 +85,17 @@ thread_local! {
 impl PyPayload for PyDict {
     const MAX_FREELIST: usize = 80;
     const HAS_FREELIST: bool = true;
+    const GC_TRACK_LAZILY: bool = true;
+
+    /// An exact dict holding only atomic keys and values starts untracked, as
+    /// in CPython; its storage tracks it once it stores anything that may be
+    /// tracked.
+    #[inline]
+    fn gc_start_untracked(zelf: &Py<Self>) -> bool {
+        use crate::class::StaticType;
+        Self::static_cell().get().is_some_and(|t| zelf.class().is(t))
+            && zelf.entries.gc_start_untracked()
+    }
 
     #[inline]
     fn class(ctx: &Context) -> &'static Py<PyType> {
@@ -78,29 +105,14 @@ impl PyPayload for PyDict {
     #[inline]
     unsafe fn freelist_push(obj: *mut PyObject) -> bool {
         DICT_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let stored = if list.len() < Self::MAX_FREELIST {
-                    list.push(obj);
-                    true
-                } else {
-                    false
-                };
-                fl.set(list);
-                stored
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::push_in(fl, obj, Self::MAX_FREELIST) })
             .unwrap_or(false)
     }
 
     #[inline]
     unsafe fn freelist_pop(_payload: &Self) -> Option<NonNull<PyObject>> {
         DICT_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let result = list.pop().map(|p| unsafe { NonNull::new_unchecked(p) });
-                fl.set(list);
-                result
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::pop_in(fl) })
             .ok()
             .flatten()
     }
@@ -682,7 +694,7 @@ impl AsMapping for PyDict {
                 let zelf = PyDict::mapping_downcast(mapping);
                 if let Some(value) = value {
                     zelf.inner_setitem(needle, value, vm)?;
-                    if zelf.as_object().is(vm.builtins.dict().as_object()) {
+                    if vm.is_builtins_dict(zelf.as_object()) {
                         crate::stdlib::_testinternalcapi::note_builtin_dict();
                     }
                     Ok(())
@@ -1031,7 +1043,7 @@ impl Py<PyDict> {
     ) -> PyResult<()> {
         if self.exact_dict(vm) {
             self.inner_setitem(key, value, vm)?;
-            if self.as_object().is(vm.builtins.dict().as_object()) {
+            if vm.is_builtins_dict(self.as_object()) {
                 crate::stdlib::_testinternalcapi::note_builtin_dict();
             }
             Ok(())
@@ -1879,6 +1891,18 @@ fn vectorcall_dict(
     vm: &VirtualMachine,
 ) -> PyResult {
     let zelf: &Py<PyType> = zelf_obj.downcast_ref().unwrap();
+    if nargs == 0 && zelf.is(vm.ctx.types.dict_type) {
+        // dict(a=1, b=2): the keyword names are already str objects, so they
+        // go in as the keys themselves, as in CPython, rather than through an
+        // owned copy of each name that the insert then turns back into a str.
+        let dict = PyDict::default();
+        if let Some(names) = kwnames {
+            for (name, value) in names.iter().zip(args) {
+                dict.inner_setitem(&**name, value, vm)?;
+            }
+        }
+        return Ok(dict.into_ref(&vm.ctx).into());
+    }
     let obj = PyDict::default().into_ref_with_type(vm, zelf.to_owned())?;
     let func_args = FuncArgs::from_vectorcall_owned(args, nargs, kwnames);
     PyDict::slot_init(obj.as_object(), func_args, vm)?;

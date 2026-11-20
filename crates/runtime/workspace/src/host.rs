@@ -68,6 +68,11 @@ impl FileHost for Workspace {
 fn status(finished: &Finished) -> (i32, Option<String>) {
     match &finished.ran.ended {
         Ended::Exited(_) if sim::mutated(Mutation::ExitIgnored) => (0, None),
+        // Killed by a signal: the status a parent shell's `$?` shows for it.
+        Ended::Exited(status) if *status < 0 => (
+            128 - status,
+            Some(format!("the command was killed by signal {}", -status)),
+        ),
         Ended::Exited(status) => (*status, None),
         Ended::Cancelled if finished.timed_out => (
             124,

@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 
+use nanocode_board::delivery::Plan;
 pub use nanocode_board::mirror::{
     Action, Author, Control, Delivery, Join, Kind, Mode, Settle, SyncOp, Synced, Target,
 };
@@ -628,7 +629,6 @@ impl<R: Renderer, M: Router, I: IdentityMap> Engine<R, M, I> {
             throttled,
             ..
         } = delivery;
-        let counted = attempts - throttled;
         let lane = format!("{message}:{target}:{revision}");
         let slot = (message.clone(), target.clone());
         let synced = |external: String, thread: Option<String>| SyncOp::Synced {
@@ -639,7 +639,8 @@ impl<R: Renderer, M: Router, I: IdentityMap> Engine<R, M, I> {
             revision: *revision,
             thread,
         };
-        if delivery.action == Action::Orphan {
+        let plan = delivery.plan(self.attempts);
+        if plan == Plan::Orphan {
             let dead = SyncOp::Undelivered {
                 task: task.clone(),
                 message: message.clone(),
@@ -651,9 +652,12 @@ impl<R: Renderer, M: Router, I: IdentityMap> Engine<R, M, I> {
             }
             return Ok(());
         }
-        let posting = matches!(delivery.action, Action::Post { .. });
-        let sweep = matches!(delivery.action, Action::Sweep);
-        if sweep || (posting && counted > 0 && !mutated(Mutation::RetryGuardSkipped)) {
+        let find = match plan {
+            Plan::Sweep => true,
+            Plan::Retry { .. } => !mutated(Mutation::RetryGuardSkipped),
+            Plan::Orphan | Plan::Exhausted | Plan::Send => false,
+        };
+        if find {
             match platform.find(&delivery.to, message).await {
                 Ok(Some(found)) => {
                     let adopted = SyncOp::Synced {
@@ -670,7 +674,7 @@ impl<R: Renderer, M: Router, I: IdentityMap> Engine<R, M, I> {
                     }
                     return Ok(());
                 }
-                Ok(None) if sweep => {
+                Ok(None) if plan == Plan::Sweep => {
                     let withdrawn = SyncOp::Undelivered {
                         task: task.clone(),
                         message: message.clone(),
@@ -692,11 +696,11 @@ impl<R: Renderer, M: Router, I: IdentityMap> Engine<R, M, I> {
                 }
             }
         }
-        if posting && counted >= self.attempts {
+        if matches!(plan, Plan::Exhausted | Plan::Retry { exhausted: true }) {
             let error = self
                 .errors
                 .remove(&slot)
-                .unwrap_or_else(|| format!("gave up after {counted} attempts"));
+                .unwrap_or_else(|| format!("gave up after {} attempts", attempts - throttled));
             let dead = SyncOp::Undelivered {
                 task: task.clone(),
                 message: message.clone(),

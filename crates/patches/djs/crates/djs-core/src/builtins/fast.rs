@@ -206,8 +206,8 @@ pub(crate) static FAST: &[FastFn] = &[
     f("StringPrototypeConcat", concat),
     f("StringPrototypeToLowerCase", to_lower_case),
     f("StringPrototypeToUpperCase", to_upper_case),
-    f("StringPrototypeToLocaleLowerCase", to_lower_case),
-    f("StringPrototypeToLocaleUpperCase", to_upper_case),
+    f("StringPrototypeToLocaleLowerCase", to_locale_lower_case),
+    f("StringPrototypeToLocaleUpperCase", to_locale_upper_case),
     f("StringPrototypeTrim", trim),
     f("StringPrototypeTrimStart", trim_start),
     f("StringPrototypeTrimEnd", trim_end),
@@ -866,6 +866,10 @@ pub(crate) fn runs_locale_compare(heap: &Heap, f: Value) -> bool {
 }
 
 fn locale_compare(heap: &mut Heap, this: Value, args: &[Value]) -> Fast {
+    // Locales or options: Intl.Collator's comparison, in the builtin.
+    if arg(args, 1) != Value::UNDEFINED || arg(args, 2) != Value::UNDEFINED {
+        return Ok(None);
+    }
     let Some((s, t)) = search(heap, this, arg(args, 0))? else {
         return Ok(None);
     };
@@ -895,6 +899,22 @@ fn to_lower_case(heap: &mut Heap, this: Value, _: &[Value]) -> Fast {
         return Ok(None);
     };
     some_str(string::to_case(heap, s, false)?)
+}
+
+/// toLocaleLowerCase without locales; with them, the builtin reads them.
+fn to_locale_lower_case(heap: &mut Heap, this: Value, args: &[Value]) -> Fast {
+    if args.first().is_some_and(|a| !a.is_undefined()) {
+        return Ok(None);
+    }
+    to_lower_case(heap, this, args)
+}
+
+/// toLocaleUpperCase without locales; with them, the builtin reads them.
+fn to_locale_upper_case(heap: &mut Heap, this: Value, args: &[Value]) -> Fast {
+    if args.first().is_some_and(|a| !a.is_undefined()) {
+        return Ok(None);
+    }
+    to_upper_case(heap, this, args)
 }
 
 fn to_upper_case(heap: &mut Heap, this: Value, _: &[Value]) -> Fast {

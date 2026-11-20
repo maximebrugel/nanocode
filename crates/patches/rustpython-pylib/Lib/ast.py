@@ -109,7 +109,7 @@ def literal_eval(node_or_string):
 def dump(
     node, annotate_fields=True, include_attributes=False,
     *,
-    indent=None, show_empty=False,
+    indent=None, show_empty=True,
 ):
     """
     Return a formatted dump of the tree in node.  This is mainly useful for

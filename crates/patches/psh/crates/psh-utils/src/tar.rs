@@ -3,6 +3,7 @@
 //! (tar czf). Archives are written in GNU's format (long names as L entries, records
 //! of 10240 bytes) and read in GNU's, ustar's and pax's. gzip is detected when
 //! reading; bzip2, xz and zstd are answered as missing. The archive is held in memory.
+//! -r appends members to an uncompressed archive.
 //! Members are written in name order (GNU writes them as the directory lists them).
 
 use psh_engine::host::{FileKind, Metadata, OpenOptions, error_text};
@@ -118,6 +119,7 @@ fn parse(argv: &[Vec<u8>]) -> Result<Options, Result<Lacks, String>> {
                 "create" => set(&mut o, b'c')?,
                 "extract" | "get" => set(&mut o, b'x')?,
                 "list" => set(&mut o, b't')?,
+                "append" => set(&mut o, b'r')?,
                 "file" => o.file = Some(value("file", attached.as_deref())?),
                 "directory" => {
                     let dir = value("directory", attached.as_deref())?;
@@ -174,7 +176,7 @@ fn parse(argv: &[Vec<u8>]) -> Result<Options, Result<Lacks, String>> {
             k += 1;
             let attached = (k < arg.len()).then(|| arg[k..].to_vec());
             match c {
-                b'c' | b'x' | b't' => set(&mut o, c)?,
+                b'c' | b'x' | b't' | b'r' => set(&mut o, c)?,
                 b'z' => o.gzip = true,
                 b'a' => o.auto = true,
                 b'v' => o.verbose += 1,
@@ -511,6 +513,33 @@ impl Tar<'_, '_> {
         self.lines_to_stderr = to_stdout;
         if !to_stdout {
             self.itself = self.o.file.as_deref().map(plain_path);
+        }
+        // -r: members are added after the archive's own, over its end blocks.
+        if self.o.mode == Some(b'r') {
+            if to_stdout || self.o.gzip {
+                self.ctx.error("Cannot update compressed archives").await;
+                self.ctx.error("Error is not recoverable: exiting now").await;
+                return 2;
+            }
+            let name = self.o.file.clone().unwrap_or_default();
+            let mut data = Vec::new();
+            if let Ok(input) = Input::open(self.ctx, &name).await {
+                let _ = input.read_to_end(self.ctx, &mut data).await;
+            }
+            if !data.is_empty() {
+                match members(&data) {
+                    Ok(list) => {
+                        let end = list.last().map_or(0, |(_, body)| body.end.div_ceil(BLOCK) * BLOCK);
+                        data.truncate(end);
+                        self.out = data;
+                    }
+                    Err(what) => {
+                        self.ctx.error(what).await;
+                        self.ctx.error("Error is not recoverable: exiting now").await;
+                        return 2;
+                    }
+                }
+            }
         }
         let items = std::mem::take(&mut self.o.items);
         let mut dir: Vec<u8> = Vec::new();
@@ -1211,7 +1240,7 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         known: std::collections::HashSet::new(),
         made: std::collections::HashSet::new(),
     };
-    if mode == b'c' {
+    if mode == b'c' || mode == b'r' {
         tar.create().await
     } else {
         tar.read_or_list().await

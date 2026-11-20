@@ -1005,7 +1005,7 @@ function ArrayPrototypeToString() {
 }
 
 // builtins/array.ts:1230 Array.prototype.toLocaleString
-function ArrayPrototypeToLocaleString() {
+function ArrayPrototypeToLocaleString(locales, options) {
   const array = %ToObject(this);
   const len = LengthOfArrayLike(array);
   if (!%ArrayJoinEnter(array)) {
@@ -1019,7 +1019,7 @@ function ArrayPrototypeToLocaleString() {
       }
       const nextElement = %Get(array, k);
       if (nextElement !== undefined && nextElement !== null) {
-        r += ToString(%Call(%GetV(nextElement, "toLocaleString"), nextElement));
+        r += ToString(%Call(%GetV(nextElement, "toLocaleString"), nextElement, locales, options));
       }
     }
   } finally {
@@ -1080,11 +1080,13 @@ function ToIndex(v) {
 
 // builtins/arraybuffer.ts:14
 function ThisArrayBuffer(v) {
-  %BufferInfo(v, 0);
+  if (%AsBool(%BufferInfo(v, 5))) {
+    throw %NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer");
+  }
   return %AsObj(v);
 }
 
-// builtins/arraybuffer.ts:20
+// builtins/arraybuffer.ts:22
 function AllocateArrayBuffer(newTarget, byteLength, max) {
   if (max !== undefined && byteLength > %AsNumber(max)) {
     throw %NewRangeError("invalid array buffer max length");
@@ -1093,7 +1095,7 @@ function AllocateArrayBuffer(newTarget, byteLength, max) {
   return %ArrayBufferCreate(proto, byteLength, max);
 }
 
-// builtins/arraybuffer.ts:33 constructor ArrayBuffer
+// builtins/arraybuffer.ts:35 constructor ArrayBuffer
 function ArrayBufferConstructor(length, options) {
   if (new.target === undefined) {
     throw %NewTypeError("must be called with new");
@@ -1109,59 +1111,59 @@ function ArrayBufferConstructor(length, options) {
   return AllocateArrayBuffer(new.target, byteLength, max);
 }
 
-// builtins/arraybuffer.ts:52 ArrayBuffer.isView
+// builtins/arraybuffer.ts:54 ArrayBuffer.isView
 function ArrayBufferIsView(arg) {
   return %IsTypedArray(arg) || %IsDataView(arg);
 }
 
-// builtins/arraybuffer.ts:60 get ArrayBuffer[Symbol.species]
+// builtins/arraybuffer.ts:62 get ArrayBuffer[Symbol.species]
 function ArrayBufferSpecies() {
   return this;
 }
 
-// builtins/arraybuffer.ts:68 get ArrayBuffer.prototype.byteLength
+// builtins/arraybuffer.ts:70 get ArrayBuffer.prototype.byteLength
 function ArrayBufferPrototypeByteLength() {
-  return %BufferInfo(this, 0);
+  return %BufferInfo(((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this)), 0);
 }
 
-// builtins/arraybuffer.ts:76 get ArrayBuffer.prototype.maxByteLength
+// builtins/arraybuffer.ts:78 get ArrayBuffer.prototype.maxByteLength
 function ArrayBufferPrototypeMaxByteLength() {
-  return %BufferInfo(this, 1);
+  return %BufferInfo(((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this)), 1);
 }
 
-// builtins/arraybuffer.ts:84 get ArrayBuffer.prototype.resizable
+// builtins/arraybuffer.ts:86 get ArrayBuffer.prototype.resizable
 function ArrayBufferPrototypeResizable() {
-  return %BufferInfo(this, 2);
+  return %BufferInfo(((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this)), 2);
 }
 
-// builtins/arraybuffer.ts:92 get ArrayBuffer.prototype.detached
+// builtins/arraybuffer.ts:94 get ArrayBuffer.prototype.detached
 function ArrayBufferPrototypeDetached() {
-  return %BufferInfo(this, 3);
+  return %BufferInfo(((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this)), 3);
 }
 
-// builtins/arraybuffer.ts:100 get ArrayBuffer.prototype.immutable
+// builtins/arraybuffer.ts:102 get ArrayBuffer.prototype.immutable
 function ArrayBufferPrototypeImmutable() {
-  return %BufferInfo(this, 4);
+  return %BufferInfo(((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this)), 4);
 }
 
-// builtins/arraybuffer.ts:105
+// builtins/arraybuffer.ts:107
 function IsImmutableBuffer(b) {
   return %AsBool(%BufferInfo(b, 4));
 }
 
-// builtins/arraybuffer.ts:110
+// builtins/arraybuffer.ts:112
 function IsDetached(b) {
   return %AsBool(%BufferInfo(b, 3));
 }
 
-// builtins/arraybuffer.ts:115
+// builtins/arraybuffer.ts:117
 function BufferLength(b) {
   return %AsNumber(%BufferInfo(b, 0));
 }
 
-// builtins/arraybuffer.ts:123 ArrayBuffer.prototype.resize
+// builtins/arraybuffer.ts:125 ArrayBuffer.prototype.resize
 function ArrayBufferPrototypeResize(newLength) {
-  const o = ((%BufferInfo(this, 0), %AsObj(this)));
+  const o = ((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this));
   if (!%AsBool(%BufferInfo(o, 2))) {
     throw %NewTypeError("array buffer is not resizable");
   }
@@ -1175,9 +1177,9 @@ function ArrayBufferPrototypeResize(newLength) {
   %BufferResize(o, newByteLength);
 }
 
-// builtins/arraybuffer.ts:142 ArrayBuffer.prototype.slice
+// builtins/arraybuffer.ts:144 ArrayBuffer.prototype.slice
 function ArrayBufferPrototypeSlice(start, end) {
-  const o = ((%BufferInfo(this, 0), %AsObj(this)));
+  const o = ((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this));
   if ((%AsBool(%BufferInfo(o, 3)))) {
     throw %NewTypeError("ArrayBuffer is detached");
   }
@@ -1187,7 +1189,7 @@ function ArrayBufferPrototypeSlice(start, end) {
   const newLen = fin > first ? fin - first : 0;
   const ctor = SpeciesConstructor(o, %RealmConstructor("ArrayBuffer"));
   const created = %Construct(ctor, newLen);
-  %BufferInfo(created, 0);
+  ((%AsBool(%BufferInfo(created, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(created));
   if ((%AsBool(%BufferInfo(created, 3)))) {
     throw %NewTypeError("ArrayBuffer is detached");
   }
@@ -1211,9 +1213,9 @@ function ArrayBufferPrototypeSlice(start, end) {
   return created;
 }
 
-// builtins/arraybuffer.ts:181
+// builtins/arraybuffer.ts:183
 function ArrayBufferCopyAndDetach(thisValue, newLength, mode) {
-  const o = ((%BufferInfo(thisValue, 0), %AsObj(thisValue)));
+  const o = ((%AsBool(%BufferInfo(thisValue, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(thisValue));
   let newByteLength = 0;
   if (newLength === undefined) {
     newByteLength = (%AsNumber(%BufferInfo(o, 0)));
@@ -1239,24 +1241,24 @@ function ArrayBufferCopyAndDetach(thisValue, newLength, mode) {
   return %BufferTransfer(o, newByteLength, max);
 }
 
-// builtins/arraybuffer.ts:213 ArrayBuffer.prototype.transfer
+// builtins/arraybuffer.ts:215 ArrayBuffer.prototype.transfer
 function ArrayBufferPrototypeTransfer(newLength) {
   return ArrayBufferCopyAndDetach(this, newLength, 1);
 }
 
-// builtins/arraybuffer.ts:221 ArrayBuffer.prototype.transferToFixedLength
+// builtins/arraybuffer.ts:223 ArrayBuffer.prototype.transferToFixedLength
 function ArrayBufferPrototypeTransferToFixedLength(newLength) {
   return ArrayBufferCopyAndDetach(this, newLength, 0);
 }
 
-// builtins/arraybuffer.ts:229 ArrayBuffer.prototype.transferToImmutable
+// builtins/arraybuffer.ts:231 ArrayBuffer.prototype.transferToImmutable
 function ArrayBufferPrototypeTransferToImmutable(newLength) {
   return ArrayBufferCopyAndDetach(this, newLength, 2);
 }
 
-// builtins/arraybuffer.ts:238 ArrayBuffer.prototype.sliceToImmutable
+// builtins/arraybuffer.ts:240 ArrayBuffer.prototype.sliceToImmutable
 function ArrayBufferPrototypeSliceToImmutable(start, end) {
-  const o = ((%BufferInfo(this, 0), %AsObj(this)));
+  const o = ((%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer")) : %AsObj(this));
   if ((%AsBool(%BufferInfo(o, 3)))) {
     throw %NewTypeError("ArrayBuffer is detached");
   }
@@ -1275,7 +1277,7 @@ function ArrayBufferPrototypeSliceToImmutable(start, end) {
   return created;
 }
 
-// builtins/arraybuffer.ts:263 value ArrayBuffer.prototype[Symbol.toStringTag]
+// builtins/arraybuffer.ts:265 value ArrayBuffer.prototype[Symbol.toStringTag]
 function ArrayBufferPrototypeToStringTag() {
   return "ArrayBuffer";
 }
@@ -1575,6 +1577,297 @@ function AsyncFromSyncIteratorThrow(...args) {
   return AsyncFromSyncIteratorContinuation(%AsObj(result), iterator, true);
 }
 
+// builtins/atomics.ts:12 value Atomics
+function AtomicsObject() {
+  return %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+}
+
+// builtins/atomics.ts:21 value Atomics[Symbol.toStringTag]
+function AtomicsToStringTag() {
+  return "Atomics";
+}
+
+// builtins/atomics.ts:29
+function ValidateIntegerTypedArray(v, waitable) {
+  let $1;
+  const o = ((%TypedArrayField(v, 0), ($1 = %AsObj(v), ((%AsBool(%TypedArrayField($1, 5)))) ? %Throw(%NewTypeError("ArrayBuffer is detached or resized")) : $1)));
+  const kind = (%F64ToI32(%AsNumber(%TypedArrayField(o, 0))));
+  if (waitable) {
+    if (kind !== 5 && kind !== 10) {
+      throw %NewTypeError("Atomics operation needs an Int32Array or BigInt64Array");
+    }
+  } else if (kind === 2 || kind === 7 || kind === 8 || kind === 9) {
+    throw %NewTypeError("Atomics operation needs an integer typed array");
+  }
+  return o;
+}
+
+// builtins/atomics.ts:43
+function ValidateAtomicAccess(o, requestIndex) {
+  const i = ToIndex(requestIndex);
+  if (i >= (%AsNumber(%TypedArrayField(o, 3)))) {
+    throw %NewRangeError("Invalid atomic access index");
+  }
+  return i;
+}
+
+// builtins/atomics.ts:52
+function AtomicOperand(o, v) {
+  if ((%F64ToI32(%AsNumber(%TypedArrayField(o, 0)))) >= 10) {
+    return (%ToBigIntPrimitive(ToPrimitive(v, "number")));
+  }
+  return (%ToIntegerOrInfinityNumber(((%IsObject(v)) ? %ToNumberPrimitive(ToPrimitive(v, "number")) : %ToNumberPrimitive(v))));
+}
+
+// builtins/atomics.ts:60
+function RevalidateAtomicAccess(o) {
+  if ((%AsBool(%TypedArrayField(o, 5)))) {
+    throw %NewTypeError("ArrayBuffer is detached or resized");
+  }
+}
+
+// builtins/atomics.ts:67
+function AtomicReadModifyWrite(ta, index, value, op) {
+  let $1;
+  const o = ValidateIntegerTypedArray(ta, false);
+  const i = (($1 = ToIndex(index), ($1 >= (%AsNumber(%TypedArrayField(o, 3)))) ? %Throw(%NewRangeError("Invalid atomic access index")) : $1));
+  const v = AtomicOperand(o, value);
+  (((%AsBool(%TypedArrayField(o, 5)))) ? %Throw(%NewTypeError("ArrayBuffer is detached or resized")) : undefined);
+  return %AtomicOp(o, i, op, v, undefined);
+}
+
+// builtins/atomics.ts:79 Atomics.add
+function AtomicsAdd(ta, index, value) {
+  return AtomicReadModifyWrite(ta, index, value, 0);
+}
+
+// builtins/atomics.ts:87 Atomics.and
+function AtomicsAnd(ta, index, value) {
+  return AtomicReadModifyWrite(ta, index, value, 1);
+}
+
+// builtins/atomics.ts:95 Atomics.compareExchange
+function AtomicsCompareExchange(ta, index, expected, replacement) {
+  let $1;
+  const o = ValidateIntegerTypedArray(ta, false);
+  const i = (($1 = ToIndex(index), ($1 >= (%AsNumber(%TypedArrayField(o, 3)))) ? %Throw(%NewRangeError("Invalid atomic access index")) : $1));
+  const e = AtomicOperand(o, expected);
+  const r = AtomicOperand(o, replacement);
+  (((%AsBool(%TypedArrayField(o, 5)))) ? %Throw(%NewTypeError("ArrayBuffer is detached or resized")) : undefined);
+  return %AtomicOp(o, i, 6, e, r);
+}
+
+// builtins/atomics.ts:108 Atomics.exchange
+function AtomicsExchange(ta, index, value) {
+  return AtomicReadModifyWrite(ta, index, value, 2);
+}
+
+// builtins/atomics.ts:116 Atomics.isLockFree
+function AtomicsIsLockFree(size) {
+  const n = (%ToIntegerOrInfinityNumber(((%IsObject(size)) ? %ToNumberPrimitive(ToPrimitive(size, "number")) : %ToNumberPrimitive(size))));
+  return n === 1 || n === 2 || n === 4 || n === 8;
+}
+
+// builtins/atomics.ts:125 Atomics.load
+function AtomicsLoad(ta, index) {
+  let $1;
+  const o = ValidateIntegerTypedArray(ta, false);
+  const i = (($1 = ToIndex(index), ($1 >= (%AsNumber(%TypedArrayField(o, 3)))) ? %Throw(%NewRangeError("Invalid atomic access index")) : $1));
+  (((%AsBool(%TypedArrayField(o, 5)))) ? %Throw(%NewTypeError("ArrayBuffer is detached or resized")) : undefined);
+  return %AtomicOp(o, i, 7, undefined, undefined);
+}
+
+// builtins/atomics.ts:136 Atomics.or
+function AtomicsOr(ta, index, value) {
+  return AtomicReadModifyWrite(ta, index, value, 3);
+}
+
+// builtins/atomics.ts:144 Atomics.store
+function AtomicsStore(ta, index, value) {
+  let $1;
+  const o = ValidateIntegerTypedArray(ta, false);
+  const i = (($1 = ToIndex(index), ($1 >= (%AsNumber(%TypedArrayField(o, 3)))) ? %Throw(%NewRangeError("Invalid atomic access index")) : $1));
+  let v = AtomicOperand(o, value);
+  if ((%F64ToI32(%AsNumber(%TypedArrayField(o, 0)))) < 10) {
+    v = %AsNumber(v) + 0;
+  }
+  (((%AsBool(%TypedArrayField(o, 5)))) ? %Throw(%NewTypeError("ArrayBuffer is detached or resized")) : undefined);
+  %AtomicOp(o, i, 2, v, undefined);
+  return v;
+}
+
+// builtins/atomics.ts:160 Atomics.sub
+function AtomicsSub(ta, index, value) {
+  return AtomicReadModifyWrite(ta, index, value, 4);
+}
+
+// builtins/atomics.ts:168 Atomics.xor
+function AtomicsXor(ta, index, value) {
+  return AtomicReadModifyWrite(ta, index, value, 5);
+}
+
+// builtins/atomics.ts:177
+function DoWaitCheck(ta, index, value, timeout) {
+  let $1;
+  const o = ValidateIntegerTypedArray(ta, true);
+  const buffer = %AsObj(%TypedArrayField(o, 1));
+  if (!%AsBool(%BufferInfo(buffer, 5))) {
+    throw %NewTypeError("Atomics.wait needs a shared typed array");
+  }
+  const i = (($1 = ToIndex(index), ($1 >= (%AsNumber(%TypedArrayField(o, 3)))) ? %Throw(%NewRangeError("Invalid atomic access index")) : $1));
+  let v = undefined;
+  if ((%F64ToI32(%AsNumber(%TypedArrayField(o, 0)))) === 10) {
+    v = (%ToBigIntPrimitive(ToPrimitive(value, "number")));
+  } else {
+    v = (%ToIntegerOrInfinityNumber(((%IsObject(value)) ? %ToNumberPrimitive(ToPrimitive(value, "number")) : %ToNumberPrimitive(value))));
+  }
+  const q = ((%IsObject(timeout)) ? %ToNumberPrimitive(ToPrimitive(timeout, "number")) : %ToNumberPrimitive(timeout));
+  let t = q;
+  if (q !== q) {
+    t = 1 / 0;
+  } else if (q < 0) {
+    t = 0;
+  }
+  const r = %NewRecord(4);
+  %RecordSet(r, 1, %BufferInfo(buffer, 6));
+  %RecordSet(r, 2, i);
+  %RecordSet(r, 3, t);
+  (((%AsBool(%TypedArrayField(o, 5)))) ? %Throw(%NewTypeError("ArrayBuffer is detached or resized")) : undefined);
+  if (!%AsBool(%AtomicOp(o, i, 8, v, undefined))) {
+    %RecordSet(r, 0, "not-equal");
+  } else if (t === 0) {
+    %RecordSet(r, 0, "timed-out");
+  } else {
+    %RecordSet(r, 0, undefined);
+  }
+  return r;
+}
+
+// builtins/atomics.ts:218 Atomics.wait
+function AtomicsWait(ta, index, value, timeout) {
+  const r = DoWaitCheck(ta, index, value, timeout);
+  const result = %RecordGet(r, 0);
+  if (result !== undefined) {
+    return %AsStr(result);
+  }
+  if (%AsNumber(%RecordGet(r, 3)) === 1 / 0) {
+    throw %NewTypeError("Atomics.wait cannot be called in this context");
+  }
+  return "timed-out";
+}
+
+// builtins/atomics.ts:231
+function WaitAsyncResult(isAsync, value) {
+  const o = %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+  %CreateDataPropertyOrThrow(o, "async", isAsync);
+  %CreateDataPropertyOrThrow(o, "value", value);
+  return o;
+}
+
+// builtins/atomics.ts:244 Atomics.waitAsync
+function AtomicsWaitAsync(ta, index, value, timeout) {
+  const r = DoWaitCheck(ta, index, value, timeout);
+  const result = %RecordGet(r, 0);
+  if (result !== undefined) {
+    return WaitAsyncResult(false, result);
+  }
+  const list = %AsObj(%RecordGet(r, 1));
+  const promise = %PromiseCreate(%RealmIntrinsic("PromisePrototype"));
+  const waiter = %NewRecord(4);
+  %RecordSet(waiter, 0, %RecordGet(r, 2));
+  %RecordSet(waiter, 1, promise);
+  %RecordSet(waiter, 2, undefined);
+  %RecordSet(waiter, 3, false);
+  AppendWaiter(list, waiter);
+  const t = %AsNumber(%RecordGet(r, 3));
+  if (t !== 1 / 0) {
+    const setTimeout = %Get(%GlobalObject(), "setTimeout");
+    if (%IsCallable(setTimeout)) {
+      const data = %NewRecord(2);
+      %RecordSet(data, 0, list);
+      %RecordSet(data, 1, waiter);
+      %Call(setTimeout, undefined, %NewBuiltinClosure(27, data, 0), t);
+    }
+  }
+  return WaitAsyncResult(true, promise);
+}
+
+// builtins/atomics.ts:272
+function AppendWaiter(list, waiter) {
+  let cur = %RecordGet(list, 0);
+  if (cur === undefined) {
+    %RecordSet(list, 0, waiter);
+    return;
+  }
+  while (%RecordGet(%AsObj(cur), 2) !== undefined) {
+    cur = %RecordGet(%AsObj(cur), 2);
+  }
+  %RecordSet(%AsObj(cur), 2, waiter);
+}
+
+// builtins/atomics.ts:285
+function RemoveWaiter(list, waiter) {
+  let prev = undefined;
+  let cur = %RecordGet(list, 0);
+  while (cur !== undefined) {
+    const next = %RecordGet(%AsObj(cur), 2);
+    if (cur === waiter) {
+      if (prev === undefined) {
+        %RecordSet(list, 0, next);
+      } else {
+        %RecordSet(%AsObj(prev), 2, next);
+      }
+      return;
+    }
+    prev = cur;
+    cur = next;
+  }
+}
+
+// builtins/atomics.ts:308 %AtomicsWaitTimeout
+function AtomicsWaitTimeout() {
+  const data = %AsObj(this);
+  const waiter = %AsObj(%RecordGet(data, 1));
+  if (%AsBool(%RecordGet(waiter, 3))) {
+    return;
+  }
+  %RecordSet(waiter, 3, true);
+  RemoveWaiter(%AsObj(%RecordGet(data, 0)), waiter);
+  ResolvePromise(%AsObj(%RecordGet(waiter, 1)), "timed-out");
+}
+
+// builtins/atomics.ts:324 Atomics.notify
+function AtomicsNotify(ta, index, count) {
+  let $1;
+  const o = ValidateIntegerTypedArray(ta, true);
+  const i = (($1 = ToIndex(index), ($1 >= (%AsNumber(%TypedArrayField(o, 3)))) ? %Throw(%NewRangeError("Invalid atomic access index")) : $1));
+  let c = 1 / 0;
+  if (count !== undefined) {
+    c = (%ToIntegerOrInfinityNumber(((%IsObject(count)) ? %ToNumberPrimitive(ToPrimitive(count, "number")) : %ToNumberPrimitive(count))));
+    if (c < 0) {
+      c = 0;
+    }
+  }
+  const buffer = %AsObj(%TypedArrayField(o, 1));
+  if (!%AsBool(%BufferInfo(buffer, 5))) {
+    return 0;
+  }
+  const list = %AsObj(%BufferInfo(buffer, 6));
+  let n = 0;
+  let cur = %RecordGet(list, 0);
+  while (cur !== undefined && n < c) {
+    const w = %AsObj(cur);
+    cur = %RecordGet(w, 2);
+    if (%AsNumber(%RecordGet(w, 0)) === i) {
+      RemoveWaiter(list, w);
+      %RecordSet(w, 3, true);
+      ResolvePromise(%AsObj(%RecordGet(w, 1)), "ok");
+      n = n + 1;
+    }
+  }
+  return n;
+}
+
 // builtins/bigint.ts:8 %ToBigInt
 function ToBigInt(v) {
   return %ToBigIntPrimitive(ToPrimitive(v, "number"));
@@ -1630,19 +1923,23 @@ function BigIntPrototypeToString(radix) {
   return %BigIntToString(x, %F64ToI32(r));
 }
 
-// builtins/bigint.ts:79 BigInt.prototype.toLocaleString
-function BigIntPrototypeToLocaleString() {
-  let $1;
-  return %BigIntToString((($1 = %PrimitiveValue(this), (!%IsBigInt($1)) ? %Throw(%NewTypeError("not a BigInt")) : $1)), 10);
+// builtins/bigint.ts:80 BigInt.prototype.toLocaleString
+function BigIntPrototypeToLocaleString(locales, options) {
+  let $1, $2;
+  const x = (($1 = %PrimitiveValue(this), (!%IsBigInt($1)) ? %Throw(%NewTypeError("not a BigInt")) : $1));
+  if (%IntlEnabled()) {
+    return (($2 = IntlNewNumberFormat(undefined, locales, options), %AsStr(%IntlFormat(0, %AsStr(%IntlSpec($2, 0)), IntlNumeric(x), undefined, false))));
+  }
+  return %BigIntToString(x, 10);
 }
 
-// builtins/bigint.ts:87 BigInt.prototype.valueOf
+// builtins/bigint.ts:92 BigInt.prototype.valueOf
 function BigIntPrototypeValueOf() {
   let $1;
   return (($1 = %PrimitiveValue(this), (!%IsBigInt($1)) ? %Throw(%NewTypeError("not a BigInt")) : $1));
 }
 
-// builtins/bigint.ts:96 value BigInt.prototype[Symbol.toStringTag]
+// builtins/bigint.ts:101 value BigInt.prototype[Symbol.toStringTag]
 function BigIntPrototypeToStringTag() {
   return "BigInt";
 }
@@ -2338,33 +2635,45 @@ function DatePrototypeToISOString() {
   return %DateFormat(%DateValue(this), 2, 3);
 }
 
-// builtins/date.ts:440 Date.prototype.toLocaleString
-function DatePrototypeToLocaleString() {
-  return %DateFormat(%DateValue(this), 3, 3);
+// builtins/date.ts:441 Date.prototype.toLocaleString
+function DatePrototypeToLocaleString(locales, options) {
+  const t = %DateValue(this);
+  if (%IntlEnabled()) {
+    return IntlDateToLocaleString(t, locales, options, "any", "all");
+  }
+  return %DateFormat(t, 3, 3);
 }
 
-// builtins/date.ts:448 Date.prototype.toLocaleDateString
-function DatePrototypeToLocaleDateString() {
-  return %DateFormat(%DateValue(this), 3, 1);
+// builtins/date.ts:454 Date.prototype.toLocaleDateString
+function DatePrototypeToLocaleDateString(locales, options) {
+  const t = %DateValue(this);
+  if (%IntlEnabled()) {
+    return IntlDateToLocaleString(t, locales, options, "date", "date");
+  }
+  return %DateFormat(t, 3, 1);
 }
 
-// builtins/date.ts:456 Date.prototype.toLocaleTimeString
-function DatePrototypeToLocaleTimeString() {
-  return %DateFormat(%DateValue(this), 3, 2);
+// builtins/date.ts:467 Date.prototype.toLocaleTimeString
+function DatePrototypeToLocaleTimeString(locales, options) {
+  const t = %DateValue(this);
+  if (%IntlEnabled()) {
+    return IntlDateToLocaleString(t, locales, options, "time", "time");
+  }
+  return %DateFormat(t, 3, 2);
 }
 
-// builtins/date.ts:465 Date.prototype.toUTCString Date.prototype.toGMTString
+// builtins/date.ts:480 Date.prototype.toUTCString Date.prototype.toGMTString
 function DatePrototypeToUTCString() {
   return %DateFormat(%DateValue(this), 0, 3);
 }
 
-// builtins/date.ts:473 Date.prototype.getYear
+// builtins/date.ts:488 Date.prototype.getYear
 function DatePrototypeGetYear() {
   const y = %DateGetField(%DateValue(this), 0, true);
   return y - 1900;
 }
 
-// builtins/date.ts:482 Date.prototype.setYear
+// builtins/date.ts:497 Date.prototype.setYear
 function DatePrototypeSetYear(year) {
   const t = %DateValue(this);
   let y = ((%IsObject(year)) ? %ToNumberPrimitive(ToPrimitive(year, "number")) : %ToNumberPrimitive(year));
@@ -2379,7 +2688,7 @@ function DatePrototypeSetYear(year) {
   return %DateSetValue(this, %DateSetFields(t, 0, nums, true));
 }
 
-// builtins/date.ts:501 Date.prototype.toJSON %DatePrototypeToJSON
+// builtins/date.ts:516 Date.prototype.toJSON %DatePrototypeToJSON
 function DatePrototypeToJSON(key) {
   const o = %ToObject(this);
   const tv = ToPrimitive(o, "number");
@@ -2392,7 +2701,7 @@ function DatePrototypeToJSON(key) {
   return %Call(%Get(o, "toISOString"), o);
 }
 
-// builtins/date.ts:519 Date.prototype[Symbol.toPrimitive] %DatePrototypeToPrimitive
+// builtins/date.ts:534 Date.prototype[Symbol.toPrimitive] %DatePrototypeToPrimitive
 function DatePrototypeToPrimitive(hint) {
   if (!%IsObject(this)) {
     throw %NewTypeError("not an object");
@@ -3296,7 +3605,7 @@ function TextLabelIsUtf8(label) {
   while (end > start && ($2 = %StrCharCodeAt(label, end - 1), $2 === 9 || $2 === 10 || $2 === 12 || $2 === 13 || $2 === 32)) {
     end -= 1;
   }
-  const l = %StrToCase(%StrSubstring(label, start, end), false);
+  const l = %StrToCase(%StrSubstring(label, start, end), 0);
   return l === "utf-8" || l === "utf8" || l === "unicode-1-1-utf-8" || l === "unicode11utf8" || l === "unicode20utf8" || l === "x-unicode20utf8";
 }
 
@@ -4221,6 +4530,1056 @@ function DynamicImport(specifier, options) {
     %RejectPromise(promise, e);
   }
   return promise;
+}
+
+// builtins/intl.ts:11
+function IntlLocaleTags(locales) {
+  if (locales === undefined) {
+    return "";
+  }
+  if (%IsString(locales)) {
+    if (%AsStr(locales) === "") {
+      throw %NewRangeError("Incorrect locale information provided");
+    }
+    return %AsStr(locales);
+  }
+  if (locales === null) {
+    throw %NewTypeError("Cannot convert undefined or null to object");
+  }
+  const one = %IntlSpec(locales, 16);
+  if (one !== undefined) {
+    return %AsStr(one);
+  }
+  const o = %ToObject(locales);
+  const len = LengthOfArrayLike(o);
+  let out = "";
+  let i = 0;
+  while (i < len) {
+    if (%HasProperty(o, i)) {
+      const v = %Get(o, i);
+      if (!%IsString(v) && !%IsObject(v)) {
+        throw %NewTypeError("Language ID should be string or object.");
+      }
+      const own = %IntlSpec(v, 16);
+      const t = own !== undefined ? %AsStr(own) : ToString(v);
+      if (t === "") {
+        throw %NewRangeError("Incorrect locale information provided");
+      }
+      out = out === "" ? t : out + "\n" + t;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+// builtins/intl.ts:51
+function IntlSplit(s, sep, from) {
+  const out = %ArrayCreate(0);
+  let start = from;
+  const len = %StrLength(s);
+  while (start < len) {
+    let end = %StrIndexOf(s, sep, start);
+    if (end < 0) {
+      end = len;
+    }
+    %ArrayPushDense(out, %StrSubstring(s, start, end));
+    start = end + 1;
+  }
+  return out;
+}
+
+// builtins/intl.ts:72
+function IntlNoNull(locales, options, message) {
+  if (options === null) {
+    %IntlLocales(IntlLocaleTags(locales), 0);
+    throw %NewTypeError(message);
+  }
+  return options;
+}
+
+// builtins/intl.ts:81
+function IntlReadOptions(options, names) {
+  if (options === undefined) {
+    return "";
+  }
+  const o = %ToObject(options);
+  let out = "";
+  let start = 0;
+  const len = %StrLength(names);
+  while (start < len) {
+    let end = %StrIndexOf(names, ",", start);
+    if (end < 0) {
+      end = len;
+    }
+    const kind = %StrSubstring(names, end - 1, end);
+    const name = %StrSubstring(names, start, end - 2);
+    start = end + 1;
+    const v = %Get(o, name);
+    if (v === undefined) {
+      continue;
+    }
+    let s = "";
+    if (kind === "b") {
+      s = %ToBoolean(v) ? "true" : "false";
+    } else if (kind === "n") {
+      const n = ((%IsObject(v)) ? %ToNumberPrimitive(ToPrimitive(v, "number")) : %ToNumberPrimitive(v));
+      if (n !== n) {
+        throw %NewRangeError(name + " value is out of range.");
+      }
+      s = %NumberToString(n, 10);
+    } else if (kind === "g") {
+      if (v === true) {
+        s = "true";
+      } else if (!%ToBoolean(v)) {
+        s = "false";
+      } else {
+        s = ToString(v);
+        if (s === "true" || s === "false") {
+          continue;
+        }
+      }
+    } else {
+      s = ToString(v);
+    }
+    out = (out === "" ? name + "\u0002" + s : out + "\u0001" + name + "\u0002" + s);
+  }
+  return out;
+}
+
+// builtins/intl.ts:130
+function IntlWith(raw, name, v) {
+  return raw === "" ? name + "\u0002" + v : raw + "\u0001" + name + "\u0002" + v;
+}
+
+// builtins/intl.ts:135
+function IntlValue(v) {
+  let $1;
+  if (v === "!t") {
+    return true;
+  }
+  if (v === "!f") {
+    return false;
+  }
+  const c = %StrLength(v) > 0 ? %StrCharCodeAt(v, 0) : 0;
+  if (c === 35) {
+    return ($1 = %StrSubstring(v, 1, %StrLength(v)), (%IsObject($1)) ? %ToNumberPrimitive(ToPrimitive($1, "number")) : %ToNumberPrimitive($1));
+  }
+  if (c === 64) {
+    return IntlSplit(v, ",", 1);
+  }
+  return v;
+}
+
+// builtins/intl.ts:153
+function IntlResolvedObject(spec) {
+  const o = %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+  let start = 0;
+  const len = %StrLength(spec);
+  while (start < len) {
+    let end = %StrIndexOf(spec, "\u0001", start);
+    if (end < 0) {
+      end = len;
+    }
+    const mid = %StrIndexOf(spec, "\u0002", start);
+    const name = %StrSubstring(spec, start, mid);
+    if (%StrCharCodeAt(name, 0) !== 64) {
+      %CreateDataPropertyOrThrow(o, name, IntlValue(%StrSubstring(spec, mid + 1, end)));
+    }
+    start = end + 1;
+  }
+  return o;
+}
+
+// builtins/intl.ts:173
+function IntlParts(encoded, unit) {
+  const s = %AsStr(encoded);
+  const out = %ArrayCreate(0);
+  let start = 0;
+  const len = %StrLength(s);
+  while (start < len) {
+    let end = %StrIndexOf(s, "\u0001", start);
+    if (end < 0) {
+      end = len;
+    }
+    const mid = %StrIndexOf(s, "\u0002", start);
+    const part = %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+    let ty = %StrSubstring(s, start, mid);
+    const at = %StrIndexOf(ty, "\u0003", 0);
+    let source = undefined;
+    if (at >= 0 && at < mid - start) {
+      source = %StrSubstring(ty, at + 1, %StrLength(ty));
+      ty = %StrSubstring(ty, 0, at);
+    }
+    %CreateDataPropertyOrThrow(part, "type", ty);
+    %CreateDataPropertyOrThrow(part, "value", %StrSubstring(s, mid + 1, end));
+    if (unit !== undefined && ty !== "literal") {
+      %CreateDataPropertyOrThrow(part, "unit", unit);
+    }
+    if (source !== undefined) {
+      %CreateDataPropertyOrThrow(part, "source", source);
+    }
+    %ArrayPushDense(out, part);
+    start = end + 1;
+  }
+  return out;
+}
+
+// builtins/intl.ts:208
+function IntlThis(v, kind, method) {
+  const spec = %IntlSpec(v, kind);
+  if (spec === undefined) {
+    let shown = "#<Object>";
+    if (!%IsObject(v)) {
+      shown = %IsSymbol(v) ? "Symbol()" : ToString(v);
+    }
+    throw %NewTypeError("Method " + method + " called on incompatible receiver " + shown);
+  }
+  return %AsStr(spec);
+}
+
+// builtins/intl.ts:221
+function IntlConstructor(name) {
+  return %AsObj(%Get(%AsObj(%Get(%GlobalObject(), "Intl")), name));
+}
+
+// builtins/intl.ts:229
+function IntlRequested(locales) {
+  const tags = IntlLocaleTags(locales);
+  %IntlLocales(tags, 0);
+  return tags;
+}
+
+// builtins/intl.ts:236
+function IntlConstruct(newTarget, name, kind, tags, raw) {
+  const ctor = (%AsObj(%Get(%AsObj(%Get(%GlobalObject(), "Intl")), name)));
+  let proto = %Get(%AsObj(newTarget === undefined ? ctor : newTarget), "prototype");
+  if (!%IsObject(proto)) {
+    proto = %Get(ctor, "prototype");
+  }
+  return %IntlCreate(%AsObj(proto), kind, %IntlResolve(kind, tags, raw));
+}
+
+// builtins/intl.ts:246
+function IntlRequireNew(newTarget, name) {
+  if (newTarget === undefined) {
+    throw %NewTypeError("Constructor Intl." + name + " requires 'new'");
+  }
+}
+
+// builtins/intl.ts:256 %IntlBoundFormat
+function IntlBoundFormat(x) {
+  const spec = %IntlSpec(this, 0);
+  if (spec !== undefined) {
+    return %AsStr(%IntlFormat(0, %AsStr(spec), IntlNumeric(x), undefined, false));
+  }
+  return %AsStr(%IntlFormat(1, %AsStr(%IntlSpec(this, 1)), ((x === undefined) ? %DateNow() : ((%IsObject(x)) ? %ToNumberPrimitive(ToPrimitive(x, "number")) : %ToNumberPrimitive(x))), undefined, false));
+}
+
+// builtins/intl.ts:268 %IntlBoundCompare
+function IntlBoundCompare(x, y) {
+  return %AsNumber(%IntlFormat(2, %AsStr(%IntlSpec(this, 2)), ToString(x), ToString(y), false));
+}
+
+// builtins/intl.ts:273
+function IntlBoundFunction(o, kind, length) {
+  const cached = %IntlBound(%AsObj(o), undefined);
+  if (cached !== undefined) {
+    return cached;
+  }
+  return %IntlBound(%AsObj(o), %NewBuiltinClosure(kind, o, length));
+}
+
+// builtins/intl.ts:282
+function IntlNfOptions() {
+  return "localeMatcher:s,numberingSystem:s,style:s,currency:s,currencyDisplay:s,currencySign:s,unit:s,unitDisplay:s,notation:s,minimumIntegerDigits:n,minimumFractionDigits:n,maximumFractionDigits:n,minimumSignificantDigits:n,maximumSignificantDigits:n,roundingIncrement:n,roundingMode:s,roundingPriority:s,trailingZeroDisplay:s,compactDisplay:s,useGrouping:g,signDisplay:s";
+}
+
+// builtins/intl.ts:286
+function IntlDtfOptions() {
+  return "localeMatcher:s,calendar:s,numberingSystem:s,hour12:b,hourCycle:s,timeZone:s,weekday:s,era:s,year:s,month:s,day:s,dayPeriod:s,hour:s,minute:s,second:s,fractionalSecondDigits:n,timeZoneName:s,formatMatcher:s,dateStyle:s,timeStyle:s";
+}
+
+// builtins/intl.ts:290
+function IntlCollatorOptions() {
+  return "usage:s,localeMatcher:s,collation:s,numeric:b,caseFirst:s,sensitivity:s,ignorePunctuation:b";
+}
+
+// builtins/intl.ts:294
+function IntlPluralOptions() {
+  return "localeMatcher:s,type:s,minimumIntegerDigits:n,minimumFractionDigits:n,maximumFractionDigits:n,minimumSignificantDigits:n,maximumSignificantDigits:n,roundingIncrement:n,roundingMode:s,roundingPriority:s,trailingZeroDisplay:s";
+}
+
+// builtins/intl.ts:303 value Intl
+function IntlObject() {
+  return %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+}
+
+// builtins/intl.ts:312 value Intl[Symbol.toStringTag]
+function IntlToStringTag() {
+  return "Intl";
+}
+
+// builtins/intl.ts:320
+function IntlCaseMode(locales, upper) {
+  if (locales === undefined) {
+    return upper;
+  }
+  const tags = %IntlLocales(IntlLocaleTags(locales), 0);
+  const nl = %StrIndexOf(tags, "\n", 0);
+  const first = nl < 0 ? tags : %StrSubstring(tags, 0, nl);
+  const n = %StrLength(first);
+  const lang = n >= 2 && (n === 2 || %StrCharCodeAt(first, 2) === 45) ? %StrSubstring(first, 0, 2) : "";
+  if (lang === "tr" || lang === "az") {
+    return upper + 2;
+  }
+  if (lang === "lt") {
+    return upper + 4;
+  }
+  if (lang === "el") {
+    return upper + 6;
+  }
+  return upper;
+}
+
+// builtins/intl.ts:346 Intl.getCanonicalLocales
+function IntlGetCanonicalLocales(locales) {
+  return IntlSplit(%IntlLocales(IntlLocaleTags(locales), 0), "\n", 0);
+}
+
+// builtins/intl.ts:351
+function IntlSupportedLocales(locales, options, kind, ctor) {
+  const tags = %IntlLocales(IntlLocaleTags(locales), kind + 1);
+  if (options !== undefined) {
+    if (options === null) {
+      throw %NewTypeError(ctor + ".supportedLocalesOf called on null or undefined");
+    }
+    const m = %Get(%ToObject(options), "localeMatcher");
+    if (m !== undefined) {
+      const s = ToString(m);
+      if (s !== "lookup" && s !== "best fit") {
+        throw %NewRangeError("Value " + s + " out of range for " + ctor + ".supportedLocalesOf options property localeMatcher");
+      }
+    }
+  }
+  return IntlSplit(tags, "\n", 0);
+}
+
+// builtins/intl.ts:371
+function IntlNewNumberFormat(newTarget, locales, options) {
+  let $1;
+  const tags = (($1 = IntlLocaleTags(locales), (%IntlLocales($1, 0), $1)));
+  return IntlConstruct(newTarget, "NumberFormat", 0, tags, IntlReadOptions(((options === null) ? (%IntlLocales(IntlLocaleTags(locales), 0), %Throw(%NewTypeError("Intl.NumberFormat called on null or undefined"))) : options), IntlNfOptions()));
+}
+
+// builtins/intl.ts:381 constructor Intl.NumberFormat
+function IntlNumberFormatConstructor(locales, options) {
+  return IntlNewNumberFormat(new.target, locales, options);
+}
+
+// builtins/intl.ts:390 Intl.NumberFormat.supportedLocalesOf
+function IntlNumberFormatSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 0, "Intl.NumberFormat");
+}
+
+// builtins/intl.ts:395
+function IntlNumeric(x) {
+  const p = ToPrimitive(x, "number");
+  if (%IsBigInt(p)) {
+    return %BigIntToString(p, 10);
+  }
+  if (%IsString(p)) {
+    return p;
+  }
+  return ((%IsObject(p)) ? %ToNumberPrimitive(ToPrimitive(p, "number")) : %ToNumberPrimitive(p));
+}
+
+// builtins/intl.ts:410 get Intl.NumberFormat.prototype.format
+function IntlNumberFormatPrototypeFormat() {
+  let $1;
+  IntlThis(this, 0, "get Intl.NumberFormat.prototype.format");
+  return (($1 = %IntlBound(%AsObj(this), undefined), ($1 !== undefined) ? $1 : %IntlBound(%AsObj(this), %NewBuiltinClosure(25, this, 1))));
+}
+
+// builtins/intl.ts:419 Intl.NumberFormat.prototype.formatToParts
+function IntlNumberFormatPrototypeFormatToParts(x) {
+  const spec = IntlThis(this, 0, "Intl.NumberFormat.prototype.formatToParts");
+  return IntlParts(%IntlFormat(0, spec, IntlNumeric(x), undefined, true), undefined);
+}
+
+// builtins/intl.ts:425
+function IntlRangeValue(v, which) {
+  if (v === undefined) {
+    throw %NewTypeError("Invalid " + which + " : undefined");
+  }
+  const n = IntlNumeric(v);
+  if (%IsObject(v) && n !== n) {
+    return "#<Object>";
+  }
+  return n;
+}
+
+// builtins/intl.ts:442 Intl.NumberFormat.prototype.formatRange
+function IntlNumberFormatPrototypeFormatRange(start, end) {
+  let $1, $2;
+  const spec = IntlThis(this, 0, "Intl.NumberFormat.prototype.formatRange");
+  if (start === undefined || end === undefined) {
+    IntlRangeValue(start, "start");
+    ((end === undefined) ? %Throw(%NewTypeError("Invalid " + "end" + " : undefined")) : ($1 = IntlNumeric(end), (%IsObject(end) && $1 !== $1) ? "#<Object>" : $1));
+  }
+  const x = IntlRangeValue(start, "start");
+  return %AsStr(%IntlFormat(0, spec, x, ((end === undefined) ? %Throw(%NewTypeError("Invalid " + "end" + " : undefined")) : ($2 = IntlNumeric(end), (%IsObject(end) && $2 !== $2) ? "#<Object>" : $2)), false));
+}
+
+// builtins/intl.ts:457 Intl.NumberFormat.prototype.formatRangeToParts
+function IntlNumberFormatPrototypeFormatRangeToParts(start, end) {
+  let $1, $2;
+  const spec = IntlThis(this, 0, "Intl.NumberFormat.prototype.formatRangeToParts");
+  if (start === undefined || end === undefined) {
+    IntlRangeValue(start, "start");
+    ((end === undefined) ? %Throw(%NewTypeError("Invalid " + "end" + " : undefined")) : ($1 = IntlNumeric(end), (%IsObject(end) && $1 !== $1) ? "#<Object>" : $1));
+  }
+  const x = IntlRangeValue(start, "start");
+  return IntlParts(%IntlFormat(0, spec, x, ((end === undefined) ? %Throw(%NewTypeError("Invalid " + "end" + " : undefined")) : ($2 = IntlNumeric(end), (%IsObject(end) && $2 !== $2) ? "#<Object>" : $2)), true), undefined);
+}
+
+// builtins/intl.ts:471 Intl.NumberFormat.prototype.resolvedOptions
+function IntlNumberFormatPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 0, "Intl.NumberFormat.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:480 value Intl.NumberFormat.prototype[Symbol.toStringTag]
+function IntlNumberFormatToStringTag() {
+  return "Intl.NumberFormat";
+}
+
+// builtins/intl.ts:490
+function IntlNewDateTimeFormat(newTarget, locales, options, required, defaults) {
+  let $1, $2;
+  const tags = (($1 = IntlLocaleTags(locales), (%IntlLocales($1, 0), $1)));
+  let raw = IntlReadOptions(options, IntlDtfOptions());
+  raw = (raw === "" ? "@required" + "\u0002" + required : raw + "\u0001" + "@required" + "\u0002" + required);
+  raw = (raw === "" ? "@defaults" + "\u0002" + defaults : raw + "\u0001" + "@defaults" + "\u0002" + defaults);
+  raw = ($2 = %NumberToString(0 - %DateTimezoneOffset(0), 10), raw === "" ? "@offset" + "\u0002" + $2 : raw + "\u0001" + "@offset" + "\u0002" + $2);
+  return IntlConstruct(newTarget, "DateTimeFormat", 1, tags, raw);
+}
+
+// builtins/intl.ts:504 constructor Intl.DateTimeFormat
+function IntlDateTimeFormatConstructor(locales, options) {
+  return IntlNewDateTimeFormat(new.target, locales, options, "any", "date");
+}
+
+// builtins/intl.ts:513 Intl.DateTimeFormat.supportedLocalesOf
+function IntlDateTimeFormatSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 1, "Intl.DateTimeFormat");
+}
+
+// builtins/intl.ts:518
+function IntlDateValue(x) {
+  if (x === undefined) {
+    return %DateNow();
+  }
+  return ((%IsObject(x)) ? %ToNumberPrimitive(ToPrimitive(x, "number")) : %ToNumberPrimitive(x));
+}
+
+// builtins/intl.ts:529 get Intl.DateTimeFormat.prototype.format
+function IntlDateTimeFormatPrototypeFormat() {
+  let $1;
+  IntlThis(this, 1, "get Intl.DateTimeFormat.prototype.format");
+  return (($1 = %IntlBound(%AsObj(this), undefined), ($1 !== undefined) ? $1 : %IntlBound(%AsObj(this), %NewBuiltinClosure(25, this, 1))));
+}
+
+// builtins/intl.ts:538 Intl.DateTimeFormat.prototype.formatToParts
+function IntlDateTimeFormatPrototypeFormatToParts(date) {
+  const spec = IntlThis(this, 1, "Intl.DateTimeFormat.prototype.formatToParts");
+  return IntlParts(%IntlFormat(1, spec, ((date === undefined) ? %DateNow() : ((%IsObject(date)) ? %ToNumberPrimitive(ToPrimitive(date, "number")) : %ToNumberPrimitive(date))), undefined, true), undefined);
+}
+
+// builtins/intl.ts:544
+function IntlDateRange(start, end) {
+  if (start === undefined || end === undefined) {
+    throw %NewTypeError("Invalid time value");
+  }
+  return IntlRangeNumber(start);
+}
+
+// builtins/intl.ts:552
+function IntlRangeNumber(v) {
+  if (%IsBigInt(v)) {
+    throw %NewTypeError("Cannot convert a BigInt value to a number");
+  }
+  if (%IsSymbol(v)) {
+    throw %NewTypeError("Cannot convert a Symbol value to a number");
+  }
+  return ((%IsObject(v)) ? %ToNumberPrimitive(ToPrimitive(v, "number")) : %ToNumberPrimitive(v));
+}
+
+// builtins/intl.ts:567 Intl.DateTimeFormat.prototype.formatRange
+function IntlDateTimeFormatPrototypeFormatRange(startDate, endDate) {
+  const spec = IntlThis(this, 1, "Intl.DateTimeFormat.prototype.formatRange");
+  const x = ((startDate === undefined || endDate === undefined) ? %Throw(%NewTypeError("Invalid time value")) : IntlRangeNumber(startDate));
+  return %AsStr(%IntlFormat(1, spec, x, IntlRangeNumber(endDate), false));
+}
+
+// builtins/intl.ts:578 Intl.DateTimeFormat.prototype.formatRangeToParts
+function IntlDateTimeFormatPrototypeFormatRangeToParts(startDate, endDate) {
+  const spec = IntlThis(this, 1, "Intl.DateTimeFormat.prototype.formatRangeToParts");
+  const x = ((startDate === undefined || endDate === undefined) ? %Throw(%NewTypeError("Invalid time value")) : IntlRangeNumber(startDate));
+  return IntlParts(%IntlFormat(1, spec, x, IntlRangeNumber(endDate), true), undefined);
+}
+
+// builtins/intl.ts:589 Intl.DateTimeFormat.prototype.resolvedOptions
+function IntlDateTimeFormatPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 1, "Intl.DateTimeFormat.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:598 value Intl.DateTimeFormat.prototype[Symbol.toStringTag]
+function IntlDateTimeFormatToStringTag() {
+  return "Intl.DateTimeFormat";
+}
+
+// builtins/intl.ts:605
+function IntlNewCollator(newTarget, locales, options) {
+  let $1;
+  const tags = (($1 = IntlLocaleTags(locales), (%IntlLocales($1, 0), $1)));
+  return IntlConstruct(newTarget, "Collator", 2, tags, IntlReadOptions(options, ("usage:s,localeMatcher:s,collation:s,numeric:b,caseFirst:s,sensitivity:s,ignorePunctuation:b")));
+}
+
+// builtins/intl.ts:615 constructor Intl.Collator
+function IntlCollatorConstructor(locales, options) {
+  return IntlNewCollator(new.target, locales, options);
+}
+
+// builtins/intl.ts:624 Intl.Collator.supportedLocalesOf
+function IntlCollatorSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 2, "Intl.Collator");
+}
+
+// builtins/intl.ts:632 get Intl.Collator.prototype.compare
+function IntlCollatorPrototypeCompare() {
+  let $1;
+  IntlThis(this, 2, "get Intl.Collator.prototype.compare");
+  return (($1 = %IntlBound(%AsObj(this), undefined), ($1 !== undefined) ? $1 : %IntlBound(%AsObj(this), %NewBuiltinClosure(26, this, 2))));
+}
+
+// builtins/intl.ts:641 Intl.Collator.prototype.resolvedOptions
+function IntlCollatorPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 2, "Intl.Collator.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:650 value Intl.Collator.prototype[Symbol.toStringTag]
+function IntlCollatorToStringTag() {
+  return "Intl.Collator";
+}
+
+// builtins/intl.ts:661 constructor Intl.PluralRules
+function IntlPluralRulesConstructor(locales, options) {
+  let $1, $2;
+  ($1 = new.target, ($1 === undefined) ? %Throw(%NewTypeError("Constructor Intl." + "PluralRules" + " requires 'new'")) : undefined);
+  const tags = (($2 = IntlLocaleTags(locales), (%IntlLocales($2, 0), $2)));
+  return IntlConstruct(new.target, "PluralRules", 3, tags, IntlReadOptions(((options === null) ? (%IntlLocales(IntlLocaleTags(locales), 0), %Throw(%NewTypeError("Intl.PluralRules called on null or undefined"))) : options), IntlPluralOptions()));
+}
+
+// builtins/intl.ts:672 Intl.PluralRules.supportedLocalesOf
+function IntlPluralRulesSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 3, "Intl.PluralRules");
+}
+
+// builtins/intl.ts:680 Intl.PluralRules.prototype.select
+function IntlPluralRulesPrototypeSelect(value) {
+  const spec = IntlThis(this, 3, "Intl.PluralRules.prototype.select");
+  return %AsStr(%IntlFormat(3, spec, ((%IsObject(value)) ? %ToNumberPrimitive(ToPrimitive(value, "number")) : %ToNumberPrimitive(value)), undefined, false));
+}
+
+// builtins/intl.ts:690 Intl.PluralRules.prototype.selectRange
+function IntlPluralRulesPrototypeSelectRange(start, end) {
+  const spec = IntlThis(this, 3, "Intl.PluralRules.prototype.selectRange");
+  if (start === undefined) {
+    throw %NewTypeError("Invalid startRange : undefined");
+  }
+  if (end === undefined) {
+    throw %NewTypeError("Invalid endRange : undefined");
+  }
+  const x = ((%IsObject(start)) ? %ToNumberPrimitive(ToPrimitive(start, "number")) : %ToNumberPrimitive(start));
+  const y = ((%IsObject(end)) ? %ToNumberPrimitive(ToPrimitive(end, "number")) : %ToNumberPrimitive(end));
+  if (x !== x) {
+    throw %NewRangeError("Invalid startRange : NaN");
+  }
+  if (y !== y) {
+    throw %NewRangeError("Invalid endRange : NaN");
+  }
+  const b = %AsStr(%IntlFormat(3, spec, y, undefined, false));
+  return %AsStr(%IntlFormat(3, spec, x, b, false));
+}
+
+// builtins/intl.ts:714 Intl.PluralRules.prototype.resolvedOptions
+function IntlPluralRulesPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 3, "Intl.PluralRules.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:723 value Intl.PluralRules.prototype[Symbol.toStringTag]
+function IntlPluralRulesToStringTag() {
+  return "Intl.PluralRules";
+}
+
+// builtins/intl.ts:734 constructor Intl.ListFormat
+function IntlListFormatConstructor(locales, options) {
+  let $1, $2;
+  ($1 = new.target, ($1 === undefined) ? %Throw(%NewTypeError("Constructor Intl." + "ListFormat" + " requires 'new'")) : undefined);
+  const tags = (($2 = IntlLocaleTags(locales), (%IntlLocales($2, 0), $2)));
+  return IntlConstruct(new.target, "ListFormat", 4, tags, IntlReadOptions(((options === null) ? (%IntlLocales(IntlLocaleTags(locales), 0), %Throw(%NewTypeError("invalid_argument"))) : options), "localeMatcher:s,type:s,style:s"));
+}
+
+// builtins/intl.ts:745 Intl.ListFormat.supportedLocalesOf
+function IntlListFormatSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 4, "Intl.ListFormat");
+}
+
+// builtins/intl.ts:750
+function IntlStringList(iterable) {
+  if (iterable === undefined) {
+    return "";
+  }
+  const list = IterableToList(iterable);
+  const len = LengthOfArrayLike(list);
+  let out = "";
+  let i = 0;
+  while (i < len) {
+    const v = %Get(list, i);
+    if (!%IsString(v)) {
+      throw %NewTypeError("Iterable yielded " + (%IsSymbol(v) ? "Symbol()" : ToString(v)) + " which is not a string");
+    }
+    out = i === 0 ? %AsStr(v) : out + "\u0001" + %AsStr(v);
+    i += 1;
+  }
+  return out;
+}
+
+// builtins/intl.ts:773 Intl.ListFormat.prototype.format
+function IntlListFormatPrototypeFormat(list) {
+  const spec = IntlThis(this, 4, "Intl.ListFormat.prototype.format");
+  return %AsStr(%IntlFormat(4, spec, IntlStringList(list), undefined, false));
+}
+
+// builtins/intl.ts:782 Intl.ListFormat.prototype.formatToParts
+function IntlListFormatPrototypeFormatToParts(list) {
+  const spec = IntlThis(this, 4, "Intl.ListFormat.prototype.formatToParts");
+  return IntlParts(%IntlFormat(4, spec, IntlStringList(list), undefined, true), undefined);
+}
+
+// builtins/intl.ts:791 Intl.ListFormat.prototype.resolvedOptions
+function IntlListFormatPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 4, "Intl.ListFormat.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:800 value Intl.ListFormat.prototype[Symbol.toStringTag]
+function IntlListFormatToStringTag() {
+  return "Intl.ListFormat";
+}
+
+// builtins/intl.ts:811 constructor Intl.RelativeTimeFormat
+function IntlRelativeTimeFormatConstructor(locales, options) {
+  let $1, $2;
+  ($1 = new.target, ($1 === undefined) ? %Throw(%NewTypeError("Constructor Intl." + "RelativeTimeFormat" + " requires 'new'")) : undefined);
+  const tags = (($2 = IntlLocaleTags(locales), (%IntlLocales($2, 0), $2)));
+  const raw = IntlReadOptions(((options === null) ? (%IntlLocales(IntlLocaleTags(locales), 0), %Throw(%NewTypeError("Intl.RelativeTimeFormat called on null or undefined"))) : options), "localeMatcher:s,numberingSystem:s,style:s,numeric:s");
+  return IntlConstruct(new.target, "RelativeTimeFormat", 5, tags, raw);
+}
+
+// builtins/intl.ts:823 Intl.RelativeTimeFormat.supportedLocalesOf
+function IntlRelativeTimeFormatSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 5, "Intl.RelativeTimeFormat");
+}
+
+// builtins/intl.ts:831 Intl.RelativeTimeFormat.prototype.format
+function IntlRelativeTimeFormatPrototypeFormat(value, unit) {
+  const spec = IntlThis(this, 5, "Intl.RelativeTimeFormat.prototype.format");
+  return %AsStr(%IntlFormat(5, spec, ((%IsObject(value)) ? %ToNumberPrimitive(ToPrimitive(value, "number")) : %ToNumberPrimitive(value)), ToString(unit), false));
+}
+
+// builtins/intl.ts:840 Intl.RelativeTimeFormat.prototype.formatToParts
+function IntlRelativeTimeFormatPrototypeFormatToParts(value, unit) {
+  const spec = IntlThis(this, 5, "Intl.RelativeTimeFormat.prototype.formatToParts");
+  const u = ToString(unit);
+  const parts = %IntlFormat(5, spec, ((%IsObject(value)) ? %ToNumberPrimitive(ToPrimitive(value, "number")) : %ToNumberPrimitive(value)), u, true);
+  const singular = %StrLength(u) > 1 && %StrCharCodeAt(u, %StrLength(u) - 1) === 115 ? %StrSubstring(u, 0, %StrLength(u) - 1) : u;
+  return IntlParts(parts, singular);
+}
+
+// builtins/intl.ts:852 Intl.RelativeTimeFormat.prototype.resolvedOptions
+function IntlRelativeTimeFormatPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 5, "Intl.RelativeTimeFormat.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:861 value Intl.RelativeTimeFormat.prototype[Symbol.toStringTag]
+function IntlRelativeTimeFormatToStringTag() {
+  return "Intl.RelativeTimeFormat";
+}
+
+// builtins/intl.ts:874 constructor Intl.Locale
+function IntlLocaleConstructor(tag, options) {
+  let $1;
+  ($1 = new.target, ($1 === undefined) ? %Throw(%NewTypeError("Constructor Intl." + "Locale" + " requires 'new'")) : undefined);
+  if (!%IsString(tag) && !%IsObject(tag)) {
+    throw %NewTypeError("First argument to Intl.Locale constructor can't be empty or missing");
+  }
+  const own = %IntlSpec(tag, 16);
+  const s = own !== undefined ? %AsStr(own) : ToString(tag);
+  if (s === "") {
+    throw %NewRangeError("First argument to Intl.Locale constructor can't be empty or missing");
+  }
+  if (options === null) {
+    throw %NewTypeError("Intl.Locale called on null or undefined");
+  }
+  const raw = IntlReadOptions(options, "language:s,script:s,region:s,calendar:s,collation:s,hourCycle:s,caseFirst:s,numeric:b,numberingSystem:s");
+  return IntlConstruct(new.target, "Locale", 16, s, raw);
+}
+
+// builtins/intl.ts:892
+function IntlLocaleGet(v, what, method) {
+  const spec = IntlThis(v, 16, method);
+  const r = %IntlFormat(16, spec, what, undefined, false);
+  if (r === undefined) {
+    return undefined;
+  }
+  const s = %AsStr(r);
+  if (s === "!t") {
+    return true;
+  }
+  if (s === "!f") {
+    return false;
+  }
+  if (%StrLength(s) > 0 && %StrSubstring(s, 0, 1) === "@") {
+    return IntlSplit(s, ",", 1);
+  }
+  return s;
+}
+
+// builtins/intl.ts:912
+function IntlNewLocale(t) {
+  return %IntlCreate(%AsObj(%Get((%AsObj(%Get(%AsObj(%Get(%GlobalObject(), "Intl")), "Locale"))), "prototype")), 16, t);
+}
+
+// builtins/intl.ts:920 Intl.Locale.prototype.maximize
+function IntlLocalePrototypeMaximize() {
+  return IntlNewLocale(%AsStr(IntlLocaleGet(this, "maximize", "Intl.Locale.prototype.maximize")));
+}
+
+// builtins/intl.ts:928 Intl.Locale.prototype.minimize
+function IntlLocalePrototypeMinimize() {
+  return IntlNewLocale(%AsStr(IntlLocaleGet(this, "minimize", "Intl.Locale.prototype.minimize")));
+}
+
+// builtins/intl.ts:936 Intl.Locale.prototype.toString
+function IntlLocalePrototypeToString() {
+  return IntlThis(this, 16, "Intl.Locale.prototype.toString");
+}
+
+// builtins/intl.ts:944 get Intl.Locale.prototype.baseName
+function IntlLocalePrototypeBaseName() {
+  return IntlLocaleGet(this, "baseName", "Intl.Locale.prototype.baseName");
+}
+
+// builtins/intl.ts:952 get Intl.Locale.prototype.calendar
+function IntlLocalePrototypeCalendar() {
+  return IntlLocaleGet(this, "calendar", "Intl.Locale.prototype.calendar");
+}
+
+// builtins/intl.ts:960 get Intl.Locale.prototype.caseFirst
+function IntlLocalePrototypeCaseFirst() {
+  return IntlLocaleGet(this, "caseFirst", "Intl.Locale.prototype.caseFirst");
+}
+
+// builtins/intl.ts:968 get Intl.Locale.prototype.collation
+function IntlLocalePrototypeCollation() {
+  return IntlLocaleGet(this, "collation", "Intl.Locale.prototype.collation");
+}
+
+// builtins/intl.ts:976 get Intl.Locale.prototype.hourCycle
+function IntlLocalePrototypeHourCycle() {
+  return IntlLocaleGet(this, "hourCycle", "Intl.Locale.prototype.hourCycle");
+}
+
+// builtins/intl.ts:984 get Intl.Locale.prototype.numeric
+function IntlLocalePrototypeNumeric() {
+  return IntlLocaleGet(this, "numeric", "Intl.Locale.prototype.numeric");
+}
+
+// builtins/intl.ts:992 get Intl.Locale.prototype.numberingSystem
+function IntlLocalePrototypeNumberingSystem() {
+  return IntlLocaleGet(this, "numberingSystem", "Intl.Locale.prototype.numberingSystem");
+}
+
+// builtins/intl.ts:1000 get Intl.Locale.prototype.language
+function IntlLocalePrototypeLanguage() {
+  return IntlLocaleGet(this, "language", "Intl.Locale.prototype.language");
+}
+
+// builtins/intl.ts:1008 get Intl.Locale.prototype.script
+function IntlLocalePrototypeScript() {
+  return IntlLocaleGet(this, "script", "Intl.Locale.prototype.script");
+}
+
+// builtins/intl.ts:1016 get Intl.Locale.prototype.region
+function IntlLocalePrototypeRegion() {
+  return IntlLocaleGet(this, "region", "Intl.Locale.prototype.region");
+}
+
+// builtins/intl.ts:1024 get Intl.Locale.prototype.calendars
+function IntlLocalePrototypeCalendars() {
+  return IntlLocaleGet(this, "calendars", "Intl.Locale.prototype.calendars");
+}
+
+// builtins/intl.ts:1032 get Intl.Locale.prototype.collations
+function IntlLocalePrototypeCollations() {
+  return IntlLocaleGet(this, "collations", "Intl.Locale.prototype.collations");
+}
+
+// builtins/intl.ts:1040 get Intl.Locale.prototype.hourCycles
+function IntlLocalePrototypeHourCycles() {
+  return IntlLocaleGet(this, "hourCycles", "Intl.Locale.prototype.hourCycles");
+}
+
+// builtins/intl.ts:1048 get Intl.Locale.prototype.numberingSystems
+function IntlLocalePrototypeNumberingSystems() {
+  return IntlLocaleGet(this, "numberingSystems", "Intl.Locale.prototype.numberingSystems");
+}
+
+// builtins/intl.ts:1056 get Intl.Locale.prototype.timeZones
+function IntlLocalePrototypeTimeZones() {
+  return IntlLocaleGet(this, "timeZones", "Intl.Locale.prototype.timeZones");
+}
+
+// builtins/intl.ts:1064 get Intl.Locale.prototype.textInfo
+function IntlLocalePrototypeTextInfo() {
+  const d = IntlLocaleGet(this, "textInfo", "Intl.Locale.prototype.textInfo");
+  const o = %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+  %CreateDataPropertyOrThrow(o, "direction", d);
+  return o;
+}
+
+// builtins/intl.ts:1075 get Intl.Locale.prototype.weekInfo
+function IntlLocalePrototypeWeekInfo() {
+  let $1, $2, $3;
+  const s = %AsStr(IntlLocaleGet(this, "weekInfo", "Intl.Locale.prototype.weekInfo"));
+  const a = %StrIndexOf(s, ":", 0);
+  const b = %StrIndexOf(s, ":", a + 1);
+  const o = %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+  %CreateDataPropertyOrThrow(o, "firstDay", ($1 = %StrSubstring(s, 0, a), (%IsObject($1)) ? %ToNumberPrimitive(ToPrimitive($1, "number")) : %ToNumberPrimitive($1)));
+  const weekend = %ArrayCreate(0);
+  const days = IntlSplit(%StrSubstring(s, a + 1, b), ",", 0);
+  let i = 0;
+  const n = LengthOfArrayLike(days);
+  while (i < n) {
+    %ArrayPushDense(weekend, ($2 = %Get(days, i), (%IsObject($2)) ? %ToNumberPrimitive(ToPrimitive($2, "number")) : %ToNumberPrimitive($2)));
+    i += 1;
+  }
+  %CreateDataPropertyOrThrow(o, "weekend", weekend);
+  %CreateDataPropertyOrThrow(o, "minimalDays", ($3 = %StrSubstring(s, b + 1, %StrLength(s)), (%IsObject($3)) ? %ToNumberPrimitive(ToPrimitive($3, "number")) : %ToNumberPrimitive($3)));
+  return o;
+}
+
+// builtins/intl.ts:1100 value Intl.Locale.prototype[Symbol.toStringTag]
+function IntlLocaleToStringTag() {
+  return "Intl.Locale";
+}
+
+// builtins/intl.ts:1109 Intl.supportedValuesOf
+function IntlSupportedValuesOf(key) {
+  return IntlSplit(%AsStr(%IntlFormat(15, ToString(key), undefined, undefined, false)), ",", 0);
+}
+
+// builtins/intl.ts:1122 constructor Intl.DisplayNames
+function IntlDisplayNamesConstructor(locales, options) {
+  let $1, $2;
+  ($1 = new.target, ($1 === undefined) ? %Throw(%NewTypeError("Constructor Intl." + "DisplayNames" + " requires 'new'")) : undefined);
+  const tags = (($2 = IntlLocaleTags(locales), (%IntlLocales($2, 0), $2)));
+  if (options === undefined || options === null) {
+    throw %NewTypeError("invalid_argument");
+  }
+  return IntlConstruct(new.target, "DisplayNames", 17, tags, IntlReadOptions(options, "localeMatcher:s,style:s,type:s,fallback:s,languageDisplay:s"));
+}
+
+// builtins/intl.ts:1136 Intl.DisplayNames.supportedLocalesOf
+function IntlDisplayNamesSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 17, "Intl.DisplayNames");
+}
+
+// builtins/intl.ts:1144 Intl.DisplayNames.prototype.resolvedOptions
+function IntlDisplayNamesPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 17, "Intl.DisplayNames.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:1152 Intl.DisplayNames.prototype.of
+function IntlDisplayNamesPrototypeOf(code) {
+  const spec = IntlThis(this, 17, "Intl.DisplayNames.prototype.of");
+  return %IntlFormat(17, spec, ToString(code), undefined, false);
+}
+
+// builtins/intl.ts:1162 value Intl.DisplayNames.prototype[Symbol.toStringTag]
+function IntlDisplayNamesToStringTag() {
+  return "Intl.DisplayNames";
+}
+
+// builtins/intl.ts:1175 constructor Intl.Segmenter
+function IntlSegmenterConstructor(locales, options) {
+  let $1, $2;
+  ($1 = new.target, ($1 === undefined) ? %Throw(%NewTypeError("Constructor Intl." + "Segmenter" + " requires 'new'")) : undefined);
+  const tags = (($2 = IntlLocaleTags(locales), (%IntlLocales($2, 0), $2)));
+  if (options === null) {
+    throw %NewTypeError("Cannot convert undefined or null to object");
+  }
+  return IntlConstruct(new.target, "Segmenter", 18, tags, IntlReadOptions(options, "localeMatcher:s,granularity:s"));
+}
+
+// builtins/intl.ts:1189 Intl.Segmenter.supportedLocalesOf
+function IntlSegmenterSupportedLocalesOf(locales, options) {
+  return IntlSupportedLocales(locales, options, 18, "Intl.Segmenter");
+}
+
+// builtins/intl.ts:1197 Intl.Segmenter.prototype.resolvedOptions
+function IntlSegmenterPrototypeResolvedOptions() {
+  return IntlResolvedObject(IntlThis(this, 18, "Intl.Segmenter.prototype.resolvedOptions"));
+}
+
+// builtins/intl.ts:1205 Intl.Segmenter.prototype.segment
+function IntlSegmenterPrototypeSegment(string) {
+  const spec = IntlThis(this, 18, "Intl.Segmenter.prototype.segment");
+  const s = ToString(string);
+  const o = %IntlCreate(%RealmIntrinsic("IntlSegmentsPrototype"), 19, spec);
+  const data = %ArrayCreate(0);
+  %ArrayPushDense(data, s);
+  %ArrayPushDense(data, undefined);
+  %ArrayPushDense(data, undefined);
+  %ArrayPushDense(data, 0);
+  %IntlBound(o, data);
+  return o;
+}
+
+// builtins/intl.ts:1223 value Intl.Segmenter.prototype[Symbol.toStringTag]
+function IntlSegmenterToStringTag() {
+  return "Intl.Segmenter";
+}
+
+// builtins/intl.ts:1228
+function IntlSegmentStarts(spec, data) {
+  let $1;
+  const have = %Get(data, 1);
+  if (have !== undefined) {
+    return %AsObj(have);
+  }
+  const enc = %AsStr(%IntlFormat(18, spec, %Get(data, 0), undefined, false));
+  const bar = %StrIndexOf(enc, "|", 0);
+  const list = bar < 0 ? enc : %StrSubstring(enc, 0, bar);
+  const parts = IntlSplit(list, ",", 0);
+  const starts = %ArrayCreate(0);
+  let i = 0;
+  const n = LengthOfArrayLike(parts);
+  while (i < n) {
+    %ArrayPushDense(starts, ($1 = %Get(parts, i), (%IsObject($1)) ? %ToNumberPrimitive(ToPrimitive($1, "number")) : %ToNumberPrimitive($1)));
+    i += 1;
+  }
+  %Set(data, 1, starts);
+  if (bar >= 0) {
+    %Set(data, 2, %StrSubstring(enc, bar + 1, %StrLength(enc)));
+  }
+  return starts;
+}
+
+// builtins/intl.ts:1252
+function IntlSegmentData(spec, data, k) {
+  let $1, $2;
+  const starts = IntlSegmentStarts(spec, data);
+  const s = %AsStr(%Get(data, 0));
+  const a = ($1 = %Get(starts, k), (%IsObject($1)) ? %ToNumberPrimitive(ToPrimitive($1, "number")) : %ToNumberPrimitive($1));
+  const b = ($2 = %Get(starts, k + 1), (%IsObject($2)) ? %ToNumberPrimitive(ToPrimitive($2, "number")) : %ToNumberPrimitive($2));
+  const o = %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+  %CreateDataPropertyOrThrow(o, "segment", %StrSubstring(s, a, b));
+  %CreateDataPropertyOrThrow(o, "index", a);
+  %CreateDataPropertyOrThrow(o, "input", s);
+  const flags = %Get(data, 2);
+  if (flags !== undefined) {
+    %CreateDataPropertyOrThrow(o, "isWordLike", %StrSubstring(%AsStr(flags), k, k + 1) === "1");
+  }
+  return o;
+}
+
+// builtins/intl.ts:1272 %IntlSegmentsPrototype%.containing
+function IntlSegmentsPrototypeContaining(index) {
+  let $1;
+  const spec = IntlThis(this, 19, "%Segments.prototype%.containing");
+  const data = %AsObj(%IntlBound(%AsObj(this), undefined));
+  const s = %AsStr(%Get(data, 0));
+  const n = (%ToIntegerOrInfinityNumber(((%IsObject(index)) ? %ToNumberPrimitive(ToPrimitive(index, "number")) : %ToNumberPrimitive(index))));
+  const len = %StrLength(s);
+  if (n < 0 || n >= len) {
+    return undefined;
+  }
+  const starts = IntlSegmentStarts(spec, data);
+  let lo = 0;
+  let hi = LengthOfArrayLike(starts) - 1;
+  while (hi - lo > 1) {
+    const mid = MathFloor((lo + hi) / 2);
+    if (($1 = %Get(starts, mid), (%IsObject($1)) ? %ToNumberPrimitive(ToPrimitive($1, "number")) : %ToNumberPrimitive($1)) <= n) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return IntlSegmentData(spec, data, lo);
+}
+
+// builtins/intl.ts:1299 %IntlSegmentsPrototype%[Symbol.iterator]
+function IntlSegmentsPrototypeIterator() {
+  const spec = IntlThis(this, 19, "%Segments.prototype%[@@iterator]");
+  const data = %AsObj(%IntlBound(%AsObj(this), undefined));
+  const it = %IntlCreate(%RealmIntrinsic("IntlSegmentIteratorPrototype"), 20, spec);
+  const own = %ArrayCreate(0);
+  %ArrayPushDense(own, %Get(data, 0));
+  %ArrayPushDense(own, %Get(data, 1));
+  %ArrayPushDense(own, %Get(data, 2));
+  %ArrayPushDense(own, 0);
+  %IntlBound(it, own);
+  return it;
+}
+
+// builtins/intl.ts:1316 %IntlSegmentIteratorPrototype%.next
+function IntlSegmentIteratorPrototypeNext() {
+  let $1;
+  const spec = IntlThis(this, 20, "%SegmentIterator.prototype%.next");
+  const data = %AsObj(%IntlBound(%AsObj(this), undefined));
+  const starts = IntlSegmentStarts(spec, data);
+  const k = ($1 = %Get(data, 3), (%IsObject($1)) ? %ToNumberPrimitive(ToPrimitive($1, "number")) : %ToNumberPrimitive($1));
+  if (k + 1 >= LengthOfArrayLike(starts)) {
+    return %CreateIterResultObject(undefined, true);
+  }
+  %Set(data, 3, k + 1);
+  return %CreateIterResultObject(IntlSegmentData(spec, data, k), false);
+}
+
+// builtins/intl.ts:1333 value %IntlSegmentIteratorPrototype%[Symbol.toStringTag]
+function IntlSegmentIteratorToStringTag() {
+  return "Segmenter String Iterator";
+}
+
+// builtins/intl.ts:1340
+function IntlNumberToLocaleString(x, locales, options) {
+  const nf = IntlNewNumberFormat(undefined, locales, options);
+  return %AsStr(%IntlFormat(0, %AsStr(%IntlSpec(nf, 0)), IntlNumeric(x), undefined, false));
+}
+
+// builtins/intl.ts:1346
+function IntlDateToLocaleString(t, locales, options, required, defaults) {
+  if (t !== t) {
+    return "Invalid Date";
+  }
+  const dtf = IntlNewDateTimeFormat(undefined, locales, options, required, defaults);
+  return %AsStr(%IntlFormat(1, %AsStr(%IntlSpec(dtf, 1)), t, undefined, false));
+}
+
+// builtins/intl.ts:1355
+function IntlLocaleCompare(s, that, locales, options) {
+  const c = IntlNewCollator(undefined, locales, options);
+  return %AsNumber(%IntlFormat(2, %AsStr(%IntlSpec(c, 2)), s, that, false));
 }
 
 // builtins/iter.ts:10 %GetIterator
@@ -6724,26 +8083,30 @@ function NumberPrototypeToString(radix) {
   return %NumberToString(x, r);
 }
 
-// builtins/number.ts:53 Number.prototype.toLocaleString
-function NumberPrototypeToLocaleString() {
-  let $1;
-  return %NumberToString((($1 = %PrimitiveValue(this), (!%IsNumber($1)) ? %Throw(%NewTypeError("not a number")) : %AsNumber($1))), 10);
+// builtins/number.ts:54 Number.prototype.toLocaleString
+function NumberPrototypeToLocaleString(locales, options) {
+  let $1, $2;
+  const x = (($1 = %PrimitiveValue(this), (!%IsNumber($1)) ? %Throw(%NewTypeError("not a number")) : %AsNumber($1)));
+  if (%IntlEnabled()) {
+    return (($2 = IntlNewNumberFormat(undefined, locales, options), %AsStr(%IntlFormat(0, %AsStr(%IntlSpec($2, 0)), IntlNumeric(x), undefined, false))));
+  }
+  return %NumberToString(x, 10);
 }
 
-// builtins/number.ts:61 Number.prototype.valueOf
+// builtins/number.ts:66 Number.prototype.valueOf
 function NumberPrototypeValueOf() {
   let $1;
   return (($1 = %PrimitiveValue(this), (!%IsNumber($1)) ? %Throw(%NewTypeError("not a number")) : %AsNumber($1)));
 }
 
-// builtins/number.ts:70 Number.prototype.toFixed
+// builtins/number.ts:75 Number.prototype.toFixed
 function NumberPrototypeToFixed(fractionDigits) {
   let $1;
   const x = (($1 = %PrimitiveValue(this), (!%IsNumber($1)) ? %Throw(%NewTypeError("not a number")) : %AsNumber($1)));
   return %NumberToFixed(x, (%ToIntegerOrInfinityNumber(((%IsObject(fractionDigits)) ? %ToNumberPrimitive(ToPrimitive(fractionDigits, "number")) : %ToNumberPrimitive(fractionDigits)))));
 }
 
-// builtins/number.ts:79 Number.prototype.toExponential
+// builtins/number.ts:84 Number.prototype.toExponential
 function NumberPrototypeToExponential(fractionDigits) {
   let $1;
   const x = (($1 = %PrimitiveValue(this), (!%IsNumber($1)) ? %Throw(%NewTypeError("not a number")) : %AsNumber($1)));
@@ -6754,7 +8117,7 @@ function NumberPrototypeToExponential(fractionDigits) {
   return %NumberToExponential(x, f);
 }
 
-// builtins/number.ts:92 Number.prototype.toPrecision
+// builtins/number.ts:97 Number.prototype.toPrecision
 function NumberPrototypeToPrecision(precision) {
   let $1;
   const x = (($1 = %PrimitiveValue(this), (!%IsNumber($1)) ? %Throw(%NewTypeError("not a number")) : %AsNumber($1)));
@@ -6764,18 +8127,18 @@ function NumberPrototypeToPrecision(precision) {
   return %NumberToPrecision(x, (%ToIntegerOrInfinityNumber(((%IsObject(precision)) ? %ToNumberPrimitive(ToPrimitive(precision, "number")) : %ToNumberPrimitive(precision)))));
 }
 
-// builtins/number.ts:101
+// builtins/number.ts:106
 function IsFiniteNumber(n) {
   return n === n && n !== 1 / 0 && n !== -1 / 0;
 }
 
-// builtins/number.ts:110 Number.isFinite
+// builtins/number.ts:115 Number.isFinite
 function NumberIsFinite(number) {
   let $1;
   return %IsNumber(number) && ($1 = %AsNumber(number), $1 === $1 && $1 !== 1 / 0 && $1 !== -1 / 0);
 }
 
-// builtins/number.ts:119 Number.isInteger
+// builtins/number.ts:124 Number.isInteger
 function NumberIsInteger(number) {
   if (!%IsNumber(number)) {
     return false;
@@ -6784,7 +8147,7 @@ function NumberIsInteger(number) {
   return (n === n && n !== 1 / 0 && n !== -1 / 0) && %ToIntegerOrInfinityNumber(n) === n;
 }
 
-// builtins/number.ts:132 Number.isNaN
+// builtins/number.ts:137 Number.isNaN
 function NumberIsNaN(number) {
   if (!%IsNumber(number)) {
     return false;
@@ -6793,7 +8156,7 @@ function NumberIsNaN(number) {
   return n !== n;
 }
 
-// builtins/number.ts:144 Number.isSafeInteger
+// builtins/number.ts:149 Number.isSafeInteger
 function NumberIsSafeInteger(number) {
   if (!NumberIsInteger(number)) {
     return false;
@@ -6802,64 +8165,64 @@ function NumberIsSafeInteger(number) {
   return n <= 9007199254740991 && n >= -9007199254740991;
 }
 
-// builtins/number.ts:156 value Number.EPSILON
+// builtins/number.ts:161 value Number.EPSILON
 function NumberEpsilon() {
   return 2.220446049250313e-16;
 }
 
-// builtins/number.ts:164 value Number.MAX_SAFE_INTEGER
+// builtins/number.ts:169 value Number.MAX_SAFE_INTEGER
 function NumberMaxSafeInteger() {
   return 9007199254740991;
 }
 
-// builtins/number.ts:172 value Number.MAX_VALUE
+// builtins/number.ts:177 value Number.MAX_VALUE
 function NumberMaxValue() {
   return 1.7976931348623157e308;
 }
 
-// builtins/number.ts:180 value Number.MIN_SAFE_INTEGER
+// builtins/number.ts:185 value Number.MIN_SAFE_INTEGER
 function NumberMinSafeInteger() {
   return -9007199254740991;
 }
 
-// builtins/number.ts:188 value Number.MIN_VALUE
+// builtins/number.ts:193 value Number.MIN_VALUE
 function NumberMinValue() {
   return 5e-324;
 }
 
-// builtins/number.ts:196 value Number.NaN
+// builtins/number.ts:201 value Number.NaN
 function NumberNaN() {
   return 0 / 0;
 }
 
-// builtins/number.ts:204 value Number.NEGATIVE_INFINITY
+// builtins/number.ts:209 value Number.NEGATIVE_INFINITY
 function NumberNegativeInfinity() {
   return -1 / 0;
 }
 
-// builtins/number.ts:212 value Number.POSITIVE_INFINITY
+// builtins/number.ts:217 value Number.POSITIVE_INFINITY
 function NumberPositiveInfinity() {
   return 1 / 0;
 }
 
-// builtins/number.ts:222 parseFloat Number.parseFloat
+// builtins/number.ts:227 parseFloat Number.parseFloat
 function GlobalParseFloat(string) {
   return %StringParseFloat(ToString(string));
 }
 
-// builtins/number.ts:232 parseInt Number.parseInt
+// builtins/number.ts:237 parseInt Number.parseInt
 function GlobalParseInt(string, radix) {
   const s = ToString(string);
   return %StringParseInt(s, %NumberToInt32(((%IsObject(radix)) ? %ToNumberPrimitive(ToPrimitive(radix, "number")) : %ToNumberPrimitive(radix))));
 }
 
-// builtins/number.ts:242 isNaN
+// builtins/number.ts:247 isNaN
 function GlobalIsNaN(number) {
   const n = ((%IsObject(number)) ? %ToNumberPrimitive(ToPrimitive(number, "number")) : %ToNumberPrimitive(number));
   return n !== n;
 }
 
-// builtins/number.ts:252 isFinite
+// builtins/number.ts:257 isFinite
 function GlobalIsFinite(number) {
   let $1;
   return ($1 = ((%IsObject(number)) ? %ToNumberPrimitive(ToPrimitive(number, "number")) : %ToNumberPrimitive(number)), $1 === $1 && $1 !== 1 / 0 && $1 !== -1 / 0);
@@ -9854,6 +11217,104 @@ function SetPrototypeIsDisjointFrom(other) {
   return true;
 }
 
+// builtins/sharedarraybuffer.ts:7
+function ThisSharedArrayBuffer(v) {
+  if (!%AsBool(%BufferInfo(v, 5))) {
+    throw %NewTypeError("SharedArrayBuffer expected");
+  }
+  return %AsObj(v);
+}
+
+// builtins/sharedarraybuffer.ts:15
+function AllocateSharedArrayBuffer(newTarget, byteLength, max) {
+  if (max !== undefined && byteLength > %AsNumber(max)) {
+    throw %NewRangeError("invalid array buffer max length");
+  }
+  const proto = GetPrototypeFromConstructor(newTarget, "SharedArrayBufferPrototype");
+  const waiters = %NewRecord(1);
+  %RecordSet(waiters, 0, undefined);
+  return %SharedArrayBufferCreate(proto, byteLength, max, waiters);
+}
+
+// builtins/sharedarraybuffer.ts:30 constructor SharedArrayBuffer
+function SharedArrayBufferConstructor(length, options) {
+  if (new.target === undefined) {
+    throw %NewTypeError("must be called with new");
+  }
+  const byteLength = ToIndex(length);
+  let max = undefined;
+  if (%IsObject(options)) {
+    const m = %Get(%AsObj(options), "maxByteLength");
+    if (m !== undefined) {
+      max = ToIndex(m);
+    }
+  }
+  return AllocateSharedArrayBuffer(new.target, byteLength, max);
+}
+
+// builtins/sharedarraybuffer.ts:49 get SharedArrayBuffer[Symbol.species]
+function SharedArrayBufferSpecies() {
+  return this;
+}
+
+// builtins/sharedarraybuffer.ts:57 get SharedArrayBuffer.prototype.byteLength
+function SharedArrayBufferPrototypeByteLength() {
+  return %BufferInfo(((!%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("SharedArrayBuffer expected")) : %AsObj(this)), 0);
+}
+
+// builtins/sharedarraybuffer.ts:65 SharedArrayBuffer.prototype.grow
+function SharedArrayBufferPrototypeGrow(newLength) {
+  const o = ((!%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("SharedArrayBuffer expected")) : %AsObj(this));
+  if (!%AsBool(%BufferInfo(o, 2))) {
+    throw %NewTypeError("SharedArrayBuffer is not growable");
+  }
+  const newByteLength = ToIndex(newLength);
+  if (newByteLength > %AsNumber(%BufferInfo(o, 1))) {
+    throw %NewRangeError("invalid array buffer length");
+  }
+  if (newByteLength < (%AsNumber(%BufferInfo(o, 0)))) {
+    throw %NewRangeError("SharedArrayBuffer cannot shrink");
+  }
+  %BufferResize(o, newByteLength);
+}
+
+// builtins/sharedarraybuffer.ts:84 get SharedArrayBuffer.prototype.growable
+function SharedArrayBufferPrototypeGrowable() {
+  return %BufferInfo(((!%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("SharedArrayBuffer expected")) : %AsObj(this)), 2);
+}
+
+// builtins/sharedarraybuffer.ts:92 get SharedArrayBuffer.prototype.maxByteLength
+function SharedArrayBufferPrototypeMaxByteLength() {
+  return %BufferInfo(((!%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("SharedArrayBuffer expected")) : %AsObj(this)), 1);
+}
+
+// builtins/sharedarraybuffer.ts:100 SharedArrayBuffer.prototype.slice
+function SharedArrayBufferPrototypeSlice(start, end) {
+  const o = ((!%AsBool(%BufferInfo(this, 5))) ? %Throw(%NewTypeError("SharedArrayBuffer expected")) : %AsObj(this));
+  const len = (%AsNumber(%BufferInfo(o, 0)));
+  const first = RelativeIndex(start, len, 0);
+  const fin = RelativeIndex(end, len, len);
+  const newLen = fin > first ? fin - first : 0;
+  const ctor = SpeciesConstructor(o, %RealmConstructor("SharedArrayBuffer"));
+  const created = %Construct(ctor, newLen);
+  ((!%AsBool(%BufferInfo(created, 5))) ? %Throw(%NewTypeError("SharedArrayBuffer expected")) : %AsObj(created));
+  if (created === o) {
+    throw %NewTypeError("cannot use identical SharedArrayBuffer");
+  }
+  if ((%AsNumber(%BufferInfo(created, 0))) < newLen) {
+    throw %NewTypeError("new SharedArrayBuffer is too small");
+  }
+  if (newLen > 0) {
+    %BufferCopy(o, first, created, 0, newLen);
+  }
+  return created;
+}
+
+// builtins/sharedarraybuffer.ts:126 value SharedArrayBuffer.prototype[Symbol.toStringTag]
+function SharedArrayBufferPrototypeToStringTag() {
+  return "SharedArrayBuffer";
+}
+
 // builtins/spread.ts:9 %ArraySpread
 function ArraySpread(arr, src) {
   const iterator = GetIterator(src);
@@ -10290,13 +11751,18 @@ function StringPrototypeEndsWith(searchString, endPosition) {
   return %StrSubstring(s, end - searchLength, end) === search;
 }
 
-// builtins/string.ts:239 String.prototype.localeCompare
-function StringPrototypeLocaleCompare(that) {
+// builtins/string.ts:242 String.prototype.localeCompare
+function StringPrototypeLocaleCompare(that, locales, options) {
+  let $1;
   const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
-  return %StrLocaleCompare(s, ToString(that));
+  const t = ToString(that);
+  if ((locales !== undefined || options !== undefined) && %IntlEnabled()) {
+    return (($1 = IntlNewCollator(undefined, locales, options), %AsNumber(%IntlFormat(2, %AsStr(%IntlSpec($1, 2)), s, t, false))));
+  }
+  return %StrLocaleCompare(s, t);
 }
 
-// builtins/string.ts:251 String.prototype.slice
+// builtins/string.ts:258 String.prototype.slice
 function StringPrototypeSlice(start, end) {
   const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
   const len = (%StrLength(s));
@@ -10308,7 +11774,7 @@ function StringPrototypeSlice(start, end) {
   return %StrSubstring(s, from, to);
 }
 
-// builtins/string.ts:267 String.prototype.substring
+// builtins/string.ts:274 String.prototype.substring
 function StringPrototypeSubstring(start, end) {
   const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
   const len = (%StrLength(s));
@@ -10317,7 +11783,7 @@ function StringPrototypeSubstring(start, end) {
   return a < b ? %StrSubstring(s, a, b) : %StrSubstring(s, b, a);
 }
 
-// builtins/string.ts:280 String.prototype.substr
+// builtins/string.ts:287 String.prototype.substr
 function StringPrototypeSubstr(start, length) {
   const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
   const size = (%StrLength(s));
@@ -10336,7 +11802,7 @@ function StringPrototypeSubstr(start, length) {
   return %StrSubstring(s, intStart, intEnd);
 }
 
-// builtins/string.ts:301
+// builtins/string.ts:308
 function CreateHTML(string, tag, attribute, value) {
   const s = ((string === undefined || string === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(string));
   let p1 = "<" + tag;
@@ -10356,72 +11822,72 @@ function CreateHTML(string, tag, attribute, value) {
   return p1 + ">" + s + "</" + tag + ">";
 }
 
-// builtins/string.ts:324 String.prototype.anchor
+// builtins/string.ts:331 String.prototype.anchor
 function StringPrototypeAnchor(name) {
   return CreateHTML(this, "a", "name", name);
 }
 
-// builtins/string.ts:332 String.prototype.big
+// builtins/string.ts:339 String.prototype.big
 function StringPrototypeBig() {
   return CreateHTML(this, "big", "", undefined);
 }
 
-// builtins/string.ts:340 String.prototype.blink
+// builtins/string.ts:347 String.prototype.blink
 function StringPrototypeBlink() {
   return CreateHTML(this, "blink", "", undefined);
 }
 
-// builtins/string.ts:348 String.prototype.bold
+// builtins/string.ts:355 String.prototype.bold
 function StringPrototypeBold() {
   return CreateHTML(this, "b", "", undefined);
 }
 
-// builtins/string.ts:356 String.prototype.fixed
+// builtins/string.ts:363 String.prototype.fixed
 function StringPrototypeFixed() {
   return CreateHTML(this, "tt", "", undefined);
 }
 
-// builtins/string.ts:364 String.prototype.fontcolor
+// builtins/string.ts:371 String.prototype.fontcolor
 function StringPrototypeFontcolor(color) {
   return CreateHTML(this, "font", "color", color);
 }
 
-// builtins/string.ts:372 String.prototype.fontsize
+// builtins/string.ts:379 String.prototype.fontsize
 function StringPrototypeFontsize(size) {
   return CreateHTML(this, "font", "size", size);
 }
 
-// builtins/string.ts:380 String.prototype.italics
+// builtins/string.ts:387 String.prototype.italics
 function StringPrototypeItalics() {
   return CreateHTML(this, "i", "", undefined);
 }
 
-// builtins/string.ts:388 String.prototype.link
+// builtins/string.ts:395 String.prototype.link
 function StringPrototypeLink(url) {
   return CreateHTML(this, "a", "href", url);
 }
 
-// builtins/string.ts:396 String.prototype.small
+// builtins/string.ts:403 String.prototype.small
 function StringPrototypeSmall() {
   return CreateHTML(this, "small", "", undefined);
 }
 
-// builtins/string.ts:404 String.prototype.strike
+// builtins/string.ts:411 String.prototype.strike
 function StringPrototypeStrike() {
   return CreateHTML(this, "strike", "", undefined);
 }
 
-// builtins/string.ts:412 String.prototype.sub
+// builtins/string.ts:419 String.prototype.sub
 function StringPrototypeSub() {
   return CreateHTML(this, "sub", "", undefined);
 }
 
-// builtins/string.ts:420 String.prototype.sup
+// builtins/string.ts:427 String.prototype.sup
 function StringPrototypeSup() {
   return CreateHTML(this, "sup", "", undefined);
 }
 
-// builtins/string.ts:430 String.prototype.concat
+// builtins/string.ts:437 String.prototype.concat
 function StringPrototypeConcat(...args) {
   let r = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
   const n = LengthOfArrayLike(args);
@@ -10431,7 +11897,7 @@ function StringPrototypeConcat(...args) {
   return r;
 }
 
-// builtins/string.ts:444 String.prototype.repeat
+// builtins/string.ts:451 String.prototype.repeat
 function StringPrototypeRepeat(count) {
   const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
   const n = (%ToIntegerOrInfinityNumber(((%IsObject(count)) ? %ToNumberPrimitive(ToPrimitive(count, "number")) : %ToNumberPrimitive(count))));
@@ -10444,7 +11910,7 @@ function StringPrototypeRepeat(count) {
   return %StrRepeat(s, n);
 }
 
-// builtins/string.ts:457
+// builtins/string.ts:464
 function StringPad(s, maxLength, fillString, atStart) {
   const intMaxLength = ToLength(maxLength);
   const stringLength = (%StrLength(s));
@@ -10461,62 +11927,64 @@ function StringPad(s, maxLength, fillString, atStart) {
   return atStart ? truncated + s : s + truncated;
 }
 
-// builtins/string.ts:478 String.prototype.padEnd
+// builtins/string.ts:485 String.prototype.padEnd
 function StringPrototypePadEnd(maxLength, fillString) {
   return StringPad(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), maxLength, fillString, false);
 }
 
-// builtins/string.ts:487 String.prototype.padStart
+// builtins/string.ts:494 String.prototype.padStart
 function StringPrototypePadStart(maxLength, fillString) {
   return StringPad(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), maxLength, fillString, true);
 }
 
-// builtins/string.ts:498 String.prototype.toLowerCase
+// builtins/string.ts:505 String.prototype.toLowerCase
 function StringPrototypeToLowerCase() {
-  return %StrToCase(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), false);
+  return %StrToCase(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), 0);
 }
 
-// builtins/string.ts:507 String.prototype.toUpperCase
+// builtins/string.ts:514 String.prototype.toUpperCase
 function StringPrototypeToUpperCase() {
-  return %StrToCase(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), true);
+  return %StrToCase(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), 1);
 }
 
-// builtins/string.ts:516 String.prototype.toLocaleLowerCase
-function StringPrototypeToLocaleLowerCase() {
-  return %StrToCase(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), false);
+// builtins/string.ts:524 String.prototype.toLocaleLowerCase
+function StringPrototypeToLocaleLowerCase(locales) {
+  const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
+  return %StrToCase(s, IntlCaseMode(locales, 0));
 }
 
-// builtins/string.ts:525 String.prototype.toLocaleUpperCase
-function StringPrototypeToLocaleUpperCase() {
-  return %StrToCase(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), true);
+// builtins/string.ts:535 String.prototype.toLocaleUpperCase
+function StringPrototypeToLocaleUpperCase(locales) {
+  const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
+  return %StrToCase(s, IntlCaseMode(locales, 1));
 }
 
-// builtins/string.ts:534 String.prototype.trim
+// builtins/string.ts:545 String.prototype.trim
 function StringPrototypeTrim() {
   return %StrTrim(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), 0);
 }
 
-// builtins/string.ts:544 String.prototype.trimStart String.prototype.trimLeft
+// builtins/string.ts:555 String.prototype.trimStart String.prototype.trimLeft
 function StringPrototypeTrimStart() {
   return %StrTrim(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), 1);
 }
 
-// builtins/string.ts:554 String.prototype.trimEnd String.prototype.trimRight
+// builtins/string.ts:565 String.prototype.trimEnd String.prototype.trimRight
 function StringPrototypeTrimEnd() {
   return %StrTrim(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)), 2);
 }
 
-// builtins/string.ts:562 String.prototype.isWellFormed
+// builtins/string.ts:573 String.prototype.isWellFormed
 function StringPrototypeIsWellFormed() {
   return %StrIsWellFormed(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)));
 }
 
-// builtins/string.ts:570 String.prototype.toWellFormed
+// builtins/string.ts:581 String.prototype.toWellFormed
 function StringPrototypeToWellFormed() {
   return %StrToWellFormed(((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this)));
 }
 
-// builtins/string.ts:579 String.prototype.normalize
+// builtins/string.ts:590 String.prototype.normalize
 function StringPrototypeNormalize(form) {
   const s = ((this === undefined || this === null) ? %Throw(%NewTypeError("null or undefined are forbidden")) : ToString(this));
   let f = "NFC";
@@ -10542,13 +12010,13 @@ function StringPrototypeNormalize(form) {
   return %AsStr(r);
 }
 
-// builtins/string.ts:612 String.fromCharCode
+// builtins/string.ts:623 String.fromCharCode
 function StringFromCharCode(...codeUnits) {
   CoerceNumbers(codeUnits);
   return %StrFromCodeUnits(codeUnits);
 }
 
-// builtins/string.ts:622 String.fromCodePoint
+// builtins/string.ts:633 String.fromCodePoint
 function StringFromCodePoint(...codePoints) {
   if (%AllCodePoints(codePoints)) {
     return %StrFromCodePoints(codePoints);
@@ -10565,7 +12033,7 @@ function StringFromCodePoint(...codePoints) {
   return %StrFromCodePoints(codePoints);
 }
 
-// builtins/string.ts:643 String.raw
+// builtins/string.ts:654 String.raw
 function StringRaw(template, ...substitutions) {
   const cooked = %ToObject(template);
   const literals = %ToObject(%Get(cooked, "raw"));
@@ -11898,7 +13366,7 @@ function TypedArrayPrototypeWith(index, value) {
 }
 
 // builtins/typedarray.ts:1457 %TypedArray%.prototype.toLocaleString
-function TypedArrayPrototypeToLocaleString() {
+function TypedArrayPrototypeToLocaleString(locales, options) {
   let $1;
   const o = ((%TypedArrayField(this, 0), ($1 = %AsObj(this), ((%AsBool(%TypedArrayField($1, 5)))) ? %Throw(%NewTypeError("ArrayBuffer is detached or resized")) : $1)));
   const len = (%AsNumber(%TypedArrayField(o, 3)));
@@ -11913,7 +13381,7 @@ function TypedArrayPrototypeToLocaleString() {
       }
       const v = %TypedArrayGet(o, k);
       if (v !== undefined) {
-        r += ToString(%Call(%GetV(v, "toLocaleString"), v));
+        r += ToString(%Call(%GetV(v, "toLocaleString"), v, locales, options));
       }
     }
   } finally {
@@ -12312,6 +13780,25 @@ function GlobalAtob(...args) {
   return %AsStr(r);
 }
 
+// builtins/webassembly.ts:11 value WebAssembly
+function WebAssemblyObject() {
+  return %ObjectCreate(%RealmIntrinsic("ObjectPrototype"));
+}
+
+// builtins/webassembly.ts:22 value WebAssembly[Symbol.toStringTag]
+function WebAssemblyToStringTag() {
+  const ns = %Get(%GlobalObject(), "WebAssembly");
+  const script = %CompileFunction(0, "WebAssembly", WebAssemblyRuntimeSource());
+  const init = %Call(script, %GlobalObject());
+  %Call(init, undefined, ns);
+  return "WebAssembly";
+}
+
+// builtins/webassembly.ts:31
+function WebAssemblyRuntimeSource() {
+  return "\"use strict\";\nconst $BigInt = BigInt, $Number = Number, $Math = Math, $Object = Object, $String = String;\nconst $Uint8Array = Uint8Array, $DataView = DataView, $ArrayBuffer = ArrayBuffer;\nconst $Promise = Promise, $WeakMap = WeakMap, $Error = Error, $TypeError = TypeError;\nconst $RangeError = RangeError, $Function = Function, $Symbol = Symbol, $Array = Array;\nconst asIntN = $BigInt.asIntN, asUintN = $BigInt.asUintN, fround = $Math.fround;\nconst defineProperty = $Object.defineProperty, freeze = $Object.freeze;\nconst isView = $ArrayBuffer.isView;\nconst abByteLength = $Object.getOwnPropertyDescriptor($ArrayBuffer.prototype, \"byteLength\").get;\nconst abTransfer = $ArrayBuffer.prototype.transfer;\nconst apply = Reflect.apply;\nconst PAGE = 65536;\nconst MAX_PAGES = 65536;\nconst MAX_TABLE = 10000000;\nfunction errorClass(name) {\nconst C = function (message) {\nreturn Reflect.construct($Error, [message, arguments[1]], new.target === undefined ? C : new.target);\n};\ndefineProperty(C, \"name\", { value: name });\ndefineProperty(C, \"length\", { value: 1 });\n$Object.setPrototypeOf(C, $Error);\nC.prototype = $Object.create($Error.prototype, {\nconstructor: { value: C, writable: true, configurable: true },\nname: { value: name, writable: true, configurable: true },\nmessage: { value: \"\", writable: true, configurable: true },\n});\ndefineProperty(C, \"prototype\", { writable: false });\nreturn C;\n}\nconst CompileError = errorClass(\"CompileError\");\nconst LinkError = errorClass(\"LinkError\");\nconst RuntimeError = errorClass(\"RuntimeError\");\nfunction trap(msg) {\nthrow new RuntimeError(msg);\n}\n/** A copy of a BufferSource's bytes, or TypeError. */\nfunction copyBytes(src, api) {\nif (isView(src)) {\nconst u = new $Uint8Array(src.buffer, src.byteOffset, src.byteLength);\nreturn u.slice();\n}\nlet len;\ntry {\nlen = apply(abByteLength, src, []);\n} catch (e) {\nthrow new $TypeError(api + \"Argument 0 must be a buffer source\");\n}\nreturn new $Uint8Array(src, 0, len).slice();\n}\nconst I32 = 0x7f, I64 = 0x7e, F32 = 0x7d, F64 = 0x7c, V128 = 0x7b, FUNCREF = 0x70, EXTERNREF = 0x6f;\nconst TYPE_NAMES = { 0x7f: \"i32\", 0x7e: \"i64\", 0x7d: \"f32\", 0x7c: \"f64\", 0x70: \"funcref\", 0x6f: \"externref\" };\nclass Reader {\nconstructor(bytes, pos, end) {\nthis.b = bytes;\nthis.p = pos;\nthis.end = end;\n}\nfail(msg, at) {\nthrow new CompileError(apiName + msg + \" @+\" + (at === undefined ? this.p : at));\n}\neof() {\nreturn this.p >= this.end;\n}\nu8() {\nif (this.p >= this.end) this.fail(\"unexpected end of section or function\");\nreturn this.b[this.p++];\n}\nu32() {\nlet r = 0, shift = 0;\nconst at = this.p;\nfor (let i = 0; i < 5; i++) {\nconst b = this.u8();\nif (i === 4 && (b & 0x70) !== 0) this.fail(\"extra bits in varint\", at);\nr += (b & 0x7f) * 2 ** shift;\nif ((b & 0x80) === 0) return r;\nshift += 7;\n}\nthis.fail(\"length overflow while decoding varint\", at);\n}\ns32() {\nlet r = 0, shift = 0, b;\nconst at = this.p;\nfor (let i = 0; ; i++) {\nif (i === 5) this.fail(\"length overflow while decoding varint\", at);\nb = this.u8();\nr |= (b & 0x7f) << shift;\nshift += 7;\nif ((b & 0x80) === 0) {\nif (i === 4) {\nconst top = b & 0x70;\nconst sign = (b & 0x08) !== 0;\nif (top !== (sign ? 0x70 : 0)) this.fail(\"extra bits in varint\", at);\nreturn r | 0;\n}\nif (b & 0x40) r |= -1 << shift;\nreturn r | 0;\n}\n}\n}\ns33() {\nlet r = 0, shift = 0, b;\nconst at = this.p;\nfor (let i = 0; ; i++) {\nif (i === 5) this.fail(\"length overflow while decoding varint\", at);\nb = this.u8();\nr += (b & 0x7f) * 2 ** shift;\nshift += 7;\nif ((b & 0x80) === 0) break;\n}\nif (b & 0x40) r -= 2 ** shift;\nreturn r;\n}\ns64() {\nlet r = 0n, shift = 0n, b;\nconst at = this.p;\nfor (let i = 0; ; i++) {\nif (i === 10) this.fail(\"length overflow while decoding varint\", at);\nb = this.u8();\nr |= $BigInt(b & 0x7f) << shift;\nshift += 7n;\nif ((b & 0x80) === 0) {\nif (i === 9 && b !== 0 && b !== 0x7f) this.fail(\"extra bits in varint\", at);\nif (b & 0x40) r -= 1n << shift;\nbreak;\n}\n}\nreturn asIntN(64, r);\n}\nf32() {\nif (this.p + 4 > this.end) this.fail(\"unexpected end\");\nconst v = new $DataView(this.b.buffer, this.b.byteOffset + this.p, 4).getFloat32(0, true);\nthis.p += 4;\nreturn v;\n}\nf64() {\nif (this.p + 8 > this.end) this.fail(\"unexpected end\");\nconst v = new $DataView(this.b.buffer, this.b.byteOffset + this.p, 8).getFloat64(0, true);\nthis.p += 8;\nreturn v;\n}\nbytes(n) {\nif (this.p + n > this.end) this.fail(\"length out of bounds\");\nconst v = this.b.subarray(this.p, this.p + n);\nthis.p += n;\nreturn v;\n}\nname() {\nconst n = this.u32();\nconst at = this.p;\nreturn utf8(this.bytes(n), this, at);\n}\n}\nfunction utf8(b, r, at) {\nlet s = \"\";\nfor (let i = 0; i < b.length; ) {\nconst c = b[i];\nlet cp, n;\nif (c < 0x80) { cp = c; n = 1; }\nelse if (c >= 0xc2 && c < 0xe0) { cp = c & 0x1f; n = 2; }\nelse if (c >= 0xe0 && c < 0xf0) { cp = c & 0x0f; n = 3; }\nelse if (c >= 0xf0 && c < 0xf5) { cp = c & 0x07; n = 4; }\nelse r.fail(\"no valid UTF-8 string\", at);\nif (i + n > b.length) r.fail(\"no valid UTF-8 string\", at);\nfor (let k = 1; k < n; k++) {\nconst d = b[i + k];\nif ((d & 0xc0) !== 0x80) r.fail(\"no valid UTF-8 string\", at);\ncp = (cp << 6) | (d & 0x3f);\n}\nif ((n === 3 && (cp < 0x800 || (cp >= 0xd800 && cp < 0xe000))) || (n === 4 && (cp < 0x10000 || cp > 0x10ffff)))\nr.fail(\"no valid UTF-8 string\", at);\ns += $String.fromCodePoint(cp);\ni += n;\n}\nreturn s;\n}\nfunction valType(r) {\nconst at = r.p;\nconst t = r.u8();\nif (t === I32 || t === I64 || t === F32 || t === F64 || t === FUNCREF || t === EXTERNREF) return t;\nif (t === V128) r.fail(\"Wasm SIMD unsupported\", at);\nr.fail(\"invalid value type 0x\" + t.toString(16), at);\n}\nfunction refType(r) {\nconst at = r.p;\nconst t = r.u8();\nif (t === FUNCREF || t === EXTERNREF) return t;\nr.fail(\"invalid reference type\", at);\n}\nfunction limits(r, max, what) {\nconst at = r.p;\nconst flags = r.u8();\nconst unit = what === \"memory\" ? \" pages\" : \" elements\";\nif (flags > 3 || (flags & 2 && what !== \"memory\")) r.fail(\"invalid \" + what + \" limits flags 0x\" + flags.toString(16), at);\nif (flags & 2) r.fail(\"shared memory is not supported\", at);\nconst min = r.u32();\nif (min > max) r.fail(\"initial \" + what + \" size (\" + min + unit + \") is larger than implementation limit (\" + max + unit + \")\", at + 1);\nlet mx = null;\nif (flags & 1) {\nconst mat = r.p;\nmx = r.u32();\nif (mx > max) r.fail(\"maximum \" + what + \" size (\" + mx + unit + \") is larger than implementation limit (\" + max + unit + \")\", mat);\nif (mx < min) r.fail(\"maximum \" + what + \" size (\" + mx + unit + \") is smaller than initial size (\" + min + unit + \")\", mat);\n}\nreturn { min, max: mx };\n}\nconst SECTION_ORDER = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 13: 6, 6: 7, 7: 8, 8: 9, 9: 10, 12: 11, 10: 12, 11: 13 };\nconst SECTION_NAMES = { 1: \"Type\", 2: \"Import\", 3: \"Function\", 4: \"Table\", 5: \"Memory\", 6: \"Global\", 7: \"Export\", 8: \"Start\", 9: \"Element\", 10: \"Code\", 11: \"Data\", 12: \"DataCount\", 13: \"Tag\" };\nfunction decode(bytes) {\nconst r = new Reader(bytes, 0, bytes.length);\nif (bytes.length === 0) r.fail(\"BufferSource argument is empty\", 0);\nif (bytes.length < 4) r.fail(\"expected 4 bytes, fell off end\", 0);\nif (bytes[0] !== 0 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d)\nr.fail(\"expected magic word 00 61 73 6d, found \" + hex4(bytes, 0), 0);\nif (bytes.length < 8) r.fail(\"expected 4 bytes, fell off end\", 4);\nif (bytes[4] !== 1 || bytes[5] !== 0 || bytes[6] !== 0 || bytes[7] !== 0)\nr.fail(\"expected version 01 00 00 00, found \" + hex4(bytes, 4), 4);\nr.p = 8;\nconst M = {\ntypes: [], imports: [], funcs: [], tables: [], mems: [], globals: [], exports: [],\nstart: null, elems: [], dataCount: null, codes: [], datas: [], customs: [],\nnImportFuncs: 0, nImportTables: 0, nImportMems: 0, nImportGlobals: 0, declared: null,\n};\nlet last = 0;\nlet nFuncDecls = 0;\nwhile (!r.eof()) {\nconst at = r.p;\nconst id = r.u8();\nconst size = r.u32();\nconst start = r.p;\nconst end = start + size;\nif (end > bytes.length) r.fail(\"section (code \" + id + \", \\\"\" + (SECTION_NAMES[id] || \"Unknown\") + \"\\\") extends past end of the module (length \" + size + \", remaining bytes \" + (bytes.length - start) + \")\", start);\nconst s = new Reader(bytes, start, end);\nif (id === 0) {\nconst name = s.name();\nM.customs.push({ name, bytes: bytes.slice(s.p, end) });\nr.p = end;\ncontinue;\n}\nconst ord = SECTION_ORDER[id];\nif (ord === undefined) r.fail(\"unknown section code #0x\" + id.toString(16), at);\nif (ord <= last) r.fail(\"unexpected section <\" + SECTION_NAMES[id] + \">\", at);\nlast = ord;\nswitch (id) {\ncase 1: {\nconst n = s.u32();\nfor (let i = 0; i < n; i++) {\nconst fat = s.p;\nconst form = s.u8();\nif (form !== 0x60) s.fail(\"invalid function type form\", fat);\nconst params = [], results = [];\nfor (let k = s.u32(); k > 0; k--) params.push(valType(s));\nfor (let k = s.u32(); k > 0; k--) results.push(valType(s));\nM.types.push({ params, results, sig: sigOf(params, results) });\n}\nbreak;\n}\ncase 2: {\nconst n = s.u32();\nfor (let i = 0; i < n; i++) {\nconst module = s.name();\nconst name = s.name();\nconst kat = s.p;\nconst kind = s.u8();\nconst imp = { module, name, kind, index: 0 };\nif (kind === 0) {\nconst t = s.u32();\nif (t >= M.types.length) s.fail(\"signature index \" + t + \" out of bounds (\" + M.types.length + \" signatures)\", kat + 1);\nimp.index = M.funcs.length;\nM.funcs.push(t);\nM.nImportFuncs++;\n} else if (kind === 1) {\nconst elem = refType(s);\nconst l = limits(s, MAX_TABLE, \"table\");\nimp.index = M.tables.length;\nM.tables.push({ elem, min: l.min, max: l.max });\nM.nImportTables++;\n} else if (kind === 2) {\nconst l = limits(s, MAX_PAGES, \"memory\");\nimp.index = M.mems.length;\nM.mems.push(l);\nM.nImportMems++;\n} else if (kind === 3) {\nconst type = valType(s);\nconst m = s.u8();\nif (m > 1) s.fail(\"invalid global mutability\", s.p - 1);\nimp.index = M.globals.length;\nM.globals.push({ type, mut: m === 1, init: null });\nM.nImportGlobals++;\n} else if (kind === 4) {\ns.fail(\"exception handling is not supported\", kat);\n} else {\ns.fail(\"unknown import kind 0x\" + kind.toString(16), kat);\n}\nM.imports.push(imp);\n}\nbreak;\n}\ncase 3: {\nconst n = s.u32();\nnFuncDecls = n;\nfor (let i = 0; i < n; i++) {\nconst at2 = s.p;\nconst t = s.u32();\nif (t >= M.types.length) s.fail(\"signature index \" + t + \" out of bounds (\" + M.types.length + \" signatures)\", at2);\nM.funcs.push(t);\n}\nbreak;\n}\ncase 4: {\nconst n = s.u32();\nfor (let i = 0; i < n; i++) {\nconst elem = refType(s);\nconst l = limits(s, MAX_TABLE, \"table\");\nM.tables.push({ elem, min: l.min, max: l.max });\n}\nbreak;\n}\ncase 5: {\nconst n = s.u32();\nfor (let i = 0; i < n; i++) M.mems.push(limits(s, MAX_PAGES, \"memory\"));\nif (M.mems.length > 1) s.fail(\"At most one memory is supported (declared \" + M.mems.length + \")\", start);\nbreak;\n}\ncase 6: {\nconst n = s.u32();\nfor (let i = 0; i < n; i++) {\nconst type = valType(s);\nconst m = s.u8();\nif (m > 1) s.fail(\"invalid global mutability\", s.p - 1);\nconst init = constExpr(s, M, type, M.globals.length);\nM.globals.push({ type, mut: m === 1, init });\n}\nbreak;\n}\ncase 7: {\nconst n = s.u32();\nconst seen = new Set();\nfor (let i = 0; i < n; i++) {\nconst nat = s.p;\nconst name = s.name();\nconst kat = s.p;\nconst kind = s.u8();\nconst index = s.u32();\nconst limit = [M.funcs.length, M.tables.length, M.mems.length, M.globals.length][kind];\nif (limit === undefined) s.fail(\"invalid export kind 0x\" + kind.toString(16), kat);\nif (index >= limit) s.fail(\"invalid \" + kindName(kind) + \" index: \" + index, kat + 1);\nif (seen.has(name)) s.fail(\"Duplicate export name '\" + name + \"'\", nat);\nseen.add(name);\nM.exports.push({ name, kind, index });\nif (kind === 0) declare(M, index);\n}\nbreak;\n}\ncase 8: {\nconst at2 = s.p;\nconst fx = s.u32();\nif (fx >= M.funcs.length) s.fail(\"function index \" + fx + \" out of bounds\", at2);\nconst t = M.types[M.funcs[fx]];\nif (t.params.length || t.results.length) s.fail(\"invalid start function: non-zero parameter or return count\", at2);\nM.start = fx;\nbreak;\n}\ncase 9: {\nconst n = s.u32();\nfor (let i = 0; i < n; i++) M.elems.push(elemSegment(s, M));\nbreak;\n}\ncase 12:\nM.dataCount = s.u32();\nbreak;\ncase 10: {\nconst n = s.u32();\nif (n !== nFuncDecls) s.fail(\"function body count \" + n + \" mismatch (\" + nFuncDecls + \" expected)\", start);\nfor (let i = 0; i < n; i++) {\nconst sz = s.u32();\nconst bs = s.p;\nif (bs + sz > end) s.fail(\"function body extends beyond end of code section\", bs);\nconst fr = new Reader(bytes, bs, bs + sz);\nconst locals = [];\nlet total = 0;\nfor (let k = fr.u32(); k > 0; k--) {\nconst at3 = fr.p;\nconst cnt = fr.u32();\ntotal += cnt;\nif (total > 50000) fr.fail(\"local count too large\", at3);\nconst t = valType(fr);\nfor (let j = 0; j < cnt; j++) locals.push(t);\n}\nM.codes.push({ locals, start: fr.p, end: bs + sz });\ns.p = bs + sz;\n}\nbreak;\n}\ncase 11: {\nconst n = s.u32();\nif (M.dataCount !== null && n !== M.dataCount) s.fail(\"data segments count \" + n + \" mismatch (\" + M.dataCount + \" expected)\", start);\nfor (let i = 0; i < n; i++) {\nconst fat = s.p;\nconst flags = s.u32();\nlet mem = 0, offset = null, mode = \"active\";\nif (flags === 1) mode = \"passive\";\nelse if (flags === 2) mem = s.u32();\nelse if (flags !== 0) s.fail(\"illegal flag value \" + flags, fat);\nif (mode === \"active\") {\nif (mem >= M.mems.length) s.fail(\"invalid memory index \" + mem + \" for data section\", fat);\noffset = constExpr(s, M, I32, M.globals.length);\n}\nconst len = s.u32();\nM.datas.push({ mode, mem, offset, bytes: s.bytes(len) });\n}\nbreak;\n}\ncase 13:\ns.fail(\"exception handling is not supported\", at);\n}\nif (s.p !== end) s.fail(\"section was \" + (s.p < end ? \"longer\" : \"shorter\") + \" than expected size (\" + size + \" bytes expected, \" + (s.p - start) + \" decoded)\", s.p);\nr.p = end;\n}\nif (nFuncDecls !== M.codes.length) r.fail(\"function count is \" + nFuncDecls + \", but code section is absent\", r.p);\nif (M.dataCount !== null && M.datas.length !== M.dataCount) r.fail(\"data segments count 0 mismatch (\" + M.dataCount + \" expected)\", r.p);\nreturn M;\n}\nfunction hex4(b, at) {\nlet s = \"\";\nfor (let i = 0; i < 4; i++) s += (i ? \" \" : \"\") + ((b[at + i] | 0) < 16 ? \"0\" : \"\") + (b[at + i] | 0).toString(16);\nreturn s;\n}\nfunction sigOf(params, results) {\nlet s = \"\";\nfor (const t of params) s += TYPE_NAMES[t][0] + (t === EXTERNREF ? \"x\" : \"\");\ns += \":\";\nfor (const t of results) s += TYPE_NAMES[t][0] + (t === EXTERNREF ? \"x\" : \"\");\nreturn s;\n}\nfunction declare(M, fx) {\nif (M.declared === null) M.declared = new Set();\nM.declared.add(fx);\n}\nfunction kindName(k) {\nreturn [\"function\", \"table\", \"memory\", \"global\"][k];\n}\nconst OP_NAMES = \"unreachable nop block loop if else try catch throw rethrow throw_ref end br br_if br_table return call call_indirect return_call return_call_indirect\".split(\" \");\nconst OP_NAMES2 = { 0x1a: \"drop\", 0x1b: \"select\", 0x1c: \"select\", 0x20: \"local.get\", 0x21: \"local.set\", 0x22: \"local.tee\", 0x23: \"global.get\", 0x24: \"global.set\", 0x25: \"table.get\", 0x26: \"table.set\", 0x3f: \"memory.size\", 0x40: \"memory.grow\", 0xd1: \"ref.is_null\" };\nconst NUM_NAMES = \"i32.eqz i32.eq i32.ne i32.lt_s i32.lt_u i32.gt_s i32.gt_u i32.le_s i32.le_u i32.ge_s i32.ge_u i64.eqz i64.eq i64.ne i64.lt_s i64.lt_u i64.gt_s i64.gt_u i64.le_s i64.le_u i64.ge_s i64.ge_u f32.eq f32.ne f32.lt f32.gt f32.le f32.ge f64.eq f64.ne f64.lt f64.gt f64.le f64.ge i32.clz i32.ctz i32.popcnt i32.add i32.sub i32.mul i32.div_s i32.div_u i32.rem_s i32.rem_u i32.and i32.or i32.xor i32.shl i32.shr_s i32.shr_u i32.rotl i32.rotr i64.clz i64.ctz i64.popcnt i64.add i64.sub i64.mul i64.div_s i64.div_u i64.rem_s i64.rem_u i64.and i64.or i64.xor i64.shl i64.shr_s i64.shr_u i64.rotl i64.rotr f32.abs f32.neg f32.ceil f32.floor f32.trunc f32.nearest f32.sqrt f32.add f32.sub f32.mul f32.div f32.min f32.max f32.copysign f64.abs f64.neg f64.ceil f64.floor f64.trunc f64.nearest f64.sqrt f64.add f64.sub f64.mul f64.div f64.min f64.max f64.copysign i32.wrap_i64 i32.trunc_f32_s i32.trunc_f32_u i32.trunc_f64_s i32.trunc_f64_u i64.extend_i32_s i64.extend_i32_u i64.trunc_f32_s i64.trunc_f32_u i64.trunc_f64_s i64.trunc_f64_u f32.convert_i32_s f32.convert_i32_u f32.convert_i64_s f32.convert_i64_u f32.demote_f64 f64.convert_i32_s f64.convert_i32_u f64.convert_i64_s f64.convert_i64_u f64.promote_f32 i32.reinterpret_f32 i64.reinterpret_f64 f32.reinterpret_i32 f64.reinterpret_i64 i32.extend8_s i32.extend16_s i64.extend8_s i64.extend16_s i64.extend32_s\".split(\" \");\nconst MEM_NAMES = \"i32.load i64.load f32.load f64.load i32.load8_s i32.load8_u i32.load16_s i32.load16_u i64.load8_s i64.load8_u i64.load16_s i64.load16_u i64.load32_s i64.load32_u i32.store i64.store f32.store f64.store i32.store8 i32.store16 i64.store8 i64.store16 i64.store32\".split(\" \");\nfunction opName(op) {\nif (op < OP_NAMES.length) return OP_NAMES[op];\nif (OP_NAMES2[op] !== undefined) return OP_NAMES2[op];\nif (op >= 0x28 && op <= 0x3e) return MEM_NAMES[op - 0x28];\nif (op >= 0x45 && op <= 0xc4) return NUM_NAMES[op - 0x45];\nreturn \"0x\" + op.toString(16);\n}\n/**\n* A constant expression of type want, as a list of [op, imm] pairs evaluated at\n* instantiation. It may read the first nGlobals globals if immutable.\n*/\nfunction constExpr(s, M, want, nGlobals) {\nconst code = [];\nconst stack = [];\nfor (;;) {\nconst at = s.p;\nconst op = s.u8();\nswitch (op) {\ncase 0x0b:\nif (stack.length !== 1 || stack[0] !== want)\ns.fail(\"type error in constant expression[0] (expected \" + TYPE_NAMES[want] + \", got \" + (stack.length ? TYPE_NAMES[stack[stack.length - 1]] : \"<empty>\") + \")\", at);\nreturn code;\ncase 0x41: code.push([op, s.s32()]); stack.push(I32); break;\ncase 0x42: code.push([op, s.s64()]); stack.push(I64); break;\ncase 0x43: code.push([op, s.f32()]); stack.push(F32); break;\ncase 0x44: code.push([op, s.f64()]); stack.push(F64); break;\ncase 0xd0: { const t = refType(s); code.push([op, t]); stack.push(t); break; }\ncase 0xd2: {\nconst fx = s.u32();\nif (fx >= M.funcs.length) s.fail(\"function index #\" + fx + \" is out of bounds\", at + 1);\ndeclare(M, fx);\ncode.push([op, fx]);\nstack.push(FUNCREF);\nbreak;\n}\ncase 0x23: {\nconst g = s.u32();\nif (g >= nGlobals) s.fail(\"Invalid global index: \" + g, at + 1);\nif (M.globals[g].mut) s.fail(\"mutable globals cannot be used in constant expressions\", at);\ncode.push([op, g]);\nstack.push(M.globals[g].type);\nbreak;\n}\ncase 0x6a: case 0x6b: case 0x6c: case 0x7c: case 0x7d: case 0x7e: {\nconst t = op < 0x70 ? I32 : I64;\nif (stack.length < 2 || stack[stack.length - 1] !== t || stack[stack.length - 2] !== t) s.fail(\"type error in constant expression\", at);\nstack.pop();\ncode.push([op, 0]);\nbreak;\n}\ndefault:\ns.fail(\"opcode \" + opName(op) + \" is not allowed in constant expressions\", at);\n}\n}\n}\nfunction elemSegment(s, M) {\nconst at = s.p;\nconst flags = s.u32();\nif (flags > 7) s.fail(\"illegal flag value \" + flags, at);\nconst passive = (flags & 1) !== 0;\nconst explicit = (flags & 2) !== 0;\nconst exprs = (flags & 4) !== 0;\nconst seg = { mode: passive ? (explicit ? \"declarative\" : \"passive\") : \"active\", table: 0, offset: null, type: FUNCREF, inits: [] };\nif (!passive) {\nif (explicit) seg.table = s.u32();\nif (seg.table >= M.tables.length) s.fail(\"out of bounds table index \" + seg.table, at);\nseg.offset = constExpr(s, M, I32, M.globals.length);\n}\nif (passive || explicit) {\nif (exprs) seg.type = refType(s);\nelse {\nconst k = s.u8();\nif (k !== 0) s.fail(\"illegal element kind 0x\" + k.toString(16) + \". Must be 0x0\", s.p - 1);\n}\n}\nconst n = s.u32();\nfor (let i = 0; i < n; i++) {\nif (exprs) seg.inits.push(constExpr(s, M, seg.type, M.globals.length));\nelse {\nconst fat = s.p;\nconst fx = s.u32();\nif (fx >= M.funcs.length) s.fail(\"element function index \" + fx + \" out of bounds\", fat);\ndeclare(M, fx);\nseg.inits.push([[0xd2, fx]]);\n}\n}\nif (seg.mode === \"active\" && M.tables[seg.table].elem !== seg.type)\ns.fail(\"Element segment of type \" + TYPE_NAMES[seg.type] + \" cannot be used for table of type \" + TYPE_NAMES[M.tables[seg.table].elem], at);\nreturn seg;\n}\nconst NUM = {};\nfunction num(op, ins, out, tpl) {\nNUM[op] = [ins, out, tpl];\n}\n{\nconst i = I32, I = I64, f = F32, d = F64;\nnum(0x45, [i], i, \"(A===0?1:0)\");\nnum(0x46, [i, i], i, \"(A===B?1:0)\");\nnum(0x47, [i, i], i, \"(A!==B?1:0)\");\nnum(0x48, [i, i], i, \"(A<B?1:0)\");\nnum(0x49, [i, i], i, \"((A>>>0)<(B>>>0)?1:0)\");\nnum(0x4a, [i, i], i, \"(A>B?1:0)\");\nnum(0x4b, [i, i], i, \"((A>>>0)>(B>>>0)?1:0)\");\nnum(0x4c, [i, i], i, \"(A<=B?1:0)\");\nnum(0x4d, [i, i], i, \"((A>>>0)<=(B>>>0)?1:0)\");\nnum(0x4e, [i, i], i, \"(A>=B?1:0)\");\nnum(0x4f, [i, i], i, \"((A>>>0)>=(B>>>0)?1:0)\");\nnum(0x50, [I], i, \"(A===0n?1:0)\");\nnum(0x51, [I, I], i, \"(A===B?1:0)\");\nnum(0x52, [I, I], i, \"(A!==B?1:0)\");\nnum(0x53, [I, I], i, \"(A<B?1:0)\");\nnum(0x54, [I, I], i, \"($u64(A)<$u64(B)?1:0)\");\nnum(0x55, [I, I], i, \"(A>B?1:0)\");\nnum(0x56, [I, I], i, \"($u64(A)>$u64(B)?1:0)\");\nnum(0x57, [I, I], i, \"(A<=B?1:0)\");\nnum(0x58, [I, I], i, \"($u64(A)<=$u64(B)?1:0)\");\nnum(0x59, [I, I], i, \"(A>=B?1:0)\");\nnum(0x5a, [I, I], i, \"($u64(A)>=$u64(B)?1:0)\");\nfor (let base = 0x5b; base <= 0x61; base += 6) {\nconst t = base === 0x5b ? f : d;\nnum(base, [t, t], i, \"(A===B?1:0)\");\nnum(base + 1, [t, t], i, \"(A!==B?1:0)\");\nnum(base + 2, [t, t], i, \"(A<B?1:0)\");\nnum(base + 3, [t, t], i, \"(A>B?1:0)\");\nnum(base + 4, [t, t], i, \"(A<=B?1:0)\");\nnum(base + 5, [t, t], i, \"(A>=B?1:0)\");\n}\nnum(0x67, [i], i, \"$clz(A)\");\nnum(0x68, [i], i, \"$ctz32(A)\");\nnum(0x69, [i], i, \"$pop32(A)\");\nnum(0x6a, [i, i], i, \"((A+B)|0)\");\nnum(0x6b, [i, i], i, \"((A-B)|0)\");\nnum(0x6c, [i, i], i, \"$imul(A,B)\");\nnum(0x6d, [i, i], i, \"$divs32(A,B)\");\nnum(0x6e, [i, i], i, \"$divu32(A,B)\");\nnum(0x6f, [i, i], i, \"$rems32(A,B)\");\nnum(0x70, [i, i], i, \"$remu32(A,B)\");\nnum(0x71, [i, i], i, \"(A&B)\");\nnum(0x72, [i, i], i, \"(A|B)\");\nnum(0x73, [i, i], i, \"(A^B)\");\nnum(0x74, [i, i], i, \"(A<<B)\");\nnum(0x75, [i, i], i, \"(A>>B)\");\nnum(0x76, [i, i], i, \"((A>>>B)|0)\");\nnum(0x77, [i, i], i, \"((A<<B)|(A>>>(32-(B&31))))\");\nnum(0x78, [i, i], i, \"((A>>>B)|(A<<(32-(B&31))))\");\nnum(0x79, [I], I, \"$clz64(A)\");\nnum(0x7a, [I], I, \"$ctz64(A)\");\nnum(0x7b, [I], I, \"$pop64(A)\");\nnum(0x7c, [I, I], I, \"$w(A+B)\");\nnum(0x7d, [I, I], I, \"$w(A-B)\");\nnum(0x7e, [I, I], I, \"$w(A*B)\");\nnum(0x7f, [I, I], I, \"$divs64(A,B)\");\nnum(0x80, [I, I], I, \"$divu64(A,B)\");\nnum(0x81, [I, I], I, \"$rems64(A,B)\");\nnum(0x82, [I, I], I, \"$remu64(A,B)\");\nnum(0x83, [I, I], I, \"(A&B)\");\nnum(0x84, [I, I], I, \"(A|B)\");\nnum(0x85, [I, I], I, \"(A^B)\");\nnum(0x86, [I, I], I, \"$w(A<<(B&63n))\");\nnum(0x87, [I, I], I, \"(A>>(B&63n))\");\nnum(0x88, [I, I], I, \"$w($u64(A)>>(B&63n))\");\nnum(0x89, [I, I], I, \"$rotl64(A,B)\");\nnum(0x8a, [I, I], I, \"$rotr64(A,B)\");\nfor (let base = 0x8b; base <= 0x99; base += 14) {\nconst t = base === 0x8b ? f : d, R = base === 0x8b ? \"$f\" : \"\";\nnum(base, [t], t, \"$abs(A)\");\nnum(base + 1, [t], t, \"(-A)\");\nnum(base + 2, [t], t, \"$ceil(A)\");\nnum(base + 3, [t], t, \"$floor(A)\");\nnum(base + 4, [t], t, \"$trunc(A)\");\nnum(base + 5, [t], t, \"$nearest(A)\");\nnum(base + 6, [t], t, R + \"($sqrt(A))\");\nnum(base + 7, [t, t], t, R + \"(A+B)\");\nnum(base + 8, [t, t], t, R + \"(A-B)\");\nnum(base + 9, [t, t], t, R + \"(A*B)\");\nnum(base + 10, [t, t], t, R + \"(A/B)\");\nnum(base + 11, [t, t], t, \"$min(A,B)\");\nnum(base + 12, [t, t], t, \"$max(A,B)\");\nnum(base + 13, [t, t], t, \"$cps(A,B)\");\n}\nnum(0xa7, [I], i, \"$N($w32(A))\");\nnum(0xa8, [f], i, \"$t32s(A)\");\nnum(0xa9, [f], i, \"$t32u(A)\");\nnum(0xaa, [d], i, \"$t32s(A)\");\nnum(0xab, [d], i, \"$t32u(A)\");\nnum(0xac, [i], I, \"$B(A)\");\nnum(0xad, [i], I, \"$B(A>>>0)\");\nnum(0xae, [f], I, \"$t64s(A)\");\nnum(0xaf, [f], I, \"$t64u(A)\");\nnum(0xb0, [d], I, \"$t64s(A)\");\nnum(0xb1, [d], I, \"$t64u(A)\");\nnum(0xb2, [i], f, \"$f(A)\");\nnum(0xb3, [i], f, \"$f(A>>>0)\");\nnum(0xb4, [I], f, \"$cvf32(A)\");\nnum(0xb5, [I], f, \"$cvf32($u64(A))\");\nnum(0xb6, [d], f, \"$f(A)\");\nnum(0xb7, [i], d, \"(A)\");\nnum(0xb8, [i], d, \"(A>>>0)\");\nnum(0xb9, [I], d, \"$N(A)\");\nnum(0xba, [I], d, \"$N($u64(A))\");\nnum(0xbb, [f], d, \"(A)\");\nnum(0xbc, [f], i, \"$ri32(A)\");\nnum(0xbd, [d], I, \"$ri64(A)\");\nnum(0xbe, [i], f, \"$rf32(A)\");\nnum(0xbf, [I], d, \"$rf64(A)\");\nnum(0xc0, [i], i, \"((A<<24)>>24)\");\nnum(0xc1, [i], i, \"((A<<16)>>16)\");\nnum(0xc2, [I], I, \"$sx8(A)\");\nnum(0xc3, [I], I, \"$sx16(A)\");\nnum(0xc4, [I], I, \"$w32(A)\");\nnum(0x100, [f], i, \"$ts32s(A)\");\nnum(0x101, [f], i, \"$ts32u(A)\");\nnum(0x102, [d], i, \"$ts32s(A)\");\nnum(0x103, [d], i, \"$ts32u(A)\");\nnum(0x104, [f], I, \"$ts64s(A)\");\nnum(0x105, [f], I, \"$ts64u(A)\");\nnum(0x106, [d], I, \"$ts64s(A)\");\nnum(0x107, [d], I, \"$ts64u(A)\");\n}\nconst LOADS = {\n0x28: [I32, 4, 2, \"$dv.getInt32(E,true)\"],\n0x29: [I64, 8, 3, \"$dv.getBigInt64(E,true)\"],\n0x2a: [F32, 4, 2, \"$dv.getFloat32(E,true)\"],\n0x2b: [F64, 8, 3, \"$dv.getFloat64(E,true)\"],\n0x2c: [I32, 1, 0, \"$dv.getInt8(E)\"],\n0x2d: [I32, 1, 0, \"$dv.getUint8(E)\"],\n0x2e: [I32, 2, 1, \"$dv.getInt16(E,true)\"],\n0x2f: [I32, 2, 1, \"$dv.getUint16(E,true)\"],\n0x30: [I64, 1, 0, \"$B($dv.getInt8(E))\"],\n0x31: [I64, 1, 0, \"$B($dv.getUint8(E))\"],\n0x32: [I64, 2, 1, \"$B($dv.getInt16(E,true))\"],\n0x33: [I64, 2, 1, \"$B($dv.getUint16(E,true))\"],\n0x34: [I64, 4, 2, \"$B($dv.getInt32(E,true))\"],\n0x35: [I64, 4, 2, \"$B($dv.getUint32(E,true))\"],\n};\nconst STORES = {\n0x36: [I32, 4, 2, \"$dv.setInt32(E,V,true)\"],\n0x37: [I64, 8, 3, \"$dv.setBigInt64(E,V,true)\"],\n0x38: [F32, 4, 2, \"$dv.setFloat32(E,V,true)\"],\n0x39: [F64, 8, 3, \"$dv.setFloat64(E,V,true)\"],\n0x3a: [I32, 1, 0, \"$dv.setInt8(E,V)\"],\n0x3b: [I32, 2, 1, \"$dv.setInt16(E,V,true)\"],\n0x3c: [I64, 1, 0, \"$dv.setInt8(E,$N(V&255n))\"],\n0x3d: [I64, 2, 1, \"$dv.setInt16(E,$N(V&65535n),true)\"],\n0x3e: [I64, 4, 2, \"$dv.setUint32(E,$N(V&4294967295n),true)\"],\n};\nfunction jsNum(v) {\nif (v !== v) return \"(0/0)\";\nif (v === 1 / 0) return \"(1/0)\";\nif (v === -1 / 0) return \"(-1/0)\";\nif (v === 0 && 1 / v < 0) return \"(-0)\";\nreturn v < 0 ? \"(\" + $String(v) + \")\" : $String(v);\n}\nfunction fill(tpl, a, b) {\nlet s = \"\";\nfor (let k = 0; k < tpl.length; k++) {\nconst c = tpl[k];\nconst name = k > 0 && tpl[k - 1] === \"$\";\ns += c === \"A\" && !name ? a : c === \"B\" && !name ? b : c;\n}\nreturn s;\n}\nfunction fillEV(tpl, e, v) {\nlet s = \"\";\nfor (let k = 0; k < tpl.length; k++) {\nconst c = tpl[k];\ns += c === \"E\" ? e : c === \"V\" ? v : c;\n}\nreturn s;\n}\n/** Validates function fi's body and returns its JS source. */\nfunction compileFunction(M, bytes, fi) {\nconst code = M.codes[fi - M.nImportFuncs];\nconst type = M.types[M.funcs[fi]];\nconst r = new Reader(bytes, code.start, code.end);\nlet curName = \"\";\nconst fail = (msg, at) => {\nthrow new CompileError(apiName + \"Compiling function #\" + fi + \" failed: \" + msg + \" @+\" + (at === undefined ? r.p : at));\n};\nconst locals = type.params.concat(code.locals);\nconst vs = []; // operand types; 0 is unknown (unreachable code)\nconst ctrl = [];\nlet out = \"\";\nlet maxDepth = 0;\nlet labels = 0;\nlet usesTmp = false;\nconst S = (n) => \"s\" + n;\nconst top = () => ctrl[ctrl.length - 1];\nconst live = () => {\nconst c = top();\nreturn !c.unreachable && !c.dead;\n};\nconst emit = (s) => {\nif (live()) out += s;\n};\nconst push = (t) => {\nvs.push(t);\nif (vs.length > maxDepth) maxDepth = vs.length;\n};\nconst pop = (want) => {\nconst c = top();\nif (vs.length === c.height) {\nif (c.unreachable) return want || 0;\nfail(\"not enough arguments on the stack for \" + curName + \" (need 1, got 0)\");\n}\nconst t = vs.pop();\nif (want && t && t !== want) fail(curName + \" expected type \" + TYPE_NAMES[want] + \", found \" + TYPE_NAMES[t]);\nreturn t || want || 0;\n};\nconst popAll = (types) => {\nfor (let k = types.length - 1; k >= 0; k--) pop(types[k]);\n};\nconst pushAll = (types) => {\nfor (const t of types) push(t);\n};\nconst labelTypes = (c) => (c.kind === \"loop\" ? c.params : c.results);\nconst pushCtrl = (kind, params, results) => {\nconst parent = ctrl.length ? top() : null;\nconst c = {\nkind, params, results,\nheight: vs.length - params.length,\nunreachable: false,\ndead: parent !== null && (parent.unreachable || parent.dead),\nlabel: \"L\" + labels++,\n};\nctrl.push(c);\nreturn c;\n};\nconst setUnreachable = () => {\nconst c = top();\nvs.length = c.height;\nc.unreachable = true;\n};\nconst retCode = () => {\nconst n = type.results.length;\nconst from = vs.length - n;\nif (n === 0) return \"return;\";\nif (n === 1) return \"return \" + S(from) + \";\";\nlet s = \"return [\";\nfor (let k = 0; k < n; k++) s += (k ? \",\" : \"\") + S(from + k);\nreturn s + \"];\";\n};\nconst branch = (depth) => {\nconst c = ctrl[ctrl.length - 1 - depth];\nif (c.kind === \"func\") return retCode();\nconst n = labelTypes(c).length;\nconst from = vs.length - n;\nlet s = \"\";\nif (from !== c.height) for (let k = 0; k < n; k++) s += S(c.height + k) + \"=\" + S(from + k) + \";\";\nreturn s + (c.kind === \"loop\" ? \"continue \" : \"break \") + c.label + \";\";\n};\nconst checkBranch = (depth, at) => {\nif (depth >= ctrl.length) fail(\"invalid branch depth: \" + depth, at);\nconst want = labelTypes(ctrl[ctrl.length - 1 - depth]);\nconst got = [];\nfor (let k = want.length - 1; k >= 0; k--) got.unshift(pop(want[k]));\nreturn got;\n};\nconst blockType = () => {\nconst at = r.p;\nconst b = r.s33();\nif (b === -64) return [[], []];\nif (b < 0) {\nconst t = b + 128;\nif (t === I32 || t === I64 || t === F32 || t === F64 || t === FUNCREF || t === EXTERNREF) return [[], [t]];\nif (t === V128) fail(\"Wasm SIMD unsupported\", at);\nfail(\"invalid block type\", at);\n}\nif (b >= M.types.length) fail(\"block type index \" + b + \" is not a signature definition\", at);\nreturn [M.types[b].params, M.types[b].results];\n};\nconst needMem = (at) => {\nif (M.mems.length === 0) fail(\"memory instruction with no memory\", at);\n};\nconst memarg = (natural, at) => {\nconst aat = r.p;\nconst align = r.u32();\nif (align >= 64) fail(\"multi-memory is not supported\", aat);\nif (align > natural) fail(\"invalid alignment; expected maximum alignment is \" + natural + \", actual alignment is \" + align, aat);\nconst off = r.u32();\nneedMem(at);\nreturn off;\n};\nconst memIndex = (at) => {\nconst m = r.u8();\nif (m !== 0) fail(\"expected memory index 0, found \" + m, at);\nneedMem(at);\n};\nconst tableIdx = (at) => {\nconst t = r.u32();\nif (t >= M.tables.length) fail(\"table index \" + t + \" out of bounds (\" + M.tables.length + \" tables)\", at);\nreturn t;\n};\nconst elemIdx = (at) => {\nconst e = r.u32();\nif (e >= M.elems.length) fail(\"invalid element segment index: \" + e, at);\nreturn e;\n};\nconst dataIdx = (at) => {\nif (M.dataCount === null) fail(\"data count section required\", at);\nconst e = r.u32();\nif (e >= M.dataCount) fail(\"invalid data segment index: \" + e, at);\nreturn e;\n};\nconst argList = (base, n) => {\nlet args = \"\";\nfor (let k = 0; k < n; k++) args += (k ? \",\" : \"\") + S(base + k);\nreturn args;\n};\nconst call = (t, callee) => {\npopAll(t.params);\nconst base = vs.length;\nconst callExpr = callee + \"(\" + argList(base, t.params.length) + \")\";\nif (t.results.length === 0) emit(callExpr + \";\");\nelse if (t.results.length === 1) emit(S(base) + \"=\" + callExpr + \";\");\nelse {\nusesTmp = true;\nlet s = \"$t=\" + callExpr + \";\";\nfor (let k = 0; k < t.results.length; k++) s += S(base + k) + \"=$t[\" + k + \"];\";\nemit(s);\n}\npushAll(t.results);\n};\nconst tailCall = (t, callee, at) => {\nconst rs = type.results;\nif (rs.length !== t.results.length || rs.some((x, k) => x !== t.results[k])) fail(\"tail call return types mismatch\", at);\npopAll(t.params);\nemit(\"return \" + callee + \"(\" + argList(vs.length, t.params.length) + \");\");\nsetUnreachable();\n};\nconst fallthru = (c, at) => {\npopAll(c.results);\nif (vs.length !== c.height) fail(\"expected \" + c.results.length + \" elements on the stack for fallthru, found \" + (vs.length - c.height + c.results.length), at);\n};\npushCtrl(\"func\", [], type.results);\nfor (;;) {\nconst at = r.p;\nif (r.eof()) fail(\"function body must end with \\\"end\\\" opcode\", at);\nconst op = r.u8();\ncurName = opName(op);\nconst simple = NUM[op];\nif (simple !== undefined) {\nconst ins = simple[0];\nconst dpt = vs.length;\npopAll(ins);\nif (live()) out += S(vs.length) + \"=\" + (ins.length === 2 ? fill(simple[2], S(dpt - 2), S(dpt - 1)) : fill(simple[2], S(dpt - 1), \"\")) + \";\";\npush(simple[1]);\ncontinue;\n}\nconst ld = LOADS[op];\nif (ld !== undefined) {\nconst off = memarg(ld[2], at);\npop(I32);\nconst a = vs.length;\nemit(S(a) + \"=\" + fillEV(ld[3], \"$ea(\" + S(a) + \",\" + off + \",\" + ld[1] + \")\", \"\") + \";\");\npush(ld[0]);\ncontinue;\n}\nconst st = STORES[op];\nif (st !== undefined) {\nconst off = memarg(st[2], at);\npop(st[0]);\npop(I32);\nconst a = vs.length;\nemit(fillEV(st[3], \"$ea(\" + S(a) + \",\" + off + \",\" + st[1] + \")\", S(a + 1)) + \";\");\ncontinue;\n}\nswitch (op) {\ncase 0x00:\nemit(\"$trap(\\\"unreachable\\\");\");\nsetUnreachable();\nbreak;\ncase 0x01:\nbreak;\ncase 0x02: case 0x03: {\nconst [ps, rs] = blockType();\npopAll(ps);\npushAll(ps);\nconst c = pushCtrl(op === 0x02 ? \"block\" : \"loop\", ps, rs);\nif (!c.dead) out += c.label + (op === 0x02 ? \":{\" : \":while(true){\");\nbreak;\n}\ncase 0x04: {\nconst [ps, rs] = blockType();\npop(I32);\nconst cond = S(vs.length);\npopAll(ps);\npushAll(ps);\nconst c = pushCtrl(\"if\", ps, rs);\nif (!c.dead) out += c.label + \":if(\" + cond + \"){\";\nbreak;\n}\ncase 0x05: {\nconst c = top();\nif (c.kind !== \"if\") fail(\"else does not match an if\", at);\nfallthru(c, at);\nc.kind = \"else\";\nc.unreachable = false;\npushAll(c.params);\nif (!c.dead) out += \"}else{\";\nbreak;\n}\ncase 0x0b: {\nconst c = top();\nfallthru(c, at);\nif (c.kind === \"if\") {\nconst ps = c.params, rs = c.results;\nif (ps.length !== rs.length || ps.some((x, k) => x !== rs[k])) fail(\"expected \" + rs.length + \" elements on the stack for fallthru, found \" + ps.length, at);\n}\nif (c.kind === \"func\") {\nif (!c.unreachable) {\npushAll(c.results);\nout += retCode();\n}\nif (r.p !== r.end) fail(\"trailing code after function end\", r.p);\nconst np = type.params.length;\nlet head = \"function f\" + fi + \"(\";\nfor (let k = 0; k < np; k++) head += (k ? \",\" : \"\") + \"l\" + k;\nhead += \"){\";\nif (locals.length > np) {\nhead += \"let \";\nfor (let k = np; k < locals.length; k++) {\nconst t = locals[k];\nhead += (k > np ? \",\" : \"\") + \"l\" + k + \"=\" + (t === I64 ? \"0n\" : t === FUNCREF || t === EXTERNREF ? \"null\" : \"0\");\n}\nhead += \";\";\n}\nif (maxDepth > 0 || usesTmp) {\nhead += \"let \";\nfor (let k = 0; k < maxDepth; k++) head += (k ? \",\" : \"\") + S(k);\nif (usesTmp) head += (maxDepth ? \",\" : \"\") + \"$t\";\nhead += \";\";\n}\nreturn head + out + \"}\\n\";\n}\nctrl.pop();\nif (!c.dead) out += c.kind === \"loop\" ? \"break;}\" : \"}\";\npushAll(c.results);\nbreak;\n}\ncase 0x0c: {\nconst depth = r.u32();\ncheckBranch(depth, at);\nconst c = ctrl[ctrl.length - 1 - depth];\npushAll(labelTypes(c));\nemit(branch(depth));\nsetUnreachable();\nbreak;\n}\ncase 0x0d: {\nconst depth = r.u32();\npop(I32);\nconst cond = S(vs.length);\nconst got = checkBranch(depth, at);\npushAll(got);\nemit(\"if(\" + cond + \"){\" + branch(depth) + \"}\");\nbreak;\n}\ncase 0x0e: {\nconst n = r.u32();\nconst depths = [];\nfor (let k = 0; k <= n; k++) {\nconst dd = r.u32();\nif (dd >= ctrl.length) fail(\"invalid branch depth: \" + dd, at);\ndepths.push(dd);\n}\npop(I32);\nconst idx = S(vs.length);\nconst arity = labelTypes(ctrl[ctrl.length - 1 - depths[n]]).length;\nconst save = vs.slice();\nfor (const dd of depths) {\nif (labelTypes(ctrl[ctrl.length - 1 - dd]).length !== arity) fail(\"br_table: inconsistent arity\", at);\ncheckBranch(dd, at);\nvs.length = 0;\nfor (const t of save) vs.push(t);\n}\nif (live()) {\nlet s = \"switch(\" + idx + \"){\";\nfor (let k = 0; k < n; k++) s += \"case \" + k + \":\" + branch(depths[k]);\ns += \"default:\" + branch(depths[n]) + \"}\";\nout += s;\n}\nsetUnreachable();\nbreak;\n}\ncase 0x0f: {\nconst got = [];\nfor (let k = type.results.length - 1; k >= 0; k--) got.unshift(pop(type.results[k]));\npushAll(got);\nemit(retCode());\nsetUnreachable();\nbreak;\n}\ncase 0x10: case 0x12: {\nconst fx = r.u32();\nif (fx >= M.funcs.length) fail(\"function index #\" + fx + \" is out of bounds\", at + 1);\nconst t = M.types[M.funcs[fx]];\nif (op === 0x10) call(t, \"f\" + fx);\nelse tailCall(t, \"f\" + fx, at);\nbreak;\n}\ncase 0x11: case 0x13: {\nconst tx = r.u32();\nif (tx >= M.types.length) fail(\"invalid signature index: \" + tx, at + 1);\nconst tb = tableIdx(at);\nif (M.tables[tb].elem !== FUNCREF) fail(\"call_indirect: immediate table #\" + tb + \" is not of a function type\", at);\npop(I32);\nconst t = M.types[tx];\nconst callee = \"$ci($T\" + tb + \",\" + S(vs.length) + \",\\\"\" + t.sig + \"\\\")\";\nif (op === 0x11) call(t, callee);\nelse tailCall(t, callee, at);\nbreak;\n}\ncase 0x1a:\npop(0);\nbreak;\ncase 0x1b: case 0x1c: {\nlet want = 0;\nif (op === 0x1c) {\nconst n = r.u32();\nif (n !== 1) fail(\"invalid number of types for select\", at);\nwant = valType(r);\n}\npop(I32);\nconst t1 = pop(want);\nconst t2 = pop(want || t1);\nconst t = want || t1 || t2;\nif (op === 0x1b && (t === FUNCREF || t === EXTERNREF)) fail(\"select without type is only valid for value type inputs\", at);\nif (op === 0x1b && t1 && t2 && t1 !== t2) fail(\"type mismatch in select\", at);\nconst b = vs.length;\nemit(S(b) + \"=\" + S(b + 2) + \"?\" + S(b) + \":\" + S(b + 1) + \";\");\npush(t);\nbreak;\n}\ncase 0x20: case 0x21: case 0x22: {\nconst x = r.u32();\nif (x >= locals.length) fail(\"invalid local index: \" + x, at + 1);\nconst t = locals[x];\nif (op === 0x20) {\nemit(S(vs.length) + \"=l\" + x + \";\");\npush(t);\n} else {\npop(t);\nemit(\"l\" + x + \"=\" + S(vs.length) + \";\");\nif (op === 0x22) push(t);\n}\nbreak;\n}\ncase 0x23: case 0x24: {\nconst x = r.u32();\nif (x >= M.globals.length) fail(\"Invalid global index: \" + x, at + 1);\nconst g = M.globals[x];\nif (op === 0x23) {\nemit(S(vs.length) + \"=$g\" + x + \".v;\");\npush(g.type);\n} else {\nif (!g.mut) fail(\"immutable global #\" + x + \" cannot be assigned\", at);\npop(g.type);\nemit(\"$g\" + x + \".v=\" + S(vs.length) + \";\");\n}\nbreak;\n}\ncase 0x25: case 0x26: {\nconst tb = tableIdx(at);\nconst et = M.tables[tb].elem;\nif (op === 0x25) {\npop(I32);\nemit(S(vs.length) + \"=$tget($T\" + tb + \",\" + S(vs.length) + \");\");\npush(et);\n} else {\npop(et);\npop(I32);\nemit(\"$tset($T\" + tb + \",\" + S(vs.length) + \",\" + S(vs.length + 1) + \");\");\n}\nbreak;\n}\ncase 0x3f: case 0x40: {\nmemIndex(at);\nif (op === 0x3f) {\nemit(S(vs.length) + \"=$ml/65536;\");\n} else {\npop(I32);\nemit(S(vs.length) + \"=$grow(\" + S(vs.length) + \");\");\n}\npush(I32);\nbreak;\n}\ncase 0x41:\nemit(S(vs.length) + \"=\" + jsNum(r.s32()) + \";\");\npush(I32);\nbreak;\ncase 0x42: {\nconst v = r.s64();\nemit(S(vs.length) + \"=\" + (v < 0n ? \"(\" + v + \"n)\" : v + \"n\") + \";\");\npush(I64);\nbreak;\n}\ncase 0x43:\nemit(S(vs.length) + \"=\" + jsNum(r.f32()) + \";\");\npush(F32);\nbreak;\ncase 0x44:\nemit(S(vs.length) + \"=\" + jsNum(r.f64()) + \";\");\npush(F64);\nbreak;\ncase 0xd0: {\nconst t = refType(r);\nemit(S(vs.length) + \"=null;\");\npush(t);\nbreak;\n}\ncase 0xd1: {\nconst t = pop(0);\nif (t && t !== FUNCREF && t !== EXTERNREF) fail(\"ref.is_null[0] expected reference type, found \" + TYPE_NAMES[t], at);\nemit(S(vs.length) + \"=\" + S(vs.length) + \"===null?1:0;\");\npush(I32);\nbreak;\n}\ncase 0xd2: {\nconst fx = r.u32();\nif (fx >= M.funcs.length) fail(\"function index #\" + fx + \" is out of bounds\", at + 1);\nif (!M.declared || !M.declared.has(fx)) fail(\"undeclared reference to function #\" + fx, at + 1);\nemit(S(vs.length) + \"=$rf(\" + fx + \");\");\npush(FUNCREF);\nbreak;\n}\ncase 0xfc: {\nconst sub = r.u32();\ncurName = \"0xfc\" + sub;\nif (sub <= 7) {\nconst [ins, outT, tpl] = NUM[0x100 + sub];\npopAll(ins);\nemit(S(vs.length) + \"=\" + fill(tpl, S(vs.length), \"\") + \";\");\npush(outT);\nbreak;\n}\nswitch (sub) {\ncase 8: {\nconst seg = dataIdx(at);\nmemIndex(at);\npop(I32); pop(I32); pop(I32);\nemit(\"$minit(\" + seg + \",\" + argList(vs.length, 3) + \");\");\nbreak;\n}\ncase 9:\nemit(\"$ddrop(\" + dataIdx(at) + \");\");\nbreak;\ncase 10:\nmemIndex(at);\nmemIndex(at);\npop(I32); pop(I32); pop(I32);\nemit(\"$mcopy(\" + argList(vs.length, 3) + \");\");\nbreak;\ncase 11:\nmemIndex(at);\npop(I32); pop(I32); pop(I32);\nemit(\"$mfill(\" + argList(vs.length, 3) + \");\");\nbreak;\ncase 12: {\nconst seg = elemIdx(at);\nconst tb = tableIdx(at);\nif (M.elems[seg].type !== M.tables[tb].elem) fail(\"table.init: type mismatch\", at);\npop(I32); pop(I32); pop(I32);\nemit(\"$tinit($T\" + tb + \",\" + seg + \",\" + argList(vs.length, 3) + \");\");\nbreak;\n}\ncase 13:\nemit(\"$edrop(\" + elemIdx(at) + \");\");\nbreak;\ncase 14: {\nconst t1 = tableIdx(at);\nconst t2 = tableIdx(at);\nif (M.tables[t1].elem !== M.tables[t2].elem) fail(\"table.copy: type mismatch\", at);\npop(I32); pop(I32); pop(I32);\nemit(\"$tcopy($T\" + t1 + \",$T\" + t2 + \",\" + argList(vs.length, 3) + \");\");\nbreak;\n}\ncase 15: {\nconst tb = tableIdx(at);\npop(I32);\npop(M.tables[tb].elem);\nconst b = vs.length;\nemit(S(b) + \"=$tgrow($T\" + tb + \",\" + S(b) + \",\" + S(b + 1) + \");\");\npush(I32);\nbreak;\n}\ncase 16: {\nconst tb = tableIdx(at);\nemit(S(vs.length) + \"=$T\" + tb + \".a.length;\");\npush(I32);\nbreak;\n}\ncase 17: {\nconst tb = tableIdx(at);\npop(I32);\npop(M.tables[tb].elem);\npop(I32);\nemit(\"$tfill($T\" + tb + \",\" + argList(vs.length, 3) + \");\");\nbreak;\n}\ndefault:\nfail(\"invalid numeric opcode: 0xfc\" + sub.toString(16).padStart(2, \"0\"), at);\n}\nbreak;\n}\ncase 0xfd:\nfail(\"Wasm SIMD unsupported\", at);\ndefault:\nfail(\"invalid opcode \" + opName(op), at);\n}\n}\n}\nconst scratch = new $DataView(new $ArrayBuffer(8));\nfunction ctz32(a) {\nreturn a === 0 ? 32 : 31 - $Math.clz32(a & -a);\n}\nfunction pop32(a) {\na = a - ((a >>> 1) & 0x55555555);\na = (a & 0x33333333) + ((a >>> 2) & 0x33333333);\nreturn $Math.imul((a + (a >>> 4)) & 0x0f0f0f0f, 0x01010101) >>> 24;\n}\nfunction hi32(a) {\nreturn $Number(asIntN(32, a >> 32n));\n}\nfunction lo32(a) {\nreturn $Number(asIntN(32, a));\n}\nfunction checkTable(t, i, n) {\nif (i + n > t.a.length) trap(\"table index is out of bounds\");\n}\nconst H = {\n$trap: trap,\n$imul: $Math.imul,\n$clz: $Math.clz32,\n$ctz32: ctz32,\n$pop32: pop32,\n$divs32: (a, b) => {\nif (b === 0) trap(\"divide by zero\");\nif (a === -2147483648 && b === -1) trap(\"divide result unrepresentable\");\nreturn (a / b) | 0;\n},\n$divu32: (a, b) => {\nif (b === 0) trap(\"divide by zero\");\nreturn ((a >>> 0) / (b >>> 0)) | 0;\n},\n$rems32: (a, b) => {\nif (b === 0) trap(\"remainder by zero\");\nreturn (a % b) | 0;\n},\n$remu32: (a, b) => {\nif (b === 0) trap(\"remainder by zero\");\nreturn ((a >>> 0) % (b >>> 0)) | 0;\n},\n$w: (a) => asIntN(64, a),\n$w32: (a) => asIntN(32, a),\n$sx8: (a) => asIntN(8, a),\n$sx16: (a) => asIntN(16, a),\n$u64: (a) => asUintN(64, a),\n$clz64: (a) => {\nconst hi = hi32(a);\nreturn $BigInt(hi !== 0 ? $Math.clz32(hi) : 32 + $Math.clz32(lo32(a)));\n},\n$ctz64: (a) => {\nconst lo = lo32(a);\nreturn $BigInt(lo !== 0 ? ctz32(lo) : 32 + ctz32(hi32(a)));\n},\n$pop64: (a) => $BigInt(pop32(hi32(a)) + pop32(lo32(a))),\n$divs64: (a, b) => {\nif (b === 0n) trap(\"divide by zero\");\nif (a === -9223372036854775808n && b === -1n) trap(\"divide result unrepresentable\");\nreturn a / b;\n},\n$divu64: (a, b) => {\nif (b === 0n) trap(\"divide by zero\");\nreturn asIntN(64, asUintN(64, a) / asUintN(64, b));\n},\n$rems64: (a, b) => {\nif (b === 0n) trap(\"remainder by zero\");\nreturn a % b;\n},\n$remu64: (a, b) => {\nif (b === 0n) trap(\"remainder by zero\");\nreturn asIntN(64, asUintN(64, a) % asUintN(64, b));\n},\n$rotl64: (a, b) => {\nconst k = b & 63n, u = asUintN(64, a);\nreturn asIntN(64, (u << k) | (u >> ((64n - k) & 63n)));\n},\n$rotr64: (a, b) => {\nconst k = b & 63n, u = asUintN(64, a);\nreturn asIntN(64, (u >> k) | (u << ((64n - k) & 63n)));\n},\n$abs: $Math.abs,\n$ceil: $Math.ceil,\n$floor: $Math.floor,\n$trunc: $Math.trunc,\n$sqrt: $Math.sqrt,\n$nearest: (a) => {\nif (a !== a || a === 0 || a === 1 / 0 || a === -1 / 0) return a;\nconst r = $Math.round(a);\nconst res = r - a === 0.5 && r % 2 !== 0 ? r - 1 : r;\nreturn res === 0 && a < 0 ? -0 : res;\n},\n$f: fround,\n$min: (a, b) => (a !== a || b !== b ? 0 / 0 : $Math.min(a, b)),\n$max: (a, b) => (a !== a || b !== b ? 0 / 0 : $Math.max(a, b)),\n$cps: (a, b) => {\nscratch.setFloat64(0, b);\nconst neg = (scratch.getUint8(0) & 0x80) !== 0;\nscratch.setFloat64(0, a);\nconst aneg = (scratch.getUint8(0) & 0x80) !== 0;\nreturn neg === aneg ? a : -a;\n},\n$t32s: (a) => {\nif (!(a > -2147483649 && a < 2147483648)) trap(\"float unrepresentable in integer range\");\nreturn $Math.trunc(a) | 0;\n},\n$t32u: (a) => {\nif (!(a > -1 && a < 4294967296)) trap(\"float unrepresentable in integer range\");\nreturn $Math.trunc(a) | 0;\n},\n$t64s: (a) => {\nif (!(a >= -9223372036854775808 && a < 9223372036854775808)) trap(\"float unrepresentable in integer range\");\nreturn $BigInt($Math.trunc(a));\n},\n$t64u: (a) => {\nif (!(a > -1 && a < 18446744073709551616)) trap(\"float unrepresentable in integer range\");\nreturn asIntN(64, $BigInt($Math.trunc(a)));\n},\n$ts32s: (a) => (a !== a ? 0 : a <= -2147483648 ? -2147483648 : a >= 2147483647 ? 2147483647 : $Math.trunc(a) | 0),\n$ts32u: (a) => (a !== a || a <= 0 ? 0 : a >= 4294967295 ? -1 : $Math.trunc(a) | 0),\n$ts64s: (a) => (a !== a ? 0n : a <= -9223372036854775808 ? -9223372036854775808n : a >= 9223372036854775807 ? 9223372036854775807n : $BigInt($Math.trunc(a))),\n$ts64u: (a) => (a !== a || a <= 0 ? 0n : a >= 18446744073709551615 ? -1n : asIntN(64, $BigInt($Math.trunc(a)))),\n$cvf32: (a) => {\nconst neg = a < 0n;\nlet u = neg ? -a : a;\nif (u >= 1n << 53n) {\nlet shift = 0n;\nwhile (u >> shift >= 1n << 53n) shift++;\nconst low = u & ((1n << shift) - 1n);\nu = ((u >> shift) | (low !== 0n ? 1n : 0n)) << shift;\n}\nconst v = fround($Number(u));\nreturn neg ? -v : v;\n},\n$B: $BigInt,\n$N: $Number,\n$ri32: (a) => {\nscratch.setFloat32(0, a, true);\nreturn scratch.getInt32(0, true);\n},\n$ri64: (a) => {\nscratch.setFloat64(0, a, true);\nreturn scratch.getBigInt64(0, true);\n},\n$rf32: (a) => {\nscratch.setInt32(0, a, true);\nreturn scratch.getFloat32(0, true);\n},\n$rf64: (a) => {\nscratch.setBigInt64(0, a, true);\nreturn scratch.getFloat64(0, true);\n},\n$tget: (t, i) => {\ncheckTable(t, i >>> 0, 1);\nreturn t.a[i >>> 0];\n},\n$tset: (t, i, v) => {\ncheckTable(t, i >>> 0, 1);\nt.a[i >>> 0] = v;\n},\n$tgrow: (t, v, n) => tableGrow(t, n >>> 0, v),\n$tfill: (t, i, v, n) => {\ni >>>= 0;\nn >>>= 0;\ncheckTable(t, i, n);\nfor (let k = 0; k < n; k++) t.a[i + k] = v;\n},\n$tcopy: (dt, st, di, si, n) => {\ndi >>>= 0;\nsi >>>= 0;\nn >>>= 0;\ncheckTable(dt, di, n);\ncheckTable(st, si, n);\nif (di <= si) for (let k = 0; k < n; k++) dt.a[di + k] = st.a[si + k];\nelse for (let k = n - 1; k >= 0; k--) dt.a[di + k] = st.a[si + k];\n},\n$ci: (t, i, sig) => {\ncheckTable(t, i >>> 0, 1);\nconst fn = t.a[i >>> 0];\nif (fn === null) trap(\"null function or function signature mismatch\");\nconst info = funcInfo.get(fn);\nif (info.sig !== sig) trap(\"null function or function signature mismatch\");\nreturn info.fn;\n},\n};\nconst HELPER_NAMES = $Object.keys(H);\nconst funcInfo = new $WeakMap();\nfunction makeMemoryCell(min, max, api) {\nlet buf;\ntry {\nbuf = new $ArrayBuffer(min * PAGE);\n} catch (e) {\nthrow new $RangeError(api + \"could not allocate memory\");\n}\nreturn { buf, dv: new $DataView(buf), u8: new $Uint8Array(buf), len: min * PAGE, max, listeners: [], obj: null };\n}\nfunction memoryGrow(m, delta) {\nconst old = m.len / PAGE;\nconst limit = m.max === null ? MAX_PAGES : m.max;\nif (delta > limit - old) return -1;\nconst newLen = (old + delta) * PAGE;\nlet nb;\ntry {\nif (abTransfer !== undefined) nb = apply(abTransfer, m.buf, [newLen]);\nelse {\nnb = new $ArrayBuffer(newLen);\nnew $Uint8Array(nb).set(m.u8);\n}\n} catch (e) {\nreturn -1;\n}\nm.buf = nb;\nm.len = newLen;\nm.dv = new $DataView(nb);\nm.u8 = new $Uint8Array(nb);\nfor (const l of m.listeners) l();\nreturn old;\n}\nfunction tableGrow(t, n, v) {\nconst old = t.a.length;\nconst limit = t.max === null ? MAX_TABLE : t.max;\nif (n > limit - old) return -1;\nfor (let k = 0; k < n; k++) t.a.push(v);\nreturn old;\n}\nfunction defaultValue(t) {\nreturn t === I64 ? 0n : t === FUNCREF || t === EXTERNREF ? null : 0;\n}\n/** ToWebAssemblyValue ( v, type ). Raw values are JS values: i64 is a BigInt. */\nfunction toWasm(v, t) {\nswitch (t) {\ncase I32: return v | 0;\ncase I64: return asIntN(64, v);\ncase F32: return fround(+v);\ncase F64: return +v;\ncase EXTERNREF: return v;\ndefault:\nif (v === null || (typeof v === \"function\" && funcInfo.has(v))) return v;\nthrow new $TypeError(\"type incompatibility when transforming from/to JS\");\n}\n}\n/** The exported function for raw function raw of type type, named index. */\nfunction exportFunction(raw, type, index) {\nconst ps = type.params;\nconst n = ps.length;\nconst multi = type.results.length > 1;\nconst w = {\n[\"\"](...args) {\nconst a = new $Array(n);\nfor (let k = 0; k < n; k++) a[k] = toWasm(args[k], ps[k]);\nconst r = apply(raw, undefined, a);\nreturn multi ? r.slice() : r;\n},\n}[\"\"];\ndefineProperty(w, \"length\", { value: n });\ndefineProperty(w, \"name\", { value: $String(index) });\nfuncInfo.set(w, { fn: raw, sig: type.sig, type });\nreturn w;\n}\n/** The raw function calling host function fn as type type. */\nfunction importFunction(fn, type) {\nconst rs = type.results;\nif (rs.length === 0) {\nreturn (...args) => {\napply(fn, undefined, args);\n};\n}\nif (rs.length === 1) {\nconst t = rs[0];\nreturn (...args) => toWasm(apply(fn, undefined, args), t);\n}\nreturn (...args) => {\nconst v = apply(fn, undefined, args);\nif (v === null || (typeof v !== \"object\" && typeof v !== \"function\")) throw new $TypeError(\"multi-return value must be iterable\");\nconst list = [...v];\nif (list.length !== rs.length) throw new $TypeError(\"multi-return length mismatch\");\nfor (let k = 0; k < rs.length; k++) list[k] = toWasm(list[k], rs[k]);\nreturn list;\n};\n}\nlet apiName = \"WebAssembly.Module(): \";\nfunction compileModule(bytes, api) {\napiName = api;\nconst M = decode(bytes);\nlet src = \"\\\"use strict\\\";const{\" + HELPER_NAMES.join(\",\") + \"}=$rt.h;\";\nsrc += \"let $dv=null,$ml=0;const $mem=$rt.mem;\";\nsrc += \"if($mem!==null){const $refresh=()=>{$dv=$mem.dv;$ml=$mem.len;};$mem.listeners.push($refresh);$refresh();}\";\nsrc += \"function $ea(a,o,n){const e=(a>>>0)+o;if(e+n>$ml)$trap(\\\"memory access out of bounds\\\");return e;}\";\nsrc += \"const{$grow,$minit,$ddrop,$mcopy,$mfill,$tinit,$edrop,$rf}=$rt;\";\nfor (let k = 0; k < M.globals.length; k++) src += \"const $g\" + k + \"=$rt.g[\" + k + \"];\";\nfor (let k = 0; k < M.tables.length; k++) src += \"const $T\" + k + \"=$rt.t[\" + k + \"];\";\nfor (let k = 0; k < M.nImportFuncs; k++) src += \"const f\" + k + \"=$rt.f[\" + k + \"];\";\nfor (let k = M.nImportFuncs; k < M.funcs.length; k++) src += compileFunction(M, bytes, k);\nsrc += \"return[\";\nfor (let k = 0; k < M.funcs.length; k++) src += (k ? \",\" : \"\") + \"f\" + k;\nsrc += \"];\";\nreturn { M, src, factory: null };\n}\nfunction factoryOf(rec) {\nif (rec.factory === null) {\nrec.factory = new $Function(\"$rt\", rec.src);\nrec.src = null;\n}\nreturn rec.factory;\n}\nfunction evalConst(code, globals, refFunc) {\nconst st = [];\nfor (const [op, imm] of code) {\nswitch (op) {\ncase 0x41: case 0x42: case 0x43: case 0x44: st.push(imm); break;\ncase 0xd0: st.push(null); break;\ncase 0xd2: st.push(refFunc(imm)); break;\ncase 0x23: st.push(globals[imm].v); break;\ncase 0x6a: { const b = st.pop(), a = st.pop(); st.push((a + b) | 0); break; }\ncase 0x6b: { const b = st.pop(), a = st.pop(); st.push((a - b) | 0); break; }\ncase 0x6c: { const b = st.pop(), a = st.pop(); st.push($Math.imul(a, b)); break; }\ncase 0x7c: { const b = st.pop(), a = st.pop(); st.push(asIntN(64, a + b)); break; }\ncase 0x7d: { const b = st.pop(), a = st.pop(); st.push(asIntN(64, a - b)); break; }\ncase 0x7e: { const b = st.pop(), a = st.pop(); st.push(asIntN(64, a * b)); break; }\n}\n}\nreturn st[0];\n}\nconst emptyBytes = new $Uint8Array(0);\nfunction instantiateModule(rec, importObject, api) {\nconst M = rec.M;\nif (M.imports.length > 0 && !isObject(importObject)) throw new $TypeError(api + \"Imports argument must be present and must be an object\");\nconst rawFuncs = new $Array(M.funcs.length);\nconst wrappers = new $Array(M.funcs.length);\nconst tables = [], globals = [];\nlet mem = null;\nfor (let k = 0; k < M.imports.length; k++) {\nconst imp = M.imports[k];\nconst where = \"Import #\" + k + \" module=\\\"\" + imp.module + \"\\\"\";\nconst ns = importObject[imp.module];\nif (!isObject(ns)) throw new $TypeError(api + where + \": module is not an object or function\");\nconst v = ns[imp.name];\nconst what = api + where + \" function=\\\"\" + imp.name + \"\\\": \";\nif (imp.kind === 0) {\nconst type = M.types[M.funcs[imp.index]];\nif (typeof v !== \"function\") throw new LinkError(what + \"function import requires a callable\");\nconst info = funcInfo.get(v);\nif (info !== undefined) {\nif (info.sig !== type.sig) throw new LinkError(what + \"imported function does not match the expected type\");\nrawFuncs[imp.index] = info.fn;\nwrappers[imp.index] = v;\n} else {\nrawFuncs[imp.index] = importFunction(v, type);\n}\n} else if (imp.kind === 1) {\nconst want = M.tables[imp.index];\nconst t = isObject(v) ? tableCells.get(v) : undefined;\nif (t === undefined) throw new LinkError(what + \"table import requires a WebAssembly.Table\");\nif (t.a.length < want.min) throw new LinkError(what + \"table import has \" + t.a.length + \" elements, need at least \" + want.min);\nif (want.max !== null) {\nif (t.max === null) throw new LinkError(what + \"table import has no maximum length, expected \" + want.max);\nif (t.max > want.max) throw new LinkError(what + \"table import has a larger maximum size \" + t.max + \" than the module's declared maximum \" + want.max);\n}\nif (t.elem !== want.elem) throw new LinkError(what + \"imported table does not match the expected type\");\ntables.push(t);\n} else if (imp.kind === 2) {\nconst want = M.mems[imp.index];\nconst m = isObject(v) ? memoryCells.get(v) : undefined;\nif (m === undefined) throw new LinkError(what + \"memory import must be a WebAssembly.Memory object\");\nconst pages = m.len / PAGE;\nif (pages < want.min) throw new LinkError(what + \"memory import has \" + pages + \" pages which is smaller than the declared initial of \" + want.min);\nif (want.max !== null) {\nif (m.max === null) throw new LinkError(what + \"memory import has no maximum limit, expected at most \" + want.max);\nif (m.max > want.max) throw new LinkError(what + \"memory import has a larger maximum size \" + m.max + \" than the module's declared maximum \" + want.max);\n}\nmem = m;\n} else {\nconst want = M.globals[imp.index];\nconst g = isObject(v) ? globalCells.get(v) : undefined;\nif (g !== undefined) {\nif (g.mut !== want.mut) throw new LinkError(what + \"imported global does not match the expected mutability\");\nif (g.type !== want.type) throw new LinkError(what + \"imported global does not match the expected type\");\nglobals.push(g);\n} else {\nif (want.mut) throw new LinkError(what + \"imported mutable global must be a WebAssembly.Global object\");\nlet val;\nif (want.type === I64) {\nif (typeof v !== \"bigint\") throw new LinkError(what + \"global import must be a BigInt value\");\nval = asIntN(64, v);\n} else if (want.type === EXTERNREF) {\nval = v;\n} else if (want.type === FUNCREF) {\nif (!(v === null || (typeof v === \"function\" && funcInfo.has(v)))) throw new LinkError(what + \"imported funcref global must be null or a WebAssembly function\");\nval = v;\n} else {\nif (typeof v !== \"number\") throw new LinkError(what + \"global import must be a number, valid Wasm reference, or WebAssembly.Global object\");\nval = toWasm(v, want.type);\n}\nglobals.push({ type: want.type, mut: false, v: val, obj: null });\n}\n}\n}\nconst refFunc = (fi) => {\nlet w = wrappers[fi];\nif (w === undefined) {\nw = exportFunction(rawFuncs[fi], M.types[M.funcs[fi]], fi);\nwrappers[fi] = w;\n}\nreturn w;\n};\nfor (let k = M.nImportTables; k < M.tables.length; k++) {\nconst t = M.tables[k];\ntables.push({ a: new $Array(t.min).fill(null), elem: t.elem, max: t.max, obj: null });\n}\nfor (let k = M.nImportMems; k < M.mems.length; k++) mem = makeMemoryCell(M.mems[k].min, M.mems[k].max, api);\nconst factory = factoryOf(rec);\nconst datas = M.datas.map((s) => s.bytes);\nlet elems = null;\nconst memOob = () => trap(\"memory access out of bounds\");\nconst rt = {\nh: H, mem, g: globals, t: tables, f: rawFuncs,\n$grow: (n) => memoryGrow(mem, n >>> 0),\n$minit: (seg, dst, src, n) => {\nconst b = datas[seg];\ndst >>>= 0; src >>>= 0; n >>>= 0;\nif (src + n > b.length || dst + n > mem.len) memOob();\nmem.u8.set(b.subarray(src, src + n), dst);\n},\n$ddrop: (seg) => {\ndatas[seg] = emptyBytes;\n},\n$mcopy: (dst, src, n) => {\ndst >>>= 0; src >>>= 0; n >>>= 0;\nif (src + n > mem.len || dst + n > mem.len) memOob();\nmem.u8.copyWithin(dst, src, src + n);\n},\n$mfill: (dst, v, n) => {\ndst >>>= 0; n >>>= 0;\nif (dst + n > mem.len) memOob();\nmem.u8.fill(v & 255, dst, dst + n);\n},\n$tinit: (t, seg, dst, src, n) => {\nconst e = elems[seg];\ndst >>>= 0; src >>>= 0; n >>>= 0;\nif (src + n > e.length || dst + n > t.a.length) trap(\"table index is out of bounds\");\nfor (let k = 0; k < n; k++) t.a[dst + k] = e[src + k];\n},\n$edrop: (seg) => {\nelems[seg] = [];\n},\n$rf: refFunc,\n};\nfor (let k = M.nImportGlobals; k < M.globals.length; k++) globals.push({ type: M.globals[k].type, mut: M.globals[k].mut, v: undefined, obj: null });\nconst made = factory(rt);\nfor (let k = M.nImportFuncs; k < made.length; k++) rawFuncs[k] = made[k];\nfor (let k = M.nImportGlobals; k < M.globals.length; k++) globals[k].v = evalConst(M.globals[k].init, globals, refFunc);\nelems = M.elems.map((s) => s.inits.map((e) => evalConst(e, globals, refFunc)));\nconst exports = $Object.create(null);\nfor (const e of M.exports) {\nlet v;\nif (e.kind === 0) v = refFunc(e.index);\nelse if (e.kind === 1) v = tableObject(tables[e.index]);\nelse if (e.kind === 2) v = memoryObject(mem);\nelse v = globalObject(globals[e.index]);\nexports[e.name] = v;\n}\nfreeze(exports);\nfor (let k = 0; k < M.elems.length; k++) {\nconst s = M.elems[k];\nif (s.mode === \"active\") {\nconst off = evalConst(s.offset, globals, refFunc) >>> 0;\nconst t = tables[s.table];\nconst e = elems[k];\nif (off + e.length > t.a.length) trap(api + \"table index is out of bounds\");\nfor (let j = 0; j < e.length; j++) t.a[off + j] = e[j];\nelems[k] = [];\n} else if (s.mode === \"declarative\") elems[k] = [];\n}\nfor (let k = 0; k < M.datas.length; k++) {\nconst s = M.datas[k];\nif (s.mode !== \"active\") continue;\nconst off = evalConst(s.offset, globals, refFunc) >>> 0;\nif (off + s.bytes.length > mem.len) trap(api + \"data segment \" + k + \" is out of bounds (offset \" + off + \", length \" + s.bytes.length + \", memory size \" + mem.len + \")\");\nmem.u8.set(s.bytes, off);\ndatas[k] = emptyBytes;\n}\nif (M.start !== null) rawFuncs[M.start]();\nreturn exports;\n}\nconst memoryCells = new $WeakMap();\nconst tableCells = new $WeakMap();\nconst globalCells = new $WeakMap();\nconst moduleRecords = new $WeakMap();\nconst instanceExports = new $WeakMap();\nfunction isObject(v) {\nreturn v !== null && (typeof v === \"object\" || typeof v === \"function\");\n}\nfunction requireNew(nt, name) {\nif (nt === undefined) throw new $TypeError(\"WebAssembly.\" + name + \" must be invoked with 'new'\");\n}\nfunction brand(map, v, what) {\nconst c = isObject(v) ? map.get(v) : undefined;\nif (c === undefined) throw new $TypeError(\"Receiver is not a \" + what);\nreturn c;\n}\nfunction toU32(v, what) {\nconst n = +v;\nif (n !== n || n === 1 / 0 || n === -1 / 0) throw new $TypeError(what + \" must be convertible to a valid number\");\nconst t = $Math.trunc(n);\nif (t < 0 || t > 4294967295) throw new $TypeError(what + \" must be in the unsigned long range\");\nreturn t;\n}\nfunction descIndex(desc, name, api, max, required) {\nconst v = desc[name];\nif (v === undefined) {\nif (required) throw new $TypeError(api + \"Property '\" + name + \"' is required\");\nreturn null;\n}\nconst t = toU32(v, api + \"Property '\" + name + \"'\");\nif (t > max) throw new $RangeError(api + \"Property '\" + name + \"': value \" + t + \" is above the upper bound \" + max);\nreturn t;\n}\nfunction parseValType(s, api) {\nswitch ($String(s)) {\ncase \"i32\": return I32;\ncase \"i64\": return I64;\ncase \"f32\": return F32;\ncase \"f64\": return F64;\ncase \"anyfunc\": case \"funcref\": return FUNCREF;\ncase \"externref\": return EXTERNREF;\n}\nthrow new $TypeError(api + \"Descriptor property 'value' must be a WebAssembly type\");\n}\nfunction moduleRecord(m, api) {\nconst rec = isObject(m) ? moduleRecords.get(m) : undefined;\nif (rec === undefined) throw new $TypeError(api + \": Argument 0 must be a WebAssembly.Module\");\nreturn rec;\n}\nclass Module {\nconstructor(bytes) {\nrequireNew(new.target, \"Module\");\nmoduleRecords.set(this, compileModule(copyBytes(bytes, \"WebAssembly.Module(): \"), \"WebAssembly.Module(): \"));\n}\nstatic exports(m) {\nreturn moduleRecord(m, \"WebAssembly.Module.exports()\").M.exports.map((e) => ({ name: e.name, kind: kindName(e.kind) }));\n}\nstatic imports(m) {\nreturn moduleRecord(m, \"WebAssembly.Module.imports()\").M.imports.map((e) => ({ module: e.module, name: e.name, kind: kindName(e.kind) }));\n}\nstatic customSections(m, name) {\nconst rec = moduleRecord(m, \"WebAssembly.Module.customSections()\");\nif (name === undefined) throw new $TypeError(\"WebAssembly.Module.customSections(): Argument 1 is required\");\nconst want = $String(name);\nconst out = [];\nfor (const c of rec.M.customs) if (c.name === want) out.push(c.bytes.slice().buffer);\nreturn out;\n}\n}\nclass Instance {\nconstructor(module, importObject) {\nrequireNew(new.target, \"Instance\");\nconst rec = moduleRecord(module, \"WebAssembly.Instance()\");\ninstanceExports.set(this, instantiateModule(rec, importObject, \"WebAssembly.Instance(): \"));\n}\nget exports() {\nreturn brand(instanceExports, this, \"WebAssembly.Instance\");\n}\n}\nclass Memory {\nconstructor(desc) {\nrequireNew(new.target, \"Memory\");\nconst api = \"WebAssembly.Memory(): \";\nif (!isObject(desc)) throw new $TypeError(api + \"Argument 0 must be a memory descriptor\");\nconst initial = descIndex(desc, \"initial\", api, MAX_PAGES, true);\nconst maximum = descIndex(desc, \"maximum\", api, MAX_PAGES, false);\nif (maximum !== null && maximum < initial) throw new $RangeError(api + \"Property 'maximum': value \" + maximum + \" is below the lower bound \" + initial);\nconst m = makeMemoryCell(initial, maximum, api);\nm.obj = this;\nmemoryCells.set(this, m);\n}\ngrow(delta) {\nconst m = brand(memoryCells, this, \"WebAssembly.Memory\");\nconst r = memoryGrow(m, toU32(delta, \"WebAssembly.Memory.grow(): Argument 0\"));\nif (r < 0) throw new $RangeError(\"WebAssembly.Memory.grow(): Maximum memory size exceeded\");\nreturn r;\n}\nget buffer() {\nreturn brand(memoryCells, this, \"WebAssembly.Memory\").buf;\n}\n}\nfunction memoryObject(m) {\nif (m.obj === null) {\nconst o = $Object.create(Memory.prototype);\nm.obj = o;\nmemoryCells.set(o, m);\n}\nreturn m.obj;\n}\nfunction tableName(t) {\nreturn t.elem === FUNCREF ? \"funcref\" : \"externref\";\n}\nclass Table {\nconstructor(desc, value) {\nrequireNew(new.target, \"Table\");\nconst api = \"WebAssembly.Table(): \";\nif (!isObject(desc)) throw new $TypeError(api + \"Argument 0 must be a table descriptor\");\nconst es = $String(desc.element);\nlet elem;\nif (es === \"anyfunc\" || es === \"funcref\") elem = FUNCREF;\nelse if (es === \"externref\") elem = EXTERNREF;\nelse throw new $TypeError(api + \"Descriptor property 'element' must be a WebAssembly reference type\");\nconst initial = descIndex(desc, \"initial\", api, MAX_TABLE, true);\nconst maximum = descIndex(desc, \"maximum\", api, 4294967295, false);\nif (maximum !== null && maximum < initial) throw new $RangeError(api + \"Property 'maximum': value \" + maximum + \" is below the lower bound \" + initial);\nconst init = arguments.length < 2 ? (elem === EXTERNREF ? undefined : null) : value === undefined && elem === FUNCREF ? null : toWasm(value, elem);\ntableCells.set(this, { a: new $Array(initial).fill(init), elem, max: maximum, obj: this });\n}\nget length() {\nreturn brand(tableCells, this, \"WebAssembly.Table\").a.length;\n}\ngrow(delta, value) {\nconst t = brand(tableCells, this, \"WebAssembly.Table\");\nconst n = toU32(delta, \"WebAssembly.Table.grow(): Argument 0\");\nconst init = arguments.length < 2 ? (t.elem === EXTERNREF ? undefined : null) : toWasm(value, t.elem);\nconst r = tableGrow(t, n, init);\nif (r < 0) throw new $RangeError(\"WebAssembly.Table.grow(): failed to grow table by \" + n);\nreturn r;\n}\nget(index) {\nconst t = brand(tableCells, this, \"WebAssembly.Table\");\nconst i = toU32(index, \"WebAssembly.Table.get(): Argument 0\");\nif (i >= t.a.length) throw new $RangeError(\"WebAssembly.Table.get(): invalid address \" + i + \" in \" + tableName(t) + \" table of size \" + t.a.length);\nreturn t.a[i];\n}\nset(index, value) {\nconst t = brand(tableCells, this, \"WebAssembly.Table\");\nconst i = toU32(index, \"WebAssembly.Table.set(): Argument 0\");\nif (i >= t.a.length) throw new $RangeError(\"WebAssembly.Table.set(): invalid address \" + i + \" in \" + tableName(t) + \" table of size \" + t.a.length);\nt.a[i] = arguments.length < 2 ? (t.elem === EXTERNREF ? undefined : null) : toWasm(value, t.elem);\n}\n}\nfunction tableObject(t) {\nif (t.obj === null) {\nconst o = $Object.create(Table.prototype);\nt.obj = o;\ntableCells.set(o, t);\n}\nreturn t.obj;\n}\nclass Global {\nconstructor(desc, value) {\nrequireNew(new.target, \"Global\");\nconst api = \"WebAssembly.Global(): \";\nif (!isObject(desc)) throw new $TypeError(api + \"Argument 0 must be a global descriptor\");\nconst mut = !!desc.mutable;\nconst type = parseValType(desc.value, api);\nconst v = value === undefined ? (type === EXTERNREF && arguments.length >= 2 ? undefined : defaultValue(type)) : toWasm(value, type);\nglobalCells.set(this, { type, mut, v, obj: this });\n}\nvalueOf() {\nreturn brand(globalCells, this, \"WebAssembly.Global\").v;\n}\nget value() {\nreturn brand(globalCells, this, \"WebAssembly.Global\").v;\n}\nset value(v) {\nconst g = brand(globalCells, this, \"WebAssembly.Global\");\nif (!g.mut) throw new $TypeError(\"WebAssembly.Global.value: Can't set the value of an immutable global.\");\ng.v = toWasm(v, g.type);\n}\n}\nfunction globalObject(g) {\nif (g.obj === null) {\nconst o = $Object.create(Global.prototype);\ng.obj = o;\nglobalCells.set(o, g);\n}\nreturn g.obj;\n}\n{\nconst classes = [Module, \"Module\", Instance, \"Instance\", Memory, \"Memory\", Table, \"Table\", Global, \"Global\"];\nfor (let k = 0; k < classes.length; k += 2) {\ndefineProperty(classes[k].prototype, $Symbol.toStringTag, { value: \"WebAssembly.\" + classes[k + 1], configurable: true });\ndefineProperty(classes[k], \"length\", { value: 1 });\n}\n}\nfunction newModule(rec) {\nconst m = $Object.create(Module.prototype);\nmoduleRecords.set(m, rec);\nreturn m;\n}\nfunction newInstance(rec, importObject, api) {\nconst inst = $Object.create(Instance.prototype);\ninstanceExports.set(inst, instantiateModule(rec, importObject, api));\nreturn inst;\n}\nfunction checkImportsArg(importObject, api) {\nif (importObject !== undefined && !isObject(importObject)) throw new $TypeError(api + \"Argument 1 must be an object\");\n}\nfunction validate(bytes) {\nconst b = copyBytes(bytes, \"WebAssembly.validate(): \");\napiName = \"WebAssembly.validate(): \";\ntry {\nconst M = decode(b);\nfor (let k = M.nImportFuncs; k < M.funcs.length; k++) compileFunction(M, b, k);\nreturn true;\n} catch (e) {\nif (e instanceof CompileError) return false;\nthrow e;\n}\n}\nfunction compile(bytes) {\nreturn new $Promise((resolve) => {\nresolve(newModule(compileModule(copyBytes(bytes, \"WebAssembly.compile(): \"), \"WebAssembly.compile(): \")));\n});\n}\nfunction instantiate(source, importObject) {\nconst api = \"WebAssembly.instantiate(): \";\nreturn new $Promise((resolve) => {\nconst rec = isObject(source) ? moduleRecords.get(source) : undefined;\nif (rec !== undefined) {\ncheckImportsArg(importObject, api);\nresolve($Promise.resolve().then(() => newInstance(rec, importObject, api)));\nreturn;\n}\nconst b = copyBytes(source, api);\ncheckImportsArg(importObject, api);\nconst r = compileModule(b, api);\nconst module = newModule(r);\nresolve($Promise.resolve().then(() => ({ module, instance: newInstance(r, importObject, api) })));\n});\n}\nasync function responseBytes(source, api) {\nconst resp = await source;\nif (!isObject(resp) || typeof resp.arrayBuffer !== \"function\") throw new $TypeError(api + \"Argument 0 must be provided and must be a Response\");\nconst headers = resp.headers;\nif (isObject(headers) && typeof headers.get === \"function\") {\nconst ct = headers.get(\"Content-Type\");\nif (ct === null || ct === undefined || $String(ct).toLowerCase().split(\";\")[0].trim() !== \"application/wasm\")\nthrow new $TypeError(api + \"Incorrect response MIME type. Expected 'application/wasm'.\");\n}\nif (resp.ok === false) throw new $TypeError(api + \"HTTP status code is not ok\");\nreturn new $Uint8Array(await resp.arrayBuffer());\n}\nasync function compileStreaming(source) {\nreturn newModule(compileModule(await responseBytes(source, \"WebAssembly.compileStreaming(): \"), \"WebAssembly.compileStreaming(): \"));\n}\nasync function instantiateStreaming(source, importObject) {\nconst api = \"WebAssembly.instantiateStreaming(): \";\nconst b = await responseBytes(source, api);\ncheckImportsArg(importObject, api);\nconst r = compileModule(b, api);\nconst module = newModule(r);\nawait undefined;\nreturn { module, instance: newInstance(r, importObject, api) };\n}\n{\nconst fns = [compile, validate, instantiate, compileStreaming, instantiateStreaming];\nfor (let k = 0; k < fns.length; k++) {\ndefineProperty(fns[k], \"length\", { value: 1 });\ndefineProperty(WebAssembly, fns[k].name, { value: fns[k], writable: true, enumerable: true, configurable: true });\n}\nconst ctors = [Module, Instance, Table, Memory, Global, CompileError, LinkError, RuntimeError];\nfor (let k = 0; k < ctors.length; k++) defineProperty(WebAssembly, ctors[k].name, { value: ctors[k], writable: true, configurable: true });\ndefineProperty(WebAssembly, $Symbol.toStringTag, { value: \"WebAssembly\", configurable: true });\n}\nreturn WebAssembly;\n";
+}
+
 %InstallConstructor("globalThis", "Array", ArrayConstructor, 1, undefined);
 %InstallMethod("Array", "isArray", ArrayIsArray, 1);
 %InstallMethod("Array", "from", ArrayFrom, 1);
@@ -12323,6 +13810,7 @@ function GlobalAtob(...args) {
 %InstallMethod("ArrayBuffer", "isView", ArrayBufferIsView, 1);
 %InstallAccessor("ArrayBuffer", %WellKnownSymbol("species"), ArrayBufferSpecies, false);
 %InstallPrototype("globalThis", "ArrayBuffer", undefined);
+%InstallValue("globalThis", "Atomics", AtomicsObject(), 5);
 %InstallConstructor("globalThis", "BigInt", BigIntConstructor, 1, undefined);
 %InstallMethod("BigInt", "asUintN", BigIntAsUintNBuiltin, 2);
 %InstallMethod("BigInt", "asIntN", BigIntAsIntNBuiltin, 2);
@@ -12371,6 +13859,35 @@ function GlobalAtob(...args) {
 %InstallMethod("globalThis", "queueMicrotask", GlobalQueueMicrotask, 1);
 %InstallConstructor("globalThis", "Function", FunctionConstructor, 1, undefined);
 %InstallPrototype("globalThis", "Function", undefined);
+%InstallValue("globalThis", "Intl", IntlObject(), 5);
+%InstallMethod("Intl", "getCanonicalLocales", IntlGetCanonicalLocales, 1);
+%InstallMethod("Intl", "supportedValuesOf", IntlSupportedValuesOf, 1);
+%InstallConstructor("Intl", "DateTimeFormat", IntlDateTimeFormatConstructor, 0, undefined);
+%InstallPrototype("Intl", "DateTimeFormat", undefined);
+%InstallMethod("Intl.DateTimeFormat", "supportedLocalesOf", IntlDateTimeFormatSupportedLocalesOf, 1);
+%InstallConstructor("Intl", "NumberFormat", IntlNumberFormatConstructor, 0, undefined);
+%InstallPrototype("Intl", "NumberFormat", undefined);
+%InstallMethod("Intl.NumberFormat", "supportedLocalesOf", IntlNumberFormatSupportedLocalesOf, 1);
+%InstallConstructor("Intl", "Collator", IntlCollatorConstructor, 0, undefined);
+%InstallPrototype("Intl", "Collator", undefined);
+%InstallMethod("Intl.Collator", "supportedLocalesOf", IntlCollatorSupportedLocalesOf, 1);
+%InstallConstructor("Intl", "PluralRules", IntlPluralRulesConstructor, 0, undefined);
+%InstallPrototype("Intl", "PluralRules", undefined);
+%InstallMethod("Intl.PluralRules", "supportedLocalesOf", IntlPluralRulesSupportedLocalesOf, 1);
+%InstallConstructor("Intl", "RelativeTimeFormat", IntlRelativeTimeFormatConstructor, 0, undefined);
+%InstallPrototype("Intl", "RelativeTimeFormat", undefined);
+%InstallMethod("Intl.RelativeTimeFormat", "supportedLocalesOf", IntlRelativeTimeFormatSupportedLocalesOf, 1);
+%InstallConstructor("Intl", "ListFormat", IntlListFormatConstructor, 0, undefined);
+%InstallPrototype("Intl", "ListFormat", undefined);
+%InstallMethod("Intl.ListFormat", "supportedLocalesOf", IntlListFormatSupportedLocalesOf, 1);
+%InstallConstructor("Intl", "Locale", IntlLocaleConstructor, 1, undefined);
+%InstallPrototype("Intl", "Locale", undefined);
+%InstallConstructor("Intl", "DisplayNames", IntlDisplayNamesConstructor, 2, undefined);
+%InstallPrototype("Intl", "DisplayNames", undefined);
+%InstallMethod("Intl.DisplayNames", "supportedLocalesOf", IntlDisplayNamesSupportedLocalesOf, 1);
+%InstallConstructor("Intl", "Segmenter", IntlSegmenterConstructor, 0, undefined);
+%InstallPrototype("Intl", "Segmenter", undefined);
+%InstallMethod("Intl.Segmenter", "supportedLocalesOf", IntlSegmenterSupportedLocalesOf, 1);
 %InstallConstructor("globalThis", "Iterator", IteratorConstructor, 0, undefined);
 %InstallMethod("Iterator", "concat", IteratorConcat, 0);
 %InstallMethod("Iterator", "from", IteratorFrom, 1);
@@ -12452,6 +13969,9 @@ function GlobalAtob(...args) {
 %InstallConstructor("globalThis", "Set", SetConstructor, 0, undefined);
 %InstallAccessor("Set", %WellKnownSymbol("species"), SetSpecies, false);
 %InstallPrototype("globalThis", "Set", undefined);
+%InstallConstructor("globalThis", "SharedArrayBuffer", SharedArrayBufferConstructor, 1, undefined);
+%InstallAccessor("SharedArrayBuffer", %WellKnownSymbol("species"), SharedArrayBufferSpecies, false);
+%InstallPrototype("globalThis", "SharedArrayBuffer", undefined);
 %InstallConstructor("globalThis", "String", StringConstructor, 1, undefined);
 %InstallMethod("String", "fromCharCode", StringFromCharCode, 1);
 %InstallMethod("String", "fromCodePoint", StringFromCodePoint, 1);
@@ -12538,6 +14058,7 @@ function GlobalAtob(...args) {
 %InstallPrototype("globalThis", "DOMException", "Error");
 %InstallMethod("globalThis", "btoa", GlobalBtoa, 1);
 %InstallMethod("globalThis", "atob", GlobalAtob, 1);
+%InstallValue("globalThis", "WebAssembly", WebAssemblyObject(), 5);
 %InstallMethod("Array.prototype", "at", ArrayPrototypeAt, 1);
 %InstallMethod("Array.prototype", "with", ArrayPrototypeWith, 2);
 %InstallMethod("Array.prototype", "concat", ArrayPrototypeConcat, 1);
@@ -12594,6 +14115,20 @@ function GlobalAtob(...args) {
 %InstallMethod("%AsyncFromSyncIteratorPrototype%", "next", AsyncFromSyncIteratorNext, 1);
 %InstallMethod("%AsyncFromSyncIteratorPrototype%", "return", AsyncFromSyncIteratorReturn, 1);
 %InstallMethod("%AsyncFromSyncIteratorPrototype%", "throw", AsyncFromSyncIteratorThrow, 1);
+%InstallValue("Atomics", %WellKnownSymbol("toStringTag"), AtomicsToStringTag(), 4);
+%InstallMethod("Atomics", "add", AtomicsAdd, 3);
+%InstallMethod("Atomics", "and", AtomicsAnd, 3);
+%InstallMethod("Atomics", "compareExchange", AtomicsCompareExchange, 4);
+%InstallMethod("Atomics", "exchange", AtomicsExchange, 3);
+%InstallMethod("Atomics", "isLockFree", AtomicsIsLockFree, 1);
+%InstallMethod("Atomics", "load", AtomicsLoad, 2);
+%InstallMethod("Atomics", "or", AtomicsOr, 3);
+%InstallMethod("Atomics", "store", AtomicsStore, 3);
+%InstallMethod("Atomics", "sub", AtomicsSub, 3);
+%InstallMethod("Atomics", "xor", AtomicsXor, 3);
+%InstallMethod("Atomics", "wait", AtomicsWait, 4);
+%InstallMethod("Atomics", "waitAsync", AtomicsWaitAsync, 4);
+%InstallMethod("Atomics", "notify", AtomicsNotify, 3);
 %InstallMethod("BigInt.prototype", "toString", BigIntPrototypeToString, 0);
 %InstallMethod("BigInt.prototype", "toLocaleString", BigIntPrototypeToLocaleString, 0);
 %InstallMethod("BigInt.prototype", "valueOf", BigIntPrototypeValueOf, 0);
@@ -12728,6 +14263,65 @@ function GlobalAtob(...args) {
 %InstallMethod("%GeneratorPrototype%", "return", GeneratorPrototypeReturn, 1);
 %InstallMethod("%GeneratorPrototype%", "throw", GeneratorPrototypeThrow, 1);
 %InstallValue("%GeneratorPrototype%", %WellKnownSymbol("toStringTag"), GeneratorPrototypeToStringTag(), 4);
+%InstallValue("Intl", %WellKnownSymbol("toStringTag"), IntlToStringTag(), 4);
+%InstallPrototypeConstructor("NumberFormat");
+%InstallMethod("Intl.NumberFormat.prototype", "resolvedOptions", IntlNumberFormatPrototypeResolvedOptions, 0);
+%InstallMethod("Intl.NumberFormat.prototype", "formatToParts", IntlNumberFormatPrototypeFormatToParts, 0);
+%InstallAccessor("Intl.NumberFormat.prototype", "format", IntlNumberFormatPrototypeFormat, false);
+%InstallMethod("Intl.NumberFormat.prototype", "formatRange", IntlNumberFormatPrototypeFormatRange, 2);
+%InstallMethod("Intl.NumberFormat.prototype", "formatRangeToParts", IntlNumberFormatPrototypeFormatRangeToParts, 2);
+%InstallPrototypeConstructor("DateTimeFormat");
+%InstallMethod("Intl.DateTimeFormat.prototype", "resolvedOptions", IntlDateTimeFormatPrototypeResolvedOptions, 0);
+%InstallMethod("Intl.DateTimeFormat.prototype", "formatToParts", IntlDateTimeFormatPrototypeFormatToParts, 0);
+%InstallAccessor("Intl.DateTimeFormat.prototype", "format", IntlDateTimeFormatPrototypeFormat, false);
+%InstallMethod("Intl.DateTimeFormat.prototype", "formatRange", IntlDateTimeFormatPrototypeFormatRange, 2);
+%InstallMethod("Intl.DateTimeFormat.prototype", "formatRangeToParts", IntlDateTimeFormatPrototypeFormatRangeToParts, 2);
+%InstallPrototypeConstructor("Collator");
+%InstallMethod("Intl.Collator.prototype", "resolvedOptions", IntlCollatorPrototypeResolvedOptions, 0);
+%InstallAccessor("Intl.Collator.prototype", "compare", IntlCollatorPrototypeCompare, false);
+%InstallPrototypeConstructor("PluralRules");
+%InstallMethod("Intl.PluralRules.prototype", "resolvedOptions", IntlPluralRulesPrototypeResolvedOptions, 0);
+%InstallMethod("Intl.PluralRules.prototype", "select", IntlPluralRulesPrototypeSelect, 0);
+%InstallMethod("Intl.PluralRules.prototype", "selectRange", IntlPluralRulesPrototypeSelectRange, 2);
+%InstallPrototypeConstructor("ListFormat");
+%InstallMethod("Intl.ListFormat.prototype", "resolvedOptions", IntlListFormatPrototypeResolvedOptions, 0);
+%InstallMethod("Intl.ListFormat.prototype", "format", IntlListFormatPrototypeFormat, 0);
+%InstallMethod("Intl.ListFormat.prototype", "formatToParts", IntlListFormatPrototypeFormatToParts, 0);
+%InstallPrototypeConstructor("RelativeTimeFormat");
+%InstallMethod("Intl.RelativeTimeFormat.prototype", "resolvedOptions", IntlRelativeTimeFormatPrototypeResolvedOptions, 0);
+%InstallMethod("Intl.RelativeTimeFormat.prototype", "format", IntlRelativeTimeFormatPrototypeFormat, 0);
+%InstallMethod("Intl.RelativeTimeFormat.prototype", "formatToParts", IntlRelativeTimeFormatPrototypeFormatToParts, 0);
+%InstallPrototypeConstructor("Locale");
+%InstallMethod("Intl.Locale.prototype", "toString", IntlLocalePrototypeToString, 0);
+%InstallMethod("Intl.Locale.prototype", "maximize", IntlLocalePrototypeMaximize, 0);
+%InstallMethod("Intl.Locale.prototype", "minimize", IntlLocalePrototypeMinimize, 0);
+%InstallAccessor("Intl.Locale.prototype", "language", IntlLocalePrototypeLanguage, false);
+%InstallAccessor("Intl.Locale.prototype", "script", IntlLocalePrototypeScript, false);
+%InstallAccessor("Intl.Locale.prototype", "region", IntlLocalePrototypeRegion, false);
+%InstallAccessor("Intl.Locale.prototype", "baseName", IntlLocalePrototypeBaseName, false);
+%InstallAccessor("Intl.Locale.prototype", "calendar", IntlLocalePrototypeCalendar, false);
+%InstallAccessor("Intl.Locale.prototype", "caseFirst", IntlLocalePrototypeCaseFirst, false);
+%InstallAccessor("Intl.Locale.prototype", "collation", IntlLocalePrototypeCollation, false);
+%InstallAccessor("Intl.Locale.prototype", "hourCycle", IntlLocalePrototypeHourCycle, false);
+%InstallAccessor("Intl.Locale.prototype", "numeric", IntlLocalePrototypeNumeric, false);
+%InstallAccessor("Intl.Locale.prototype", "numberingSystem", IntlLocalePrototypeNumberingSystem, false);
+%InstallAccessor("Intl.Locale.prototype", "calendars", IntlLocalePrototypeCalendars, false);
+%InstallAccessor("Intl.Locale.prototype", "collations", IntlLocalePrototypeCollations, false);
+%InstallAccessor("Intl.Locale.prototype", "hourCycles", IntlLocalePrototypeHourCycles, false);
+%InstallAccessor("Intl.Locale.prototype", "numberingSystems", IntlLocalePrototypeNumberingSystems, false);
+%InstallAccessor("Intl.Locale.prototype", "textInfo", IntlLocalePrototypeTextInfo, false);
+%InstallAccessor("Intl.Locale.prototype", "timeZones", IntlLocalePrototypeTimeZones, false);
+%InstallAccessor("Intl.Locale.prototype", "weekInfo", IntlLocalePrototypeWeekInfo, false);
+%InstallPrototypeConstructor("DisplayNames");
+%InstallMethod("Intl.DisplayNames.prototype", "resolvedOptions", IntlDisplayNamesPrototypeResolvedOptions, 0);
+%InstallMethod("Intl.DisplayNames.prototype", "of", IntlDisplayNamesPrototypeOf, 0);
+%InstallPrototypeConstructor("Segmenter");
+%InstallMethod("Intl.Segmenter.prototype", "resolvedOptions", IntlSegmenterPrototypeResolvedOptions, 0);
+%InstallMethod("Intl.Segmenter.prototype", "segment", IntlSegmenterPrototypeSegment, 0);
+%InstallMethod("%IntlSegmentsPrototype%", "containing", IntlSegmentsPrototypeContaining, 0);
+%InstallMethod("%IntlSegmentsPrototype%", %WellKnownSymbol("iterator"), IntlSegmentsPrototypeIterator, 0);
+%InstallMethod("%IntlSegmentIteratorPrototype%", "next", IntlSegmentIteratorPrototypeNext, 0);
+%InstallValue("%IntlSegmentIteratorPrototype%", %WellKnownSymbol("toStringTag"), IntlSegmentIteratorToStringTag(), 4);
 %InstallMethod("Array.prototype", "keys", ArrayPrototypeKeys, 0);
 %InstallMethod("Array.prototype", "entries", ArrayPrototypeEntries, 0);
 %InstallPrototypeConstructor("Array");
@@ -12905,6 +14499,12 @@ function GlobalAtob(...args) {
 %InstallMethod("Set.prototype", "entries", SetPrototypeEntries, 0);
 %InstallPrototypeConstructor("Set");
 %InstallMethod("Set.prototype", %WellKnownSymbol("iterator"), SetPrototypeValues, 0);
+%InstallAccessor("SharedArrayBuffer.prototype", "byteLength", SharedArrayBufferPrototypeByteLength, false);
+%InstallMethod("SharedArrayBuffer.prototype", "grow", SharedArrayBufferPrototypeGrow, 1);
+%InstallAccessor("SharedArrayBuffer.prototype", "growable", SharedArrayBufferPrototypeGrowable, false);
+%InstallAccessor("SharedArrayBuffer.prototype", "maxByteLength", SharedArrayBufferPrototypeMaxByteLength, false);
+%InstallMethod("SharedArrayBuffer.prototype", "slice", SharedArrayBufferPrototypeSlice, 2);
+%InstallValue("SharedArrayBuffer.prototype", %WellKnownSymbol("toStringTag"), SharedArrayBufferPrototypeToStringTag(), 4);
 %InstallMethod("String.prototype", "charCodeAt", StringPrototypeCharCodeAt, 1);
 %InstallMethod("String.prototype", "charAt", StringPrototypeCharAt, 1);
 %InstallMethod("String.prototype", "concat", StringPrototypeConcat, 1);
@@ -13033,6 +14633,7 @@ function GlobalAtob(...args) {
 %InstallAccessor("DOMException.prototype", "message", DOMExceptionPrototypeMessage, false);
 %InstallAccessor("DOMException.prototype", "code", DOMExceptionPrototypeCode, false);
 %InstallPrototypeConstructor("DOMException");
+%InstallValue("WebAssembly", %WellKnownSymbol("toStringTag"), WebAssemblyToStringTag(), 4);
 %InstallValue("Array.prototype", %WellKnownSymbol("unscopables"), ArrayPrototypeUnscopables(), 4);
 %InstallValue("ArrayBuffer.prototype", %WellKnownSymbol("toStringTag"), ArrayBufferPrototypeToStringTag(), 4);
 %InstallPrototypeConstructor("BigInt");
@@ -13056,6 +14657,15 @@ function GlobalAtob(...args) {
 %InstallPrototypeConstructor("SuppressedError");
 %InstallMethod("Function.prototype", %WellKnownSymbol("hasInstance"), FunctionPrototypeHasInstance, 1);
 %InstallValue("Function.prototype", %WellKnownSymbol("hasInstance"), FunctionPrototypeHasInstance, 0);
+%InstallValue("Intl.NumberFormat.prototype", %WellKnownSymbol("toStringTag"), IntlNumberFormatToStringTag(), 4);
+%InstallValue("Intl.DateTimeFormat.prototype", %WellKnownSymbol("toStringTag"), IntlDateTimeFormatToStringTag(), 4);
+%InstallValue("Intl.Collator.prototype", %WellKnownSymbol("toStringTag"), IntlCollatorToStringTag(), 4);
+%InstallValue("Intl.PluralRules.prototype", %WellKnownSymbol("toStringTag"), IntlPluralRulesToStringTag(), 4);
+%InstallValue("Intl.ListFormat.prototype", %WellKnownSymbol("toStringTag"), IntlListFormatToStringTag(), 4);
+%InstallValue("Intl.RelativeTimeFormat.prototype", %WellKnownSymbol("toStringTag"), IntlRelativeTimeFormatToStringTag(), 4);
+%InstallValue("Intl.Locale.prototype", %WellKnownSymbol("toStringTag"), IntlLocaleToStringTag(), 4);
+%InstallValue("Intl.DisplayNames.prototype", %WellKnownSymbol("toStringTag"), IntlDisplayNamesToStringTag(), 4);
+%InstallValue("Intl.Segmenter.prototype", %WellKnownSymbol("toStringTag"), IntlSegmenterToStringTag(), 4);
 %InstallAccessor("Iterator.prototype", %WellKnownSymbol("toStringTag"), IteratorPrototypeToStringTagSet, true);
 %InstallValue("Map.prototype", %WellKnownSymbol("toStringTag"), MapPrototypeToStringTag(), 4);
 %InstallPrototypeConstructor("Number");
@@ -13063,6 +14673,7 @@ function GlobalAtob(...args) {
 %InstallPrototypeConstructor("Promise");
 %InstallMethod("RegExp.prototype", %WellKnownSymbol("split"), RegExpPrototypeSplit, 2);
 %InstallValue("Set.prototype", %WellKnownSymbol("toStringTag"), SetPrototypeToStringTag(), 4);
+%InstallPrototypeConstructor("SharedArrayBuffer");
 %InstallMethod("String.prototype", %WellKnownSymbol("iterator"), StringPrototypeIterator, 0);
 %InstallValue("Symbol.prototype", %WellKnownSymbol("toStringTag"), SymbolPrototypeToStringTag(), 4);
 %InstallAccessor("%TypedArray%.prototype", %WellKnownSymbol("toStringTag"), TypedArrayPrototypeToStringTag, false);
@@ -13100,6 +14711,7 @@ function GlobalAtob(...args) {
 %InstallIntrinsic("AsyncIteratorCloseThrow", AsyncIteratorCloseThrow);
 %InstallIntrinsic("AsyncFromSyncIteratorUnwrap", AsyncFromSyncIteratorUnwrap);
 %InstallIntrinsic("AsyncFromSyncIteratorCloseThrow", AsyncFromSyncIteratorCloseThrow);
+%InstallIntrinsic("AtomicsWaitTimeout", AtomicsWaitTimeout);
 %InstallIntrinsic("ToBigInt", ToBigInt);
 %InstallIntrinsic("ToPrimitive", ToPrimitive);
 %InstallIntrinsic("ToNumber", ToNumber);
@@ -13149,6 +14761,8 @@ function GlobalAtob(...args) {
 %InstallIntrinsic("AsyncGeneratorFunctionConstructor", AsyncGeneratorFunctionConstructor);
 %InstallIntrinsic("AsyncFunctionConstructor", AsyncFunctionConstructor);
 %InstallIntrinsic("DynamicImport", DynamicImport);
+%InstallIntrinsic("IntlBoundFormat", IntlBoundFormat);
+%InstallIntrinsic("IntlBoundCompare", IntlBoundCompare);
 %InstallIntrinsic("GetIterator", GetIterator);
 %InstallIntrinsic("IteratorClose", IteratorClose);
 %InstallIntrinsic("IteratorCloseThrow", IteratorCloseThrow);

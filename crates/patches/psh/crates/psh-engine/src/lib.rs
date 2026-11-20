@@ -131,11 +131,17 @@ pub struct ShellConfig {
 impl ShellConfig {
     /// Native stack an embedder should budget per nesting level: a function call
     /// measured about 3 KiB in release and 15 KiB in debug builds
-    /// (`examples/stackprobe.rs`, D1050, D1059).
-    pub const STACK_PER_LEVEL: usize = 16 * 1024;
-    /// The default nesting limit: 1000 levels need up to 16 MiB of stack. On wasm32
-    /// (1 MiB stack by default) use about 200, or link with a larger stack.
-    pub const DEFAULT_MAX_DEPTH: u32 = 1000;
+    /// (`examples/stackprobe.rs`, D1050, D1059), but a level that runs `case`, `if`,
+    /// `eval` and a command substitution takes up to 17 KiB in release and 45 KiB in
+    /// debug builds (overflowing at about 1,900 levels of an 84 MiB stack).
+    pub const STACK_PER_LEVEL: usize = if cfg!(debug_assertions) { 64 } else { 24 } * 1024;
+    /// The default nesting limit, near bash's practical depth: bash 5.2 with the
+    /// default 8 MiB `ulimit -s` and FUNCNEST unset dies with SIGSEGV after about 5,290
+    /// levels of `f(){ f; }`, so scripts that work in bash stay under 5000. 5000 levels
+    /// need about 120 MiB of stack in release (`std_host::ENGINE_STACK` reserves it; only
+    /// touched pages cost memory). On wasm32 (1 MiB stack by default) use about 200, or
+    /// link with a larger stack.
+    pub const DEFAULT_MAX_DEPTH: u32 = 5000;
 
     /// A config with closed stdio, an empty environment and `/` as the working
     /// directory.
@@ -285,6 +291,8 @@ impl Shell {
             nested_shells: cfg.nested_shells,
             own_program: cfg.own_program.clone(),
             rng: Cell::new(0),
+            rseed: Cell::new(None),
+            last_random: Cell::new(0),
             seconds_base: Cell::new(cfg.host.now().as_nanos() as i128),
             forked: Cell::new(None),
             catch: cfg.catch.clone(),
@@ -338,10 +346,13 @@ impl Shell {
             last_procsub: None,
             var_fds: Vec::new(),
             stage_subshell: false,
+            stage_gate: None,
             time_subshell: None,
             last_args: Vec::new(),
             subshell_level: 0,
             arith_unbound: false,
+            arith_syntax: false,
+            sub_fatal: false,
             exported_funcs: Rc::new(Vec::new()),
             traced_funcs: Rc::new(Vec::new()),
             readonly_funcs: Rc::new(Vec::new()),
@@ -367,6 +378,10 @@ impl Shell {
             own_sigs: Cell::new(0),
             top: true,
             fork_job: false,
+            bg_simple: false,
+            stage_simple: false,
+            own_simple: None,
+            parent_exit: false,
             sigs: state::Sigs::Shell,
             xtrace_level: 1,
             cmd_name: None,
@@ -408,6 +423,8 @@ impl Shell {
         self.before = None;
         self.core.jobs.set(0);
         self.core.rng.set(0);
+        self.core.rseed.set(None);
+        self.core.last_random.set(0);
         self.core
             .seconds_base
             .set(self.core.host.now().as_nanos() as i128);
@@ -727,6 +744,8 @@ pub(crate) fn initial_vars(host: &dyn Host, env: &[(Vec<u8>, Vec<u8>)], cwd: &[u
             v.value = vars::Value::Assoc(Default::default());
         }
     }
+    // The command hash table as an array; psh has no hash table, so it stays empty.
+    vars.entry("BASH_CMDS").value = vars::Value::Assoc(Default::default());
     // Who and where the shell runs, from the host (D1328). As in bash: UID and
     // EUID (readonly integers) and the names below give way to the environment's;
     // PPID never does; GROUPS is computed, so assignments to it do nothing.
@@ -1247,8 +1266,11 @@ async fn run_chunk(
                 vp.status = 1;
                 return None;
             }
-            vp.status = 2;
-            Some(2)
+            // An unterminated quote keeps a failing status (a failed command, then `echo 'a`).
+            if !(e.keeps_status && vp.status != 0) {
+                vp.status = 2;
+            }
+            Some(vp.status)
         }
     }
 }
@@ -1290,3 +1312,86 @@ pub fn run_on_test_host(source: &str) -> (i32, Vec<u8>, Vec<u8>) {
     };
     (status, host.stdout(), host.stderr())
 }
+
+#[cfg(test)]
+mod parity_tests {
+    use super::run_on_test_host as run;
+
+    fn err(s: &str) -> String {
+        String::from_utf8_lossy(&run(s).2).into_owned()
+    }
+
+    #[test]
+    fn an_unterminated_quote_keeps_a_failing_status() {
+        assert_eq!(run("false\necho 'a").0, 1);
+        assert_eq!(run("(exit 3)\necho \"a").0, 3);
+        assert_eq!(run("true\necho 'a").0, 2);
+        assert_eq!(run("false\nif true; then").0, 2);
+    }
+
+    #[test]
+    fn an_unterminated_array_value_goes_on_with_status_1() {
+        assert_eq!(run("arr=(x 'y)").0, 1);
+        assert_eq!(run("arr+=(\"x-'d\"q'\")").0, 1);
+    }
+
+    #[test]
+    fn an_arithmetic_error_in_a_here_document_fails_only_its_command() {
+        let (status, out, _) = run("! cat <<EOF\n$((1/0))\nEOF\necho after $?");
+        assert_eq!((status, &out[..]), (0, &b"after 0\n"[..]));
+        let (_, out, _) = run("cat <<EOF || echo or $?\n$((1/0))\nEOF");
+        assert_eq!(out, b"or 1\n");
+    }
+
+    #[test]
+    fn an_unterminated_here_document_ends_in_a_newline_after_expansion() {
+        let (_, out, _) = run("a='end\n'\ncat <<EOF\n$a");
+        assert_eq!(out, b"end\n\n");
+    }
+
+    #[test]
+    fn a_function_from_dash_c_names_its_messages_environment() {
+        assert!(err("f() { cd /nonexistent; }; f").starts_with("environment: line 1: cd:"));
+        assert!(err("f() { eval \"echo 'q\"; }; f").starts_with("environment: eval: line 1:"));
+    }
+
+    #[test]
+    fn messages_are_worded_as_bash_5_2_does() {
+        assert!(err("let n=n + 1").contains("let: +: syntax error: operand expected"));
+        assert!(err("[ 1 -eq x ]").contains("[: x: integer expression expected"));
+        assert!(err(".").contains(".: usage: . filename [arguments]"));
+    }
+
+    #[test]
+    fn a_dead_arithmetic_branch_refuses_a_negative_exponent() {
+        let (status, out, e) = run("echo $(( 1 ? 1 : 2 ** -3 ))");
+        assert_eq!((status, &out[..]), (1, &b""[..]));
+        assert!(String::from_utf8_lossy(&e).contains("exponent less than 0"));
+    }
+
+    #[test]
+    fn a_pre_increment_followed_by_another_fails_after_its_change() {
+        let (_, out, e) = run("let n=--n++; echo $n");
+        assert_eq!(out, b"-1\n");
+        assert!(String::from_utf8_lossy(&e)
+            .contains("let: n=--n++: ++: assignment requires lvalue (error token is \"++\")"));
+        assert_eq!(run("n=5; echo $((--n++))").0, 1);
+    }
+
+    #[test]
+    fn a_let_word_with_parens_is_one_pattern() {
+        let (_, out, _) = run("shopt -s nullglob\nlet n=(1 ? 1 : 1); echo \"[$n]\"");
+        assert_eq!(out, b"[]\n");
+        let (_, out, _) = run("let n=(1 * 2); echo $n");
+        assert_eq!(out, b"2\n");
+    }
+}
+
+#[cfg(test)]
+mod bashtests_parity_tests;
+#[cfg(test)]
+mod coverage_parity_tests;
+#[cfg(test)]
+mod fuzz_parity_tests;
+#[cfg(test)]
+mod perf_tests;

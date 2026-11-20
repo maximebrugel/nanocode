@@ -966,6 +966,18 @@ pub fn ready_type(ty: *mut Type) {
         if t.alloc.is_none() {
             t.alloc = Some(PyType_GenericAlloc);
         }
+        // CPython gives a heap type without tp_new its base's tp_new; for
+        // a direct subclass of object that is object_new, which allocates
+        // the C struct through tp_alloc. Without it the class would inherit
+        // the VM's object.__new__ and hand C code an object with no struct
+        // behind it (sqlite3's Connection and Cursor crashed this way).
+        if t.new.is_none()
+            && t.flags & TPFLAGS_HEAPTYPE != 0
+            && t.flags & TPFLAGS_DISALLOW_INSTANTIATION == 0
+            && t.base_type == bridge::PyBaseObject_Type.get()
+        {
+            t.new = Some(PyType_GenericNew);
+        }
         if t.free.is_none() {
             t.free = Some(heap::PyObject_Free);
         }

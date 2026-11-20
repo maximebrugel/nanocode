@@ -45,6 +45,19 @@ impl<'a> PayloadReader<'a> {
         }
     }
 
+    /// Loads payloads the caller decodes into values it owns and then drops, so a
+    /// store's payload memo hands back and forgets its copies of them and keeps
+    /// none: kept, they would hold the decoded values' bytes a second time.
+    pub async fn take_payloads(self, payloads: Vec<EncodedPayload>) -> Result<Vec<EncodedPayload>> {
+        match self.0 {
+            Source::Store(store, state_id) => match store.payload_memo.as_deref() {
+                Some(memo) => memo.take_many(&payloads, store, state_id).await,
+                None => EncodedPayload::load_many(&payloads, &mut store.clone(), state_id).await,
+            },
+            Source::Owner(_) | Source::Session(_) => self.load_payloads(payloads).await,
+        }
+    }
+
     pub async fn load_payload(self, payload: EncodedPayload) -> Result<EncodedPayload> {
         match self.0 {
             Source::Owner(owner) => owner.load_payload(payload).await,
@@ -272,8 +285,8 @@ pub async fn load_sequence<T: DeserializeOwned>(
 ) -> Result<Vec<T>> {
     load_sequence_payloads(reader, sequence, keys)
         .await?
-        .iter()
-        .map(EncodedPayload::decode)
+        .into_iter()
+        .map(|payload| payload.decode())
         .collect()
 }
 

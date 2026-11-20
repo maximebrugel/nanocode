@@ -17,9 +17,12 @@ mod cmd;
 mod commit;
 mod diff;
 mod extra;
+mod graph;
 mod index;
 mod line_diff;
 mod log;
+mod merge;
+mod misc;
 mod pack;
 mod patch;
 mod pkt;
@@ -90,6 +93,8 @@ pub struct Git<'a> {
     pub columns: Option<usize>,
     /// What the command changes, carried out once its body has ended.
     pub plan: RefCell<write::Plan>,
+    /// stdin read to its end, for the commands that read it (else empty).
+    pub stdin: Vec<u8>,
 }
 
 impl Git<'_> {
@@ -120,14 +125,11 @@ impl Io<'_> {
 /// A command that changes the repository or the worktree in a way this git does not.
 const WRITES: &[&str] = &[
     "am",
-    "apply",
     "bisect",
-    "cherry-pick",
     "commit-tree",
     "filter-branch",
     "format-patch",
     "gc",
-    "hash-object",
     "lfs",
     "maintenance",
     "mergetool",
@@ -139,7 +141,6 @@ const WRITES: &[&str] = &[
     "repack",
     "replace",
     "rerere",
-    "revert",
     "sparse-checkout",
     "submodule",
     "update-index",
@@ -177,7 +178,9 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
     let (planned, plans) = mpsc::channel();
     let status = ctx
         .run_blocking(
-            BlockingOptions { stdin: false },
+            BlockingOptions {
+                stdin: reads_stdin(argv),
+            },
             (argv.to_vec(), now, offset, planned),
             body,
         )
@@ -199,11 +202,36 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
 
 type Args = (Vec<Vec<u8>>, i64, i64, mpsc::Sender<write::Plan>);
 
+/// Whether the command reads stdin: an option that says so, or apply without a file.
+fn reads_stdin(argv: &[Vec<u8>]) -> bool {
+    let words: Vec<&[u8]> = argv.iter().skip(1).map(Vec::as_slice).collect();
+    if words.contains(&b"--stdin".as_slice()) {
+        return true;
+    }
+    // The command is the first word that is not an option or an option's value.
+    let mut at = 0;
+    while at < words.len() && words[at].starts_with(b"-") {
+        let takes_value = matches!(words[at], b"-C" | b"-c" | b"--git-dir" | b"--work-tree");
+        at += if takes_value { 2 } else { 1 };
+    }
+    match words.get(at) {
+        Some(&command) if command == b"apply" => {
+            let rest = &words[at + 1..];
+            rest.iter().all(|w| w.starts_with(b"-")) || rest.contains(&b"-".as_slice())
+        }
+        _ => false,
+    }
+}
+
 fn body(ctx: &mut SyncCtx, (argv, now, offset, planned): Args) -> i32 {
+    let mut stdin = Vec::new();
+    if reads_stdin(&argv) {
+        let _ = std::io::Read::read_to_end(&mut ctx.stdin(), &mut stdin);
+    }
     let mut out = BufWriter::with_capacity(64 * 1024, ctx.writer(1));
     let mut err = ctx.writer(2);
     let mut plan = write::Plan::default();
-    let result = start(ctx, &argv, (now, offset), &mut out, &mut err, &mut plan);
+    let result = start(ctx, &argv, (now, offset), stdin, &mut out, &mut err, &mut plan);
     let result = match result {
         Ok(status) => out.flush().map(|()| status).map_err(Error::Io),
         Err(e) => Err(e),
@@ -245,6 +273,7 @@ fn start(
     ctx: &SyncCtx,
     argv: &[Vec<u8>],
     (now, offset): (i64, i64),
+    stdin: Vec<u8>,
     out: &mut Out,
     err: &mut SyncWriter,
     plan: &mut write::Plan,
@@ -392,6 +421,7 @@ fn start(
         },
         columns,
         plan: RefCell::default(),
+        stdin,
     };
     let status = cmd::dispatch(&git, &mut io, &command, rest)?;
     *plan = git.plan.take();

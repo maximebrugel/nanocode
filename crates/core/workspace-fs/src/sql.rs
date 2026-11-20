@@ -1,5 +1,7 @@
 use crate::{
     model::{Corrupt, Digest, Entry, Manifest, Refusal},
+    objects::Objects,
+    sim::{Mutation, mutated},
     store::{Batch, Blob, Failure, Store},
 };
 use nanocode_bytes::Bytes;
@@ -27,10 +29,20 @@ const SCHEMA_POSTGRES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS nanocode_workspace_blobs (digest TEXT PRIMARY KEY, data TEXT NOT NULL, refs BIGINT NOT NULL)",
 ];
 
-const MIGRATIONS: [Migration; 1] = [Migration {
-    statements: [SCHEMA_SQLITE, SCHEMA_POSTGRES],
-    adopt: None,
-}];
+const DEAD_INDEX: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS nanocode_workspace_blobs_dead ON nanocode_workspace_blobs (digest) WHERE refs <= 0",
+];
+
+const MIGRATIONS: [Migration; 2] = [
+    Migration {
+        statements: [SCHEMA_SQLITE, SCHEMA_POSTGRES],
+        adopt: None,
+    },
+    Migration {
+        statements: [DEAD_INDEX, DEAD_INDEX],
+        adopt: None,
+    },
+];
 
 const LOAD: Dialects = [
     "SELECT CAST(h.version AS TEXT), e.path, e.kind, e.digest, CAST(e.size AS TEXT), CAST(e.mode AS TEXT), CAST(e.mtime AS TEXT), e.target FROM nanocode_workspace_heads AS h LEFT JOIN nanocode_workspace_entries AS e ON e.workspace = h.workspace WHERE h.workspace = ?1 ORDER BY e.path",
@@ -38,13 +50,18 @@ const LOAD: Dialects = [
 ];
 
 const CLAIM_FIRST: Dialects = [
-    "INSERT INTO nanocode_workspace_heads (workspace, version, token) VALUES (?1, 1, ?2) ON CONFLICT (workspace) DO NOTHING",
-    "INSERT INTO nanocode_workspace_heads (workspace, version, token) VALUES ($1::text, 1, $2::text) ON CONFLICT (workspace) DO NOTHING",
+    "INSERT INTO nanocode_workspace_heads (workspace, version, token) SELECT ?1, 1, ?2 WHERE NOT EXISTS (SELECT 1 FROM nanocode_workspace_blobs WHERE digest IN (SELECT value FROM json_each(?3)) AND data LIKE '@gone:%') ON CONFLICT (workspace) DO NOTHING",
+    "INSERT INTO nanocode_workspace_heads (workspace, version, token) SELECT $1::text, 1, $2::text WHERE NOT EXISTS (SELECT 1 FROM nanocode_workspace_blobs WHERE digest IN (SELECT jsonb_array_elements_text($3::text::jsonb)) AND data LIKE '@gone:%') ON CONFLICT (workspace) DO NOTHING",
 ];
 
 const CLAIM_NEXT: Dialects = [
-    "UPDATE nanocode_workspace_heads SET version = version + 1, token = ?2 WHERE workspace = ?1 AND version = CAST(?3 AS INTEGER)",
-    "UPDATE nanocode_workspace_heads SET version = version + 1, token = $2::text WHERE workspace = $1::text AND version = CAST($3::text AS BIGINT)",
+    "UPDATE nanocode_workspace_heads SET version = version + 1, token = ?2 WHERE workspace = ?1 AND version = CAST(?3 AS INTEGER) AND NOT EXISTS (SELECT 1 FROM nanocode_workspace_blobs WHERE digest IN (SELECT value FROM json_each(?4)) AND data LIKE '@gone:%')",
+    "UPDATE nanocode_workspace_heads SET version = version + 1, token = $2::text WHERE workspace = $1::text AND version = CAST($3::text AS BIGINT) AND NOT EXISTS (SELECT 1 FROM nanocode_workspace_blobs WHERE digest IN (SELECT jsonb_array_elements_text($4::text::jsonb)) AND data LIKE '@gone:%')",
+];
+
+const CLAIM_ANY: Dialects = [
+    "UPDATE nanocode_workspace_heads SET version = version + 1, token = ?2 WHERE workspace = ?1 AND ?3 IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nanocode_workspace_blobs WHERE digest IN (SELECT value FROM json_each(?4)) AND data LIKE '@gone:%')",
+    "UPDATE nanocode_workspace_heads SET version = version + 1, token = $2::text WHERE workspace = $1::text AND $3::text IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nanocode_workspace_blobs WHERE digest IN (SELECT jsonb_array_elements_text($4::text::jsonb)) AND data LIKE '@gone:%')",
 ];
 
 const CLEAR: Dialects = [
@@ -58,8 +75,8 @@ const PUT: Dialects = [
 ];
 
 const ADD_BLOB: Dialects = [
-    "INSERT INTO nanocode_workspace_blobs (digest, data, refs) SELECT ?3, ?4, 1 WHERE EXISTS (SELECT 1 FROM nanocode_workspace_heads WHERE workspace = ?1 AND token = ?2) ON CONFLICT (digest) DO UPDATE SET refs = nanocode_workspace_blobs.refs + 1",
-    "INSERT INTO nanocode_workspace_blobs (digest, data, refs) SELECT $3::text, $4::text, 1 WHERE EXISTS (SELECT 1 FROM nanocode_workspace_heads WHERE workspace = $1::text AND token = $2::text) ON CONFLICT (digest) DO UPDATE SET refs = nanocode_workspace_blobs.refs + 1",
+    "INSERT INTO nanocode_workspace_blobs (digest, data, refs) SELECT ?3, ?4, 1 WHERE EXISTS (SELECT 1 FROM nanocode_workspace_heads WHERE workspace = ?1 AND token = ?2) ON CONFLICT (digest) DO UPDATE SET refs = nanocode_workspace_blobs.refs + 1, data = CASE WHEN nanocode_workspace_blobs.data LIKE '@gone:%' THEN excluded.data ELSE nanocode_workspace_blobs.data END",
+    "INSERT INTO nanocode_workspace_blobs (digest, data, refs) SELECT $3::text, $4::text, 1 WHERE EXISTS (SELECT 1 FROM nanocode_workspace_heads WHERE workspace = $1::text AND token = $2::text) ON CONFLICT (digest) DO UPDATE SET refs = nanocode_workspace_blobs.refs + 1, data = CASE WHEN nanocode_workspace_blobs.data LIKE '@gone:%' THEN excluded.data ELSE nanocode_workspace_blobs.data END",
 ];
 
 const RELEASE_BLOBS: Dialects = [
@@ -72,6 +89,16 @@ const DROP_BLOBS: Dialects = [
     "DELETE FROM nanocode_workspace_blobs WHERE digest IN (SELECT jsonb_array_elements_text($3::text::jsonb)) AND refs <= 0 AND EXISTS (SELECT 1 FROM nanocode_workspace_heads WHERE workspace = $1::text AND token = $2::text)",
 ];
 
+const RELEASE_EARLY: Dialects = [
+    "UPDATE nanocode_workspace_blobs SET refs = refs - 1 WHERE digest IN (SELECT value FROM json_each(?3)) AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+    "UPDATE nanocode_workspace_blobs SET refs = refs - 1 WHERE digest IN (SELECT jsonb_array_elements_text($3::text::jsonb)) AND $1::text IS NOT NULL AND $2::text IS NOT NULL",
+];
+
+const DROP_EARLY: Dialects = [
+    "DELETE FROM nanocode_workspace_blobs WHERE digest IN (SELECT value FROM json_each(?3)) AND refs <= 0 AND ?1 IS NOT NULL AND ?2 IS NOT NULL",
+    "DELETE FROM nanocode_workspace_blobs WHERE digest IN (SELECT jsonb_array_elements_text($3::text::jsonb)) AND refs <= 0 AND $1::text IS NOT NULL AND $2::text IS NOT NULL",
+];
+
 const HEAD: Dialects = [
     "SELECT CAST(version AS TEXT), token FROM nanocode_workspace_heads WHERE workspace = ?1",
     "SELECT CAST(version AS TEXT), token FROM nanocode_workspace_heads WHERE workspace = $1::text",
@@ -82,13 +109,91 @@ const BLOB: Dialects = [
     "SELECT data FROM nanocode_workspace_blobs WHERE digest = $1::text",
 ];
 
+const TOMBSTONE: Dialects = [
+    "INSERT INTO nanocode_workspace_blobs (digest, data, refs) SELECT value, ?2, 0 FROM json_each(?1) WHERE true ON CONFLICT (digest) DO NOTHING",
+    "INSERT INTO nanocode_workspace_blobs (digest, data, refs) SELECT e, $2::text, 0 FROM jsonb_array_elements_text($1::text::jsonb) AS e ON CONFLICT (digest) DO NOTHING",
+];
+
+const DEAD: Dialects = [
+    "SELECT digest, data FROM nanocode_workspace_blobs WHERE refs <= 0 ORDER BY digest LIMIT CAST(?1 AS INTEGER)",
+    "SELECT digest, data FROM nanocode_workspace_blobs WHERE refs <= 0 ORDER BY digest LIMIT CAST($1::text AS BIGINT)",
+];
+
+const EXPIRE: Dialects = [
+    "DELETE FROM nanocode_workspace_blobs WHERE digest IN (SELECT value FROM json_each(?1)) AND data IN (SELECT value FROM json_each(?2)) AND refs <= 0",
+    "DELETE FROM nanocode_workspace_blobs WHERE digest IN (SELECT jsonb_array_elements_text($1::text::jsonb)) AND data IN (SELECT jsonb_array_elements_text($2::text::jsonb)) AND refs <= 0",
+];
+
+const OBJECT: &str = "@object";
+const GONE: &str = "@gone:";
+const OBJECT_PREFIX: &str = "blobs/";
+const STAMP_DIGITS: usize = 20;
+
 const FILE: &str = "file";
 const DIR: &str = "dir";
 const SYMLINK: &str = "symlink";
 
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sweep {
+    pub settle_ms: u64,
+    pub window_ms: u64,
+    pub put_ms: u64,
+}
+
+impl Sweep {
+    pub const DEFAULT: Self = Self {
+        settle_ms: 5 * 60 * 1000,
+        window_ms: 30 * 60 * 1000,
+        put_ms: 10 * 60 * 1000,
+    };
+
+    #[must_use]
+    pub const fn grace_ms(self) -> u64 {
+        self.settle_ms
+            .saturating_add(self.window_ms)
+            .saturating_add(self.put_ms)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub next: Option<String>,
+    pub marked: usize,
+    pub deleted: usize,
+    pub expired: usize,
+}
+
+struct Bucket {
+    objects: Arc<dyn Objects>,
+    sweep: Sweep,
+    clock: Clock,
+}
+
 pub struct SqlStore {
     host: Arc<dyn Sql>,
     dialect: SqlDialect,
+    bucket: Option<Bucket>,
+}
+
+fn object_key(hex: &str) -> String {
+    format!("{OBJECT_PREFIX}{hex}")
+}
+
+fn stamp(data: &str) -> Option<u64> {
+    data.strip_prefix(GONE)?.get(..STAMP_DIGITS)?.parse().ok()
+}
+
+#[must_use]
+pub fn system_clock() -> Clock {
+    Arc::new(|| {
+        nanocode_platform::system_time()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            })
+    })
 }
 
 fn backend(error: StoreError) -> Failure {
@@ -120,6 +225,7 @@ fn entry_row(path: &str, entry: &Entry) -> Value {
             size,
             mode,
             mtime_ns,
+            link,
         } => Value::Array(vec![
             text(path.to_owned()),
             text(FILE.to_owned()),
@@ -127,7 +233,7 @@ fn entry_row(path: &str, entry: &Entry) -> Value {
             text(size.to_string()),
             text(mode.to_string()),
             text(mtime_ns.to_string()),
-            Value::Null,
+            link.map_or(Value::Null, |link| text(link.to_string())),
         ]),
         Entry::Dir { mode, mtime_ns } => Value::Array(vec![
             text(path.to_owned()),
@@ -163,6 +269,7 @@ fn parse_entry(row: &SqlRow) -> Result<Option<(String, Entry)>, Failure> {
             size: number(row, 4, path)?,
             mode: number(row, 5, path)?,
             mtime_ns,
+            link: column(row, 7).map(|_| number(row, 7, path)).transpose()?,
         },
         Some(DIR) => Entry::Dir {
             mode: number(row, 5, path)?,
@@ -189,7 +296,142 @@ impl SqlStore {
             .await
             .map_err(backend)?;
         let dialect = host.dialect();
-        Ok(Self { host, dialect })
+        Ok(Self {
+            host,
+            dialect,
+            bucket: None,
+        })
+    }
+
+    pub async fn with_objects(
+        host: Arc<dyn Sql>,
+        objects: Arc<dyn Objects>,
+        sweep: Sweep,
+        clock: Clock,
+    ) -> Result<Self, Failure> {
+        let mut store = Self::open(host).await?;
+        store.bucket = Some(Bucket {
+            objects,
+            sweep,
+            clock,
+        });
+        Ok(store)
+    }
+
+    async fn put_objects(&self, batch: &Batch) -> Result<(), Failure> {
+        let Some(bucket) = &self.bucket else {
+            return Ok(());
+        };
+        let started = (bucket.clock)();
+        let mut blobs: Vec<&Blob> = batch.blobs().iter().collect();
+        blobs.sort_unstable_by_key(|blob| blob.digest().hex());
+        for blob in blobs {
+            let bytes = Bytes::copy_from_slice(blob.bytes());
+            bucket
+                .objects
+                .put(&object_key(&blob.digest().hex()), &bytes)
+                .await?;
+        }
+        if (bucket.clock)().saturating_sub(started) > bucket.sweep.put_ms {
+            return Err(Failure::Backend(
+                "object puts outlasted the sweep's put window".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn sweep(&self, after: &str, limit: usize) -> Result<Swept, Failure> {
+        let Some(bucket) = &self.bucket else {
+            return Ok(Swept::default());
+        };
+        let mut swept = self.reap(bucket, limit).await?;
+        let listed = bucket.objects.list(OBJECT_PREFIX, after, limit).await?;
+        swept.next = (listed.len() >= limit)
+            .then(|| listed.last().map(|last| last.key.clone()))
+            .flatten();
+        let now = (bucket.clock)();
+        let young = bucket.sweep.put_ms.saturating_add(bucket.sweep.settle_ms);
+        let mut old: Vec<String> = listed
+            .iter()
+            .filter(|listed| listed.modified_ms.saturating_add(young) < now)
+            .filter_map(|listed| listed.key.strip_prefix(OBJECT_PREFIX))
+            .filter(|hex| Digest::parse(hex).is_some())
+            .map(str::to_owned)
+            .collect();
+        old.sort_unstable();
+        if old.is_empty() {
+            return Ok(swept);
+        }
+        if mutated(Mutation::SqlSweepSkipsTombstone) {
+            for hex in &old {
+                bucket.objects.delete(&object_key(hex)).await?;
+                swept.deleted += 1;
+            }
+            return Ok(swept);
+        }
+        let mark = format!(
+            "{GONE}{now:0width$}:{}",
+            nanocode_platform::uuid_v4().simple(),
+            width = STAMP_DIGITS
+        );
+        let marked = old.len();
+        let list = json(old.into_iter().map(Value::String).collect());
+        let statements = [SqlStatement {
+            sql: self.pick(&TOMBSTONE),
+            params: vec![&list, &mark],
+        }];
+        self.host
+            .transaction("workspace_tombstone", &statements)
+            .await
+            .map_err(backend)?;
+        swept.marked = marked;
+        Ok(swept)
+    }
+
+    async fn reap(&self, bucket: &Bucket, limit: usize) -> Result<Swept, Failure> {
+        let mut swept = Swept::default();
+        let limit_text = limit.to_string();
+        let statements = [SqlStatement {
+            sql: self.pick(&DEAD),
+            params: vec![&limit_text],
+        }];
+        let results = self
+            .host
+            .run(SqlAccess::Read, "workspace_dead", &statements)
+            .await
+            .map_err(backend)?;
+        let now = (bucket.clock)();
+        let sweep = bucket.sweep;
+        let mut expired = (Vec::new(), Vec::new());
+        for row in results.first().into_iter().flatten() {
+            let (Some(hex), Some(data)) = (column(row, 0), column(row, 1)) else {
+                continue;
+            };
+            let Some(at) = stamp(data) else {
+                continue;
+            };
+            let age = now.saturating_sub(at);
+            if age >= sweep.grace_ms() {
+                expired.0.push(Value::String(hex.to_owned()));
+                expired.1.push(Value::String(data.to_owned()));
+            } else if age >= sweep.settle_ms && age < sweep.settle_ms + sweep.window_ms {
+                bucket.objects.delete(&object_key(hex)).await?;
+                swept.deleted += 1;
+            }
+        }
+        if !expired.0.is_empty() {
+            swept.expired = expired.0.len();
+            let (digests, marks) = (json(expired.0), json(expired.1));
+            let statements = [SqlStatement {
+                sql: self.pick(&EXPIRE),
+                params: vec![&digests, &marks],
+            }];
+            self.host
+                .transaction("workspace_expire", &statements)
+                .await
+                .map_err(backend)?;
+        }
+        Ok(swept)
     }
 
     const fn pick(&self, sql: &Dialects) -> &'static str {
@@ -252,21 +494,51 @@ impl SqlStore {
                 .map(|digest| Value::String(digest.hex()))
                 .collect(),
         );
-        let blobs: Vec<(String, String)> = batch
+        self.put_objects(batch).await?;
+        let fresh = json(
+            batch
+                .blobs()
+                .iter()
+                .map(|blob| Value::String(blob.digest().hex()))
+                .collect(),
+        );
+        let early = mutated(Mutation::SqlReleaseBeforeCommit) && !change.dropped.is_empty();
+        let released = change.dropped.iter().filter(|_| !early);
+        let mut blobs: Vec<(String, Option<String>)> = batch
             .blobs()
             .iter()
-            .map(|blob| (blob.digest().hex(), STANDARD.encode(blob.bytes())))
+            .map(|blob| {
+                let data = if self.bucket.is_some() {
+                    OBJECT.to_owned()
+                } else {
+                    STANDARD.encode(blob.bytes())
+                };
+                (blob.digest().hex(), Some(data))
+            })
+            .chain(released.map(|digest| (digest.hex(), None)))
             .collect();
-        let mut statements = Vec::with_capacity(6 + blobs.len());
+        blobs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let lists: Vec<String> = blobs
+            .iter()
+            .map(|(digest, data)| match data {
+                Some(_) => String::new(),
+                None => json(vec![Value::String(digest.clone())]),
+            })
+            .collect();
+        let mut statements = Vec::with_capacity(5 + blobs.len());
         statements.push(if change.base == 0 {
             SqlStatement {
                 sql: self.pick(&CLAIM_FIRST),
-                params: vec![workspace, &token],
+                params: vec![workspace, &token, &fresh],
             }
         } else {
             SqlStatement {
-                sql: self.pick(&CLAIM_NEXT),
-                params: vec![workspace, &token, &base],
+                sql: self.pick(if mutated(Mutation::SqlSkipVersionCas) {
+                    &CLAIM_ANY
+                } else {
+                    &CLAIM_NEXT
+                }),
+                params: vec![workspace, &token, &base, &fresh],
             }
         });
         if !change.entries.is_empty() {
@@ -279,17 +551,29 @@ impl SqlStore {
                 params: vec![workspace, &token, &put],
             });
         }
-        for (digest, data) in &blobs {
-            statements.push(SqlStatement {
-                sql: self.pick(&ADD_BLOB),
-                params: vec![workspace, &token, digest, data],
+        for ((digest, data), list) in blobs.iter().zip(&lists) {
+            statements.push(match data {
+                Some(data) => SqlStatement {
+                    sql: self.pick(&ADD_BLOB),
+                    params: vec![workspace, &token, digest, data],
+                },
+                None => SqlStatement {
+                    sql: self.pick(&RELEASE_BLOBS),
+                    params: vec![workspace, &token, list],
+                },
             });
         }
-        if !change.dropped.is_empty() {
-            statements.push(SqlStatement {
-                sql: self.pick(&RELEASE_BLOBS),
+        if early {
+            let release = [&RELEASE_EARLY, &DROP_EARLY].map(|sql| SqlStatement {
+                sql: self.pick(sql),
                 params: vec![workspace, &token, &dropped],
             });
+            self.host
+                .run(SqlAccess::Write, "workspace_release", &release)
+                .await
+                .map_err(backend)?;
+        }
+        if !change.dropped.is_empty() && !early {
             statements.push(SqlStatement {
                 sql: self.pick(&DROP_BLOBS),
                 params: vec![workspace, &token, &dropped],
@@ -299,11 +583,24 @@ impl SqlStore {
             sql: self.pick(&HEAD),
             params: vec![workspace],
         });
-        let results = self
-            .host
-            .transaction("workspace_commit", &statements)
-            .await
-            .map_err(backend)?;
+        let results = if mutated(Mutation::SqlSplitTransaction) {
+            let mut results = Vec::with_capacity(statements.len());
+            for statement in &statements {
+                let one = std::slice::from_ref(statement);
+                let answered = self
+                    .host
+                    .run(SqlAccess::Write, "workspace_commit", one)
+                    .await
+                    .map_err(backend)?;
+                results.extend(answered);
+            }
+            results
+        } else {
+            self.host
+                .transaction("workspace_commit", &statements)
+                .await
+                .map_err(backend)?
+        };
         if results.len() != statements.len() {
             return Err(Failure::Backend(format!(
                 "the SQL host answered {} of {} statements",
@@ -350,6 +647,22 @@ impl SqlStore {
         else {
             return Err(Failure::Missing(*digest));
         };
+        if data.starts_with(GONE) {
+            return Err(Failure::Missing(*digest));
+        }
+        if data == OBJECT {
+            let Some(bucket) = &self.bucket else {
+                return Err(Failure::Backend(format!(
+                    "blob {hex} lives in object storage but this store has none"
+                )));
+            };
+            let bytes = bucket
+                .objects
+                .get(&object_key(&hex))
+                .await?
+                .ok_or(Failure::Missing(*digest))?;
+            return Blob::verified(*digest, bytes);
+        }
         let bytes = STANDARD
             .decode(data)
             .map_err(|_| corrupt(&hex, "a stored blob is not base64"))?;

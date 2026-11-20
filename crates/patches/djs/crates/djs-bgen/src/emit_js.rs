@@ -47,17 +47,18 @@ pub fn emit(p: &Program, sources: &Sources, omit: &[&str], slim: bool) -> String
     let kept: Vec<&Builtin> = p.builtins.iter().filter(|b| !gone(b)).collect();
     // The constructors the omitted builtins make: kept builtins installed onto them
     // (`%TypedArray%.prototype.toString` is Array's) go too.
-    let gone_ctors: Vec<&str> = p
+    let gone_ctors: Vec<String> = p
         .builtins
         .iter()
         .filter(|b| gone(b))
         .flat_map(|b| &b.installs)
-        .filter(|i| i.on_global() && matches!(i.kind, InstallKind::Constructor { .. }))
-        .map(|i| i.key.as_str())
+        .filter(|i| i.is_constructor())
+        .map(|i| i.path())
         .collect();
     let on_gone = |i: &Install| {
-        let root = i.target.split('.').next().unwrap_or("");
-        gone_ctors.contains(&root)
+        gone_ctors.iter().any(|c| {
+            i.target.strip_prefix(c.as_str()).is_some_and(|r| r.is_empty() || r.starts_with('.'))
+        })
     };
     let mut out = String::from(HEADER);
     if !slim && !omit.is_empty() {
@@ -125,42 +126,70 @@ pub fn emit(p: &Program, sources: &Sources, omit: &[&str], slim: bool) -> String
     // first, so that the paths of the others resolve; then the rest, in source order.
     // A constructor's statics (installs onto the constructor itself) come right after
     // it, then its `prototype` (D2052).
-    let ctor_keys: Vec<&str> = kept
+    let ctor_keys: Vec<String> = kept
         .iter()
         .flat_map(|b| &b.installs)
-        .filter(|i| i.on_global() && matches!(i.kind, InstallKind::Constructor { .. }))
-        .map(|i| i.key.as_str())
+        .filter(|i| i.is_constructor())
+        .map(|i| i.path())
         .collect();
+    // Namespaces that hold constructors (Intl): all their installs go here, so that
+    // node's order of the namespace (D2072) can interleave functions and constructors.
+    let ctor_parents: Vec<String> = kept
+        .iter()
+        .flat_map(|b| &b.installs)
+        .filter(|i| i.is_constructor() && !i.on_global())
+        .map(|i| i.target.clone())
+        .collect();
+    let in_first = |i: &Install| {
+        i.on_global() || i.is_constructor() || (ctor_parents.contains(&i.target) && !i.key.starts_with('['))
+    };
+    let mut first = Vec::new();
     for &b in &kept {
-        for i in b.installs.iter().filter(|i| i.on_global()) {
-            out.push_str(&install(b, i));
+        for i in b.installs.iter().filter(|i| in_first(i)) {
+            let mut chunk = install(b, i);
             if let InstallKind::Constructor { parent } = &i.kind {
+                let path = i.path();
                 let mut statics = Vec::new();
                 for &sb in &kept {
-                    for si in sb.installs.iter().filter(|si| si.target == i.key) {
+                    for si in sb.installs.iter().filter(|si| si.target == path) {
                         statics.push((si.target.clone(), si.key.clone(), install(sb, si)));
                     }
                 }
                 // qjs's order of the statics (D2072).
                 crate::qjs_order::reorder(&mut statics);
-                for (_, _, line) in statics {
-                    out.push_str(&line);
-                }
-                out.push_str(&format!(
-                    "%InstallPrototype({}, {}, {});\n",
+                let proto = format!(
+                    "%InstallPrototype({}, {}, {});
+",
                     js_str(&i.target),
                     js_str(&i.key),
                     parent.as_deref().map(js_str).unwrap_or("undefined".into())
-                ));
+                );
+                // The Intl constructors' prototype comes before their statics, as in node.
+                if crate::qjs_order::prototype_first(&path) {
+                    chunk.push_str(&proto);
+                }
+                for (_, _, line) in statics {
+                    chunk.push_str(&line);
+                }
+                if !crate::qjs_order::prototype_first(&path) {
+                    chunk.push_str(&proto);
+                }
             }
+            first.push((i.target.clone(), i.key.clone(), chunk));
         }
+    }
+    crate::qjs_order::reorder(&mut first);
+    for (_, _, chunk) in first {
+        out.push_str(&chunk);
     }
     let mut rest = Vec::new();
     for &b in &kept {
         for i in b
             .installs
             .iter()
-            .filter(|i| !i.on_global() && !ctor_keys.contains(&i.target.as_str()) && !on_gone(i))
+            .filter(|i| {
+                !in_first(i) && !ctor_keys.contains(&i.target) && !on_gone(i)
+            })
         {
             rest.push((i.target.clone(), i.key.clone(), install(b, i)));
         }
@@ -169,12 +198,9 @@ pub fn emit(p: &Program, sources: &Sources, omit: &[&str], slim: bool) -> String
     // otherwise (D2150).
     for &b in &kept {
         for i in &b.installs {
-            if i.on_global()
-                && let InstallKind::Constructor { .. } = i.kind
-                && i.key != "Proxy"
-            {
+            if i.is_constructor() && i.key != "Proxy" {
                 rest.push((
-                    format!("{}.prototype", i.key),
+                    format!("{}.prototype", i.path()),
                     "constructor".to_string(),
                     format!("%InstallPrototypeConstructor({});\n", js_str(&i.key)),
                 ));

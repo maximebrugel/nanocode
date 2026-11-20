@@ -82,6 +82,18 @@ impl Install {
         self.target == "globalThis"
     }
 
+    pub fn is_constructor(&self) -> bool {
+        matches!(self.kind, InstallKind::Constructor { .. })
+    }
+
+    pub fn path(&self) -> String {
+        if self.on_global() {
+            self.key.clone()
+        } else {
+            format!("{}.{}", self.target, self.key)
+        }
+    }
+
     /// For comments and the report: `Array.prototype.map`, `get Symbol.prototype.description`,
     /// `constructor Error`, `value Math.PI`.
     pub fn label(&self) -> String {
@@ -362,10 +374,10 @@ fn builtin_info(
                 continue;
             };
             if matches!(kind, InstallKind::Constructor { .. })
-                && (target != "globalThis" || symbol_key(&key).is_some())
+                && (target.contains('.') || target.starts_with('%') || symbol_key(&key).is_some())
             {
                 err(format!(
-                    "`@constructor {}`: constructors are globals; use a plain name",
+                    "`@constructor {}`: constructors are globals or Namespace.Name",
                     t.value
                 ));
             }

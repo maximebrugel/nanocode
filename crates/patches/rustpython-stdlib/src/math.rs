@@ -16,7 +16,7 @@ mod math {
     use nanocode_numeric::BigInt;
     use nanocode_numeric::{Signed, ToPrimitive};
 
-    use super::{float_repr, pymath_exception};
+    use super::pymath_exception;
 
     // Constants
     #[pyattr]
@@ -99,30 +99,27 @@ mod math {
         // Check base first for proper error messages
         if let Some(b) = base {
             if b <= 0.0 {
-                return Err(vm.new_value_error(format!(
-                    "expected a positive input, got {}",
-                    super::float_repr(b)
-                )));
+                return Err(vm.new_value_error("math domain error"));
             }
             if b == 1.0 {
-                return Err(vm.new_value_error("math domain error"));
+                // CPython divides log(x) by log(base) == 0.0, after checking x.
+                let x_ok = match x.downcast_ref::<PyInt>() {
+                    Some(i) => pymath::math::log_bigint(i.as_bigint(), None).is_ok(),
+                    None => pymath::math::log(x.try_float(vm)?.to_f64(), None).is_ok(),
+                };
+                return Err(if x_ok {
+                    vm.new_zero_division_error("float division by zero")
+                } else {
+                    vm.new_value_error("math domain error")
+                });
             }
         }
         // Handle BigInt specially for large values (only for actual int type, not float)
         if let Some(i) = x.downcast_ref::<PyInt>() {
-            return pymath::math::log_bigint(i.as_bigint(), base).map_err(|err| match err {
-                pymath::Error::EDOM => vm.new_value_error("expected a positive input"),
-                _ => pymath_exception(err, vm),
-            });
+            return pymath::math::log_bigint(i.as_bigint(), base).map_err(|err| pymath_exception(err, vm));
         }
         let val = x.try_float(vm)?.to_f64();
-        pymath::math::log(val, base).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a positive input, got {}",
-                super::float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::log(val, base).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
@@ -134,38 +131,20 @@ mod math {
     fn log2(x: PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
         // Handle BigInt specially for large values (only for actual int type, not float)
         if let Some(i) = x.downcast_ref::<PyInt>() {
-            return pymath::math::log2_bigint(i.as_bigint()).map_err(|err| match err {
-                pymath::Error::EDOM => vm.new_value_error("expected a positive input"),
-                _ => pymath_exception(err, vm),
-            });
+            return pymath::math::log2_bigint(i.as_bigint()).map_err(|err| pymath_exception(err, vm));
         }
         let val = x.try_float(vm)?.to_f64();
-        pymath::math::log2(val).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a positive input, got {}",
-                super::float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::log2(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
     fn log10(x: PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
         // Handle BigInt specially for large values (only for actual int type, not float)
         if let Some(i) = x.downcast_ref::<PyInt>() {
-            return pymath::math::log10_bigint(i.as_bigint()).map_err(|err| match err {
-                pymath::Error::EDOM => vm.new_value_error("expected a positive input"),
-                _ => pymath_exception(err, vm),
-            });
+            return pymath::math::log10_bigint(i.as_bigint()).map_err(|err| pymath_exception(err, vm));
         }
         let val = x.try_float(vm)?.to_f64();
-        pymath::math::log10(val).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a positive input, got {}",
-                super::float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::log10(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
@@ -176,38 +155,20 @@ mod math {
     #[pyfunction]
     fn sqrt(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::sqrt(val).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a nonnegative input, got {}",
-                super::float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::sqrt(val).map_err(|err| pymath_exception(err, vm))
     }
 
     // Trigonometric functions:
     #[pyfunction]
     fn acos(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::acos(val).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a number in range from -1 up to 1, got {}",
-                float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::acos(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
     fn asin(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::asin(val).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a number in range from -1 up to 1, got {}",
-                float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::asin(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
@@ -223,12 +184,7 @@ mod math {
     #[pyfunction]
     fn cos(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::cos(val).map_err(|err| match err {
-            pymath::Error::EDOM => {
-                vm.new_value_error(format!("expected a finite input, got {}", float_repr(val)))
-            }
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::cos(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
@@ -250,23 +206,13 @@ mod math {
     #[pyfunction]
     fn sin(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::sin(val).map_err(|err| match err {
-            pymath::Error::EDOM => {
-                vm.new_value_error(format!("expected a finite input, got {}", float_repr(val)))
-            }
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::sin(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
     fn tan(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::tan(val).map_err(|err| match err {
-            pymath::Error::EDOM => {
-                vm.new_value_error(format!("expected a finite input, got {}", float_repr(val)))
-            }
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::tan(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
@@ -294,13 +240,7 @@ mod math {
     #[pyfunction]
     fn atanh(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::atanh(val).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a number between -1 and 1, got {}",
-                super::float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::atanh(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
@@ -332,13 +272,7 @@ mod math {
     #[pyfunction]
     fn gamma(x: ArgIntoFloat, vm: &VirtualMachine) -> PyResult<f64> {
         let val = x.into_float();
-        pymath::math::gamma(val).map_err(|err| match err {
-            pymath::Error::EDOM => vm.new_value_error(format!(
-                "expected a noninteger or positive integer, got {}",
-                super::float_repr(val)
-            )),
-            _ => pymath_exception(err, vm),
-        })
+        pymath::math::gamma(val).map_err(|err| pymath_exception(err, vm))
     }
 
     #[pyfunction]
@@ -383,7 +317,7 @@ mod math {
             let v = try_f64_to_bigint(v?.to_f64().ceil(), vm)?;
             return Ok(vm.ctx.new_int(v).into());
         }
-        Err(vm.new_type_error(format!("must be real number, not {}", x.class().name())))
+        Err(vm.new_type_error(format!("must be real number, not {}", x.class().slot_name())))
     }
 
     #[pyfunction]
@@ -403,7 +337,7 @@ mod math {
             let v = try_f64_to_bigint(v?.to_f64().floor(), vm)?;
             return Ok(vm.ctx.new_int(v).into());
         }
-        Err(vm.new_type_error(format!("must be real number, not {}", x.class().name())))
+        Err(vm.new_type_error(format!("must be real number, not {}", x.class().slot_name())))
     }
 
     #[pyfunction]
@@ -439,7 +373,10 @@ mod math {
     fn fsum(seq: ArgIterable<ArgIntoFloat>, vm: &VirtualMachine) -> PyResult<f64> {
         let values: Result<Vec<f64>, _> =
             seq.iter(vm)?.map(|r| r.map(|v| v.into_float())).collect();
-        pymath::math::fsum(values?).map_err(|err| pymath_exception(err, vm))
+        pymath::math::fsum(values?).map_err(|err| match err {
+            pymath::Error::ERANGE => vm.new_overflow_error("intermediate overflow in fsum"),
+            pymath::Error::EDOM => vm.new_value_error("-inf + inf in fsum"),
+        })
     }
 
     #[pyfunction]
@@ -937,26 +874,5 @@ pub(crate) fn pymath_exception(err: pymath::Error, vm: &VirtualMachine) -> PyBas
     match err {
         pymath::Error::EDOM => vm.new_value_error("math domain error"),
         pymath::Error::ERANGE => vm.new_overflow_error("math range error"),
-    }
-}
-
-/// Format a float in Python style (ensures trailing .0 for integers).
-fn float_repr(value: f64) -> String {
-    if value.is_nan() {
-        "nan".to_owned()
-    } else if value.is_infinite() {
-        if value.is_sign_positive() {
-            "inf".to_owned()
-        } else {
-            "-inf".to_owned()
-        }
-    } else {
-        let s = format!("{value}");
-        // If no decimal point and not in scientific notation, add .0
-        if !s.contains('.') && !s.contains('e') && !s.contains('E') {
-            format!("{s}.0")
-        } else {
-            s
-        }
     }
 }

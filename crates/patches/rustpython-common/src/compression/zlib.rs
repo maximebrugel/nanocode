@@ -202,6 +202,20 @@ impl RawInflate {
 }
 
 
+/// CPython's `zlib_error` text: "Error <code> while decompressing data[: <msg>]".
+fn inflate_error_message(e: InflateError, zmsg: Option<&str>) -> String {
+    let (code, fallback) = match e {
+        InflateError::NeedDict { .. } => (2, None),
+        InflateError::Stream => (-2, Some("inconsistent stream state")),
+        InflateError::Data => (-3, Some("invalid input data")),
+        InflateError::Memory => (-4, Some(e.as_str())),
+    };
+    match zmsg.or(fallback) {
+        Some(msg) => format!("Error {code} while decompressing data: {msg}"),
+        None => format!("Error {code} while decompressing data"),
+    }
+}
+
 /// Drive an inflate stream over chained input, retrying with an optional
 /// preset dictionary when the stream requests one.
 fn decompress_chunks(
@@ -256,7 +270,7 @@ fn decompress_chunks(
                             continue 'outer;
                         }
                         None => {
-                            return Err(d.error_message().unwrap_or(e.as_str()).to_owned());
+                            return Err(inflate_error_message(e, d.error_message()));
                         }
                     }
                 }

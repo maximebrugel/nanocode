@@ -473,10 +473,12 @@ impl<'c> Compiler<'c> {
                 self.ins.push(Ins::NoErrRestore(r));
             }
         }
-        // A pipeline that does not run leaves the status as it is.
+        // A pipeline that does not run leaves the status as it is, and the
+        // next operator decides on that status: in a && b || c a failing a
+        // skips b and still runs c.
         let end = self.pc();
-        for at in ends {
-            self.patch(at, end);
+        for (k, &at) in ends.iter().enumerate() {
+            self.patch(at, ends.get(k + 1).copied().unwrap_or(end));
         }
     }
 
@@ -864,6 +866,7 @@ impl<'c> Compiler<'c> {
                     value: self.arith(value, text)?,
                 }
             }
+            ArithKind::Fail { .. } => return None,
         };
         self.exprs.push(node);
         Some((self.exprs.len() - 1) as u32)
@@ -1442,6 +1445,8 @@ async fn run_with<'p>(
                             Op::Break(..) => Unwind::Break(*n),
                             _ => Unwind::Continue(*n),
                         };
+                        // `break` and `continue` succeed, as their builtins do.
+                        vp.status = 0;
                         match land(vp, &mut ex, *lp, *in_cond, u) {
                             Landing::Jump(to) => {
                                 pc = to;
@@ -1954,6 +1959,41 @@ mod tests {
             "x=-0; for ((i=0;i<2;i++)); do ((i)) && x=-0; done; echo \"$x\"",
         ] {
             check(source, b"-0\n");
+        }
+    }
+
+    #[test]
+    fn flat_and_or_lists_try_each_operator_on_the_last_status() {
+        for (source, expected) in [
+            (
+                "for x in a b; do [ x = y ] && echo yes || echo no; done",
+                &b"no
+no
+"[..],
+            ),
+            (
+                "i=0; while [ $i -lt 2 ]; do [[ x == y ]] && echo yes || echo no; i=$((i+1)); done",
+                &b"no
+no
+"[..],
+            ),
+            (
+                "for x in a; do [ x = x ] && echo yes || echo no; done",
+                &b"yes
+"[..],
+            ),
+            (
+                "for x in a; do [ x = y ] || [ x = z ] && echo yes || echo no; done",
+                &b"no
+"[..],
+            ),
+            (
+                "for x in a; do [ x = x ] || echo skipped && echo ran; done",
+                &b"ran
+"[..],
+            ),
+        ] {
+            check(source, expected);
         }
     }
 

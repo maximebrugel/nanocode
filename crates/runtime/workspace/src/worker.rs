@@ -6,42 +6,95 @@ use std::{
     task::Poll,
 };
 
+use nanocode_digest::Sha256;
 use nanocode_shell::{
-    Commands, Config as ShellConfig, Credentials, Fetch, FileSystem, Identity, Kind, Limits,
-    Machine, Remove, Script, Shell, Step, Write,
+    Commands, Config as ShellConfig, Credentials, Fetch, FileDownload, FileSystem, FileUpload,
+    Identity, Kind, Limits, Machine, Remove, Reply as Answer, SHA256_BYTES, Script, Shell, Step,
+    Write,
 };
-use nanocode_sync::{Stream, oneshot, stream::FuturesUnordered, unbounded};
+use nanocode_sync::{Stream, StreamExt, oneshot, stream::FuturesUnordered, unbounded};
 
 use crate::{
-    Command, Config, Finished,
+    Command, Config, Finished, Found,
     sim::{self, Mutation},
 };
 
-type Reply<T> = oneshot::Sender<Result<T, String>>;
+pub type Reply<T> = oneshot::Sender<Result<T, String>>;
 
 pub enum Job {
     Read(Vec<u8>, Reply<Option<Vec<u8>>>),
     Write(Vec<u8>, Vec<u8>, Reply<()>),
     Remove(Vec<u8>, Reply<()>),
     Run(Command, Reply<Finished>),
+    Upload(
+        Vec<u8>,
+        [u8; SHA256_BYTES],
+        unbounded::Receiver<Part>,
+        Reply<()>,
+    ),
+    Download(Vec<u8>, Reply<Option<FileDownload>>),
+}
+
+pub enum Part {
+    Chunk(Vec<u8>, Reply<()>),
+    Seal(Reply<[u8; SHA256_BYTES]>),
+    Commit(Reply<()>),
+}
+
+struct Buffered {
+    files: Rc<dyn FileSystem>,
+    path: Vec<u8>,
+    expected: [u8; SHA256_BYTES],
+    data: Vec<u8>,
+    hasher: Sha256,
+}
+
+impl FileUpload for Buffered {
+    fn push(&mut self, chunk: &[u8]) -> io::Result<()> {
+        self.hasher.update(chunk);
+        self.data.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn sha256(&self) -> [u8; SHA256_BYTES] {
+        self.hasher.finalize()
+    }
+
+    fn commit(self: Box<Self>) -> Answer<()> {
+        if self.sha256() != self.expected {
+            return Answer::Now(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the uploaded bytes do not hash to the expected sha256",
+            )));
+        }
+        self.files.write(&self.path, &self.data, Write::Replace)
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub fn start(config: Config, jobs: unbounded::Receiver<Job>) -> io::Result<()> {
+pub fn start(config: Config, jobs: unbounded::Receiver<Job>) -> io::Result<Found> {
     let handle = nanocode_platform::Handle::try_current().ok();
+    let (told, found) = oneshot::channel();
     std::thread::Builder::new()
         .name("workspace".to_owned())
+        .stack_size(nanocode_shell::ENGINE_STACK)
         .spawn(move || {
             let _entered = handle.as_ref().map(nanocode_platform::Handle::enter);
-            nanocode_sync::block_on(serve(config, jobs));
-        })
-        .map(drop)
+            let kept = Kept::new(config);
+            if told.send(kept.offers()).is_ok() {
+                nanocode_sync::block_on(serve(Rc::new(kept), jobs));
+            }
+        })?;
+    nanocode_sync::block_on(found)
+        .map_err(|_| io::Error::other("the workspace's worker stopped before it started"))
 }
 
 #[cfg(target_family = "wasm")]
-pub fn start(config: Config, jobs: unbounded::Receiver<Job>) -> io::Result<()> {
-    nanocode_platform::spawn_local(serve(config, jobs));
-    Ok(())
+pub fn start(config: Config, jobs: unbounded::Receiver<Job>) -> io::Result<Found> {
+    let kept = Kept::new(config);
+    let found = kept.offers();
+    nanocode_platform::spawn_local(serve(Rc::new(kept), jobs));
+    Ok(found)
 }
 
 struct Kept {
@@ -56,18 +109,30 @@ struct Kept {
     slice: u32,
 }
 
-async fn serve(config: Config, mut jobs: unbounded::Receiver<Job>) {
-    let kept = Rc::new(Kept {
-        files: (config.files)(),
-        machine: (config.machine)(),
-        commands: (config.commands)(),
-        fetch: config.fetch.as_ref().map(|fetch| fetch()),
-        credentials: config.credentials.as_ref().map(|credentials| credentials()),
-        identity: config.identity,
-        limits: config.limits,
-        env: config.env,
-        slice: config.slice,
-    });
+impl Kept {
+    fn new(config: Config) -> Self {
+        Self {
+            files: (config.files)(),
+            machine: (config.machine)(),
+            commands: (config.commands)(),
+            fetch: config.fetch.as_ref().map(|fetch| fetch()),
+            credentials: config.credentials.as_ref().map(|credentials| credentials()),
+            identity: config.identity,
+            limits: config.limits,
+            env: config.env,
+            slice: config.slice,
+        }
+    }
+
+    fn offers(&self) -> Found {
+        Found {
+            network: self.fetch.is_some(),
+            commands: self.commands.names(),
+        }
+    }
+}
+
+async fn serve(kept: Rc<Kept>, mut jobs: unbounded::Receiver<Job>) {
     let mut running: FuturesUnordered<Pin<Box<dyn Future<Output = ()>>>> = FuturesUnordered::new();
     let mut open = true;
     poll_fn(|context| {
@@ -112,17 +177,99 @@ impl Kept {
                 }
                 let _ = reply.send(finished);
             }
+            Job::Upload(path, sha256, parts, reply) => {
+                self.upload(path, sha256, parts, reply).await
+            }
+            Job::Download(path, reply) => {
+                let _ = reply.send(self.download(&path).await);
+            }
+        }
+    }
+
+    async fn found(&self, path: &[u8]) -> Result<bool, String> {
+        match self.files.stat(path, true).get().await {
+            Ok(found) if found.kind == Kind::Dir => Err(format!("{}: Is a directory", shown(path))),
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(said(path, &error)),
+        }
+    }
+
+    async fn download(&self, path: &[u8]) -> Result<Option<FileDownload>, String> {
+        if !self.found(path).await? {
+            return Ok(None);
+        }
+        match self.files.download(path, self.limits.file).get().await {
+            Ok(download) => Ok(Some(download)),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                let read = self.files.read(path, self.limits.file).get().await;
+                let bytes = read.map_err(|error| said(path, &error))?;
+                Ok(Some(FileDownload {
+                    sha256: Sha256::digest(&bytes),
+                    bytes,
+                }))
+            }
+            Err(error) => Err(said(path, &error)),
+        }
+    }
+
+    async fn opened(
+        &self,
+        path: &[u8],
+        sha256: [u8; SHA256_BYTES],
+    ) -> Result<Box<dyn FileUpload>, String> {
+        self.parents(path).await?;
+        match self.files.upload(path, sha256).get().await {
+            Ok(upload) => Ok(upload),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(Box::new(Buffered {
+                files: self.files.clone(),
+                path: path.to_vec(),
+                expected: sha256,
+                data: Vec::new(),
+                hasher: Sha256::new(),
+            })),
+            Err(error) => Err(said(path, &error)),
+        }
+    }
+
+    async fn upload(
+        &self,
+        path: Vec<u8>,
+        sha256: [u8; SHA256_BYTES],
+        mut parts: unbounded::Receiver<Part>,
+        reply: Reply<()>,
+    ) {
+        let mut upload = match self.opened(&path, sha256).await {
+            Ok(upload) => upload,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        if reply.send(Ok(())).is_err() {
+            return;
+        }
+        while let Some(part) = parts.next().await {
+            match part {
+                Part::Chunk(chunk, reply) => {
+                    let pushed = upload.push(&chunk).map_err(|error| said(&path, &error));
+                    let _ = reply.send(pushed);
+                }
+                Part::Seal(reply) => {
+                    let _ = reply.send(Ok(upload.sha256()));
+                }
+                Part::Commit(reply) => {
+                    let committed = upload.commit().get().await;
+                    let _ = reply.send(committed.map_err(|error| said(&path, &error)));
+                    return;
+                }
+            }
         }
     }
 
     async fn read(&self, path: &[u8]) -> Result<Option<Vec<u8>>, String> {
-        let found = match self.files.stat(path, true).get().await {
-            Ok(found) => found,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(said(path, &error)),
-        };
-        if found.kind == Kind::Dir {
-            return Err(format!("{}: Is a directory", shown(path)));
+        if !self.found(path).await? {
+            return Ok(None);
         }
         let data = self.files.read(path, self.limits.file).get().await;
         data.map(|data| match sim::mutated(Mutation::ReadTruncates) {
@@ -133,6 +280,12 @@ impl Kept {
     }
 
     async fn write(&self, path: &[u8], data: &[u8]) -> Result<(), String> {
+        self.parents(path).await?;
+        let written = self.files.write(path, data, Write::Replace).get().await;
+        written.map_err(|error| said(path, &error))
+    }
+
+    async fn parents(&self, path: &[u8]) -> Result<(), String> {
         let mut parent = Vec::new();
         let names: Vec<&[u8]> = path.split(|byte| *byte == b'/').collect();
         let parents = match sim::mutated(Mutation::WriteSkipsParents) {
@@ -155,8 +308,7 @@ impl Kept {
                 Err(error) => return Err(said(&parent, &error)),
             }
         }
-        let written = self.files.write(path, data, Write::Replace).get().await;
-        written.map_err(|error| said(path, &error))
+        Ok(())
     }
 
     async fn remove(&self, path: &[u8]) -> Result<(), String> {

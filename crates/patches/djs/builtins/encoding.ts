@@ -47,7 +47,7 @@ function TextLabelIsUtf8(label: Str): boolean {
   while (end > start && TextIsAsciiWhitespace(StrCharCodeAt(label, end - 1))) {
     end -= 1;
   }
-  const l: Str = StrToCase(StrSubstring(label, start, end), false);
+  const l: Str = StrToCase(StrSubstring(label, start, end), 0);
   return l === "utf-8" || l === "utf8" || l === "unicode-1-1-utf-8" || l === "unicode11utf8" ||
     l === "unicode20utf8" || l === "x-unicode20utf8";
 }

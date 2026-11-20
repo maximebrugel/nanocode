@@ -1027,12 +1027,6 @@ def _read_bytes(fp, size, error_template="ran out of data"):
 
 @set_module("numpy.lib.format")
 def isfileobj(f):
-    if not isinstance(f, (io.FileIO, io.BufferedReader, io.BufferedWriter)):
-        return False
-    try:
-        # BufferedReader/Writer may raise OSError when
-        # fetching `fileno()` (e.g. when wrapping BytesIO).
-        f.fileno()
-        return True
-    except OSError:
-        return False
+    # nanocode: a Python file here has no descriptor C code can fdopen, so arrays are
+    # written and read through the file's Python methods, with the same bytes.
+    return False

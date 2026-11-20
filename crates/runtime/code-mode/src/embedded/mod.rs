@@ -89,8 +89,14 @@ pub enum EmbeddedToolMode {
     Direct,
 }
 
+pub const AUTO: &str = "auto";
+
 pub trait HandCalls: Send + Sync + 'static {
     fn here(&self, hand: &str) -> bool;
+
+    fn auto(&self, _tool: &str) -> bool {
+        false
+    }
 
     fn call<'a>(
         &'a self,
@@ -148,7 +154,11 @@ pub fn tool_not_available(name: &str) -> ToolOutput {
     }))
 }
 
-pub fn take_hand(declared: bool, input: Value) -> Result<(Value, Option<String>), ToolOutput> {
+pub fn take_hand(
+    declared: bool,
+    auto: bool,
+    input: Value,
+) -> Result<(Value, Option<String>), ToolOutput> {
     let Value::Object(mut fields) = input else {
         return Ok((input, None));
     };
@@ -156,7 +166,7 @@ pub fn take_hand(declared: bool, input: Value) -> Result<(Value, Option<String>)
         return Ok((Value::Object(fields), None));
     }
     match fields.remove("hand") {
-        None => Ok((Value::Object(fields), None)),
+        None => Ok((Value::Object(fields), auto.then(|| AUTO.to_owned()))),
         Some(Value::String(hand)) => Ok((Value::Object(fields), Some(hand))),
         Some(_) => Err(ToolOutput::error(
             "`hand` must be the name of an attached hand; nothing was dispatched",

@@ -793,7 +793,13 @@ pub(super) async fn chatter(world: &World, epoch: u64) {
                     continue;
                 };
                 chat.heard.borrow_mut().squats += 1;
-                write(world, board, &step.key, &Op::Claim { task, lease_ms: 1 }).await;
+                let claim = Op::Claim {
+                    task,
+                    lease_ms: 1,
+                    fence: None,
+                    cap: None,
+                };
+                write(world, board, &step.key, &claim).await;
                 world.nap(3).await;
                 if board.refresh().await.is_ok() {
                     labels_check(chat, board.fold(), world.now_ms());

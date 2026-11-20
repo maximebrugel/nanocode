@@ -207,7 +207,18 @@ fn report(
         i += 1;
     }
     let root = git.work_tree()?.to_vec();
-    in_progress(git)?;
+    // A merge, cherry-pick or revert stopped on conflicts: the short forms show it.
+    let mut merging = false;
+    for name in [&b"MERGE_HEAD"[..], b"CHERRY_PICK_HEAD", b"REVERT_HEAD"] {
+        merging |= git
+            .repo
+            .fs
+            .stat_opt(&join(&git.repo.git_dir, name), false)?
+            .is_some();
+    }
+    if !(merging && (short || porcelain)) {
+        in_progress(git)?;
+    }
     let spec = Pathspec::new(&git.prefix, &paths)
         .map_err(|p| Error::Fatal(format!("{p}: '{p}' is outside repository")))?;
     let refresh = prepared.is_none() && git.var("GIT_OPTIONAL_LOCKS").as_deref() != Some("0");
@@ -229,9 +240,11 @@ fn report(
             *unmerged.entry(entry.path.clone()).or_default() |= 1 << (entry.stage - 1);
         }
     }
-    if !unmerged.is_empty() {
+    if !unmerged.is_empty() && !(short || porcelain) {
         return Err(super::diff::unmerged());
     }
+    // The unmerged paths show as one row each; the rest compares as usual.
+    work.index.entries.retain(|e| e.stage == 0);
     let mut staged = work.staged(head_tree.as_ref(), &spec)?;
     if renames {
         staged = detect_renames(&git.repo, staged, 30000)?;
@@ -244,6 +257,7 @@ fn report(
     };
     // The walk for untracked files first: it passes the tracked ones too.
     let mut others = untracked(&work, mode, &spec, &env_home)?;
+    others.retain(|path| !unmerged.contains_key(path));
     if mode != Untracked::No && !restored.is_empty() {
         others.extend(restored);
         crate::order::sort(&mut others);
@@ -283,6 +297,20 @@ fn report(
     for change in &unstaged {
         let row = rows.entry(change.path.clone()).or_default();
         row.work = letter(change);
+    }
+    for (path, stages) in &unmerged {
+        let row = rows.entry(path.clone()).or_default();
+        row.from = None;
+        // Which of base (1), ours (2) and theirs (4) the index holds.
+        (row.index, row.work) = match stages {
+            1 => ('D', 'D'),
+            2 => ('A', 'U'),
+            3 => ('U', 'D'),
+            4 => ('U', 'A'),
+            5 => ('D', 'U'),
+            6 => ('A', 'A'),
+            _ => ('U', 'U'),
+        };
     }
     let head_ref = git.repo.head_ref()?;
     let upstream = head_ref

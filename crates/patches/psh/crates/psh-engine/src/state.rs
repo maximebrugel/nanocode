@@ -38,6 +38,10 @@ pub(crate) struct Core {
     pub own_program: Option<Vec<u8>>,
     /// `$RANDOM`'s state (shared by subshells, which bash reseeds; close enough).
     pub rng: Cell<u64>,
+    /// `$RANDOM`'s seed for bash's own generator, once seeded or first read.
+    pub rseed: Cell<Option<u32>>,
+    /// The last `$RANDOM`: bash never returns the same value twice in a row.
+    pub last_random: Cell<u32>,
     /// `$SECONDS` counts from this time: nanoseconds since the epoch; may be before it (`SECONDS=100` on a host whose
     /// clock reads the epoch).
     pub seconds_base: Cell<i128>,
@@ -264,6 +268,9 @@ impl Core {
     }
 }
 
+/// A cache by a word's span.
+pub(crate) type SpanMap<T> = RefCell<crate::vars::NameMap<(u32, u32), T>>;
+
 /// A parsed chunk plus the line table of its source, for `line N:` in messages.
 pub(crate) struct Code {
     pub ast: Arc<Ast>,
@@ -273,9 +280,9 @@ pub(crate) struct Code {
     pub line_base: u32,
     /// The arithmetic words of this chunk that are literal text, parsed
     /// (`arith::literal`), by the word's span.
-    pub arith: RefCell<crate::vars::NameMap<(u32, u32), Rc<crate::arith::Literal>>>,
+    pub arith: SpanMap<Rc<crate::arith::Literal>>,
     /// The loops of this chunk compiled to flat code (`flat::compiled`), by span.
-    pub flat: RefCell<crate::vars::NameMap<(u32, u32), Option<Rc<crate::flat::Prog>>>>,
+    pub flat: SpanMap<Option<Rc<crate::flat::Prog>>>,
 }
 
 impl Code {
@@ -420,6 +427,9 @@ pub(crate) struct Vp {
     /// This vproc is a pipeline stage that is a `( … )`: the subshell is the stage
     /// itself (bash counts it once in `BASH_SUBSHELL`).
     pub stage_subshell: bool,
+    /// A pipeline stage's place at the stages' start gate, until its command runs
+    /// (`exec::pass_gate`); a subshell of the stage has none.
+    pub stage_gate: Option<Rc<crate::exec::GateTicket>>,
     pub time_subshell: Option<bool>,
     /// The last words of the simple commands running, innermost last: `$_` once each
     /// completes.
@@ -429,6 +439,12 @@ pub(crate) struct Vp {
     /// The last arithmetic evaluation failed on an unset variable under `set -u`: the
     /// error ends the shell, as an unbound variable in a word does.
     pub arith_unbound: bool,
+    /// The last arithmetic error was in the expression itself (syntax, division by 0),
+    /// not from a variable it read.
+    pub arith_syntax: bool,
+    /// An array subscript failed to evaluate as arithmetic: bash abandons the whole
+    /// script (or subshell) with status 1, not only the command line.
+    pub sub_fatal: bool,
     /// The names of the functions `export -f` marked: a `bash` psh runs itself starts
     /// with them, and a program gets them as bash passes them (`BASH_FUNC_name%%`).
     pub exported_funcs: Rc<Vec<String>>,
@@ -481,6 +497,20 @@ pub(crate) struct Vp {
     /// This vproc is a background job of one simple command that has not run it yet:
     /// if the command turns out to be no program, the job forks first (D1900).
     pub fork_job: bool,
+    /// This vproc is a background job of one simple command that has not run it yet:
+    /// a `%job` command word there is `bg`, not `fg`.
+    pub bg_simple: bool,
+    /// This vproc is a pipeline stage of one simple command that has not run it yet:
+    /// bash looks up a `%job` command word only in a shell that has not forked for
+    /// it, so there it is a plain command name.
+    pub stage_simple: bool,
+    /// A forked simple command's own address (a pipeline stage or `cmd &`): bash's child
+    /// holds the EXIT trap it inherited until it runs the command, so an expansion error
+    /// in the command's own words runs that trap there.
+    pub own_simple: Option<usize>,
+    /// The vproc this subshell was copied from ran an EXIT trap of its own (a trap a
+    /// subshell only inherited is gone in bash's grandchildren).
+    pub parent_exit: bool,
     /// Where the shell's pending signals are (D1411).
     pub sigs: Sigs,
     /// Levels of command substitution and `eval`: `set -x` repeats PS4's first char.
@@ -547,6 +577,14 @@ impl Vp {
         sub.top = false;
         sub.own_sigs = Cell::new(0);
         sub.fork_job = false;
+        sub.bg_simple = false;
+        sub.stage_simple = false;
+        sub.own_simple = None;
+        sub.parent_exit = self
+            .traps
+            .map
+            .get(&crate::builtins::trap::TrapKey::Exit)
+            .is_some_and(|t| t.active && !t.action.is_empty());
         sub.traps = self.traps.for_subshell(
             self.opts.get(crate::options::SetOpt::Errtrace),
             self.opts.get(crate::options::SetOpt::Functrace)
@@ -555,6 +593,7 @@ impl Vp {
         sub.jobs = Default::default();
         sub.subshell_level += 1;
         sub.stage_subshell = false;
+        sub.stage_gate = None;
         sub.time_subshell = None;
         sub.bashpid = None;
         sub
@@ -568,7 +607,7 @@ impl Vp {
         };
         let now = self.core.host.now();
         let v = match d {
-            Dynamic::Random => (self.next_random() & 0x7fff).to_string(),
+            Dynamic::Random => self.bash_random().to_string(),
             Dynamic::Srandom => ((self.next_random() >> 16) as u32).to_string(),
             Dynamic::Seconds => ((now.as_nanos() as i128 - self.core.seconds_base.get()).max(0)
                 / 1_000_000_000)
@@ -696,6 +735,23 @@ impl Vp {
         out
     }
 
+    /// `$RANDOM`: bash's generator (5.1+), so a seeded sequence matches bash's.
+    fn bash_random(&self) -> u32 {
+        let mut seed = self.core.rseed.get().unwrap_or_else(|| {
+            let now = self.core.host.now();
+            (now.as_secs() as u32) ^ now.subsec_micros() ^ self.core.host.pid()
+        });
+        loop {
+            seed = park_miller(seed);
+            let rv = ((seed >> 16) ^ (seed & 0xffff)) & 0x7fff;
+            if rv != self.core.last_random.get() {
+                self.core.rseed.set(Some(seed));
+                self.core.last_random.set(rv);
+                return rv;
+            }
+        }
+    }
+
     fn next_random(&self) -> u64 {
         // xorshift64*: any well-mixed sequence will do; bash's own is not reproduced.
         let mut x = self.core.rng.get();
@@ -723,10 +779,13 @@ impl Vp {
             .and_then(|v| std::str::from_utf8(v).ok()?.trim().parse().ok())
             .unwrap_or(0);
         match var.dynamic {
-            Some(Dynamic::Random) => self
-                .core
-                .rng
-                .set((n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1),
+            Some(Dynamic::Random) => {
+                self.core
+                    .rng
+                    .set((n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+                self.core.rseed.set(Some(n as u32));
+                self.core.last_random.set(0);
+            }
             Some(Dynamic::BashArgv0) => {
                 if let Some(v) = var.get() {
                     self.arg0 = v.to_vec();
@@ -953,6 +1012,20 @@ impl Vp {
         self.assign_with(name, value, false)
     }
 
+    /// Whether `name+=value` appends to the variable's own string in place: a set,
+    /// plain scalar that no attribute, reference or computed value changes.
+    pub(crate) fn appends_in_place(&self, name: &str) -> bool {
+        self.vars.get(name).is_some_and(|v| {
+            !v.nameref
+                && !v.readonly
+                && !v.integer
+                && v.case == Case::None
+                && !v.declared_only
+                && v.dynamic.is_none()
+                && matches!(v.value, crate::vars::Value::Str(_))
+        })
+    }
+
     /// `name=value` or `name+=value`.
     pub(crate) fn assign_with(
         &mut self,
@@ -969,6 +1042,19 @@ impl Vp {
             ),
             None => (!name.contains('['), true),
         };
+        // `name+=value` on a plain string: append in place rather than copying the old
+        // value, so building a string in a loop stays linear.
+        if append && self.appends_in_place(name) {
+            let allexport = self.opts.get(crate::options::SetOpt::Allexport);
+            if let Some(var) = self.vars.get_mut(name)
+                && let crate::vars::Value::Str(s) = &mut var.value
+            {
+                s.extend_from_slice(&value);
+                var.declared_only = false;
+                var.exported |= allexport;
+                return Ok(());
+            }
+        }
         if own {
             return self.assign_target(name, value, append, plain && !append);
         }
@@ -1163,6 +1249,14 @@ impl Vp {
             out
         }
     }
+}
+
+/// One step of bash's `intrand32`: Park–Miller's minimal standard, by Schrage's method.
+fn park_miller(last: u32) -> u32 {
+    let last = if last == 0 { 123_459_876 } else { i64::from(last) };
+    let (h, l) = (last / 127_773, last % 127_773);
+    let t = 16_807 * l - 2_836 * h;
+    (if t < 0 { t + 0x7fff_ffff } else { t }) as u32
 }
 
 /// `C:/x` or `C:\x`.

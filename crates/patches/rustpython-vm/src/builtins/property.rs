@@ -197,7 +197,9 @@ impl PyProperty {
         error_type: &str,
         vm: &VirtualMachine,
     ) -> PyResult<String> {
-        let prop_name = self.get_property_name(vm)?;
+        // CPython 3.12 names the property here only when __set_name__ named it, never from its getter's __name__,
+        // so a property attached after the class was made reads "property of 'C' object has no setter".
+        let prop_name = self.name.read().clone();
         let obj_type = obj.class();
         let qualname = obj_type.__qualname__(vm);
 

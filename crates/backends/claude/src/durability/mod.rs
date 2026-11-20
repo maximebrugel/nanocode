@@ -90,8 +90,11 @@ impl DurableAgentExt for ClaudeBuilder {
             .abandon_stale_kinds(MAINTENANCE_KINDS)
             .await
             .map_err(agent_error)?;
-        let preloaded =
-            state.take_checkpoint_preload(checkpoint.as_ref().map_or("", EncodedPayload::key));
+        let (preloaded, preloaded_records) = state
+            .take_checkpoint_preload_with_records(
+                checkpoint.as_ref().map_or("", EncodedPayload::key),
+            )
+            .unzip();
         let record = state.record().await.map_err(agent_error)?;
         let branches = Branches {
             store: state.shared_store(),
@@ -116,9 +119,13 @@ impl DurableAgentExt for ClaudeBuilder {
         } else {
             builder
         };
+        let mut read = preloaded_records
+            .flatten()
+            .map(Arc::unwrap_or_clone)
+            .unwrap_or_default();
         let checkpoint = match (checkpoint, preloaded) {
             (Some(_), Some(preloaded)) => Some(
-                hydrate(PayloadReader::from(&owner), preloaded)
+                hydrate(PayloadReader::from(&owner), preloaded, &mut read)
                     .instrument(nanocode_trace::info_span!(
                         target: "nanocode",
                         "claude.open.hydrate",
@@ -134,7 +141,7 @@ impl DurableAgentExt for ClaudeBuilder {
                 );
                 let decoded = span.in_scope(|| value.decode()).map_err(agent_error)?;
                 Some(
-                    hydrate(PayloadReader::from(&owner), decoded)
+                    hydrate(PayloadReader::from(&owner), decoded, &mut read)
                         .instrument(span)
                         .await?,
                 )
@@ -167,6 +174,7 @@ impl DurableAgentExt for ClaudeBuilder {
                 branches,
                 hydrated: nanocode_sync::Slot::default(),
                 hydrating: nanocode_sync::Sequencer::new(),
+                stored: nanocode_sync::Slot::new(Some(read).filter(|read| !read.is_empty())),
             }),
             checkpoint,
         )
@@ -214,6 +222,7 @@ struct ClaudeExecution {
     branches: Branches,
     hydrated: nanocode_sync::Slot<(String, Value, bool)>,
     hydrating: nanocode_sync::Sequencer,
+    stored: nanocode_sync::Slot<HashSet<String>>,
 }
 
 struct Deferred {
@@ -369,6 +378,7 @@ impl LazyClaudeExecution {
                         },
                         hydrated,
                         hydrating: nanocode_sync::Sequencer::new(),
+                        stored: nanocode_sync::Slot::default(),
                     },
                     reopened,
                 })
@@ -578,6 +588,12 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
         true
     }
 
+    fn take_stored_records(&self) -> Option<HashSet<String>> {
+        self.ready
+            .get()
+            .and_then(|acquired| acquired.execution.stored.take())
+    }
+
     fn holds_back_formats(&self) -> bool {
         self.store.holds_back_formats()
     }
@@ -752,13 +768,21 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
             let reader = PayloadReader::from(&self.owner);
             let admission = match admission {
                 Admission::Completed { checkpoint, output } => ClaudeAdmission::Completed {
-                    checkpoint: hydrate(reader, checkpoint).await?,
+                    // None: the durable head with nothing in flight, which the
+                    // live conversation already holds; Null tells the agent to
+                    // reuse it rather than hydrate a second full copy.
+                    checkpoint: match checkpoint {
+                        Some(checkpoint) => hydrate(reader, checkpoint, &mut HashSet::new()).await?,
+                        None => Value::Null,
+                    },
                     output: format::hydrate_output(reader, output)
                         .await
                         .map_err(agent_error)?,
                 },
-                Admission::Failed { checkpoint, error } => ClaudeAdmission::Failed {
-                    checkpoint: hydrate(reader, checkpoint).await?,
+                // Nothing reads a failed request's checkpoint: replay only
+                // reports its error.
+                Admission::Failed { error, .. } => ClaudeAdmission::Failed {
+                    checkpoint: Value::Null,
                     error,
                 },
                 admission => map_admission(admission),
@@ -930,13 +954,16 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 return Ok(Some(hydrated));
             }
             span.record("hydrated", "read");
+            let mut read = HashSet::new();
             let hydrated = format::hydrate_cursor(
                 PayloadReader::from(&self.owner),
                 value.decode().map_err(agent_error)?,
+                &mut read,
             )
             .instrument(span)
             .await
             .map_err(agent_error)?;
+            self.stored.put(read);
             self.hydrated
                 .put((value.key().to_owned(), hydrated.clone(), false));
             Ok(Some(hydrated))
@@ -969,13 +996,16 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 }
                 _ => {
                     span.record("hydrated", "read");
+                    let mut read = HashSet::new();
                     let hydrated = format::hydrate_cursor(
                         PayloadReader::from(&self.owner),
                         value.decode().map_err(agent_error)?,
+                        &mut read,
                     )
                     .instrument(span)
                     .await
                     .map_err(agent_error)?;
+                    self.stored.put(read);
                     (value.key().to_owned(), hydrated)
                 }
             };
@@ -1002,12 +1032,15 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 self.hydrated.put((key, hydrated, ahead));
                 return Ok(true);
             }
+            let mut read = HashSet::new();
             let hydrated = format::hydrate_cursor(
                 PayloadReader::from(&self.owner),
                 value.decode().map_err(agent_error)?,
+                &mut read,
             )
             .await
             .map_err(agent_error)?;
+            self.stored.put(read);
             self.hydrated.put((value.key().to_owned(), hydrated, true));
             Ok(true)
         })
@@ -1045,12 +1078,15 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 self.hydrated.put((key, cursor, true));
                 return Ok(Prefetched::Kept);
             }
+            let mut read = HashSet::new();
             let hydrated = format::hydrate_cursor(
                 PayloadReader::from(&self.owner),
                 value.decode().map_err(agent_error)?,
+                &mut read,
             )
             .await
             .map_err(agent_error)?;
+            self.stored.put(read);
             self.hydrated.put((value.key().to_owned(), hydrated, true));
             Ok(Prefetched::Read)
         })
@@ -1235,6 +1271,10 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
         true
     }
 
+    fn take_stored_records(&self) -> Option<HashSet<String>> {
+        self.stored.take()
+    }
+
     fn holds_back_formats(&self) -> bool {
         self.session.holds_back_formats()
     }
@@ -1325,8 +1365,12 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
     }
 }
 
-async fn hydrate(reader: PayloadReader<'_>, checkpoint: Value) -> AgentResult<Value> {
-    format::hydrate_snapshot(reader, checkpoint, &mut HashSet::new())
+async fn hydrate(
+    reader: PayloadReader<'_>,
+    checkpoint: Value,
+    read: &mut HashSet<String>,
+) -> AgentResult<Value> {
+    format::hydrate_snapshot(reader, checkpoint, read)
         .await
         .map_err(agent_error)
 }
@@ -1439,9 +1483,10 @@ fn map_admission(admission: Admission<Value, Value>) -> ClaudeAdmission {
     match admission {
         Admission::Accepted => ClaudeAdmission::Execute,
         Admission::Pending => ClaudeAdmission::Resume,
-        Admission::Completed { checkpoint, output } => {
-            ClaudeAdmission::Completed { checkpoint, output }
-        }
+        Admission::Completed { checkpoint, output } => ClaudeAdmission::Completed {
+            checkpoint: checkpoint.unwrap_or(Value::Null),
+            output,
+        },
         Admission::Failed { checkpoint, error } => ClaudeAdmission::Failed { checkpoint, error },
         Admission::Cancelled => ClaudeAdmission::Cancelled,
     }

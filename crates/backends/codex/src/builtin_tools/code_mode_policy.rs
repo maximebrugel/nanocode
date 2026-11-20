@@ -5,7 +5,8 @@ use std::{
 
 use nanocode_process_contracts::JOB_TOOLS;
 use nanocode_tool_host::{
-    CodeModeToolObservation, CodeModeToolPolicy, WorkspaceToolRouting, contract::ToolOutputContent,
+    CodeModeToolObservation, CodeModeToolPolicy, FileAccess, WorkspaceToolRouting,
+    contract::ToolOutputContent,
 };
 use serde_json::Value;
 
@@ -55,8 +56,14 @@ impl CodeModeToolPolicy for StandardToolPolicy {
         })
     }
 
-    fn exclusive(&self, name: &str) -> bool {
-        StandardTool::ApplyPatch.name() == name
+    fn file_access(&self, name: &str, input: &Value) -> Vec<FileAccess> {
+        if StandardTool::ApplyPatch.name() != name {
+            return Vec::new();
+        }
+        super::apply_patch::touched_paths(input)
+            .into_iter()
+            .map(FileAccess::Write)
+            .collect()
     }
 
     fn direct_host_tool(&self, name: &str) -> bool {

@@ -137,7 +137,7 @@ pub(super) async fn eval(vp: &mut Vp, args: &[Vec<u8>]) -> R {
 /// `source FILE [ARGS]` and `. FILE [ARGS]`.
 pub(super) async fn source(vp: &mut Vp, args: &[Vec<u8>]) -> R {
     let name = s(&args[0]).into_owned();
-    let usage = format!("{name}: usage: {name} [-p path] filename [arguments]\n");
+    let usage = format!("{name}: usage: {name} filename [arguments]\n");
     let mut i = 1;
     let mut search: Option<Vec<u8>> = None;
     while let Some(a) = args.get(i) {

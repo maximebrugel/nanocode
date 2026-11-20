@@ -72,12 +72,17 @@ function BigIntPrototypeToString(this: Value, radix?: Value): Str {
 }
 
 /**
- * BigInt.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] ), 21.2.3.2. Without
+ * BigInt.prototype.toLocaleString ( [ locales [ , options ] ] ), ECMA-402 20.2.1. Without
  * Intl it is toString() (QuickJS passes the locale on as a radix; node does not).
  * @builtin BigInt.prototype.toLocaleString
+ * @length 0
  */
-function BigIntPrototypeToLocaleString(this: Value): Str {
-  return BigIntToString(ThisBigIntValue(this), 10);
+function BigIntPrototypeToLocaleString(this: Value, locales?: Value, options?: Value): Str {
+  const x: Value = ThisBigIntValue(this);
+  if (IntlEnabled()) {
+    return IntlNumberToLocaleString(x, locales, options);
+  }
+  return BigIntToString(x, 10);
 }
 
 /**

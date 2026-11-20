@@ -25,7 +25,10 @@ use md5::Md5;
 use crate::lock::PyMutex as Mutex;
 use sha1::Sha1;
 use sha256::{SHA224_INITIAL_STATE, SHA224_OUTPUT_BYTES, SHA256_INITIAL_STATE, Sha256};
-use sha512::{SHA384_INITIAL_STATE, SHA384_OUTPUT_BYTES, SHA512_INITIAL_STATE, Sha512};
+use sha512::{
+    SHA384_INITIAL_STATE, SHA384_OUTPUT_BYTES, SHA512_224_INITIAL_STATE, SHA512_224_OUTPUT_BYTES,
+    SHA512_256_INITIAL_STATE, SHA512_256_OUTPUT_BYTES, SHA512_INITIAL_STATE, Sha512,
+};
 
 const SHA3_224_OUTPUT_BYTES: usize = 28;
 const SHA3_256_OUTPUT_BYTES: usize = 32;
@@ -42,6 +45,8 @@ enum HashState {
     Sha256(Sha256),
     Sha384(Sha512),
     Sha512(Sha512),
+    Sha512t224(Sha512),
+    Sha512t256(Sha512),
     Sha3 { state: Keccak, output_bytes: usize },
     Shake(Keccak),
     Blake2b(Blake2b),
@@ -57,6 +62,8 @@ impl HashState {
             "sha256" => Self::Sha256(Sha256::new(SHA256_INITIAL_STATE)),
             "sha384" => Self::Sha384(Sha512::new(SHA384_INITIAL_STATE)),
             "sha512" => Self::Sha512(Sha512::new(SHA512_INITIAL_STATE)),
+            "sha512_224" => Self::Sha512t224(Sha512::new(SHA512_224_INITIAL_STATE)),
+            "sha512_256" => Self::Sha512t256(Sha512::new(SHA512_256_INITIAL_STATE)),
             "sha3_224" => Self::sha3(SHA3_224_OUTPUT_BYTES),
             "sha3_256" => Self::sha3(SHA3_256_OUTPUT_BYTES),
             "sha3_384" => Self::sha3(SHA3_384_OUTPUT_BYTES),
@@ -85,7 +92,10 @@ impl HashState {
             Self::Md5(state) => state.update(data),
             Self::Sha1(state) => state.update(data),
             Self::Sha224(state) | Self::Sha256(state) => state.update(data),
-            Self::Sha384(state) | Self::Sha512(state) => state.update(data),
+            Self::Sha384(state)
+            | Self::Sha512(state)
+            | Self::Sha512t224(state)
+            | Self::Sha512t256(state) => state.update(data),
             Self::Sha3 { state, .. } | Self::Shake(state) => state.update(data),
             Self::Blake2b(state) => state.update(data),
             Self::Blake2s(state) => state.update(data),
@@ -100,6 +110,8 @@ impl HashState {
             Self::Sha256(state) => state.clone().finalize().to_vec(),
             Self::Sha384(state) => state.clone().finalize()[..SHA384_OUTPUT_BYTES].to_vec(),
             Self::Sha512(state) => state.clone().finalize().to_vec(),
+            Self::Sha512t224(state) => state.clone().finalize()[..SHA512_224_OUTPUT_BYTES].to_vec(),
+            Self::Sha512t256(state) => state.clone().finalize()[..SHA512_256_OUTPUT_BYTES].to_vec(),
             Self::Sha3 {
                 state,
                 output_bytes,
@@ -370,7 +382,7 @@ pub fn digest_block_size(name: &str) -> Option<usize> {
         "md5" => md5::BLOCK_BYTES,
         "sha1" => sha1::BLOCK_BYTES,
         "sha224" | "sha256" => sha256::BLOCK_BYTES,
-        "sha384" | "sha512" => sha512::BLOCK_BYTES,
+        "sha384" | "sha512" | "sha512_224" | "sha512_256" => sha512::BLOCK_BYTES,
         "blake2s" => blake2s::BLOCK_BYTES,
         "blake2b" => blake2b::BLOCK_BYTES,
         "sha3_224" => 144,
@@ -392,6 +404,8 @@ pub fn digest_output_size(name: &str) -> Option<usize> {
         "sha256" => sha256::OUTPUT_BYTES,
         "sha384" => SHA384_OUTPUT_BYTES,
         "sha512" => sha512::OUTPUT_BYTES,
+        "sha512_224" => SHA512_224_OUTPUT_BYTES,
+        "sha512_256" => SHA512_256_OUTPUT_BYTES,
         "sha3_224" => SHA3_224_OUTPUT_BYTES,
         "sha3_256" => SHA3_256_OUTPUT_BYTES,
         "sha3_384" => SHA3_384_OUTPUT_BYTES,

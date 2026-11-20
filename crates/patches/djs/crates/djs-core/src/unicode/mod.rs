@@ -22,6 +22,8 @@ pub mod normalize;
 
 pub mod case;
 
+pub mod locale_case;
+
 /// Looks up `c` in a packed, sorted range table (see `tables.rs`).
 fn in_table(table: &[u32], c: u32) -> bool {
     // Index of the first range that starts after `c`; the candidate is the one before.

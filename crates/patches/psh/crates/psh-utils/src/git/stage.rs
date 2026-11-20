@@ -68,14 +68,20 @@ pub fn named(git: &Git<'_>, paths: &[String]) -> Res<Vec<String>> {
 /// showing it (written in the second the index was) is compared now, and marked when
 /// it did change, as git marks it: the index written next is younger than the file.
 pub fn edit(work: &Work<'_, '_>) -> Res<Index> {
+    edit_with(work, false)
+}
+
+/// The index to change, as edit gives it; with unmerged on, a path a merge left
+/// unmerged may be in it (as git add resolves one).
+pub fn edit_with(work: &Work<'_, '_>, unmerged: bool) -> Res<Index> {
     let mut index = work.index.clone();
     let written = index.written.div_euclid(1_000_000_000);
     let mut blocked = false;
     for entry in &mut index.entries {
-        if entry.stage != 0 {
+        if entry.stage != 0 && !unmerged {
             return Err(super::diff::unmerged());
         }
-        if i64::from(entry.mtime.0) < written || entry.mode == 0o160000 {
+        if entry.stage != 0 || i64::from(entry.mtime.0) < written || entry.mode == 0o160000 {
             continue;
         }
         if let Some(State::Changed(_)) = later(work.state(entry), &mut blocked)? {
@@ -212,7 +218,7 @@ pub fn add(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
         Pathspec::new(&git.prefix, &specs).map_err(outside)?
     };
     let work = Work::new(&git.repo, &root)?;
-    let mut index = edit(&work)?;
+    let mut index = edit_with(&work, true)?;
     let env = env_of(git);
     // The walk for untracked files first: it passes the tracked ones too.
     let others = if update {

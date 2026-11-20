@@ -11,7 +11,7 @@ use nanocode_shell::{
 };
 use nanocode_sync::block_on;
 use nanocode_workspace::{
-    Config, Workspace, WorkspaceHost,
+    Command, Config, Workspace, WorkspaceHost,
     sim::{self as workspace_sim, Mutation as Rule},
 };
 use serde_json::{Value, json};
@@ -25,7 +25,7 @@ const FILES: [&str; 5] = ["a.txt", "b.txt", "d/c.txt", "d/e/f.txt", "n.txt"];
 const SHELL_FILES: [&str; 3] = ["a.txt", "b.txt", "n.txt"];
 const PIECES: [&str; 5] = ["a", "b", "ab", "\n", "c"];
 const SLICE: u32 = 4096;
-const DEPTH: u32 = 64;
+const DEPTH: u32 = nanocode_shell::DEFAULT_DEPTH;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceHostMutation {
@@ -96,7 +96,7 @@ pub struct WorkspaceHostStats {
 }
 
 impl WorkspaceHostStats {
-    const fn add(&mut self, other: &Self) {
+    pub const fn add(&mut self, other: &Self) {
         self.seeds += other.seeds;
         self.writes += other.writes;
         self.edits += other.edits;
@@ -225,6 +225,22 @@ fn simulate(seed: u64, mutation: WorkspaceHostMutation) -> WorkspaceHostOutcome 
     let files = start(seed);
     let wrong = block_on(async {
         files.write(b"/w/.keep", b"").await.map_err(|error| format!("setup: {error}"))?;
+        let deep = Rng::derive(seed, "workspace_host_depth").range(1, u64::from(DEPTH) - 1);
+        let nested = files
+            .run(Command {
+                script: format!("g(){{ (( $1 <= 0 )) && return; g $(( $1 - 1 )); }}; g {deep}; echo deep"),
+                cwd: ROOT.as_bytes().to_vec(),
+                env: Vec::new(),
+                timeout: None,
+            })
+            .await?;
+        if nested.ran.stdout != b"deep\n" {
+            return Err(format!(
+                "{deep} nested calls under a limit of {DEPTH}: {:?} {}",
+                nested.ran.ended,
+                String::from_utf8_lossy(&nested.ran.stderr)
+            ));
+        }
         let built = nanocode::claude::host_tools(
             PathBuf::from(ROOT),
             Arc::new(files.clone()),

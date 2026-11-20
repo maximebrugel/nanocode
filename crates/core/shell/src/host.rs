@@ -2,7 +2,7 @@ use crate::{
     answers::Answers,
     command::{Call, Commands, Session, Stream},
     file::{self, Device, bad_descriptor},
-    fs::{FileSystem, Kind, Remove, Reply, Stat, Write, join, normalize},
+    fs::{FileSystem, Kind, Links, Remove, Reply, Stat, WholeFile, Write, join, normalize},
     machine::{Identity, Machine},
     shell::{Changes, Limit, Limits},
 };
@@ -10,8 +10,8 @@ use nanocode_bytes::Bytes;
 use psh_engine::{
     ControlHandle, HostFile,
     host::{
-        Access, ChildFd, DirEntry, ExitStatus, ExtProc, FileKind, HostFuture, HostInfo, Metadata,
-        OpenOptions, RunInShell, SIGKILL, Signal, SpawnSpec, Spawned,
+        Access, ChildFd, DirEntry, ExitStatus, ExtProc, ExtraMetadata, FileKind, HostFuture, HostInfo, KnownEntry, Metadata,
+        OpenOptions, Rlimit, RunInShell, SIGKILL, Signal, SpawnSpec, Spawned,
     },
 };
 use std::{
@@ -29,13 +29,16 @@ const SYMLINK_HOPS: u32 = 40;
 const DEVICES: &[u8] = b"/dev";
 
 pub(crate) struct Vfs {
-    pub(crate) fs: Rc<dyn FileSystem>,
+    pub(crate) fs: RefCell<Rc<dyn FileSystem>>,
     pub(crate) commands: Rc<dyn Commands>,
     pub(crate) machine: Rc<dyn Machine>,
     pub(crate) identity: Identity,
     pub(crate) limits: Limits,
     pub(crate) strict: bool,
     pub(crate) operations: Cell<u64>,
+    /// Counts the calls that may change a file's contents (writes, removes, renames),
+    /// so an open file can tell whether its file changed since its own last write.
+    pub(crate) writes: Cell<u64>,
     pub(crate) changes: RefCell<Changes>,
     pub(crate) missing: RefCell<Vec<Vec<u8>>>,
     pub(crate) refused: Cell<Option<Limit>>,
@@ -48,9 +51,26 @@ pub(crate) struct Vfs {
     pub(crate) left: Cell<u64>,
     pub(crate) slice: Cell<u32>,
     pub(crate) utilities: &'static [psh_engine::util::UtilEntry],
+    /// While a command Python started runs to completion inside one call, its
+    /// sleeps are deadlines the run loop waits out itself (see
+    /// [`crate::command::Session::run`]), since no executor drives timers then.
+    pub(crate) timers: RefCell<Option<Vec<(Duration, Waker)>>>,
+    /// How far such runs have skipped ahead of the machine's clock where the
+    /// platform cannot wait in place (wasm): their sleeps end at once, in
+    /// deadline order, and the shell's clock moves on by what they slept.
+    pub(crate) skipped: Cell<Duration>,
 }
 
 impl Vfs {
+    /// The machine's clock, plus what sleeps skipped where it cannot wait.
+    pub(crate) fn now(&self) -> Duration {
+        self.machine.now().saturating_add(self.skipped.get())
+    }
+
+    pub(crate) fn fs(&self) -> Rc<dyn FileSystem> {
+        self.fs.borrow().clone()
+    }
+
     pub(crate) fn refuse(&self, limit: Limit) {
         if self.refused.get().is_none() {
             self.refused.set(Some(limit));
@@ -96,7 +116,7 @@ impl Vfs {
 
     pub(crate) fn stat(&self, path: &[u8], follow: bool) -> Reply<Stat> {
         match self.charge() {
-            Ok(()) => self.fs.stat(path, follow),
+            Ok(()) => self.fs().stat(path, follow),
             Err(error) => Reply::Now(Err(error)),
         }
     }
@@ -104,7 +124,7 @@ impl Vfs {
     pub(crate) fn read(&self, path: &[u8]) -> Reply<Bytes> {
         let limit = self.limits.file;
         match self.charge() {
-            Ok(()) => self.fs.read(path, limit).map(move |result| {
+            Ok(()) => self.fs().read(path, limit).map(move |result| {
                 result.and_then(|data| {
                     if data.len() as u64 > limit {
                         Err(io::ErrorKind::FileTooLarge.into())
@@ -120,7 +140,8 @@ impl Vfs {
     pub(crate) fn write(self: &Rc<Self>, path: &[u8], data: &[u8], how: Write) -> Reply<()> {
         match self.charge() {
             Ok(()) => {
-                let reply = self.fs.write(path, data, how);
+                self.writes.set(self.writes.get() + 1);
+                let reply = self.fs().write(path, data, how);
                 if self.changes.borrow().written.contains(path) {
                     return reply;
                 }
@@ -131,10 +152,49 @@ impl Vfs {
         }
     }
 
+    /// Writes the leading files of `files` in one step where the file system has one
+    /// (see [`FileSystem::write_files`]), as many as the operation and file limits let
+    /// pass: how many it wrote. The caller writes the rest one by one, meeting a limit
+    /// as a single write does.
+    pub(crate) fn write_files(self: &Rc<Self>, files: &[WholeFile<'_>], dir_mode: u32) -> Reply<usize> {
+        let left = self.limits.operations.saturating_sub(self.operations.get());
+        let files = &files[..files
+            .iter()
+            .take(usize::try_from(left).unwrap_or(usize::MAX))
+            .take_while(|file| file.data.len() as u64 <= self.limits.file)
+            .count()];
+        if files.is_empty() {
+            return Reply::Now(Ok(0));
+        }
+        let paths: Vec<(Vec<u8>, bool)> = files
+            .iter()
+            .map(|file| (file.path.to_vec(), file.mode & 0o7777 != file::FILE_MODE))
+            .collect();
+        let vfs = self.clone();
+        self.fs().write_files(files, dir_mode).map(move |result| {
+            let wrote = result?;
+            vfs.operations.set(vfs.operations.get() + wrote.files as u64);
+            let mut changes = vfs.changes.borrow_mut();
+            for dir in wrote.made {
+                changes.removed.remove(&dir);
+                changes.made.insert(dir);
+            }
+            for at in wrote.created {
+                if let Some((path, true)) = paths.get(at) {
+                    changes.modes.insert(path.clone());
+                }
+            }
+            for (path, _) in paths.into_iter().take(wrote.files) {
+                changes.wrote(path);
+            }
+            Ok(wrote.files)
+        })
+    }
+
     pub(crate) fn set_mode(self: &Rc<Self>, path: &[u8], mode: u32) -> Reply<()> {
         match self.charge() {
             Ok(()) => {
-                let reply = self.fs.set_mode(path, mode);
+                let reply = self.fs().set_mode(path, mode);
                 let path = path.to_vec();
                 self.change(reply, move |changes| {
                     changes.modes.insert(path);
@@ -147,7 +207,7 @@ impl Vfs {
     pub(crate) fn mkdir(self: &Rc<Self>, path: Vec<u8>, mode: u32) -> Reply<()> {
         match self.charge() {
             Ok(()) => {
-                let reply = self.fs.mkdir(&path, mode);
+                let reply = self.fs().mkdir(&path, mode);
                 self.change(reply, move |changes| {
                     changes.removed.remove(&path);
                     changes.made.insert(path);
@@ -160,7 +220,8 @@ impl Vfs {
     pub(crate) fn remove(self: &Rc<Self>, path: Vec<u8>, what: Remove) -> Reply<()> {
         match self.charge() {
             Ok(()) => {
-                let reply = self.fs.remove(&path, what);
+                self.writes.set(self.writes.get() + 1);
+                let reply = self.fs().remove(&path, what);
                 self.change(reply, move |changes| changes.removed(path))
             }
             Err(error) => Reply::Now(Err(error)),
@@ -170,7 +231,8 @@ impl Vfs {
     pub(crate) fn rename(self: &Rc<Self>, from: Vec<u8>, to: Vec<u8>) -> Reply<()> {
         match self.charge() {
             Ok(()) => {
-                let reply = self.fs.rename(&from, &to);
+                self.writes.set(self.writes.get() + 1);
+                let reply = self.fs().rename(&from, &to);
                 self.change(reply, move |changes| changes.moved(from, to))
             }
             Err(error) => Reply::Now(Err(error)),
@@ -180,7 +242,7 @@ impl Vfs {
     pub(crate) fn symlink(self: &Rc<Self>, target: &[u8], link: Vec<u8>) -> Reply<()> {
         match self.charge() {
             Ok(()) => {
-                let reply = self.fs.symlink(target, &link);
+                let reply = self.fs().symlink(target, &link);
                 self.change(reply, move |changes| {
                     changes.removed.remove(&link);
                     changes.linked.insert(link);
@@ -190,9 +252,20 @@ impl Vfs {
         }
     }
 
+    pub(crate) fn hard_link(self: &Rc<Self>, existing: &[u8], link: Vec<u8>) -> Reply<()> {
+        match self.charge() {
+            Ok(()) => {
+                self.writes.set(self.writes.get() + 1);
+                let reply = self.fs().hard_link(existing, &link);
+                self.change(reply, move |changes| changes.wrote(link))
+            }
+            Err(error) => Reply::Now(Err(error)),
+        }
+    }
+
     pub(crate) fn set_mtime(&self, path: &[u8], mtime_ns: i64) -> Reply<()> {
         match self.charge() {
-            Ok(()) => self.fs.set_mtime(path, mtime_ns),
+            Ok(()) => self.fs().set_mtime(path, mtime_ns),
             Err(error) => Reply::Now(Err(error)),
         }
     }
@@ -206,14 +279,21 @@ impl Vfs {
 
     pub(crate) fn list(&self, path: &[u8]) -> Reply<Vec<Vec<u8>>> {
         match self.charge() {
-            Ok(()) => self.fs.list(path),
+            Ok(()) => self.fs().list(path),
+            Err(error) => Reply::Now(Err(error)),
+        }
+    }
+
+    pub(crate) fn list_kinds(&self, path: &[u8]) -> Reply<Vec<(Vec<u8>, Option<Kind>)>> {
+        match self.charge() {
+            Ok(()) => self.fs().list_kinds(path),
             Err(error) => Reply::Now(Err(error)),
         }
     }
 
     pub(crate) fn read_link(&self, path: &[u8]) -> Reply<Vec<u8>> {
         match self.charge() {
-            Ok(()) => self.fs.read_link(path),
+            Ok(()) => self.fs().read_link(path),
             Err(error) => Reply::Now(Err(error)),
         }
     }
@@ -267,18 +347,27 @@ fn inode(path: &[u8]) -> u64 {
     hash
 }
 
-fn metadata(path: &[u8], stat: Stat, info: &HostInfo) -> Metadata {
+/// The inode of a hard-linked file, the same through each of its names.
+fn shared_inode(links: Links) -> u64 {
+    inode(format!("\0link {}", links.group).as_bytes())
+}
+
+const fn file_kind(kind: Kind) -> FileKind {
+    match kind {
+        Kind::File => FileKind::File,
+        Kind::Dir => FileKind::Dir,
+        Kind::Symlink => FileKind::Symlink,
+    }
+}
+
+fn metadata(path: &[u8], stat: Stat, links: Option<Links>, info: &HostInfo) -> Metadata {
     Metadata {
-        kind: match stat.kind {
-            Kind::File => FileKind::File,
-            Kind::Dir => FileKind::Dir,
-            Kind::Symlink => FileKind::Symlink,
-        },
+        kind: file_kind(stat.kind),
         size: stat.size,
         mode: stat.mode,
         mtime_ns: stat.mtime_ns,
         dev: 1,
-        ino: inode(path),
+        ino: links.map_or_else(|| inode(path), shared_inode),
         uid: info.uid,
         gid: info.groups.first().copied().unwrap_or(info.uid),
     }
@@ -299,6 +388,20 @@ fn device(path: &[u8]) -> Metadata {
 
 pub(crate) struct Host(pub(crate) Rc<Vfs>);
 
+/// The limits a stock Linux machine gives a process, for the ones every such machine
+/// shares (no core dumps by default, the rest unlimited), so `ulimit -f` and `ulimit -c`
+/// work as there; the machine-dependent ones (open files, processes, stack) are absent.
+/// What `ulimit` sets stays in the shell, as nothing here enforces it.
+const fn sandbox_rlimit(resource: Rlimit) -> Option<(psh_engine::host::Limit, psh_engine::host::Limit)> {
+    match resource {
+        Rlimit::Core => Some((Some(0), None)),
+        Rlimit::FileSize | Rlimit::Data | Rlimit::Rss | Rlimit::As | Rlimit::Cpu | Rlimit::Locks => {
+            Some((None, None))
+        }
+        _ => None,
+    }
+}
+
 impl psh_engine::Host for Host {
     fn open(&self, path: &[u8], opts: OpenOptions) -> HostFuture<io::Result<Rc<dyn HostFile>>> {
         let path = normalize(path);
@@ -306,6 +409,28 @@ impl psh_engine::Host for Host {
             return Box::pin(std::future::ready(Ok(Rc::new(device) as Rc<dyn HostFile>)));
         }
         Box::pin(file::open(self.0.clone(), path, opts))
+    }
+
+    fn write_files(
+        &self,
+        files: &[psh_engine::host::WholeFile<'_>],
+        dir_mode: u32,
+    ) -> HostFuture<io::Result<usize>> {
+        let paths: Vec<Vec<u8>> = files
+            .iter()
+            .map(|file| normalize(file.path))
+            .take_while(|path| Device::at(path, &self.0.machine).is_none())
+            .collect();
+        let files: Vec<WholeFile<'_>> = files
+            .iter()
+            .zip(&paths)
+            .map(|(file, path)| WholeFile {
+                path,
+                data: file.data,
+                mode: file.mode,
+            })
+            .collect();
+        self.0.write_files(&files, dir_mode).boxed()
     }
 
     fn stat(&self, path: &[u8], follow: bool) -> HostFuture<io::Result<Metadata>> {
@@ -317,7 +442,10 @@ impl psh_engine::Host for Host {
         self.0
             .stat(&path, follow)
             .map(move |result| match result {
-                Ok(stat) => Ok(metadata(&path, stat, &vfs.identity.info)),
+                Ok(stat) => {
+                    let links = vfs.fs().links(&path, follow);
+                    Ok(metadata(&path, stat, links, &vfs.identity.info))
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound && path == DEVICES => {
                     Ok(metadata(
                         &path,
@@ -327,6 +455,7 @@ impl psh_engine::Host for Host {
                             mode: 0o755,
                             mtime_ns: 0,
                         },
+                        None,
                         &vfs.identity.info,
                     ))
                 }
@@ -370,6 +499,24 @@ impl psh_engine::Host for Host {
                     names.dedup();
                 }
                 Ok(names.into_iter().map(|name| DirEntry { name }).collect())
+            })
+            .boxed()
+    }
+
+    fn read_dir_kinds(&self, path: &[u8]) -> HostFuture<io::Result<Vec<KnownEntry>>> {
+        let path = normalize(path);
+        if path == DEVICES {
+            // Devices are not in the file system's listing; read_dir adds them.
+            let listed = self.read_dir(&path);
+            return Box::pin(async move { Ok(listed.await?.into_iter().map(|e| (e, None)).collect()) });
+        }
+        self.0
+            .list_kinds(&path)
+            .map(|result| {
+                Ok(result?
+                    .into_iter()
+                    .map(|(name, kind)| (DirEntry { name }, kind.map(file_kind)))
+                    .collect())
             })
             .boxed()
     }
@@ -476,6 +623,10 @@ impl psh_engine::Host for Host {
         self.0.identity.info.clone()
     }
 
+    fn rlimit(&self, resource: Rlimit) -> Option<(psh_engine::host::Limit, psh_engine::host::Limit)> {
+        sandbox_rlimit(resource)
+    }
+
     fn mkdir(&self, path: &[u8], mode: u32) -> HostFuture<io::Result<()>> {
         self.0.mkdir(normalize(path), mode).boxed()
     }
@@ -494,6 +645,28 @@ impl psh_engine::Host for Host {
 
     fn symlink(&self, target: &[u8], link: &[u8]) -> HostFuture<io::Result<()>> {
         self.0.symlink(target, normalize(link)).boxed()
+    }
+
+    fn hard_link(&self, existing: &[u8], link: &[u8]) -> HostFuture<io::Result<()>> {
+        self.0.hard_link(&normalize(existing), normalize(link)).boxed()
+    }
+
+    fn stat_extra(
+        &self,
+        path: &[u8],
+        follow: bool,
+    ) -> HostFuture<io::Result<(Metadata, ExtraMetadata)>> {
+        let stat = psh_engine::Host::stat(self, path, follow);
+        let vfs = self.0.clone();
+        let path = normalize(path);
+        Box::pin(async move {
+            let metadata = stat.await?;
+            let mut extra = ExtraMetadata::derived(&metadata);
+            if let Some(links) = vfs.fs().links(&path, follow) {
+                extra.nlink = links.names;
+            }
+            Ok((metadata, extra))
+        })
     }
 
     fn read_link(&self, path: &[u8]) -> HostFuture<io::Result<Vec<u8>>> {
@@ -530,11 +703,24 @@ impl psh_engine::Host for Host {
     }
 
     fn now(&self) -> Duration {
-        self.0.machine.now()
+        self.0.now()
     }
 
     fn sleep(&self, duration: Duration) -> HostFuture<()> {
-        self.0.machine.sleep(duration)
+        if self.0.timers.borrow().is_none() {
+            return self.0.machine.sleep(duration);
+        }
+        let vfs = self.0.clone();
+        let until = vfs.now().saturating_add(duration);
+        Box::pin(std::future::poll_fn(move |cx| {
+            if vfs.now() >= until {
+                return Poll::Ready(());
+            }
+            if let Some(timers) = vfs.timers.borrow_mut().as_mut() {
+                timers.push((until, cx.waker().clone()));
+            }
+            Poll::Pending
+        }))
     }
 
     fn pid(&self) -> u32 {

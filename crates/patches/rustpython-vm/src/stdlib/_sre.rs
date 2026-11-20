@@ -1114,13 +1114,19 @@ mod _sre {
         fn repr_wtf8(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<Wtf8Buf> {
             with_sre_str!(zelf.pattern, &zelf.string, vm, |str_drive| {
                 let match_repr = zelf.get_slice(0, str_drive, vm).unwrap().repr(vm)?;
+                // CPython formats the match with %.50R: its repr cut to 50 code points.
+                let repr = match_repr.as_wtf8();
+                let repr = match repr.code_point_indices().nth(50) {
+                    Some((end, _)) => &repr[..end],
+                    None => repr,
+                };
                 Ok(wtf8_concat!(
                     "<re.Match object; span=(",
                     zelf.regs[0].0,
                     ", ",
                     zelf.regs[0].1,
                     "), match=",
-                    match_repr.as_wtf8(),
+                    repr,
                     '>',
                 ))
             })

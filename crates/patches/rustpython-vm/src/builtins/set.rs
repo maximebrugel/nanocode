@@ -2,8 +2,8 @@
  * Builtin set type with a sequence of unique items.
  */
 use super::{
-    IterStatus, PositionIterInternal, PyDict, PyDictRef, PyGenericAlias, PyTupleRef, PyType,
-    PyTypeRef, builtins_iter, locked_step,
+    IterStatus, PositionIterInternal, PyDict, PyDictRef, PyGenericAlias, PyInt, PyStr, PyTupleRef,
+    PyType, PyTypeRef, builtins_iter, locked_step,
 };
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
@@ -12,12 +12,11 @@ use crate::{
     common::{
         ascii,
         hash::PyHash,
-        lock::{LazyLock, PyMutex},
+        lock::{LazyLock, PyMutex, PyRwLock, PyRwLockReadGuard, PyRwLockWriteGuard},
         rc::PyRc,
         wtf8::Wtf8Buf,
     },
     convert::ToPyResult,
-    dict_inner::{self, DictSize},
     function::{
         ArgIterable, FuncArgs, NameOthers, OptionalArg, PosArgs, PyArithmeticValue,
         PyComparisonValue,
@@ -38,7 +37,627 @@ use rustpython_common::{
     hash,
 };
 
-pub(crate) type SetContentType = dict_inner::Dict<()>;
+// The set's storage is a port of CPython 3.12's setobject.c: an
+// open-addressing table of (hash, key) slots with dummies, probed linearly and
+// then by perturbation, so sets iterate, pop and combine in CPython's order.
+const SET_MINSIZE: usize = 8;
+const LINEAR_PROBES: usize = 9;
+const PERTURB_SHIFT: u32 = 5;
+/// The hash a dummy slot keeps, which no live key has.
+const DUMMY_HASH: PyHash = -1;
+
+/// One slot: active with a key, empty (`hash == 0`) or a dummy
+/// (`hash == DUMMY_HASH`) left by a removal.
+#[derive(Clone)]
+struct SetSlot {
+    hash: PyHash,
+    key: Option<PyObjectRef>,
+}
+
+impl SetSlot {
+    const EMPTY: Self = Self { hash: 0, key: None };
+
+    #[inline]
+    fn is_dummy(&self) -> bool {
+        self.key.is_none() && self.hash == DUMMY_HASH
+    }
+}
+
+struct SetTableInner {
+    /// `mask + 1` slots: a power of two, at least `SET_MINSIZE`.
+    table: Vec<SetSlot>,
+    /// Active and dummy slots.
+    fill: usize,
+    /// Active slots.
+    used: usize,
+    /// Where `pop` starts looking.
+    finger: usize,
+    /// Changes whenever `table` is rebuilt, as CPython's `so->table` pointer
+    /// does: a probe interrupted by `__eq__` restarts when it moved.
+    generation: u64,
+}
+
+impl Default for SetTableInner {
+    fn default() -> Self {
+        Self {
+            table: vec![SetSlot::EMPTY; SET_MINSIZE],
+            fill: 0,
+            used: 0,
+            finger: 0,
+            generation: 0,
+        }
+    }
+}
+
+unsafe impl crate::object::Traverse for SetTableInner {
+    fn traverse(&self, tracer_fn: &mut crate::object::TraverseFn<'_>) {
+        for slot in &self.table {
+            if let Some(key) = &slot.key {
+                key.traverse(tracer_fn);
+            }
+        }
+    }
+}
+
+/// The probe sequence of `set_lookkey` and `set_add_entry`: each bucket and,
+/// when they fit, its `LINEAR_PROBES` neighbours, then `i = i*5 + 1 + perturb`.
+#[derive(Clone, Copy)]
+struct SetProbe {
+    i: usize,
+    j: usize,
+    left: usize,
+    perturb: u64,
+}
+
+impl SetProbe {
+    #[inline]
+    const fn run_len(i: usize, mask: usize) -> usize {
+        if i + LINEAR_PROBES <= mask {
+            LINEAR_PROBES
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    const fn new(hash: PyHash, mask: usize) -> Self {
+        let i = (hash as u64 & mask as u64) as usize;
+        Self {
+            i,
+            j: i,
+            left: Self::run_len(i, mask),
+            perturb: hash as u64,
+        }
+    }
+
+    #[inline]
+    const fn advance(&mut self, mask: usize) {
+        if self.left > 0 {
+            self.left -= 1;
+            self.j += 1;
+        } else {
+            self.perturb >>= PERTURB_SHIFT;
+            self.i = ((self.i as u64)
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(self.perturb)
+                & mask as u64) as usize;
+            self.j = self.i;
+            self.left = Self::run_len(self.i, mask);
+        }
+    }
+}
+
+enum SetStep {
+    /// The key is in this active slot.
+    Found(usize),
+    /// The probe reached this empty slot without finding the key.
+    Missing(usize),
+    /// This slot's key has the same hash and needs a Python `__eq__`.
+    Compare(usize, PyObjectRef),
+}
+
+/// The set changed size under an iterator.
+struct SetChanged;
+
+/// Equality that runs no Python, so it may run under the table's lock: exact
+/// `int`s and exact `str`s. `None` asks for a real `__eq__`.
+#[inline]
+fn set_fast_eq(stored: &PyObject, key: &PyObject, vm: &VirtualMachine) -> Option<bool> {
+    let class = stored.class();
+    if !class.is(key.class()) {
+        return None;
+    }
+    if class.is(vm.ctx.types.int_type) {
+        // SAFETY: both are exactly `int`.
+        let (a, b) = unsafe {
+            (
+                stored.downcast_unchecked_ref::<PyInt>(),
+                key.downcast_unchecked_ref::<PyInt>(),
+            )
+        };
+        return Some(a.as_bigint() == b.as_bigint());
+    }
+    if class.is(vm.ctx.types.str_type) {
+        // SAFETY: both are exactly `str`.
+        let (a, b) = unsafe {
+            (
+                stored.downcast_unchecked_ref::<PyStr>(),
+                key.downcast_unchecked_ref::<PyStr>(),
+            )
+        };
+        return Some(a.as_wtf8() == b.as_wtf8());
+    }
+    None
+}
+
+/// `set_insert_clean`: place a key known to be absent into a table without dummies.
+fn set_insert_clean(table: &mut [SetSlot], mask: usize, key: PyObjectRef, hash: PyHash) {
+    let mut probe = SetProbe::new(hash, mask);
+    loop {
+        let slot = &mut table[probe.j];
+        if slot.key.is_none() {
+            *slot = SetSlot {
+                hash,
+                key: Some(key),
+            };
+            return;
+        }
+        probe.advance(mask);
+    }
+}
+
+impl SetTableInner {
+    #[inline]
+    fn mask(&self) -> usize {
+        self.table.len() - 1
+    }
+
+    /// Walk the probe sequence until the key turns up, an empty slot ends it,
+    /// or an entry needs a Python `__eq__`. With `freeslot`, remember the last
+    /// dummy passed, as `set_add_entry` does.
+    #[inline]
+    fn probe(
+        &self,
+        key: &PyObject,
+        hash: PyHash,
+        probe: &mut SetProbe,
+        mut freeslot: Option<&mut Option<usize>>,
+        vm: &VirtualMachine,
+    ) -> SetStep {
+        let mask = self.mask();
+        loop {
+            let slot = &self.table[probe.j];
+            match &slot.key {
+                None => {
+                    if slot.hash != DUMMY_HASH {
+                        return SetStep::Missing(probe.j);
+                    }
+                    if let Some(free) = freeslot.as_deref_mut() {
+                        *free = Some(probe.j);
+                    }
+                }
+                Some(stored) if slot.hash == hash => {
+                    if stored.is(key) {
+                        return SetStep::Found(probe.j);
+                    }
+                    match set_fast_eq(stored, key, vm) {
+                        Some(true) => return SetStep::Found(probe.j),
+                        Some(false) => {}
+                        None => return SetStep::Compare(probe.j, stored.clone()),
+                    }
+                }
+                Some(_) => {}
+            }
+            probe.advance(mask);
+        }
+    }
+
+    /// Whether slot `j` of the same table still holds `startkey` after an
+    /// `__eq__` ran unlocked.
+    fn still_holds(&self, generation: u64, j: usize, startkey: &PyObject) -> bool {
+        self.generation == generation
+            && self
+                .table
+                .get(j)
+                .and_then(|slot| slot.key.as_ref())
+                .is_some_and(|key| key.is(startkey))
+    }
+
+    /// `set_table_resize`: rebuild into the smallest table larger than `minused`.
+    fn resize(&mut self, minused: usize) {
+        let mut newsize = SET_MINSIZE;
+        while newsize <= minused {
+            newsize <<= 1;
+        }
+        if newsize == SET_MINSIZE && self.table.len() == SET_MINSIZE && self.fill == self.used {
+            // No dummies, so no point doing anything.
+            return;
+        }
+        let old_len = self.table.len();
+        let old = core::mem::replace(&mut self.table, vec![SetSlot::EMPTY; newsize]);
+        let newmask = newsize - 1;
+        for slot in old {
+            if let Some(key) = slot.key {
+                set_insert_clean(&mut self.table, newmask, key, slot.hash);
+            }
+        }
+        self.fill = self.used;
+        // A small table rebuilt in place keeps CPython's smalltable pointer.
+        if !(old_len == SET_MINSIZE && newsize == SET_MINSIZE) {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    #[inline]
+    fn grow_minused(&self) -> usize {
+        if self.used > 50000 {
+            self.used * 2
+        } else {
+            self.used * 4
+        }
+    }
+}
+
+/// A set's elements. Like `dict_inner::Dict`, it takes a read or write lock
+/// per operation and never runs Python under it: `__eq__` runs unlocked, and
+/// removed keys are released after unlocking.
+#[derive(Default)]
+pub(crate) struct SetTable {
+    inner: PyRwLock<SetTableInner>,
+}
+
+unsafe impl crate::object::Traverse for SetTable {
+    fn traverse(&self, tracer_fn: &mut crate::object::TraverseFn<'_>) {
+        self.inner.traverse(tracer_fn);
+    }
+}
+
+impl SetTable {
+    fn read(&self) -> PyRwLockReadGuard<'_, SetTableInner> {
+        self.inner.read()
+    }
+
+    fn write(&self) -> PyRwLockWriteGuard<'_, SetTableInner> {
+        self.inner.write()
+    }
+
+    fn len(&self) -> usize {
+        self.read().used
+    }
+
+    fn sizeof(&self) -> usize {
+        core::mem::size_of::<Self>() + self.read().table.len() * core::mem::size_of::<SetSlot>()
+    }
+
+    /// `set_contains_entry` (`set_lookkey`).
+    fn contains(&self, vm: &VirtualMachine, key: &PyObject, hash: PyHash) -> PyResult<bool> {
+        'restart: loop {
+            let mut guard = self.read();
+            let generation = guard.generation;
+            let mut probe = SetProbe::new(hash, guard.mask());
+            loop {
+                match guard.probe(key, hash, &mut probe, None, vm) {
+                    SetStep::Found(_) => return Ok(true),
+                    SetStep::Missing(_) => return Ok(false),
+                    SetStep::Compare(j, startkey) => {
+                        drop(guard);
+                        let eq = vm.bool_eq(&startkey, key)?;
+                        guard = self.read();
+                        if !guard.still_holds(generation, j, &startkey) {
+                            drop(guard);
+                            drop(startkey);
+                            continue 'restart;
+                        }
+                        // Still in the table, so this is not the last reference.
+                        drop(startkey);
+                        if eq {
+                            return Ok(true);
+                        }
+                        probe.advance(guard.mask());
+                    }
+                }
+            }
+        }
+    }
+
+    /// `set_add_entry`.
+    fn add(&self, vm: &VirtualMachine, key: &PyObject, hash: PyHash) -> PyResult<()> {
+        'restart: loop {
+            let mut guard = self.write();
+            let generation = guard.generation;
+            let mut probe = SetProbe::new(hash, guard.mask());
+            let mut freeslot = None;
+            loop {
+                match guard.probe(key, hash, &mut probe, Some(&mut freeslot), vm) {
+                    SetStep::Found(_) => return Ok(()),
+                    SetStep::Missing(j) => {
+                        let inner = &mut *guard;
+                        inner.used += 1;
+                        if let Some(free) = freeslot
+                            && inner.table[free].is_dummy()
+                        {
+                            inner.table[free] = SetSlot {
+                                hash,
+                                key: Some(key.to_owned()),
+                            };
+                            return Ok(());
+                        }
+                        inner.table[j] = SetSlot {
+                            hash,
+                            key: Some(key.to_owned()),
+                        };
+                        inner.fill += 1;
+                        if inner.fill * 5 >= inner.mask() * 3 {
+                            let minused = inner.grow_minused();
+                            inner.resize(minused);
+                        }
+                        return Ok(());
+                    }
+                    SetStep::Compare(j, startkey) => {
+                        drop(guard);
+                        if vm.bool_eq(&startkey, key)? {
+                            return Ok(());
+                        }
+                        guard = self.write();
+                        if !guard.still_holds(generation, j, &startkey) {
+                            drop(guard);
+                            drop(startkey);
+                            continue 'restart;
+                        }
+                        drop(startkey);
+                        probe.advance(guard.mask());
+                    }
+                }
+            }
+        }
+    }
+
+    /// `set_discard_entry`: whether the key was there.
+    fn discard(&self, vm: &VirtualMachine, key: &PyObject, hash: PyHash) -> PyResult<bool> {
+        'restart: loop {
+            let mut guard = self.write();
+            let generation = guard.generation;
+            let mut probe = SetProbe::new(hash, guard.mask());
+            let found = loop {
+                match guard.probe(key, hash, &mut probe, None, vm) {
+                    SetStep::Found(j) => break j,
+                    SetStep::Missing(_) => return Ok(false),
+                    SetStep::Compare(j, startkey) => {
+                        drop(guard);
+                        let eq = vm.bool_eq(&startkey, key)?;
+                        guard = self.write();
+                        if !guard.still_holds(generation, j, &startkey) {
+                            drop(guard);
+                            drop(startkey);
+                            continue 'restart;
+                        }
+                        drop(startkey);
+                        if eq {
+                            break j;
+                        }
+                        probe.advance(guard.mask());
+                    }
+                }
+            };
+            let removed = {
+                let inner = &mut *guard;
+                let slot = &mut inner.table[found];
+                slot.hash = DUMMY_HASH;
+                inner.used -= 1;
+                slot.key.take()
+            };
+            drop(guard);
+            drop(removed);
+            return Ok(true);
+        }
+    }
+
+    /// `set_pop`, from the search finger.
+    fn pop(&self) -> Option<PyObjectRef> {
+        let mut guard = self.write();
+        if guard.used == 0 {
+            return None;
+        }
+        let inner = &mut *guard;
+        let mask = inner.mask();
+        let mut i = inner.finger & mask;
+        while inner.table[i].key.is_none() {
+            i = (i + 1) & mask;
+        }
+        let slot = &mut inner.table[i];
+        slot.hash = DUMMY_HASH;
+        let key = slot.key.take();
+        inner.used -= 1;
+        inner.finger = i + 1;
+        key
+    }
+
+    /// `set_clear_internal`.
+    fn clear(&self) {
+        let _removed = {
+            let mut guard = self.write();
+            guard.fill = 0;
+            guard.used = 0;
+            if guard.table.len() != SET_MINSIZE {
+                guard.generation = guard.generation.wrapping_add(1);
+            }
+            core::mem::replace(&mut guard.table, vec![SetSlot::EMPTY; SET_MINSIZE])
+        };
+    }
+
+    /// Take over `other`'s table, as `set_swap_bodies` does for an in-place
+    /// update. The search finger stays.
+    fn replace_with(&self, other: Self) {
+        let replacement = other.inner.into_inner();
+        let _removed = {
+            let mut guard = self.write();
+            let finger = guard.finger;
+            let both_small =
+                guard.table.len() == SET_MINSIZE && replacement.table.len() == SET_MINSIZE;
+            let generation = if both_small {
+                guard.generation
+            } else {
+                guard.generation.wrapping_add(1)
+            };
+            let old = core::mem::replace(&mut *guard, replacement);
+            guard.finger = finger;
+            guard.generation = generation;
+            old
+        };
+    }
+
+    /// The table's slots with its fill and size, or `None` when it is empty.
+    fn snapshot(&self) -> Option<(Vec<SetSlot>, usize, usize)> {
+        let guard = self.read();
+        (guard.used != 0).then(|| (guard.table.clone(), guard.fill, guard.used))
+    }
+
+    /// The part of `set_merge` that runs no Python: one resize up front, then,
+    /// into an empty table, a straight copy of the slots when the sizes match
+    /// and there are no dummies, else `set_insert_clean`. Hands the slots back
+    /// when this table is not empty and each key needs `set_add_entry`.
+    fn merge_presized(
+        &self,
+        slots: Vec<SetSlot>,
+        other_fill: usize,
+        other_used: usize,
+    ) -> Option<Vec<SetSlot>> {
+        let mut guard = self.write();
+        let inner = &mut *guard;
+        if (inner.fill + other_used) * 5 >= inner.mask() * 3 {
+            inner.resize((inner.used + other_used) * 2);
+        }
+        if inner.fill != 0 {
+            return Some(slots);
+        }
+        if inner.mask() == slots.len() - 1 && other_fill == other_used {
+            // This table holds no keys, so replacing it releases none. CPython
+            // copies into the same table, so no probe needs to restart.
+            inner.table = slots;
+        } else {
+            let mask = inner.mask();
+            for slot in slots {
+                if let Some(key) = slot.key {
+                    set_insert_clean(&mut inner.table, mask, key, slot.hash);
+                }
+            }
+        }
+        inner.fill = other_used;
+        inner.used = other_used;
+        None
+    }
+
+    /// `set_merge`.
+    fn merge(&self, other: &Self, vm: &VirtualMachine) -> PyResult<()> {
+        if core::ptr::eq(self, other) {
+            return Ok(());
+        }
+        let Some((slots, other_fill, other_used)) = other.snapshot() else {
+            return Ok(());
+        };
+        if let Some(slots) = self.merge_presized(slots, other_fill, other_used) {
+            for slot in slots {
+                if let Some(key) = slot.key {
+                    self.add(vm, &key, slot.hash)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `set_update_internal` for an exact dict's keys: presize, then add.
+    fn merge_keys(&self, keys: Vec<(PyObjectRef, PyHash)>, vm: &VirtualMachine) -> PyResult<()> {
+        {
+            let mut guard = self.write();
+            let size = keys.len();
+            if (guard.fill + size) * 5 >= guard.mask() * 3 {
+                let minused = (guard.used + size) * 2;
+                guard.resize(minused);
+            }
+        }
+        for (key, hash) in keys {
+            self.add(vm, &key, hash)?;
+        }
+        Ok(())
+    }
+
+    /// `set_copy`: a new table merged from this one.
+    fn copy(&self) -> Self {
+        let new = Self::default();
+        if let Some((slots, other_fill, other_used)) = self.snapshot() {
+            let rest = new.merge_presized(slots, other_fill, other_used);
+            debug_assert!(rest.is_none(), "a new table is empty");
+        }
+        new
+    }
+
+    /// The end of `set_difference_update_internal`: rebuild once dummies are
+    /// over a quarter of the table.
+    fn purge_dummies(&self) {
+        let mut guard = self.write();
+        if guard.fill - guard.used <= guard.mask() / 4 {
+            return;
+        }
+        let minused = guard.grow_minused();
+        guard.resize(minused);
+    }
+
+    fn keys(&self) -> Vec<PyObjectRef> {
+        self.read()
+            .table
+            .iter()
+            .filter_map(|slot| slot.key.clone())
+            .collect()
+    }
+
+    fn keys_with_hashes(&self) -> Vec<(PyObjectRef, PyHash)> {
+        self.read()
+            .table
+            .iter()
+            .filter_map(|slot| slot.key.as_ref().map(|key| (key.clone(), slot.hash)))
+            .collect()
+    }
+
+    /// Fold the live hashes under the read lock; `f` must not run Python.
+    fn fold_hashes<Acc>(&self, init: Acc, f: impl FnMut(Acc, PyHash) -> Acc) -> Acc {
+        self.read()
+            .table
+            .iter()
+            .filter(|slot| slot.key.is_some())
+            .map(|slot| slot.hash)
+            .fold(init, f)
+    }
+
+    /// `setiter_iternext`: the first live slot at or after `position`, with
+    /// the position after it, unless the set no longer has `used` keys.
+    fn next_checked(
+        &self,
+        position: usize,
+        used: usize,
+    ) -> Result<Option<(usize, PyObjectRef)>, SetChanged> {
+        let guard = self.read();
+        if guard.used != used {
+            return Err(SetChanged);
+        }
+        Ok(guard
+            .table
+            .iter()
+            .enumerate()
+            .skip(position)
+            .find_map(|(i, slot)| slot.key.as_ref().map(|key| (i + 1, key.clone()))))
+    }
+
+    /// The keys an iterator at `position` has still to return.
+    fn keys_from(&self, position: usize) -> Vec<PyObjectRef> {
+        self.read()
+            .table
+            .iter()
+            .skip(position)
+            .filter_map(|slot| slot.key.clone())
+            .collect()
+    }
+}
 
 #[pyclass(module = false, name = "set", unhashable = true, traverse)]
 #[derive(Default)]
@@ -180,7 +799,7 @@ impl PyPayload for PyFrozenSet {
 
 #[derive(Default, Clone)]
 pub(super) struct PySetInner {
-    content: PyRc<SetContentType>,
+    content: PyRc<SetTable>,
 }
 
 unsafe impl crate::object::Traverse for PySetInner {
@@ -209,18 +828,6 @@ impl PySetInner {
         let set = Self::default();
         set.update_internal(iterable, vm)?;
         Ok(set)
-    }
-
-    /// Elements of `obj` with their stored hashes, or `None` if `obj` keeps
-    /// none and must be iterated generically. Mirrors the `PyAnySet_Check` /
-    /// `PyDict_CheckExact` fast paths in CPython's `set_update_internal`.
-    fn cached_hashes(obj: &PyObject, vm: &VirtualMachine) -> Option<Vec<(PyObjectRef, PyHash)>> {
-        if let Some(set) = extract_set(obj) {
-            Some(set.content.keys_with_hashes())
-        } else {
-            obj.downcast_ref_if_exact::<PyDict>(vm)
-                .map(|dict| dict._as_dict_inner().keys_with_hashes())
-        }
     }
 
     fn fold_op<O>(
@@ -272,15 +879,19 @@ impl PySetInner {
         self.content.sizeof()
     }
 
+    /// `set_copy`: a new set merged from this one, which can lay its keys out
+    /// differently from the original.
     fn copy(&self) -> Self {
         Self {
-            content: PyRc::new((*self.content).clone()),
+            content: PyRc::new(self.content.copy()),
         }
     }
 
     fn contains(&self, needle: &PyObject, vm: &VirtualMachine) -> PyResult<bool> {
-        let result = self
-            .retry_op_with_frozenset(needle, vm, |needle, vm| self.content.contains(vm, needle));
+        let result = self.retry_op_with_frozenset(needle, vm, |needle, vm| {
+            let hash = needle.hash(vm)?;
+            self.content.contains(vm, needle, hash)
+        });
         Self::wrap_unhashable_error(result, needle, vm)
     }
 
@@ -291,7 +902,7 @@ impl PySetInner {
         hash: PyHash,
         vm: &VirtualMachine,
     ) -> PyResult<bool> {
-        self.content.contains_known_hash(vm, needle, hash)
+        self.content.contains(vm, needle, hash)
     }
 
     fn compare(&self, other: &Self, op: PyComparisonOp, vm: &VirtualMachine) -> PyResult<bool> {
@@ -315,20 +926,11 @@ impl PySetInner {
         Ok(true)
     }
 
+    /// `set_update_internal` into this set, returning it: what the dict
+    /// views' `|` does to the set it builds, and `set_union` to its copy.
     pub(super) fn union(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<Self> {
-        let set = self.clone();
-        if let Some(elements) = Self::cached_hashes(other.as_object(), vm) {
-            for (item, hash) in elements {
-                set.add_known_hash(&item, hash, vm)?;
-            }
-            return Ok(set);
-        }
-        for item in other.iter(vm)? {
-            let item = item?;
-            set.add(&item, vm)?;
-        }
-
-        Ok(set)
+        self.update_internal(other.as_object().to_owned(), vm)?;
+        Ok(self.clone())
     }
 
     pub(super) fn intersection(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<Self> {
@@ -367,72 +969,79 @@ impl PySetInner {
         Ok(set)
     }
 
+    /// `set_difference`.
     fn difference_new(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<Self> {
-        // Scanning the left side avoids visiting and retaining a much larger
-        // exclusion collection. Match CPython's comparison direction as well.
-        if let Some(other_set) = extract_set(other.as_object()) {
-            if self.len() >> 2 <= other_set.len() {
-                return self
-                    .difference_by(|key, hash| other_set.contains_known_hash(key, hash, vm), vm);
-            }
-        } else if let Some(dict) = other.as_object().downcast_ref_if_exact::<PyDict>(vm)
-            && self.len() >> 2 <= dict._as_dict_inner().len()
-        {
-            return self.difference_by(
-                |key, hash| dict._as_dict_inner().contains_known_hash(vm, key, hash),
-                vm,
-            );
+        let other_size = if let Some(other_set) = extract_set(other.as_object()) {
+            Some(other_set.len())
+        } else {
+            other
+                .as_object()
+                .downcast_ref_if_exact::<PyDict>(vm)
+                .map(|dict| dict._as_dict_inner().len())
+        };
+        let Some(other_size) = other_size else {
+            return self.copy_and_difference(other, vm);
+        };
+        // A much larger left side is cheaper to copy than to scan.
+        if self.len() >> 2 > other_size {
+            return self.copy_and_difference(other, vm);
         }
-        self.copy().difference(other, vm)
-    }
-
-    // The dict-view caller supplies a private working table.
-    pub(super) fn difference(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<Self> {
-        self.difference_update(core::iter::once(other), vm)?;
-        Ok(self.clone())
-    }
-
-    fn difference_by(
-        &self,
-        contains: impl Fn(&PyObject, PyHash) -> PyResult<bool>,
-        vm: &VirtualMachine,
-    ) -> PyResult<Self> {
         let result = Self::default();
-        for (key, hash) in self.content.keys_with_hashes() {
-            if !contains(&key, hash)? {
-                result.add_known_hash(&key, hash, vm)?;
+        if let Some(other_set) = extract_set(other.as_object()) {
+            for (key, hash) in self.content.keys_with_hashes() {
+                if !other_set.contains_known_hash(&key, hash, vm)? {
+                    result.content.add(vm, &key, hash)?;
+                }
+            }
+        } else if let Some(dict) = other.as_object().downcast_ref_if_exact::<PyDict>(vm) {
+            for (key, hash) in self.content.keys_with_hashes() {
+                if !dict._as_dict_inner().contains_known_hash(vm, &*key, hash)? {
+                    result.content.add(vm, &key, hash)?;
+                }
             }
         }
         Ok(result)
     }
 
+    /// `set_copy_and_difference`.
+    fn copy_and_difference(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<Self> {
+        let result = self.copy();
+        result.difference_update_internal(other, vm)?;
+        Ok(result)
+    }
+
+    /// `difference_update` in place, returning this set: the dict views' `-`.
+    pub(super) fn difference(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<Self> {
+        self.difference_update_internal(other, vm)?;
+        Ok(self.clone())
+    }
+
+    /// `symmetric_difference_update` in place, returning this set: the dict
+    /// views' `^`.
     pub(super) fn symmetric_difference(
         &self,
         other: ArgIterable,
         vm: &VirtualMachine,
     ) -> PyResult<Self> {
-        let new_inner = self.clone();
+        self.symmetric_difference_update_internal(other, vm)?;
+        Ok(self.clone())
+    }
 
-        if let Some(elements) = Self::cached_hashes(other.as_object(), vm) {
-            // the source is already duplicate-free
-            for (item, hash) in elements {
-                new_inner
-                    .content
-                    .delete_or_insert_known_hash(vm, &item, hash, ())?;
+    /// `set_symmetric_difference`: a copy of `other` toggled by this set's keys.
+    fn symmetric_difference_new(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<Self> {
+        let result = Self::from_object(other.as_object().to_owned(), vm)?;
+        result.toggle(self.content.keys_with_hashes(), vm)?;
+        Ok(result)
+    }
+
+    /// Remove each key that is present and add each that is not.
+    fn toggle(&self, keys: Vec<(PyObjectRef, PyHash)>, vm: &VirtualMachine) -> PyResult<()> {
+        for (key, hash) in keys {
+            if !self.content.discard(vm, &key, hash)? {
+                self.content.add(vm, &key, hash)?;
             }
-            return Ok(new_inner);
         }
-
-        // We want to remove duplicates in other
-        let other_set = Self::from_iter(other.iter(vm)?, vm)?;
-
-        for (item, hash) in other_set.content.keys_with_hashes() {
-            new_inner
-                .content
-                .delete_or_insert_known_hash(vm, &item, hash, ())?;
-        }
-
-        Ok(new_inner)
+        Ok(())
     }
 
     fn issuperset(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<bool> {
@@ -495,25 +1104,34 @@ impl PySetInner {
     }
 
     fn add(&self, item: &PyObject, vm: &VirtualMachine) -> PyResult<()> {
-        let result = self.content.insert(vm, item, ());
+        let result = item
+            .hash(vm)
+            .and_then(|hash| self.content.add(vm, item, hash));
         Self::wrap_unhashable_error(result, item, vm)
     }
 
     /// [`Self::add`] with a known hash.
     fn add_known_hash(&self, item: &PyObject, hash: PyHash, vm: &VirtualMachine) -> PyResult<()> {
-        let result = self.content.insert_known_hash(vm, item, hash, ());
-        Self::wrap_unhashable_error(result, item, vm)
+        self.content.add(vm, item, hash)
     }
 
     fn remove(&self, item: &PyObject, vm: &VirtualMachine) -> PyResult<()> {
-        let result =
-            self.retry_op_with_frozenset(item, vm, |item, vm| self.content.delete(vm, item));
+        let result = self.retry_op_with_frozenset(item, vm, |item, vm| {
+            let hash = item.hash(vm)?;
+            if self.content.discard(vm, item, hash)? {
+                Ok(())
+            } else {
+                Err(vm.new_key_error(item.to_owned()))
+            }
+        });
         Self::wrap_unhashable_error(result, item, vm)
     }
 
     fn discard(&self, item: &PyObject, vm: &VirtualMachine) -> PyResult<bool> {
-        let result = self
-            .retry_op_with_frozenset(item, vm, |item, vm| self.content.delete_if_exists(vm, item));
+        let result = self.retry_op_with_frozenset(item, vm, |item, vm| {
+            let hash = item.hash(vm)?;
+            self.content.discard(vm, item, hash)
+        });
         Self::wrap_unhashable_error(result, item, vm)
     }
 
@@ -526,8 +1144,7 @@ impl PySetInner {
     }
 
     fn pop(&self, vm: &VirtualMachine) -> PyResult {
-        // TODO: should be pop_front, but that requires rearranging every index
-        if let Some((key, _)) = self.content.pop_back() {
+        if let Some(key) = self.content.pop() {
             Ok(key)
         } else {
             let err_msg = vm.ctx.new_str(ascii!("pop from an empty set")).into();
@@ -535,6 +1152,7 @@ impl PySetInner {
         }
     }
 
+    /// `set_update_internal`.
     fn update_internal(&self, iterable: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
         // check AnySet
         if let Ok(any_set) = AnySet::try_from_object(vm, iterable.to_owned()) {
@@ -553,17 +1171,12 @@ impl PySetInner {
     }
 
     fn merge_set(&self, any_set: AnySet, vm: &VirtualMachine) -> PyResult<()> {
-        for (item, hash) in any_set.as_inner().content.keys_with_hashes() {
-            self.add_known_hash(&item, hash, vm)?;
-        }
-        Ok(())
+        self.content.merge(&any_set.as_inner().content, vm)
     }
 
     fn merge_dict(&self, dict: &Py<PyDict>, vm: &VirtualMachine) -> PyResult<()> {
-        for (key, hash) in dict._as_dict_inner().keys_with_hashes() {
-            self.add_known_hash(&key, hash, vm)?;
-        }
-        Ok(())
+        self.content
+            .merge_keys(dict._as_dict_inner().keys_with_hashes(), vm)
     }
 
     fn intersection_update(
@@ -572,8 +1185,37 @@ impl PySetInner {
         vm: &VirtualMachine,
     ) -> PyResult<()> {
         let temp_inner = self.intersection_multi(others, vm)?;
-        let content = PyRc::try_unwrap(temp_inner.content).unwrap_or_else(|table| (*table).clone());
-        self.content.replace_contents(content);
+        let content = PyRc::try_unwrap(temp_inner.content).unwrap_or_else(|table| table.copy());
+        self.content.replace_with(content);
+        Ok(())
+    }
+
+    /// `set_difference_update_internal`.
+    fn difference_update_internal(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<()> {
+        if let Some(other_set) = extract_set(other.as_object()) {
+            if PyRc::ptr_eq(&self.content, &other_set.content) {
+                self.clear();
+                return Ok(());
+            }
+            // Against a much larger set, remove only the common keys.
+            let keys = if other_set.len() >> 3 > self.len() {
+                self.intersection_set(other_set, vm)?
+                    .content
+                    .keys_with_hashes()
+            } else {
+                other_set.content.keys_with_hashes()
+            };
+            for (key, hash) in keys {
+                self.content.discard(vm, &key, hash)?;
+            }
+        } else {
+            for item in other.iter(vm)? {
+                let key = item?;
+                let hash = key.hash(vm)?;
+                self.content.discard(vm, &key, hash)?;
+            }
+        }
+        self.content.purge_dummies();
         Ok(())
     }
 
@@ -582,35 +1224,33 @@ impl PySetInner {
         others: impl core::iter::Iterator<Item = ArgIterable>,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        for iterable in others {
-            let elements = if let Some(other_set) = extract_set(iterable.as_object()) {
-                if PyRc::ptr_eq(&self.content, &other_set.content) {
-                    self.clear();
-                    continue;
-                }
-                // Build the intersection first: besides bounding the work by
-                // our size, this preserves CPython's equality/error ordering.
-                Some(if other_set.len() >> 3 > self.len() {
-                    self.intersection_set(other_set, vm)?
-                        .content
-                        .keys_with_hashes()
-                } else {
-                    other_set.content.keys_with_hashes()
-                })
-            } else {
-                Self::cached_hashes(iterable.as_object(), vm)
-            };
-            if let Some(elements) = elements {
-                for (item, hash) in elements {
-                    self.content.delete_if_exists_known_hash(vm, &*item, hash)?;
-                }
-                continue;
-            }
-            for item in iterable.iter(vm)? {
-                self.content.delete_if_exists(vm, &*item?)?;
-            }
+        for other in others {
+            self.difference_update_internal(other, vm)?;
         }
         Ok(())
+    }
+
+    /// `set_symmetric_difference_update`.
+    fn symmetric_difference_update_internal(
+        &self,
+        other: ArgIterable,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let keys = if let Some(other_set) = extract_set(other.as_object()) {
+            if PyRc::ptr_eq(&self.content, &other_set.content) {
+                self.clear();
+                return Ok(());
+            }
+            other_set.content.keys_with_hashes()
+        } else if let Some(dict) = other.as_object().downcast_ref_if_exact::<PyDict>(vm) {
+            dict._as_dict_inner().keys_with_hashes()
+        } else {
+            // A set of the other keys first, which drops their duplicates.
+            Self::from_object(other.as_object().to_owned(), vm)?
+                .content
+                .keys_with_hashes()
+        };
+        self.toggle(keys, vm)
     }
 
     fn symmetric_difference_update(
@@ -618,21 +1258,8 @@ impl PySetInner {
         others: impl core::iter::Iterator<Item = ArgIterable>,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        for iterable in others {
-            if let Some(elements) = Self::cached_hashes(iterable.as_object(), vm) {
-                // the source is already duplicate-free
-                for (item, hash) in elements {
-                    self.content
-                        .delete_or_insert_known_hash(vm, &item, hash, ())?;
-                }
-                continue;
-            }
-            // We want to remove duplicates in iterable
-            let iterable_set = Self::from_iter(iterable.iter(vm)?, vm)?;
-            for (item, hash) in iterable_set.content.keys_with_hashes() {
-                self.content
-                    .delete_or_insert_known_hash(vm, &item, hash, ())?;
-            }
+        for other in others {
+            self.symmetric_difference_update_internal(other, vm)?;
         }
         Ok(())
     }
@@ -691,16 +1318,11 @@ impl PySetInner {
         vm: &VirtualMachine,
     ) -> PyResult<T> {
         match result {
-            Err(cause) if cause.fast_isinstance(vm.ctx.exceptions.type_error) => {
-                let message = cause.as_object().str(vm)?;
-                let err = vm.new_type_error(format!(
-                    "cannot use '{}' as a set element ({message})",
-                    item.class().name()
-                ));
-                err.set_cause(Some(cause));
-                Err(err)
+            // CPython 3.12 (the parity reference) raises the hash error unchanged.
+            result => {
+                let _ = (item, vm);
+                result
             }
-            result => result,
         }
     }
 }
@@ -812,11 +1434,11 @@ impl PySet {
         vm: &VirtualMachine,
     ) -> PyResult<PyArithmeticValue<Self>> {
         if let Ok(other) = AnySet::try_from_object(vm, other) {
-            Ok(PyArithmeticValue::Implemented(self.op(
-                other,
-                PySetInner::symmetric_difference,
-                vm,
-            )?))
+            Ok(PyArithmeticValue::Implemented(Self {
+                inner: self
+                    .inner
+                    .symmetric_difference_new(other.into_iterable(vm)?, vm)?,
+            }))
         } else {
             Ok(PyArithmeticValue::NotImplemented)
         }
@@ -828,10 +1450,8 @@ impl PySet {
     }
 
     fn __iand__(zelf: PyRef<Self>, set: AnySet, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
-        if !set.is(zelf.as_object()) {
-            zelf.inner
-                .intersection_update(core::iter::once(set.into_iterable(vm)?), vm)?;
-        }
+        zelf.inner
+            .intersection_update(core::iter::once(set.into_iterable(vm)?), vm)?;
         Ok(zelf)
     }
 
@@ -873,6 +1493,12 @@ impl PySet {
     flags(BASETYPE, _MATCH_SELF, HAS_WEAKREF)
 )]
 impl Py<PySet> {
+    /// `_PySet_Update`, which `SET_UPDATE` runs: a set or dict operand merges
+    /// its table, so a folded frozenset constant lands in CPython's order.
+    pub(crate) fn update_from(&self, iterable: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        self.inner.update_internal(iterable, vm)
+    }
+
     #[pymethod(coexist)]
     fn __contains__(&self, object: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
         self.contains(&object, vm)
@@ -923,11 +1549,9 @@ impl Py<PySet> {
 
     #[pymethod]
     fn symmetric_difference(&self, other: ArgIterable, vm: &VirtualMachine) -> PyResult<PySet> {
-        self.fold_op(
-            core::iter::once(other),
-            PySetInner::symmetric_difference,
-            vm,
-        )
+        Ok(PySet {
+            inner: self.inner.symmetric_difference_new(other, vm)?,
+        })
     }
 
     #[pymethod]
@@ -1342,11 +1966,12 @@ impl PyFrozenSet {
         vm: &VirtualMachine,
     ) -> PyResult<PyArithmeticValue<Self>> {
         if let Ok(other) = AnySet::try_from_object(vm, other) {
-            Ok(PyArithmeticValue::Implemented(self.op(
-                other,
-                PySetInner::symmetric_difference,
-                vm,
-            )?))
+            Ok(PyArithmeticValue::Implemented(Self {
+                inner: self
+                    .inner
+                    .symmetric_difference_new(other.into_iterable(vm)?, vm)?,
+                ..Default::default()
+            }))
         } else {
             Ok(PyArithmeticValue::NotImplemented)
         }
@@ -1428,11 +2053,10 @@ impl Py<PyFrozenSet> {
         other: ArgIterable,
         vm: &VirtualMachine,
     ) -> PyResult<PyFrozenSet> {
-        self.fold_op(
-            core::iter::once(other),
-            PySetInner::symmetric_difference,
-            vm,
-        )
+        Ok(PyFrozenSet {
+            inner: self.inner.symmetric_difference_new(other, vm)?,
+            ..Default::default()
+        })
     }
 
     #[pymethod]
@@ -1657,11 +2281,15 @@ impl TryFromObject for AnySet {
 
 #[pyclass(module = false, name = "set_iterator")]
 pub(crate) struct PySetIterator {
-    size: DictSize,
+    /// The set's size when the iterator was made: `si_used`.
+    used: usize,
+    /// What `__length_hint__` answers: `si->len`, one less per key returned.
+    remaining: PyAtomic<usize>,
     /// Whether the set was found to have changed, which `setiter_iternext()`
     /// records by writing a size no set can have. Sticky: what it makes the
     /// iterator answer, it answers from then on.
     changed: PyAtomic<bool>,
+    /// The next table slot to look at: `si_pos`.
     internal: PyMutex<PositionIterInternal<AnySet>>,
 }
 
@@ -1681,8 +2309,10 @@ impl PyPayload for PySetIterator {
 
 impl PySetIterator {
     fn new(set: AnySet) -> Self {
+        let used = set.as_inner().len();
         Self {
-            size: set.as_inner().content.size(),
+            used,
+            remaining: Radium::new(used),
             changed: Radium::new(false),
             internal: PyMutex::new(PositionIterInternal::new(set, 0)),
         }
@@ -1699,13 +2329,12 @@ impl Py<PySetIterator> {
         if self.changed.load(Ordering::Relaxed) {
             return 0;
         }
-        self.internal.lock().length_hint(|set| {
-            if set.as_inner().content.size() == self.size {
-                self.size.entries_size
-            } else {
-                0
+        match &self.internal.lock().status {
+            IterStatus::Active(set) if set.as_inner().len() == self.used => {
+                self.remaining.load(Ordering::Relaxed)
             }
-        })
+            _ => 0,
+        }
     }
 
     #[pymethod]
@@ -1719,13 +2348,7 @@ impl Py<PySetIterator> {
             (vm.ctx
                 .new_list(match &internal.status {
                     IterStatus::Exhausted => vec![],
-                    IterStatus::Active(set) => set
-                        .as_inner()
-                        .content
-                        .keys()
-                        .into_iter()
-                        .skip(internal.position)
-                        .collect(),
+                    IterStatus::Active(set) => set.as_inner().content.keys_from(internal.position),
                 })
                 .into(),),
         ))
@@ -1745,18 +2368,20 @@ impl IterNext for PySetIterator {
                 // change: an iterator that has raised keeps raising.
                 return (Err(mutated()), None);
             }
-            let entry = set.as_inner().content.next_entry_checked(
-                internal.position,
-                &zelf.size,
-                |key, ()| key.to_owned(),
-            );
-            match entry {
-                Err(crate::dict_inner::DictChanged) => {
+            match set
+                .as_inner()
+                .content
+                .next_checked(internal.position, zelf.used)
+            {
+                Err(SetChanged) => {
                     zelf.changed.store(true, Ordering::Relaxed);
                     (Err(mutated()), None)
                 }
                 Ok(Some((position, key))) => {
                     internal.position = position;
+                    let left = zelf.remaining.load(Ordering::Relaxed);
+                    zelf.remaining
+                        .store(left.saturating_sub(1), Ordering::Relaxed);
                     (Ok(PyIterReturn::Return(key)), None)
                 }
                 Ok(None) => (Ok(PyIterReturn::StopIteration(None)), internal.exhaust()),

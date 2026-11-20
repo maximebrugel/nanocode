@@ -50,29 +50,14 @@ impl PyPayload for PyComplex {
     #[inline]
     unsafe fn freelist_push(obj: *mut PyObject) -> bool {
         COMPLEX_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let stored = if list.len() < Self::MAX_FREELIST {
-                    list.push(obj);
-                    true
-                } else {
-                    false
-                };
-                fl.set(list);
-                stored
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::push_in(fl, obj, Self::MAX_FREELIST) })
             .unwrap_or(false)
     }
 
     #[inline]
     unsafe fn freelist_pop(_payload: &Self) -> Option<NonNull<PyObject>> {
         COMPLEX_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let result = list.pop().map(|p| unsafe { NonNull::new_unchecked(p) });
-                fl.set(list);
-                result
-            })
+            .try_with(|fl| unsafe { crate::object::FreeList::pop_in(fl) })
             .ok()
             .flatten()
     }
@@ -300,7 +285,7 @@ fn recovered_quot(r: Complex64, a: Complex64, b: Complex64) -> Complex64 {
 }
 
 fn inner_div(v1: Complex64, v2: Complex64, vm: &VirtualMachine) -> PyResult<Complex64> {
-    quot(v1, v2).ok_or_else(|| vm.new_zero_division_error("division by zero"))
+    quot(v1, v2).ok_or_else(|| vm.new_zero_division_error("complex division by zero"))
 }
 
 /// Raise to a non-negative integer power by repeated squaring.
@@ -595,7 +580,7 @@ impl Py<PyComplex> {
             .ok_or_else(|| {
                 vm.new_type_error(format!(
                     "must be real number, not {}",
-                    number.class().name()
+                    number.class().slot_name()
                 ))
             })?
             .0;
@@ -728,14 +713,14 @@ impl AsNumber for PyComplex {
                     |a, b| inner_div(a, b, vm),
                     |a_complex, b_real| {
                         if b_real == 0.0 {
-                            Err(vm.new_zero_division_error("division by zero"))
+                            Err(vm.new_zero_division_error("complex division by zero"))
                         } else {
                             Ok(Complex64::new(a_complex.re / b_real, a_complex.im / b_real))
                         }
                     },
                     |a_real, b_complex| {
                         rc_quot(a_real, b_complex)
-                            .ok_or_else(|| vm.new_zero_division_error("division by zero"))
+                            .ok_or_else(|| vm.new_zero_division_error("complex division by zero"))
                     },
                     vm,
                 )

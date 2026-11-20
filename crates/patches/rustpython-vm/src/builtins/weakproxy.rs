@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-#[pyclass(module = "weakref", name = "weakproxy", unhashable = true)]
+#[pyclass(module = "weakref", name = "ProxyType", unhashable = true)]
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct PyWeakProxy(PyWeak);

@@ -12,6 +12,7 @@ pub const ROOT_MARK: &str = "SIMROOT";
 pub const CHILD_MARK: &str = "SIMCHILD";
 pub const EFFECT_TOOL: &str = "sim_effect";
 const REWRITTEN_TEXT: &str = "rewritten";
+const DURABLE_MARK: &str = "\"durable\":true";
 const RECEIPT_MARK: &str = "\"accepted\":true";
 const REMINDER_LEAD: &str = "Before finishing, call `submit_result`";
 const RUNNING_MARK: &str = "Script running with cell ID ";
@@ -359,15 +360,22 @@ fn answers_only(message: &Value) -> bool {
 }
 
 fn accepted_receipt(messages: &[Value]) -> bool {
+    receipt_with(messages, &[RECEIPT_MARK])
+}
+
+fn durable_receipt(messages: &[Value]) -> bool {
+    receipt_with(messages, &[RECEIPT_MARK, DURABLE_MARK])
+}
+
+fn receipt_with(messages: &[Value], marks: &[&str]) -> bool {
     messages
         .iter()
         .filter(|message| role(message) == Some("user"))
         .flat_map(|message| blocks(message).iter())
         .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
         .any(|block| {
-            text_of(block.get("content").unwrap_or(&Value::Null))
-                .replace('\\', "")
-                .contains(RECEIPT_MARK)
+            let text = text_of(block.get("content").unwrap_or(&Value::Null)).replace('\\', "");
+            marks.iter().all(|mark| text.contains(mark))
         })
 }
 
@@ -534,6 +542,16 @@ impl ModelServer {
             matches!(conversation.agent, Agent::Child { .. }) && accepted_receipt(&messages);
         if receipted {
             self.world.receipt(&label);
+            if durable_receipt(&messages) {
+                self.world.durable_receipt(&label);
+            }
+        } else if matches!(conversation.agent, Agent::Child { .. })
+            && let Some(epoch) = self.world.durable_receipt_epoch(&label)
+            && epoch < self.world.epoch()
+        {
+            self.world.wrong(format!(
+                "durable_receipt_rewound: the model saw {label}'s submit_result receipt marked durable in epoch {epoch}, then after a restart got a request for {label} without it"
+            ));
         }
         let held = receipted
             && self.world.holds_receipt()

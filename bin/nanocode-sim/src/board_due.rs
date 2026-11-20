@@ -1,10 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use nanocode_board::{
-    ClaimId, Event, EventId, Fold, NewTask, Op, Outcome, Phase, TaskId,
+    Board, BoardError, ClaimId, Event, EventId, Fold, NewTask, Op, Outcome, Phase, TaskId,
     schedule::{Cron, Recur, Retry},
+    stage::Stage,
     tasks::Terms,
+    wake::{Napping, Timer, Wake},
 };
+use nanocode_turnlog::{LogHost, MemoryLog};
 
 use crate::rng::Rng;
 
@@ -12,8 +19,12 @@ const WRITER: &str = "agent:due";
 const MINUTE: u64 = 60_000;
 const HOUR: u64 = 60 * MINUTE;
 const LEASE: u64 = 5 * MINUTE;
-const CRONS: [&str; 6] = [
+// A backstop for a drain that spins in virtual time without the lapsed-lease
+// check catching it; passing seeds have needed just over a day.
+const DRAIN: u64 = 7 * 24 * HOUR;
+const CRONS: [&str; 7] = [
     "*/5 * * * *",
+    "*/30 8-18 * JAN-JUN,sep MON-FRI",
     "0 * * * *",
     "15,45 * * * *",
     "*/10 9-17 * * 1-5",
@@ -21,6 +32,20 @@ const CRONS: [&str; 6] = [
     "7-59/20 */2 * * *",
 ];
 const OFFSETS: [i16; 5] = [-480, 0, 60, 330, 840];
+const NAMED: [(&str, &str); 5] = [
+    ("0 9 * JAN-MAR MON-FRI", "0 9 * 1-3 1-5"),
+    ("*/15 * * jun,Dec sun", "*/15 * * 6,12 0"),
+    ("30 2 1 FEB/3 SAT,SUN", "30 2 1 2/3 6,0"),
+    ("0 0 * * TUE-SAT/2", "0 0 * * 2-6/2"),
+    ("0 0 * Nov-dec Sat", "0 0 * 11-12 6"),
+];
+const UNNAMED: [&str; 5] = [
+    "0 0 * * FOO",
+    "0 0 * JANUARY *",
+    "0 0 * MON *",
+    "0 0 * * DEC",
+    "JAN 0 * * *",
+];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DueStats {
@@ -255,6 +280,8 @@ fn step(
             Op::Claim {
                 task: id.clone(),
                 lease_ms: LEASE,
+                fence: None,
+                cap: None,
             },
         )? {
             continue;
@@ -288,7 +315,157 @@ fn step(
     Ok(!ready.is_empty())
 }
 
+fn names() -> Result<(), String> {
+    for (named, numbered) in NAMED {
+        if Cron::parse(named)? != Cron::parse(numbered)? {
+            return Err(format!("{named:?} parses unlike {numbered:?}"));
+        }
+    }
+    match UNNAMED.iter().find(|cron| Cron::parse(cron).is_ok()) {
+        Some(cron) => Err(format!("{cron:?} parsed though a name is out of place")),
+        None => Ok(()),
+    }
+}
+
+struct Stepped(Cell<u64>);
+
+impl Timer for Stepped {
+    fn now_ms(&self) -> u64 {
+        self.0.get()
+    }
+
+    fn sleep_until(&self, at_ms: u64) -> Napping<'_> {
+        self.0.set(self.0.get().max(at_ms));
+        Box::pin(std::future::ready(()))
+    }
+}
+
+struct Deaf<'t>(&'t Stepped);
+
+impl Wake for Deaf<'_> {
+    fn wait<'a>(&'a self, _scope: &'a str, _seen: u64, until_ms: u64) -> Napping<'a> {
+        self.0.sleep_until(until_ms)
+    }
+}
+
+struct Owed {
+    due_ms: u64,
+    retry: Option<Retry>,
+    claims: u64,
+}
+
+async fn waits(seed: u64) -> Result<u64, String> {
+    let shown = |error: BoardError| format!("due waiter: {error}");
+    let mut rng = Rng::derive(seed, "board due wake");
+    let start = 1_700_000_000_000 + rng.range(0, 400 * 24 * HOUR);
+    let timer = Stepped(Cell::new(start));
+    let wake = Deaf(&timer);
+    let host: Arc<dyn LogHost> = Arc::new(MemoryLog::new());
+    let mut board = Board::open(host, "due", super::access::identity(WRITER))
+        .await
+        .map_err(shown)?;
+    board.charter(start).await.map_err(shown)?;
+    let mut owed = BTreeMap::new();
+    for number in 0..rng.range(1, 6) {
+        let due_ms = start + rng.range(1, 3 * HOUR);
+        let mut terms = Terms::due(due_ms);
+        if rng.chance(500_000) {
+            terms = terms.retry(rng.range(2, 5), rng.range(1, 10) * MINUTE);
+        }
+        let task = NewTask {
+            id: TaskId(format!("wake{number}")),
+            parent: None,
+            spec: "wake".to_owned(),
+            labels: BTreeMap::new(),
+            needs: Vec::new(),
+            terms: Terms::default(),
+        };
+        let retry = terms.retry;
+        board
+            .post_due(start, task.clone(), terms)
+            .await
+            .map_err(shown)?;
+        owed.insert(
+            task.id,
+            Owed {
+                due_ms,
+                retry,
+                claims: 0,
+            },
+        );
+    }
+    let mut wakes = 0;
+    while let Some(want) = owed.values().map(|owed| owed.due_ms).min() {
+        let until = timer.now_ms() + 4 * HOUR;
+        let picked = board
+            .next_ready(&wake, &timer, &BTreeMap::new(), until)
+            .await
+            .map_err(shown)?;
+        let now = timer.now_ms();
+        let Some(id) = picked else {
+            return Err(format!(
+                "a waiter for a task due at {want} woke at {now} with none ready"
+            ));
+        };
+        if now != want {
+            return Err(format!("a waiter for a task due at {want} woke at {now}"));
+        }
+        let task = owed
+            .get_mut(&id)
+            .ok_or_else(|| format!("the waiter picked {id}, which owes nothing"))?;
+        if task.due_ms > now {
+            return Err(format!(
+                "the waiter picked {id} at {now}, before it was due at {}",
+                task.due_ms
+            ));
+        }
+        wakes += 1;
+        board
+            .submit(
+                now,
+                Op::Claim {
+                    task: id.clone(),
+                    lease_ms: LEASE,
+                    fence: None,
+                    cap: None,
+                },
+            )
+            .await
+            .map_err(shown)?;
+        let Some(Phase::Claimed { claim, .. }) =
+            board.fold().task(&id).map(|task| task.phase.clone())
+        else {
+            return Err(format!("the waiter claimed {id} but does not hold it"));
+        };
+        task.claims += 1;
+        let again = task
+            .retry
+            .filter(|retry| task.claims < retry.max_attempts && rng.chance(600_000));
+        let outcome = match again {
+            Some(_) => Outcome::Failed("due run failed".to_owned()),
+            None => Outcome::Done("due run done".to_owned()),
+        };
+        let finish = Op::Finish {
+            task: id.clone(),
+            claim,
+            outcome,
+        };
+        board.submit(now, finish).await.map_err(shown)?;
+        match again {
+            Some(retry) => {
+                task.due_ms = now + retry.delay(task.claims).ok_or("a retry delay overflowed")?
+            }
+            None => {
+                owed.remove(&id);
+            }
+        }
+    }
+    Ok(wakes)
+}
+
 pub fn run(seed: u64) -> Result<DueStats, String> {
+    names()?;
+    nanocode_sync::block_on(waits(seed))?;
     let mut rng = Rng::derive(seed, "board due");
     let start = 1_700_000_000_000 + rng.range(0, 400 * 24 * HOUR);
     let horizon = start + rng.range(2, 9) * HOUR;
@@ -346,9 +523,20 @@ pub fn run(seed: u64) -> Result<DueStats, String> {
         }
         let mut owed = false;
         for (id, task) in host.fold.tasks() {
-            owed |= !task.finished() && oracle.due(&host.fold, id)?.1 <= cut;
+            let open = !task.finished() && oracle.due(&host.fold, id)?.1 <= cut;
+            if open && task.stage(now) == Stage::Lapsed && host.fold.claimable(id, now).is_err() {
+                return Err(format!(
+                    "{id}'s lease lapsed but it cannot be claimed at {now}"
+                ));
+            }
+            owed |= open;
         }
         match host.fold.next_due() {
+            Some(due_ms) if owed && due_ms > cut + DRAIN => {
+                return Err(format!(
+                    "due tasks owed before {cut} were still open at {due_ms}"
+                ));
+            }
             Some(due_ms) if owed => now = due_ms,
             _ if owed => {
                 return Err(format!(

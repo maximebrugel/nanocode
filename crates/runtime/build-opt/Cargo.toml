@@ -1,0 +1,20 @@
+[package]
+name = "nanocode-build-opt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license = "Apache-2.0"
+repository.workspace = true
+description = "Build and check planning for Rust workspaces: the crate graph, what a diff affects, sharding and machine slots"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

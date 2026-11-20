@@ -82,6 +82,7 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
     };
     let mut status = 0;
     let mut buf = vec![0u8; 64 * 1024];
+    let out_id = ctx.fd_identity(1);
     for name in common::operands_or_stdin(&p) {
         let input = match Input::open(ctx, &name).await {
             Ok(i) => i,
@@ -91,6 +92,24 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 continue;
             }
         };
+        // GNU: a regular file that is also the output, read from before its end, would
+        // grow without end.
+        if let Some((dev, ino, _)) = out_id {
+            let (id, pos) = match &input {
+                Input::File(f) => (f.identity(), f.seek(std::io::SeekFrom::Current(0))),
+                Input::Stdin => (ctx.fd_identity(0), ctx.seek_stdin(std::io::SeekFrom::Current(0))),
+            };
+            let pos = pos.and_then(Result::ok).unwrap_or(0);
+            if let Some((d, i, size)) = id
+                && (d, i) == (dev, ino)
+                && pos < size
+            {
+                let shown = common::quote_name(&name, false);
+                ctx.error(&format!("{shown}: input file is output file")).await;
+                status = 1;
+                continue;
+            }
+        }
         loop {
             let n = match input.read(ctx, &mut buf).await {
                 Ok(0) => break,
@@ -101,12 +120,13 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                     break;
                 }
             };
-            let out = if st.plain() {
-                buf[..n].to_vec()
+            let written = if st.plain() {
+                ctx.write(&buf[..n]).await
             } else {
-                format(&st, &mut state, &buf[..n])
+                let out = format(&st, &mut state, &buf[..n]);
+                ctx.write(&out).await
             };
-            if let Err(e) = ctx.write(&out).await {
+            if let Err(e) = written {
                 return common::write_failed(ctx, &e).await;
             }
             ctx.check().await;

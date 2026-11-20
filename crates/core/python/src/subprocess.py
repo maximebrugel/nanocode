@@ -311,11 +311,8 @@ class Popen:
             data = self.stdin._data.getvalue()
         else:
             data = _drain(self._stdin)
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
+        # Like CPython, a child does not flush this program's sys.stdout: what it
+        # holds comes out after the child's output unless the program flushed it.
         merged = self._stderr == STDOUT
         try:
             ran = _inline(self._argv, self._env, self._cwd, data, merged)
@@ -427,3 +424,12 @@ def getstatusoutput(cmd, *, encoding=None, errors=None):
 
 def getoutput(cmd, *, encoding=None, errors=None):
     return getstatusoutput(cmd, encoding=encoding, errors=errors)[1]
+
+
+# CPython keeps unreaped children in _active and reaps them in _cleanup(); test.support calls it.
+# Every Popen here waits for its child, so there is never one to reap.
+_active = []
+
+
+def _cleanup():
+    pass

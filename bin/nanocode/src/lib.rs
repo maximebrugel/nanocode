@@ -485,10 +485,11 @@ async fn unanswered(host: &Host, session: &str) -> bool {
         return false;
     };
     store.load(session).await.is_ok_and(|stored| {
-        stored
-            .transcript
-            .iter()
-            .all(|item| matches!(item, TranscriptItem::User(_)))
+        stored.into_transcript().is_ok_and(|transcript| {
+            transcript
+                .iter()
+                .all(|item| matches!(item, TranscriptItem::User(_)))
+        })
     })
 }
 

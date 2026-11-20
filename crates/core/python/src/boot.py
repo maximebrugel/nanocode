@@ -5,6 +5,14 @@ import posix
 import builtins
 import time
 import _frozen_importlib
+import _frozen_importlib_external
+
+# The path-based machinery is not installed (_Finder imports), so its module has no
+# _bootstrap until set here; importlib.util.spec_from_file_location needs it.
+if getattr(_frozen_importlib_external, '_bootstrap', None) is None:
+    _frozen_importlib_external._set_bootstrap_module(_frozen_importlib)
+if getattr(_frozen_importlib, '_bootstrap_external', None) is None:
+    _frozen_importlib._bootstrap_external = _frozen_importlib_external
 
 sys.builtin_module_names = tuple(sys.builtin_module_names) + ('posix',)
 
@@ -206,7 +214,9 @@ class _Loader:
 
     def get_code(self, name=None):
         with open(self.path, 'rb') as file:
-            return compile(file.read(), self.path, 'exec')
+            source = file.read()
+        # As importlib does, so a SyntaxError's traceback drops the import machinery.
+        return _frozen_importlib._call_with_frames_removed(compile, source, self.path, 'exec')
 
     def get_data(self, path):
         with open(path, 'rb') as file:
@@ -218,7 +228,23 @@ class _Loader:
 
     def exec_module(self, module):
         module.__file__ = self.path
-        exec(self.get_code(), module.__dict__)
+        _frozen_importlib._call_with_frames_removed(exec, self.get_code(), module.__dict__)
+
+
+class _Sourceless(_Loader):
+    # A legacy m.pyc beside where m.py would be, as CPython's SourcelessFileLoader
+    # imports it: its code after the 16-byte header, once the magic number matches.
+    def get_source(self, name=None):
+        return None
+
+    def get_code(self, name=None):
+        import marshal
+        from importlib.util import MAGIC_NUMBER
+        with open(self.path, 'rb') as file:
+            data = file.read()
+        if data[:4] != MAGIC_NUMBER:
+            raise ImportError(f'bad magic number in {self.name!r}: {data[:4]!r}', name=self.name, path=self.path)
+        return marshal.loads(data[16:])
 
 
 _loaded = []
@@ -239,6 +265,23 @@ _stdlib = set(sys.stdlib_module_names)
 _stdlib.update(('_ast_unparse', '_hmac', '_py_warnings', '_remote_debugging', '_types', '_zstd', 'annotationlib', 'compression'))
 
 
+def _archive(base):
+    # The zip archive that holds base: the archive itself (an app.pyz on sys.path)
+    # or a directory inside one (a zipped package's __path__, lib.zip/pkg), as
+    # zipimport finds it. None for a directory, or a path that is in no archive.
+    while base:
+        try:
+            kind = posix.stat(base).st_mode & 0o170000
+        except OSError:
+            parent = base.rpartition('/')[0]
+            if parent == base:
+                return None
+            base = parent
+            continue
+        return base if kind == 0o100000 else None
+    return None
+
+
 class _Finder:
     @staticmethod
     def find_spec(name, path=None, target=None):
@@ -249,19 +292,43 @@ class _Finder:
         for base in sys.path if path is None else path:
             if not isinstance(base, str):
                 continue
-            base = (base or '.') + '/' + tail
+            # As CPython's FileFinder does, a relative entry is searched from the working
+            # directory, so modules found there name absolute files.
+            if not base.startswith('/'):
+                base = posix.getcwd() if base in ('', '.') else posix.getcwd() + '/' + base
+            # A zip archive on the path, or a package inside one, imports through zipimport.
+            # As with CPython's path hook, an archive zipimport can't open is skipped, while
+            # errors from finding the module (a SyntaxError in its source) propagate.
+            if _archive(base) is not None:
+                import zipimport
+                try:
+                    importer = zipimport.zipimporter(base)
+                except ImportError:
+                    continue
+                spec = importer.find_spec(name)
+                if spec is not None:
+                    _loaded.append(name)
+                    return spec
+                continue
+            base = base.rstrip('/') + '/' + tail
             try:
                 if posix.stat(base).st_mode & 0o170000 == 0o040000:
                     portions.append(base)
             except OSError:
                 pass
-            for file, package in ((base + '/__init__.py', True), (base + '.py', False)):
+            for file, package in ((base + '/__init__.py', True), (base + '/__init__.pyc', True), (base + '.py', False), (base + '.pyc', False)):
                 try:
                     if posix.stat(file).st_mode & 0o170000 != 0o100000:
                         continue
                 except OSError:
                     continue
-                spec = _frozen_importlib.ModuleSpec(name, _Loader(name, file, package), origin=file, is_package=package)
+                loader = (_Sourceless if file.endswith('.pyc') else _Loader)(name, file, package)
+                spec = _frozen_importlib.ModuleSpec(name, loader, origin=file, is_package=package)
+                # As FileFinder's specs do: __file__ from the origin, and __cached__ the
+                # .pyc a source would compile to (a sourceless .pyc is its own).
+                spec.has_location = True
+                if file.endswith('.pyc'):
+                    spec.cached = file
                 if package:
                     spec.submodule_search_locations = [base]
                 _loaded.append(name)
@@ -326,6 +393,18 @@ class _Entry:
 sys.path_hooks.append(_Entry)
 
 
+def _zipped(path):
+    # The path hook for an archive or a directory inside one, so pkgutil and
+    # importlib.resources reach a zipped package as CPython's zipimporter hook does.
+    if _archive(path) is None:
+        raise ImportError('not a zip archive', path=path)
+    import zipimport
+    return zipimport.zipimporter(path)
+
+
+sys.path_hooks.append(_zipped)
+
+
 def _load_unlocked(spec, load=_frozen_importlib._load_unlocked):
     if isinstance(spec.loader, _Loader):
         return load(spec)
@@ -364,15 +443,31 @@ class _Shim:
 sys.meta_path.insert(0, _Shim)
 
 
+class _FrozenFiles(_frozen_importlib.FrozenImporter):
+    # A frozen site package's data files sit beside its file name, as an installed one's do.
+    @staticmethod
+    def get_resource_reader(name=None):
+        spec = sys.modules[name].__spec__
+        if spec.submodule_search_locations is None:
+            return None
+        from importlib.resources.readers import FileReader
+
+        class _Path:
+            path = spec.loader_state.filename
+
+        return FileReader(_Path)
+
+
 class _Located:
     @staticmethod
     def find_spec(name, path=None, target=None):
-        if name.partition('.')[0] not in ('matplotlib', 'mpl_toolkits', 'numpy'):
+        if name.partition('.')[0] not in ('matplotlib', 'mpl_toolkits', 'numpy', 'tzdata'):
             return None
         spec = _frozen_importlib.FrozenImporter.find_spec(name)
         if spec is not None:
             tail = '/__init__.py' if spec.submodule_search_locations is not None else '.py'
             spec.loader_state.filename = '%s/lib/python%d.%d/site-packages/%s%s' % (sys.prefix, *sys.version_info[:2], name.replace('.', '/'), tail)
+            spec.loader = _FrozenFiles
         return spec
 
     @staticmethod
@@ -423,11 +518,19 @@ _resumed = {}
 sys.meta_path.insert(0, _Resumer)
 
 
-def _stdio(fd, name):
+def _stdio(fd, name, unbuffered=False):
     raw = FileIO(fd, 'r' if fd == 0 else 'w', False)
     raw.name = name
-    if fd == 0:
-        text = _io.TextIOWrapper(_io.BufferedReader(raw), 'utf-8', 'surrogateescape', None, False)
+    if fd == 1:
+        # As CPython: stdout is line-buffered on a terminal and otherwise held until it
+        # fills, is flushed or the program ends (so os._exit drops it); -u writes through.
+        try:
+            tty = raw.isatty()
+        except Exception:
+            tty = False
+        text = _io.TextIOWrapper(_io.BufferedWriter(raw), 'utf-8', 'surrogateescape', '\n', tty or unbuffered, unbuffered)
+    elif fd == 0:
+        text = _io.TextIOWrapper(_io.BufferedReader(raw), 'utf-8', 'surrogateescape', '\n', False)
     else:
         text = _io.TextIOWrapper(_io.BufferedWriter(raw), 'utf-8', 'backslashreplace' if fd == 2 else 'surrogateescape', '\n', fd == 2)
     text.mode = 'r' if fd == 0 else 'w'
@@ -580,7 +683,7 @@ _bounded()
 _warnings_base = None
 
 
-def _start(argv, first):
+def _start(argv, first, unbuffered=False):
     global _unfinished, _warnings_base
     posix._reset()
     if 'matplotlib' in sys.modules:
@@ -623,9 +726,15 @@ def _start(argv, first):
         environ._data.update(fresh)
     sys.argv = argv
     sys.executable = sys._base_executable = '/usr/bin/python3'
-    sys.path[:] = [posix._abs(first).decode('utf-8', 'surrogateescape') if first else '', sys.prefix + '/lib/python%d.%d/site-packages' % sys.version_info[:2]]
+    extra = []
+    for entry in posix.environ.get(b'PYTHONPATH', b'').split(b':') if posix.environ.get(b'PYTHONPATH') else ():
+        entry = posix._abs(entry or b'.').decode('utf-8', 'surrogateescape')
+        if entry not in extra:
+            extra.append(entry)
+    sys.path[:] = [posix._abs(first).decode('utf-8', 'surrogateescape') if first else '', *extra, sys.prefix + '/lib/python%d.%d/site-packages' % sys.version_info[:2]]
     sys.stdin = sys.__stdin__ = _stdio(0, '<stdin>')
-    sys.stdout = sys.__stdout__ = _stdio(1, '<stdout>')
+    unbuffered = unbuffered or bool(posix.environ.get(b'PYTHONUNBUFFERED'))
+    sys.stdout = sys.__stdout__ = _stdio(1, '<stdout>', unbuffered)
     sys.stderr = sys.__stderr__ = _stdio(2, '<stderr>')
 
 

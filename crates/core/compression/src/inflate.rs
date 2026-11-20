@@ -183,6 +183,17 @@ struct Tables {
     work: [u16; WORK_ENTRIES],
 }
 
+impl Tables {
+    const EMPTY: Self = Self {
+        code_lengths: [Code::EMPTY; CODE_LENGTH_TABLE_ENTRIES],
+        lengths: [Code::EMPTY; LENGTH_TABLE_ENTRIES],
+        distances: [Code::EMPTY; DISTANCE_TABLE_ENTRIES],
+        literals: [None; LITERAL_ENTRIES],
+        lens: [0; CODE_LENGTHS_CAPACITY],
+        work: [0; WORK_ENTRIES],
+    };
+}
+
 #[derive(Clone)]
 pub struct Inflate {
     mode: Mode,
@@ -245,16 +256,32 @@ impl Inflate {
             length_bits: 0,
             distance_source: DistanceSource::Fixed,
             distance_bits: 0,
-            tables: Box::new(Tables {
-                code_lengths: [Code::EMPTY; CODE_LENGTH_TABLE_ENTRIES],
-                lengths: [Code::EMPTY; LENGTH_TABLE_ENTRIES],
-                distances: [Code::EMPTY; DISTANCE_TABLE_ENTRIES],
-                literals: [None; LITERAL_ENTRIES],
-                lens: [0; CODE_LENGTHS_CAPACITY],
-                work: [0; WORK_ENTRIES],
-            }),
+            tables: Box::new(Tables::EMPTY),
             window: Window::new(),
         })
+    }
+
+    /// Returns to the state `new` gives for the same window bits, keeping the
+    /// window and table allocations, so a caller inflating many small streams
+    /// does not allocate and zero 32 KiB for each one.
+    pub fn reset(&mut self) {
+        self.mode = Mode::Header;
+        self.wrapper = Wrapper::Unknown;
+        self.last_block = false;
+        self.have_dictionary = false;
+        self.hold = 0;
+        self.bits = 0;
+        self.checksum = ADLER32_INITIAL;
+        self.crc = CRC32_INITIAL;
+        self.total = 0;
+        self.total_in = 0;
+        self.message = None;
+        self.length_source = LengthSource::Fixed;
+        self.length_bits = 0;
+        self.distance_source = DistanceSource::Fixed;
+        self.distance_bits = 0;
+        *self.tables = Tables::EMPTY;
+        self.window.clear();
     }
 
     pub fn inflate(

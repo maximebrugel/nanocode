@@ -34,6 +34,14 @@ pub(crate) fn units(text: &[u8], utf8: bool) -> (Vec<Unit>, Vec<usize>) {
     (units, offs)
 }
 
+/// Splits text into units, without the offsets `units` records.
+pub(crate) fn unit_vec(text: &[u8], utf8: bool) -> Vec<Unit> {
+    if !utf8 || text.is_ascii() {
+        return text.iter().map(|&b| u32::from(b)).collect();
+    }
+    units(text, utf8).0
+}
+
 /// Decodes the first UTF-8 char of `b`.
 pub(crate) fn decode_one(b: &[u8]) -> Option<(char, usize)> {
     let n = match b[0] {
@@ -84,6 +92,58 @@ enum ClassItem {
     One(Unit),
     Range(Unit, Unit),
     Named(&'static str),
+    /// An invalid class name or collating symbol: matches nothing.
+    Never,
+}
+
+/// POSIX collating-element names bash knows (`[.hyphen.]`), besides single chars.
+const COLLSYMS: &[(&str, u8)] = &[
+    ("NUL", 0), ("alert", 7), ("backspace", 8), ("tab", 9), ("newline", 10),
+    ("vertical-tab", 11), ("form-feed", 12), ("carriage-return", 13), ("space", b' '),
+    ("exclamation-mark", b'!'), ("quotation-mark", b'"'), ("number-sign", b'#'),
+    ("dollar-sign", b'$'), ("percent-sign", b'%'), ("ampersand", b'&'), ("apostrophe", b'\''),
+    ("left-parenthesis", b'('), ("right-parenthesis", b')'), ("asterisk", b'*'),
+    ("plus-sign", b'+'), ("comma", b','), ("hyphen", b'-'), ("hyphen-minus", b'-'),
+    ("period", b'.'), ("full-stop", b'.'), ("slash", b'/'), ("solidus", b'/'), ("zero", b'0'),
+    ("one", b'1'), ("two", b'2'), ("three", b'3'), ("four", b'4'), ("five", b'5'),
+    ("six", b'6'), ("seven", b'7'), ("eight", b'8'), ("nine", b'9'), ("colon", b':'),
+    ("semicolon", b';'), ("less-than-sign", b'<'), ("equals-sign", b'='),
+    ("greater-than-sign", b'>'), ("question-mark", b'?'), ("commercial-at", b'@'),
+    ("left-square-bracket", b'['), ("backslash", b'\\'), ("reverse-solidus", b'\\'),
+    ("right-square-bracket", b']'), ("circumflex", b'^'), ("circumflex-accent", b'^'),
+    ("underscore", b'_'), ("low-line", b'_'), ("grave-accent", b'`'), ("left-brace", b'{'),
+    ("left-curly-bracket", b'{'), ("vertical-line", b'|'), ("right-brace", b'}'),
+    ("right-curly-bracket", b'}'), ("tilde", b'~'), ("DEL", 127),
+];
+
+/// A `[.sym.]` or `[=c=]` element at `u[i]` (the `[`): the char it stands for
+/// (`None` for an unknown multi-char symbol, which matches nothing) and the index after it.
+fn bracket_elem(u: &[Unit], i: usize) -> Option<(Option<Unit>, usize)> {
+    let delim = *u.get(i + 1)?;
+    if u[i] != '[' as u32 || (delim != '.' as u32 && delim != '=' as u32) {
+        return None;
+    }
+    let start = i + 2;
+    // The element holds at least one char, so `[.].]` is the symbol `]`.
+    let mut j = start + 1;
+    while j + 1 < u.len() && !(u[j] == delim && u[j + 1] == ']' as u32) {
+        j += 1;
+    }
+    if j + 1 >= u.len() {
+        return None;
+    }
+    let body = &u[start..j];
+    let c = match body {
+        [c] => Some(*c),
+        _ => {
+            let name: String = body.iter().filter_map(|&c| char::from_u32(c)).collect();
+            COLLSYMS
+                .iter()
+                .find(|(n, _)| delim == '.' as u32 && *n == name)
+                .map(|(_, b)| u32::from(*b))
+        }
+    };
+    Some((c, j + 2))
 }
 
 const CLASSES: &[&str] = &[
@@ -182,7 +242,7 @@ impl Pattern {
     }
 
     pub(crate) fn with(pat: &[u8], opts: MatchOpts) -> Pattern {
-        let (u, _) = units(pat, opts.utf8);
+        let u = unit_vec(pat, opts.utf8);
         let (mut toks, _) = compile(&u, 0, opts.extglob, false);
         let groups = toks.iter().any(|t| matches!(t, Tok::Group { .. }));
         if opts.nocase {
@@ -241,7 +301,7 @@ impl Pattern {
     }
 
     pub(crate) fn matches(&self, text: &[u8], utf8: bool) -> bool {
-        self.matches_units(&units(text, utf8).0)
+        self.matches_units(&unit_vec(text, utf8))
     }
 }
 
@@ -271,7 +331,7 @@ fn fold_toks(toks: &mut [Tok]) {
                             *a = fold(*a);
                             *b = fold(*b);
                         }
-                        ClassItem::Named(_) => {}
+                        ClassItem::Named(_) | ClassItem::Never => {}
                     }
                 }
             }
@@ -350,28 +410,34 @@ fn parse_class(u: &[Unit], mut i: usize) -> Option<(Tok, usize)> {
                     .iter()
                     .filter_map(|&c| char::from_u32(c))
                     .collect();
-                if let Some(n) = CLASSES.iter().find(|n| **n == name) {
-                    items.push(ClassItem::Named(n));
-                    i = j + 2;
-                    continue;
-                }
+                // bash 5.2: an unknown class name makes the bracket match nothing.
+                items.push(match CLASSES.iter().find(|n| **n == name) {
+                    Some(n) => ClassItem::Named(n),
+                    None => ClassItem::Never,
+                });
+                i = j + 2;
+                continue;
             }
         }
-        let (lo, next) = if c == '\\' as u32 && i + 1 < u.len() {
-            (u[i + 1], i + 2)
-        } else {
-            (c, i + 1)
-        };
-        if next + 1 < u.len() && u[next] == '-' as u32 && u[next + 1] != ']' as u32 {
-            let (hi, after) = if u[next + 1] == '\\' as u32 && next + 2 < u.len() {
-                (u[next + 2], next + 3)
+        let elem = |i: usize| -> (Option<Unit>, usize) {
+            if let Some(e) = bracket_elem(u, i) {
+                e
+            } else if u[i] == '\\' as u32 && i + 1 < u.len() {
+                (Some(u[i + 1]), i + 2)
             } else {
-                (u[next + 1], next + 2)
-            };
-            items.push(ClassItem::Range(lo, hi));
+                (Some(u[i]), i + 1)
+            }
+        };
+        let (lo, next) = elem(i);
+        if next + 1 < u.len() && u[next] == '-' as u32 && u[next + 1] != ']' as u32 {
+            let (hi, after) = elem(next + 1);
+            items.push(match (lo, hi) {
+                (Some(lo), Some(hi)) => ClassItem::Range(lo, hi),
+                _ => ClassItem::Never,
+            });
             i = after;
         } else {
-            items.push(ClassItem::One(lo));
+            items.push(lo.map_or(ClassItem::Never, ClassItem::One));
             i = next;
         }
     }
@@ -389,6 +455,7 @@ fn tok_matches(tok: &Tok, c: Unit) -> bool {
                 ClassItem::One(x) => *x == c,
                 ClassItem::Range(lo, hi) => *lo <= c && c <= *hi,
                 ClassItem::Named(n) => class_matches(n, c),
+                ClassItem::Never => false,
             });
             hit != *negated
         }
@@ -662,7 +729,7 @@ pub(crate) fn replace_with(
 ) -> Vec<u8> {
     let utf8 = opts.utf8;
     let p = Pattern::with(pat, opts);
-    let fixed = match_len(&units(pat, utf8).0);
+    let fixed = match_len(&unit_vec(pat, utf8));
     let (u, offs) = units(text, utf8);
     let n = u.len();
     let fits = |len: usize| fixed.is_none_or(|m| m == len);
@@ -688,14 +755,27 @@ pub(crate) fn replace_with(
             }
             text.to_vec()
         }
+        // bash: an empty value is replaced whole when the pattern matches the empty string.
+        ReplaceMode::First | ReplaceMode::All if n == 0 => {
+            let mut out = Vec::new();
+            if !pat.is_empty() && p.matches_units(&[]) {
+                put(&mut out, rep, b"");
+            }
+            out
+        }
         ReplaceMode::First | ReplaceMode::All => {
             let mut out = Vec::new();
             let mut i = 0;
             let mut last = 0;
             while i <= n {
-                let found = (i..=n)
-                    .rev()
-                    .find(|&e| e > i && fits(e - i) && p.matches_units(&u[i..e]));
+                // A pattern of one length can only end in one place: trying every end
+                // made each replacement quadratic in the length of the text.
+                let found = match fixed {
+                    Some(m) => {
+                        (m > 0 && i + m <= n && p.matches_units(&u[i..i + m])).then_some(i + m)
+                    }
+                    None => (i..=n).rev().find(|&e| e > i && p.matches_units(&u[i..e])),
+                };
                 match found {
                     Some(e) => {
                         out.extend_from_slice(&text[offs[last]..offs[i]]);

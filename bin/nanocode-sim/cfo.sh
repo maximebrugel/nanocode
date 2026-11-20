@@ -98,10 +98,11 @@ default_table='
 1 canary_idempotent_reported_unknown canary --scenario turns --mutation idempotent_reported_unknown
 1 canary_recovery_skips_clientless canary --scenario turns --mutation recovery_skips_clientless
 1 canary_tick_not_atomic canary --scenario turns --mutation tick_not_atomic
-1 canary_seal_skipped canary:4000 --scenario turns --live-seqs floor --mutation seal_skipped
+1 canary_seal_skipped canary:250 --scenario turns --live-seqs floor --mutation seal_skipped
 1 canary_http_reuse_dirty canary:100 --scenario runtime --store kv --wire http --mutation http-reuse-dirty
 1 canary_http_no_read_timeout canary:200 --scenario runtime --store kv --wire http --mutation http-no-read-timeout
 1 canary_tool_result_twice canary:40 --scenario runtime --store kv --wire http --mutation tool-result-twice
+1 canary_http_coding_passthrough canary:40 --scenario runtime --store kv --wire http --mutation http-coding-passthrough
 1 canary_drop_cancelled_prompt canary:100 --scenario runtime --mutation drop-cancelled-prompt
 1 canary_websocket_corrupt_payload canary --scenario websocket --mutation corrupt_payload
 1 canary_websocket_drop_client_byte canary --scenario websocket --mutation drop_client_byte
@@ -149,6 +150,16 @@ default_table='
 1 canary_http_real_elapsed canary:40 --scenario runtime --store kv --wire http --twice --mutation http-real-elapsed
 1 canary_child_acks_early canary:1000 --scenario runtime --children remote --mutation child-acks-early
 1 canary_child_adopts_turn canary:400 --scenario runtime --children remote --mutation child-adopts-turn
+4 runtime_log pass --scenario runtime --store log
+4 runtime_log_board pass --scenario runtime --store log --subagents-board
+1 runtime_board_pinned_claim_terminal pass --scenario runtime --subagents-board --seed 1795172135120000028
+4 agents_board pass --scenario agents --subagents-board
+4 hands_fleet pass --scenario hands --fleet 4
+1 canary_coordinator_forgets_spawns canary:200 --scenario runtime --children remote --mutation coordinator-forgets-spawns
+1 canary_acks_unflushed canary:400 --scenario runtime --store log --mutation acks-unflushed
+1 canary_reopen_forgets_agents canary:100 --scenario runtime --store log --subagents-board --mutation reopen-forgets-agents
+1 canary_board_failures_unread canary:100 --scenario agents --subagents-board --mutation board_failures_unread
+1 canary_fleet_swallow_unsent canary:250 --scenario hands --fleet 4 --mutation fleet_swallow_unsent
 1 canary_child_forgets_notice canary:100 --scenario runtime --children remote --mutation child-forgets-notice
 1 canary_child_respawns_fresh canary:400 --scenario runtime --children remote --mutation child-respawns-fresh
 1 canary_child_settles_lazily canary:100 --scenario runtime --children remote --mutation child-settles-lazily
@@ -157,23 +168,180 @@ default_table='
 1 canary_hands_forget_pending canary:200 --scenario hands --mutation forget_pending
 1 canary_hands_cross_replies canary:200 --scenario hands --mutation cross_replies
 1 canary_hands_mangle_runtime canary:200 --scenario hands --mutation mangle_runtime
+1 canary_hands_reply_overwrites canary:40 --scenario hands --mutation reply_overwrites
+1 canary_hands_resume_waiting_only canary:350 --scenario hands --mutation resume_waiting_only
+8 workspace_stack pass --scenario workspace_stack
+2 workspace_stack_twice pass --scenario workspace_stack --twice
+1 canary_workspace_stack_torn_commit canary:200 --scenario workspace_stack --mutation torn_commit
+1 canary_workspace_stack_visible_before_commit canary:200 --scenario workspace_stack --mutation visible_before_commit
+1 canary_workspace_stack_answers_now canary:200 --scenario workspace_stack --mutation answers_now
+1 canary_workspace_stack_has_nothing canary:200 --scenario workspace_stack --mutation has_nothing
+1 canary_workspace_stack_has_everything canary:200 --scenario workspace_stack --mutation has_everything
+1 canary_workspace_stack_auto_off canary:200 --scenario workspace_stack --mutation auto_off
+4 workspace_crash pass --scenario workspace_crash
+1 workspace_crash_twice pass --scenario workspace_crash --twice
+1 canary_workspace_crash_torn_commit canary:200 --scenario workspace_crash --mutation torn_commit
+1 canary_workspace_crash_backend_failure_acked canary:200 --scenario workspace_crash --mutation backend_failure_acked
+1 canary_workspace_crash_visible_before_commit canary:200 --scenario workspace_crash --mutation visible_before_commit
+1 canary_workspace_crash_lost_update canary:200 --scenario workspace_crash --mutation lost_update
+1 canary_workspace_crash_stale_retry_overwrites canary:200 --scenario workspace_crash --mutation stale_retry_overwrites
+8 workspace_sql pass --scenario workspace_sql
+1 canary_workspace_sql_stale_read_skips_reload canary:400 --scenario workspace_sql --mutation stale_read_skips_reload
 1 canary_executor_skip_abort canary --scenario executor --mutation skip_abort
 1 canary_executor_leak_cancelled canary --scenario executor --mutation leak_cancelled
 1 canary_executor_uncounted_polls canary:100 --scenario executor --mutation uncounted_polls
 1 canary_executor_unchecked_drive canary:40 --scenario executor --mutation unchecked_drive
+8 board pass --scenario board
+2 board_twice pass --scenario board --twice
+1 board_pinned_squatted_ids pass --scenario board --seed 1795147396000000556
+1 board_pinned_join_root pass --scenario board --seed 1208986242872782921
+1 board_shards_pinned_short_lease pass --scenario board_shards --seed 156486433204944099
+4 board_steer pass --scenario board_steer
+2 board_steer_twice pass --scenario board_steer --twice
+1 canary_board_steer_lost_on_move canary:40 --scenario board_steer --mutation steer_lost_on_move
+1 canary_board_steer_redelivered_after_heed canary:40 --scenario board_steer --mutation steer_redelivered_after_heed
+1 canary_board_heed_from_stale_claim canary:40 --scenario board_steer --mutation heed_from_stale_claim
+1 canary_board_leases_never_expire canary:50 --scenario board --mutation leases_never_expire
+1 canary_board_steer_by_claim_follows canary:40 --scenario board_steer --mutation steer_by_claim_follows
+1 canary_board_steer_to_terminal canary:40 --scenario board_steer --mutation steer_to_terminal
+1 canary_board_finish_ignores_steers canary:40 --scenario board_steer --mutation finish_ignores_steers
+1 canary_board_steer_kept_on_cancel canary:40 --scenario board_steer --mutation steer_kept_on_cancel
+1 canary_board_step_takes_steers_twice canary:40 --scenario board_steer --mutation step_takes_steers_twice
+1 canary_board_step_heeds_unseen_steers canary:40 --scenario board_steer --mutation step_heeds_unseen_steers
+8 board_brief pass --scenario board_brief
+2 board_brief_twice pass --scenario board_brief --twice
+1 canary_board_brief_over_budget canary:40 --scenario board_brief --mutation brief_over_budget
+1 canary_board_brief_drops_steer canary:40 --scenario board_brief --mutation brief_drops_steer
+1 canary_board_brief_leaks_parent_history canary:40 --scenario board_brief --mutation brief_leaks_parent_history
+8 dispatcher pass --scenario dispatcher
+2 dispatcher_twice pass --scenario dispatcher --twice
+1 canary_dispatcher_starts_before_intent canary:100 --scenario dispatcher --mutation dispatcher_starts_before_intent
+1 canary_dispatcher_retire_keeps_claims canary:40 --scenario dispatcher --mutation dispatcher_retire_keeps_claims
+1 canary_dispatcher_sleeps_through_idle canary:40 --scenario dispatcher --mutation dispatcher_sleeps_through_idle
+1 canary_dispatcher_sleeps_after_acting canary:40 --scenario dispatcher --mutation dispatcher_sleeps_after_acting
+1 canary_dispatcher_never_reaps canary:40 --scenario dispatcher --mutation dispatcher_never_reaps
+4 board_shards pass --scenario board_shards
+2 board_shards_twice pass --scenario board_shards --twice
+1 canary_board_shards_group_skips_seq canary:40 --scenario board_shards --mutation group_skips_seq
+1 canary_board_shards_group_verdict_from_plan canary:40 --scenario board_shards --mutation group_verdict_from_plan
+1 canary_board_shards_group_splits canary:40 --scenario board_shards --mutation group_splits
+1 canary_board_shards_route_ignores_task canary:40 --scenario board_shards --mutation route_ignores_task
+1 canary_board_shards_merge_skips_partition canary:40 --scenario board_shards --mutation merge_skips_partition
+1 canary_board_shards_merged_index_skips_rows canary:40 --scenario board_shards --mutation merged_index_skips_rows
+1 canary_board_shards_merged_index_ignores_rank canary:40 --scenario board_shards --mutation merged_index_ignores_rank
+1 canary_board_shards_child_follows_parent canary:40 --scenario board_shards --mutation child_follows_parent
+1 canary_board_shards_cross_move_keeps_parent canary:40 --scenario board_shards --mutation cross_move_keeps_parent
+1 canary_board_shards_cross_move_skips_unmark canary:40 --scenario board_shards --mutation cross_move_skips_unmark
+1 canary_board_shards_cross_move_ingests_first canary:40 --scenario board_shards --mutation cross_move_ingests_first
+1 canary_board_shards_epoch_fence_ignored canary:40 --scenario board_shards --mutation epoch_fence_ignored
+1 canary_board_shards_claim_cap_ignored canary:40 --scenario board_shards --mutation claim_cap_ignored
+1 canary_board_shards_claim_cap_ignores_label canary:40 --scenario board_shards --mutation claim_cap_ignores_label
+1 canary_board_shards_finish_forgets_worker canary:40 --scenario board_shards --mutation finish_forgets_worker
+1 canary_board_shards_renew_ignores_cap canary:40 --scenario board_shards --mutation renew_ignores_cap
 1 canary_capture_skip_trim canary --scenario capture --mutation skip_trim
 1 canary_capture_drop_chunk canary --scenario capture --mutation drop_chunk
 1 canary_buffered_admission_written canary --scenario turns --policy turnlog --mutation buffered_admission_written
 1 canary_cell_before_checkpoint canary --scenario turns --policy turnlog --mutation cell_before_checkpoint
 1 canary_open_drops_journals canary --scenario turns --policy turnlog --mutation open_drops_journals
 1 canary_resume_redispatches_running canary --scenario turns --policy turnlog --mutation resume_redispatches_running
+1 canary_snapshot_ratio_ignored canary:100 --scenario turns --policy turnlog --event-bytes 4096 --mutation snapshot_ratio_ignored
+1 canary_snapshot_pointer_stale canary:100 --scenario turns --policy turnlog --mutation snapshot_pointer_stale
+1 canary_sections_pruned canary:100 --scenario turns --policy turnlog --snapshot-rows 4 --mutation sections_pruned
+1 canary_sections_kept canary:100 --scenario turns --policy turnlog --event-bytes 4096 --mutation sections_kept
+1 canary_part_read_unloaded canary:100 --scenario turns --policy turnlog --snapshot-rows 4 --mutation part_read_unloaded
+1 canary_forgets_other_cell canary:20 --scenario turns --policy turnlog --mutation forgets_other_cell
+1 canary_content_rewritten_stale canary:20 --scenario turns --policy turnlog --mutation content_rewritten_stale
+1 canary_content_collected_live canary:20 --scenario turns --policy turnlog --mutation content_collected_live
 1 canary_agents_cancel_ignored canary:200 --scenario agents --mutation cancel_ignored
 1 canary_agents_shutdown_hangs canary:200 --scenario agents --mutation shutdown_hangs
 1 canary_agents_shutdown_keeps_harness canary:200 --scenario agents --mutation shutdown_keeps_harness
+1 canary_agents_pool_retire_keeps_agent canary:40 --scenario agents --mutation pool_retire_keeps_agent
+1 canary_agents_pool_forgets_intent canary:40 --scenario agents --mutation pool_forgets_intent
+1 canary_agents_board_pool_forgets_intent canary:40 --scenario agents --subagents-board --mutation pool_forgets_intent
+4 agents_subagents_board_delayed pass --scenario agents --subagents-board-delayed
+4 agents_subagents_board_lagging pass --scenario agents --subagents-board-lagging
+1 agents_board_lagging_pinned_placement pass --scenario agents --subagents-board-lagging --seed 5
+4 runtime_subagents_board_delayed pass --scenario runtime --subagents-board-delayed
+4 runtime_subagents_board_lagging pass --scenario runtime --subagents-board-lagging
+1 canary_subagents_board_polled_once canary:40 --scenario agents --subagents-board-mutation polled_once
+1 canary_subagents_board_append_unflushed canary:40 --scenario agents --subagents-board-mutation append_unflushed
+1 canary_subagents_board_reopen_lost canary:100 --scenario runtime --subagents-board-mutation reopen_lost
+1 canary_subagents_board_steers_taken_mid_turn canary:40 --scenario agents --subagents-board-mutation steers_taken_mid_turn
+1 canary_subagents_board_steers_never_delivered canary:40 --scenario agents --subagents-board-mutation steers_never_delivered
+1 canary_subagents_board_refresh_once canary:40 --scenario runtime --subagents-board-mutation refresh_once
+1 canary_board_fenced_unsettled canary:40 --scenario board --mutation fenced_unsettled
 1 canary_runtime_kv_power_loss_drops_acked canary:100 --scenario runtime --store kv --mutation power_loss_drops_acked
-1 canary_runtime_kv_power_loss_drops_acceptance canary:400 --scenario runtime --store kv --mutation power_loss_drops_acceptance
+1 canary_runtime_kv_power_loss_drops_acceptance canary:100 --scenario runtime --store kv --mutation power_loss_drops_acceptance
 1 canary_runtime_kv_record_insert_drops canary:100 --scenario runtime --store kv --mutation record_insert_drops
 1 canary_capture_redact_then_trim canary:4000 --scenario capture --mutation redact_then_trim
+8 cell_calls pass --scenario cell_calls
+2 cell_calls_twice pass --scenario cell_calls --twice
+1 canary_cell_calls_cross_results canary:8 --scenario cell_calls --mutation cross_results
+1 canary_cell_calls_root_recovery_unbound canary:8 --scenario cell_calls --mutation root_recovery_unbound
+8 repo_cache pass --scenario repo_cache
+2 repo_cache_twice pass --scenario repo_cache --twice
+1 canary_repo_cache_shared_head canary:8 --scenario repo_cache --mutation shared_head
+1 canary_repo_cache_fetch_moves_heads canary:8 --scenario repo_cache --mutation fetch_moves_heads
+1 canary_repo_cache_refs_before_objects canary:8 --scenario repo_cache --mutation refs_before_objects
+1 canary_repo_cache_resend_held canary:8 --scenario repo_cache --mutation resend_held
+1 canary_repo_cache_shared_lock canary:8 --scenario repo_cache --mutation shared_lock
+1 canary_plog_unfenced canary:50 --scenario plog --mutation unfenced
+1 canary_plog_partial canary:50 --scenario plog --mutation partial
+1 canary_plog_overwrite canary:50 --scenario plog --mutation overwrite
+1 canary_plog_batch_duplicates canary:100 --scenario plog --mutation batch_duplicates
+1 canary_plog_missed_ring canary:100 --scenario plog --mutation missed_ring
+1 canary_plog_snapshot_skipped canary:50 --scenario plog --mutation snapshot_skipped
+1 canary_plog_prune_ignores_cursors canary:400 --scenario plog --mutation prune_ignores_cursors
+1 canary_plog_lost_ack_rejected canary:100 --scenario plog --mutation lost_ack_rejected
+8 live pass --scenario live
+2 live_twice pass --scenario live --twice
+1 canary_live_settle_drops_deletes canary:20 --scenario live --mutation settle_drops_deletes
+1 canary_live_settle_keeps_start canary:20 --scenario live --mutation settle_keeps_start
+1 canary_live_resume_skips_first canary:50 --scenario live --mutation resume_skips_first
+1 canary_live_floor_ignored canary:20 --scenario live --mutation floor_ignored
+1 canary_live_rebase_skipped canary:20 --scenario live --mutation rebase_skipped
+1 canary_live_snapshot_skips_row canary:20 --scenario live --mutation snapshot_skips_row
+1 canary_live_snapshot_at_head canary:20 --scenario live --mutation snapshot_at_head
+1 canary_live_outline_leaks canary:20 --scenario live --mutation outline_leaks
+1 canary_live_encode_every_frame canary:20 --scenario live --mutation encode_every_frame
+1 canary_live_rebase_drops_touched canary:100 --scenario live --mutation rebase_drops_touched
+1 canary_live_repeats_reapplied canary:20 --scenario live --mutation repeats_reapplied
+1 canary_live_ack_before_commit canary:20 --scenario live --mutation ack_before_commit
+1 canary_live_drop_on_ack canary:20 --scenario live --mutation drop_on_ack
+1 canary_live_unknown_refuses canary:20 --scenario live --mutation unknown_refuses
+1 canary_live_ack_early canary:20 --scenario live --mutation ack_early
+1 canary_live_instance_per_socket canary:20 --scenario live --mutation instance_per_socket
+1 canary_live_overload_keeps_frames canary:20 --scenario live --mutation overload_keeps_frames
+1 canary_live_coalesce_drops_frame canary:20 --scenario live --mutation coalesce_drops_frame
+1 canary_live_rebuild_skips_first canary:20 --scenario live --mutation rebuild_skips_first
+8 controlplane pass --scenario controlplane --ops 2000
+2 controlplane_twice pass --scenario controlplane --ops 1500 --twice
+1 canary_controlplane_claim_ignores_lease canary:32 --scenario controlplane --ops 300 --mutation claim_ignores_lease
+1 canary_controlplane_post_overwrites canary:32 --scenario controlplane --ops 300 --mutation post_overwrites
+1 canary_controlplane_next_ignores_rank canary:32 --scenario controlplane --ops 300 --mutation next_ignores_rank
+1 canary_controlplane_budget_skips_inflight canary:64 --scenario controlplane --ops 300 --mutation budget_skips_inflight
+1 canary_controlplane_wake_dropped canary:32 --scenario controlplane --ops 300 --mutation wake_dropped
+1 canary_controlplane_goal_finished_early canary:32 --scenario controlplane --ops 300 --mutation goal_finished_early
+1 canary_controlplane_spawn_retry_renames canary:32 --scenario controlplane --ops 300 --mutation spawn_retry_renames
+8 partitions pass --scenario partitions
+2 partitions_twice pass --scenario partitions --twice
+1 canary_partitions_unfenced canary:64 --scenario partitions --mutation unfenced
+1 canary_partitions_claim_keeps_epoch canary:64 --scenario partitions --mutation claim_keeps_epoch
+1 canary_partitions_waits_for_free canary:64 --scenario partitions --mutation waits_for_free
+1 canary_partitions_keeps_moved canary:64 --scenario partitions --mutation keeps_moved
+1 canary_partitions_assign_by_index canary:64 --scenario partitions --mutation assign_by_index
+1 canary_partitions_replays_in_flight canary:64 --scenario partitions --mutation replays_in_flight
+1 canary_partitions_double_claim canary:64 --scenario partitions --mutation double_claim
+1 canary_partitions_lost_claim canary:64 --scenario partitions --mutation lost_claim
+4 scale pass --scenario scale
+1 scale_twice pass --scenario scale --twice
+1 canary_scale_global_lock canary:16 --scenario scale --mutation global_lock
+1 canary_scale_row_per_record canary:16 --scenario scale --mutation row_per_record
+1 canary_scale_one_node canary:16 --scenario scale --mutation one_node
+1 canary_scale_double_claim canary:16 --scenario scale --mutation double_claim
+1 scale_skewed pass --scenario scale --load skewed
+1 scale_skewed_twice pass --scenario scale --load skewed --twice
+1 canary_scale_ignore_hot canary:16 --scenario scale --load skewed --mutation ignore_hot
 '
 default_known='
 '

@@ -8,6 +8,8 @@ pub mod access;
 pub mod cost;
 pub mod files;
 pub mod middleware;
+pub mod shards;
+pub mod steer;
 pub mod tasks;
 pub mod wake;
 pub mod watch;
@@ -16,12 +18,16 @@ use sim::{Mutation, mutated};
 
 const END: u64 = i64::MAX as u64;
 
+/// How many times [`Board::catch_up`] tries a read that fails.
+pub const READ_TRIES: usize = 3;
+
 pub struct Board {
     host: Arc<dyn LogHost>,
     scope: String,
     writer: String,
     identity: access::Identity,
     minted: u64,
+    minted_by: std::collections::BTreeMap<String, u64>,
     fold: Fold,
     contended: bool,
     chain: middleware::Chain,
@@ -61,6 +67,7 @@ impl Board {
             writer: identity.actor().to_string(),
             identity,
             minted: 0,
+            minted_by: std::collections::BTreeMap::new(),
             fold,
             contended: false,
             chain: middleware::Chain::default(),
@@ -100,6 +107,35 @@ impl Board {
         self.fold_rows(rows)
     }
 
+    /// Refreshes, trying a read that fails with a store error up to [`READ_TRIES`] times. A
+    /// failed refresh leaves the fold where it was, so it hides tasks, claims, steers and
+    /// phases that landed since: a caller that answers or decides from the fold calls this
+    /// and learns whether the fold is current.
+    pub async fn catch_up(&mut self) -> Result<(), BoardError> {
+        let tries = if mutated(Mutation::RefreshOnce) {
+            1
+        } else {
+            READ_TRIES
+        };
+        let mut tried = 1;
+        loop {
+            match self.refresh().await {
+                Err(BoardError::Store(_)) if tried < tries => tried += 1,
+                result => return result,
+            }
+        }
+    }
+
+    /// The log scope this board reads and appends.
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// The host this board reads and appends through.
+    pub fn host(&self) -> &Arc<dyn LogHost> {
+        &self.host
+    }
+
     pub async fn submit(&mut self, at_ms: u64, op: Op) -> Result<Applied, BoardError> {
         self.minted += 1;
         let id = EventId(format!("{}.{}", self.writer, self.minted));
@@ -123,7 +159,6 @@ impl Board {
         if mutated(Mutation::MiddlewareRerunsLanded) {
             self.chain.vet(&id, &self.writer, &op)?;
         }
-        self.refresh().await?;
         if let Some(verdict) = self.fold.outcome(&id) {
             return verdict
                 .clone()
@@ -164,5 +199,121 @@ impl Board {
                 }
             }
         }
+    }
+}
+
+/// One write in a group: by another actor than the board's writer when `by` is set (a node
+/// committing for the agents it hosts), keyed for idempotence when `key` is set.
+#[derive(Clone, Debug)]
+pub struct Write {
+    pub by: Option<String>,
+    pub key: Option<String>,
+    pub at_ms: u64,
+    pub op: Op,
+}
+
+impl Board {
+    fn mint(&mut self, by: &str, key: Option<&str>) -> EventId {
+        if let Some(key) = key.filter(|_| !mutated(Mutation::KeysIgnored)) {
+            return EventId(format!("{by}#{key}"));
+        }
+        let minted = if by == self.writer {
+            &mut self.minted
+        } else {
+            let fold = &self.fold;
+            self.minted_by
+                .entry(by.to_owned())
+                .or_insert_with(|| fold.minted(by))
+        };
+        *minted += 1;
+        EventId(format!("{by}.{minted}"))
+    }
+
+    /// Commits many writes as one group: their rows go down in one append at the fold's next
+    /// seq, and the fold judges each in order. Returns each write's verdict, in order, and how
+    /// many appends the group took.
+    pub async fn submit_group(
+        &mut self,
+        writes: Vec<Write>,
+    ) -> (Vec<Result<Applied, BoardError>>, u64) {
+        let mut verdicts: Vec<Option<Result<Applied, BoardError>>> = vec![None; writes.len()];
+        if self.contended
+            && let Err(error) = self.refresh().await
+        {
+            return (writes.iter().map(|_| Err(error.clone())).collect(), 0);
+        }
+        let mut members = Vec::new();
+        let mut events = Vec::new();
+        for (index, write) in writes.into_iter().enumerate() {
+            let by = write.by.unwrap_or_else(|| self.writer.clone());
+            let id = self.mint(&by, write.key.as_deref());
+            match self.chain.vet(&id, &by, &write.op) {
+                Ok(op) => {
+                    members.push(index);
+                    events.push(Event {
+                        id,
+                        by,
+                        at_ms: write.at_ms,
+                        op,
+                    });
+                }
+                Err(error) => verdicts[index] = Some(Err(error)),
+            }
+        }
+        let mut group = self.fold.group(events);
+        loop {
+            let (first, rows) = match group.plan(&self.fold) {
+                group::GroupStep::Done => break,
+                group::GroupStep::Scan { from } => {
+                    let rows = self.host.scan(&self.scope, from, END).await;
+                    if let Err(error) = group.read(&mut self.fold, rows) {
+                        group.fail_open(&error);
+                        break;
+                    }
+                    continue;
+                }
+                group::GroupStep::Append { first, rows } => (first, rows),
+            };
+            let appended = if mutated(Mutation::GroupSplits) {
+                let mut appended = Ok(());
+                for row in &rows {
+                    appended = self
+                        .host
+                        .append(&self.scope, std::slice::from_ref(row))
+                        .await;
+                    if appended.is_err() {
+                        break;
+                    }
+                }
+                appended
+            } else {
+                self.host.append(&self.scope, &rows).await
+            };
+            let settled = match appended {
+                Ok(()) => group.acknowledged(&mut self.fold, first),
+                Err(error) => {
+                    self.contended = true;
+                    group.failed(first, error);
+                    let rows = self.host.scan(&self.scope, self.fold.next(), END).await;
+                    if rows.as_ref().is_ok_and(Vec::is_empty) {
+                        self.contended = false;
+                    }
+                    group.read(&mut self.fold, rows)
+                }
+            };
+            if let Err(error) = settled {
+                group.fail_open(&error);
+                break;
+            }
+        }
+        let rounds = group.rounds();
+        for (index, verdict) in members.into_iter().zip(group.settled()) {
+            verdicts[index] = Some(verdict);
+        }
+        let verdicts = verdicts
+            .into_iter()
+            .map(|verdict| verdict.unwrap_or_else(|| Err(BoardError::Dropped("unsettled".into()))))
+            .collect();
+        (verdicts, rounds)
     }
 }

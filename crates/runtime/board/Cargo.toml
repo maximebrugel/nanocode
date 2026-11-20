@@ -16,6 +16,7 @@ nanocode-board-fold.workspace = true
 nanocode-cost-fold.workspace = true
 nanocode-digest.workspace = true
 nanocode-durability-core.workspace = true
+nanocode-partitions.workspace = true
 nanocode-sync.workspace = true
 nanocode-turnlog.workspace = true
 serde_json.workspace = true

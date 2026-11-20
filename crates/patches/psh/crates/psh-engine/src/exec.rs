@@ -101,6 +101,7 @@ async fn run_background(vp: &mut Vp, code: &Rc<Code>, list: ListId, item: usize)
     // does: the copy is the job's process, with a pid, and outlives the shell (D1900).
     let forks = sub.fds.all_files() && vp.core.host.forks();
     sub.fork_job = forks && direct;
+    sub.bg_simple = direct;
     // The job's vproc is the subshell of a job that is one `( … )`, as bash forks once
     // for it: its commands are the job's own, and a signal sent to the job ends them.
     sub.stage_subshell = ao.rest.is_empty()
@@ -140,8 +141,12 @@ async fn run_background(vp: &mut Vp, code: &Rc<Code>, list: ListId, item: usize)
                 .map
                 .values()
                 .any(|t| t.active && !t.action.is_empty());
-            if direct && !traps {
-                sub.exec_tail = Some(std::ptr::from_ref(code.ast.cmd(p.stages[0].cmd)) as usize);
+            if direct {
+                let own = Some(std::ptr::from_ref(code.ast.cmd(p.stages[0].cmd)) as usize);
+                sub.own_simple = own;
+                if !traps {
+                    sub.exec_tail = own;
+                }
             }
             run_command_unchecked(&mut sub, &code, p.stages[0].cmd).await
         } else {
@@ -571,15 +576,43 @@ async fn run_pipeline_stages(vp: &mut Vp, code: &Rc<Code>, p: &Pipeline) -> R {
     // `shopt -s lastpipe`: the last command runs in this shell (no job control here).
     let lastpipe = vp.opts.shopt(Shopt::Lastpipe);
     let mut joins: Vec<Join<i32>> = Vec::with_capacity(n);
+    // The stages start first to last, as bash forks them, and each expands its words
+    // and opens its own redirections before the gate; its command runs once every
+    // stage got that far (`pass_gate`), however long an open takes. So a later
+    // stage's `> out` is there for `ls` (`ls | cat > out`), while `echo *`
+    // expanded before it, and `tee out` in `ls | tee out | comm - f > out` writes
+    // after the last stage truncated `out`.
+    let gate = Rc::new(StageGate {
+        arrived: std::cell::RefCell::new(vec![false; n]),
+        passed: std::cell::RefCell::new(vec![false; n]),
+        waiters: Default::default(),
+    });
+    let mut ready: Vec<Vp> = Vec::with_capacity(n);
+    let start = |ready: &mut Vec<Vp>, joins: &mut Vec<Join<i32>>| {
+        let first = joins.len();
+        for (k, sub) in ready.drain(..).enumerate() {
+            let cmd = p.stages[first + k].cmd;
+            joins.push(spawn_sub(sub, code.clone(), Body::Stage(cmd)));
+        }
+    };
     let mut next_in: Option<Fd> = None;
+    // The pipe the next stage reads, watched at its gate.
+    let mut next_watch: Option<pipe::Watch> = None;
     let mut last_here = None;
     for (i, stage) in p.stages.iter().enumerate() {
         if i + 1 == n && lastpipe {
+            start(&mut ready, &mut joins);
             let saved = vp.fds.clone();
             if let Some(r) = next_in.take() {
                 vp.fds.set(0, r);
             }
+            vp.stage_gate = Some(GateTicket::new(
+                &gate,
+                i,
+                next_watch.take().into_iter().collect(),
+            ));
             let r = run_command_unchecked(vp, code, stage.cmd).await;
+            vp.stage_gate = None;
             restore_fds(vp, saved);
             last_here = Some(r);
             break;
@@ -607,8 +640,11 @@ async fn run_pipeline_stages(vp: &mut Vp, code: &Rc<Code>, p: &Pipeline) -> R {
         if let Some(r) = next_in.take() {
             sub.fds.set(0, r);
         }
+        let mut pipes: Vec<pipe::Watch> = next_watch.take().into_iter().collect();
         if i + 1 < n {
             let (r, w) = pipe::pipe();
+            pipes.push(w.watch());
+            next_watch = Some(r.watch());
             let w: Fd = Rc::new(FdObj::PipeWrite(w));
             sub.fds.set(1, w.clone());
             if stage.pipe_stderr {
@@ -616,8 +652,10 @@ async fn run_pipeline_stages(vp: &mut Vp, code: &Rc<Code>, p: &Pipeline) -> R {
             }
             next_in = Some(Rc::new(FdObj::PipeRead(r)));
         }
-        joins.push(spawn_sub(sub, code.clone(), Body::Stage(stage.cmd)));
+        sub.stage_gate = Some(GateTicket::new(&gate, i, pipes));
+        ready.push(sub);
     }
+    start(&mut ready, &mut joins);
     let mut statuses = Vec::with_capacity(n);
     for j in joins {
         match crate::signals::or_signal(vp, crate::signals::Gives::Fatal, j).await {
@@ -626,6 +664,7 @@ async fn run_pipeline_stages(vp: &mut Vp, code: &Rc<Code>, p: &Pipeline) -> R {
             Err(sig) => return Ok(128 + sig),
         }
     }
+    notice_done_jobs(vp);
     if let Some(r) = last_here {
         statuses.push(r?);
     }
@@ -653,6 +692,136 @@ async fn run_pipeline_stages(vp: &mut Vp, code: &Rc<Code>, p: &Pipeline) -> R {
         check_failure(vp, last).await?;
     }
     check_failure(vp, status).await
+}
+
+/// How many stages, its own included, a stage's command waits for at the gate: bash
+/// forks the stages one after another, and a stage forked three or more forks later
+/// usually opens its files after the first one's program has started (`> out` in
+/// `ls | xargs … | sort | grep … > out` is not there yet for `ls`, while it is in
+/// `ls | cat > out`).
+const STAGE_REACH: usize = 3;
+
+/// The start gate of a pipeline's stages: which have reached it and which went on
+/// past it, and the stages waiting there.
+pub(crate) struct StageGate {
+    arrived: std::cell::RefCell<Vec<bool>>,
+    passed: std::cell::RefCell<Vec<bool>>,
+    waiters: std::cell::RefCell<Vec<std::task::Waker>>,
+}
+
+impl StageGate {
+    fn wake_all(&self) {
+        for w in self.waiters.borrow_mut().drain(..) {
+            w.wake();
+        }
+    }
+
+    fn register(&self, cx: &std::task::Context<'_>) {
+        let mut waiters = self.waiters.borrow_mut();
+        if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            waiters.push(cx.waker().clone());
+        }
+    }
+}
+
+/// A stage's place at its pipeline's [`StageGate`]: it arrives once, when its command
+/// is about to run or when the stage ends before that. It watches the pipes between
+/// the stage and its neighbours.
+pub(crate) struct GateTicket {
+    gate: Rc<StageGate>,
+    index: usize,
+    pipes: Vec<pipe::Watch>,
+}
+
+impl GateTicket {
+    fn new(gate: &Rc<StageGate>, index: usize, pipes: Vec<pipe::Watch>) -> Rc<GateTicket> {
+        Rc::new(GateTicket {
+            gate: gate.clone(),
+            index,
+            pipes,
+        })
+    }
+
+    fn arrive(&self) {
+        if !std::mem::replace(&mut self.gate.arrived.borrow_mut()[self.index], true) {
+            self.gate.wake_all();
+        }
+    }
+
+    fn pass(&self) {
+        self.arrive();
+        if !std::mem::replace(&mut self.gate.passed.borrow_mut()[self.index], true) {
+            self.gate.wake_all();
+        }
+    }
+
+    /// Whether the stages this one's command waits for reached the gate.
+    fn open(&self) -> bool {
+        let arrived = self.gate.arrived.borrow();
+        let end = (self.index + STAGE_REACH).min(arrived.len());
+        arrived[..end].iter().all(|a| *a)
+    }
+
+    /// A stage starts once the stage `STAGE_REACH` places before it went past the
+    /// gate (its program started) or ended, as bash forks it that much later.
+    pub(crate) async fn wait_turn(&self) {
+        let Some(before) = self.index.checked_sub(STAGE_REACH) else {
+            return;
+        };
+        std::future::poll_fn(|cx| {
+            if self.gate.passed.borrow()[before] {
+                return std::task::Poll::Ready(());
+            }
+            self.gate.register(cx);
+            std::task::Poll::Pending
+        })
+        .await;
+    }
+}
+
+impl Drop for GateTicket {
+    fn drop(&mut self) {
+        self.pass();
+    }
+}
+
+/// A pipeline stage's command waits here, after its words and redirections, until
+/// every stage got that far, as bash's stage processes have all started and opened
+/// their files by the time the first one's program runs. However long a stage takes
+/// to get there (a redirection's file opens on a host thread), the others wait; one
+/// goes on early only when the stage at the other end of one of its pipes waits on it
+/// before its own gate (`echo x | echo "$(cat)"`), which would otherwise never come.
+pub(crate) async fn pass_gate(vp: &mut Vp) {
+    let Some(ticket) = vp.stage_gate.take() else {
+        return;
+    };
+    ticket.arrive();
+    let mut yielded = false;
+    let ticket_ref = &ticket;
+    std::future::poll_fn(move |cx| {
+        let ticket = ticket_ref;
+        // Every stage yields once, so the stages' commands start in pipeline order
+        // even when the last one to reach the gate opens it.
+        if !std::mem::replace(&mut yielded, true) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        if ticket.open() {
+            return std::task::Poll::Ready(());
+        }
+        // Every watch registers, so a neighbour that starts waiting wakes this one.
+        let mut waited_on = false;
+        for w in &ticket.pipes {
+            waited_on |= w.poll_waited_on(cx);
+        }
+        if waited_on {
+            return std::task::Poll::Ready(());
+        }
+        ticket.gate.register(cx);
+        std::task::Poll::Pending
+    })
+    .await;
+    ticket.pass();
 }
 
 /// Clones the state for a subshell, or fails past the nesting limit (D1050).
@@ -698,15 +867,44 @@ pub(crate) fn spawn_sub(sub: Vp, code: Rc<Code>, body: Body) -> Join<i32> {
                 r
             }
             Body::Stage(c) => {
+                if let Some(ticket) = sub.stage_gate.clone() {
+                    ticket.wait_turn().await;
+                }
                 let cmd = code.ast.cmd(c);
+                // bash runs an `if`, loop or `case` stage without the subshell's exit
+                // processing: an EXIT trap set there fires only on `exit`.
+                if matches!(
+                    cmd.kind,
+                    CommandKind::If(_)
+                        | CommandKind::While(_)
+                        | CommandKind::For(_)
+                        | CommandKind::Select(_)
+                        | CommandKind::ArithFor(_)
+                        | CommandKind::Case(_)
+                ) {
+                    let r = run_command_unchecked(&mut sub, &code, c).await;
+                    let last = sub.status;
+                    return match r {
+                        Ok(s) => s,
+                        Err(u @ Unwind::Exit(_)) => {
+                            let status = u.status(last);
+                            Box::pin(trap::exit_trap(&mut sub, status)).await
+                        }
+                        Err(u) => u.status(last),
+                    };
+                }
                 // bash does not exec while a trap could still run in the subshell.
                 let traps = sub
                     .traps
                     .map
                     .values()
                     .any(|t| t.active && !t.action.is_empty());
-                if matches!(cmd.kind, CommandKind::Simple(_)) && !traps {
-                    sub.exec_tail = Some(std::ptr::from_ref(cmd) as usize);
+                if matches!(cmd.kind, CommandKind::Simple(_)) {
+                    sub.stage_simple = true;
+                    sub.own_simple = Some(std::ptr::from_ref(cmd) as usize);
+                    if !traps {
+                        sub.exec_tail = sub.own_simple;
+                    }
                 }
                 run_command_unchecked(&mut sub, &code, c).await
             }
@@ -767,7 +965,9 @@ fn run_command_with<'a>(
                 vp.line = code.line(cmd.span.start);
                 run_coproc(vp, code, cmd.span, cp).await
             }
-            _ if cmd.redirects.is_empty() => run_compound(vp, code, cmd).await,
+            _ if cmd.redirects.is_empty() && vp.stage_gate.is_none() => {
+                run_compound(vp, code, cmd).await
+            }
             _ => Box::pin(with_redirects(vp, code, cmd)).await,
         };
         // Process substitutions of this command are closed when it completes.
@@ -929,6 +1129,9 @@ async fn with_redirects(vp: &mut Vp, code: &Rc<Code>, cmd: &Command) -> R {
         }
         Some(saved)
     };
+    if vp.stage_gate.is_some() {
+        Box::pin(pass_gate(vp)).await;
+    }
     let r = run_compound(vp, code, cmd).await;
     if let Some(saved) = saved {
         restore_fds(vp, saved);
@@ -1028,7 +1231,18 @@ async fn run_subshell(vp: &mut Vp, code: &Rc<Code>, list: ListId) -> R {
     if vp.top {
         vp.sigs.child_ended(&vp.core);
     }
+    notice_done_jobs(vp);
     Ok(status)
+}
+
+/// A non-interactive bash without `set -m` drops the background jobs that have finished
+/// from its table each time it waits for a foreground child (a program, pipeline,
+/// subshell or substitution): `jobs` no longer lists them and `%1` no longer names
+/// one, while `wait PID` still answers their status.
+pub(crate) fn notice_done_jobs(vp: &Vp) {
+    if !vp.opts.interactive && !vp.opts.get(SetOpt::Monitor) {
+        vp.jobs.borrow_mut().drop_done();
+    }
 }
 
 async fn run_if(vp: &mut Vp, code: &Rc<Code>, c: &psh_syntax::IfCommand) -> R {
@@ -1077,7 +1291,14 @@ async fn define_function(
         vp.error(&format!("{name}: readonly function")).await;
         return Ok(1);
     }
-    let source = vp.msg_name();
+    // Its file, which its messages and `BASH_SOURCE` name: outside any function or
+    // sourced file, the script's own, else bash's `environment` for `-c` and
+    // `main` for a script read from stdin.
+    let source = match (vp.calls.is_empty(), vp.opts.dash_c, vp.opts.stdin) {
+        (true, true, _) => "environment".to_string(),
+        (true, false, true) => "main".to_string(),
+        _ => vp.msg_name(),
+    };
     Rc::make_mut(&mut vp.funcs).insert(
         name,
         Rc::new(Func {
@@ -1456,8 +1677,7 @@ pub(crate) fn run_item<'a>(
         let p = &item.first;
         if item.background {
             background(vp, code, id, i).await
-        } else if item.rest.is_empty() && p.stages.len() == 1 && !p.negated() && p.time.is_none()
-        {
+        } else if item.rest.is_empty() && p.stages.len() == 1 && !p.negated() && p.time.is_none() {
             let cmd = p.stages[0].cmd;
             if let Some(now) = crate::now::command(vp, code, cmd, true) {
                 match now {
@@ -1539,7 +1759,7 @@ async fn run_case(vp: &mut Vp, code: &Rc<Code>, cmd: &Command, c: &psh_syntax::C
         let text = command_text(code, cmd);
         builtins::set::xtrace(vp, text.trim_ascii_end()).await;
     }
-    let utf8 = vp.utf8();
+    let text = crate::pattern::unit_vec(&word, vp.utf8());
     let mut status = 0;
     let mut i = 0;
     let mut fall = false;
@@ -1553,7 +1773,7 @@ async fn run_case(vp: &mut Vp, code: &Rc<Code>, cmd: &Command, c: &psh_syntax::C
                     &pat,
                     vp.match_opts(vp.opts.shopt(Shopt::Nocasematch)),
                 )
-                .matches(&word, utf8)
+                .matches_units(&text)
                 {
                     hit = true;
                     break;
@@ -1779,6 +1999,11 @@ async fn prefix_assigns(
             (Some(idx), AssignValue::Scalar(w)) => {
                 let ctx = expand::subscript_ctx(vp, name);
                 let (sub, st1) = Box::pin(expand::expand_single(vp, code, idx, ctx)).await?;
+                if ctx == Ctx::Word && sub.is_empty() {
+                    let msg = format!("{name}[{}]: bad array subscript", code.ast.text(idx.span));
+                    vp.error(&msg).await;
+                    return Err(Unwind::Abort(1));
+                }
                 let (v, st2) = Box::pin(expand::assign_value(vp, code, w)).await?;
                 *subst_status = st2.or(st1).or(*subst_status);
                 if argv.is_empty() && vp.opts.get(SetOpt::Xtrace) {
@@ -1796,8 +2021,12 @@ async fn prefix_assigns(
                 code.ast.text(idx.span)
             )),
         };
+        crate::arith::notes(vp).await;
         if let Err(msg) = r {
             vp.error(&msg).await;
+            if std::mem::take(&mut vp.sub_fatal) {
+                return Err(Unwind::Exit(1));
+            }
             if (vp.opts.get(SetOpt::Posix) || vp.opts.get(SetOpt::Errexit))
                 && argv.first().is_none_or(|n| builtins::is_special(vp, n))
             {
@@ -1850,16 +2079,23 @@ fn compound_text(items: &[crate::arrays::ArrayItem]) -> Vec<u8> {
 }
 
 pub(crate) fn simple_line(code: &Code, cmd: &Command, s: &SimpleCommand) -> u32 {
-    let first = [
-        s.assigns.first().map(|a| a.span),
-        s.words.first().map(|w| w.span),
-        cmd.redirects.first().map(|r| r.span),
-    ]
-    .into_iter()
-    .flatten()
-    .min_by_key(|sp| sp.start);
-    match first {
-        Some(sp) if sp.end > sp.start => code.line(sp.end - 1),
+    // Bash stamps a simple command with its line number when it reduces the first
+    // element, which is once the next token has been read: the line where the second
+    // element's first token ends (`nosuch 'a<newline>b'` is line 2, while
+    // `echo $LINENO 'a<newline>b'` is line 1).
+    // A redirection's first token is its operator.
+    let mut elems: Vec<(psh_syntax::Span, bool)> = s
+        .assigns
+        .iter()
+        .map(|a| (a.span, false))
+        .chain(s.words.iter().map(|w| (w.span, false)))
+        .chain(cmd.redirects.iter().map(|r| (r.span, true)))
+        .collect();
+    elems.sort_by_key(|(sp, _)| sp.start);
+    match (elems.first(), elems.get(1)) {
+        (_, Some((sp, true))) => code.line(sp.start),
+        (_, Some((sp, false))) if sp.end > sp.start => code.line(sp.end - 1),
+        (Some((sp, _)), _) if sp.end > sp.start => code.line(sp.end - 1),
         _ => code.line(cmd.span.start),
     }
 }
@@ -1999,7 +2235,11 @@ fn run_simple<'a>(
             vp.exec_tail = None;
         }
         vp.line = simple_line(code, cmd, s);
-        let (argv, assigns) = match Box::pin(prepare_simple(vp, code, cmd, s)).await? {
+        let prepared = Box::pin(prepare_simple(vp, code, cmd, s)).await;
+        if prepared.is_err() && vp.own_simple == Some(std::ptr::from_ref(cmd) as usize) {
+            trap::arm_inherited_exit(vp);
+        }
+        let (argv, assigns) = match prepared? {
             Prepared::Done(status) => return Ok(status),
             Prepared::Run(argv, assigns) => {
                 if vp.opts.get(SetOpt::Xtrace) {
@@ -2049,6 +2289,21 @@ fn run_simple<'a>(
                     .iter()
                     .map(|(n, _)| (n.clone(), vp.vars.get(n).cloned()))
                     .collect();
+                // `v=x export v`: bash exports the temporary binding and copies it to the
+                // shell's own variable, so it outlives the command.
+                let promoted: Vec<String> = match which.name() {
+                    "export" => args
+                        .iter()
+                        .filter_map(|a| match a {
+                            builtins::declare::DeclArg::Word(w) => {
+                                old.iter().find(|(n, _)| n.as_bytes() == w.as_slice())
+                            }
+                            _ => None,
+                        })
+                        .map(|(n, _)| n.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 for (n, v) in assigns {
                     vp.set_var(&n, v);
                     vp.vars.entry(&n).exported = true;
@@ -2058,6 +2313,9 @@ fn run_simple<'a>(
                 let r = if cmd.redirects.is_empty()
                     || Box::pin(apply_redirects(vp, code, &cmd.redirects)).await?
                 {
+                    if vp.stage_gate.is_some() {
+                        Box::pin(pass_gate(vp)).await;
+                    }
                     Box::pin(builtins::declare::run(vp, which, args)).await
                 } else if !via && builtins::is_special(vp, which.name().as_bytes()) {
                     restore_fds(vp, saved.clone());
@@ -2076,7 +2334,7 @@ fn run_simple<'a>(
                 restore_fds(vp, saved);
                 for (n, v) in old {
                     match v {
-                        _ if special => {}
+                        _ if special || promoted.contains(&n) => {}
                         Some(v) => vp.vars.insert(&n, v),
                         None => {
                             vp.vars.remove(&n);
@@ -2093,6 +2351,9 @@ fn run_simple<'a>(
             vp.fg_text = Some(String::from_utf8_lossy(&command_text(code, cmd)).into_owned());
         }
         if cmd.redirects.is_empty() {
+            if vp.stage_gate.is_some() {
+                Box::pin(pass_gate(vp)).await;
+            }
             vp.exec_now = tail;
             return run_argv(vp, argv, assigns).await;
         }
@@ -2105,6 +2366,9 @@ fn run_simple<'a>(
                 || !vp.funcs.contains_key("exec"))
         {
             let ok = Box::pin(apply_redirects(vp, code, &cmd.redirects)).await;
+            if vp.stage_gate.is_some() {
+                Box::pin(pass_gate(vp)).await;
+            }
             // Nothing is restored, so nothing to apply again.
             vp.var_fds.clear();
             return match ok? {
@@ -2116,7 +2380,17 @@ fn run_simple<'a>(
         }
 
         let saved = vp.fds.clone();
-        match Box::pin(apply_redirects(vp, code, &cmd.redirects)).await {
+        // Bash performs an external command's redirections in the child it forks, so
+        // what expanding them sets (`$((n++))` in a here-document, `${x:=f}`, `{fd}>`)
+        // does not reach the shell.
+        let forks = forks_for(vp, &argv);
+        let vars = forks.then(|| vp.vars.clone());
+        let applied = Box::pin(apply_redirects(vp, code, &cmd.redirects)).await;
+        if let Some(vars) = vars {
+            vp.vars = vars;
+            vp.var_fds.clear();
+        }
+        match applied {
             Ok(true) => {}
             Ok(false) => {
                 restore_fds(vp, saved);
@@ -2125,10 +2399,18 @@ fn run_simple<'a>(
                 }
                 return Ok(1);
             }
+            // An expansion error there ends only that child (`cat <<< ${x?}` is 127).
+            Err(Unwind::Abort(status) | Unwind::Exit(status)) if forks => {
+                restore_fds(vp, saved);
+                return Ok(status);
+            }
             Err(u) => {
                 restore_fds(vp, saved);
                 return Err(u);
             }
+        }
+        if vp.stage_gate.is_some() {
+            Box::pin(pass_gate(vp)).await;
         }
         if tail {
             // The vproc ends with this command: nothing to restore, and the saved
@@ -2143,12 +2425,57 @@ fn run_simple<'a>(
     })
 }
 
+/// Whether bash forks to run `argv`: it is neither a function nor a builtin, also
+/// behind `command` (`command cat`), and including a name that is not found.
+fn forks_for(vp: &Vp, argv: &[Vec<u8>]) -> bool {
+    let mut i = 0;
+    while argv.get(i).is_some_and(|a| a == b"command")
+        && !vp.funcs.contains_key("command")
+        && builtins::get(vp, b"command").is_some()
+    {
+        i += 1;
+        while argv.get(i).is_some_and(|a| a == b"-p" || a == b"--") {
+            i += 1;
+        }
+        if argv.get(i).is_some_and(|a| a.starts_with(b"-")) {
+            return false;
+        }
+    }
+    let Some(name) = argv.get(i) else {
+        return false;
+    };
+    if i == 0 && name.starts_with(b"%") {
+        return false;
+    }
+    let function = i == 0
+        && std::str::from_utf8(name)
+            .ok()
+            .is_some_and(|n| vp.funcs.contains_key(n));
+    !function && !builtins::is_special(vp, name) && builtins::get(vp, name).is_none()
+}
+
 /// Runs an expanded command: a builtin or an external.
 fn run_argv(
     vp: &mut Vp,
     argv: Vec<Vec<u8>>,
     assigns: Vec<(String, Vec<u8>)>,
 ) -> LocalBoxFuture<'_, R> {
+    // A command word that starts with `%` is a job: bash resumes it with `fg`, or
+    // `bg` when run with `&`, ahead of functions and the PATH.
+    let bg = std::mem::take(&mut vp.bg_simple);
+    let stage = std::mem::take(&mut vp.stage_simple);
+    if argv[0].starts_with(b"%") && !stage {
+        vp.fork_job = false;
+        let resume = if bg {
+            "bg"
+        } else {
+            "fg"
+        };
+        let mut argv = argv;
+        argv.insert(0, resume.as_bytes().to_vec());
+        vp.exec_now = false;
+        return Box::pin(run_builtin(vp, argv, assigns));
+    }
     if std::mem::take(&mut vp.fork_job) {
         return Box::pin(run_job_argv(vp, argv, assigns));
     }
@@ -2176,11 +2503,28 @@ fn run_argv(
         match crate::util::lookup(vp, &argv[0]).await {
             Some(e) if !reads_own_process(vp, &argv).await => {
                 vp.exec_now = false;
-                crate::util::run(vp, e, argv, assigns).await
+                // Bash forks for it: while the child starts, the pipe's reader takes
+                // what earlier commands wrote and may exit, so the utility's first
+                // write meets the closed pipe (`{ echo 1; cat f; echo 3; cat f; } |
+                // head -3` is 141). After it, the shell waits for its exit while the
+                // reader takes what it wrote.
+                hand_off_stdout(vp);
+                let r = crate::util::run(vp, e, argv, assigns).await;
+                hand_off_stdout(vp);
+                r
             }
             _ => run_external(vp, argv, assigns).await,
         }
     })
+}
+
+/// See [`crate::pipe::PipeWriter::hand_off`].
+fn hand_off_stdout(vp: &Vp) {
+    if let Some(out) = vp.fd(1)
+        && let FdObj::PipeWrite(w) = &*out
+    {
+        w.hand_off();
+    }
 }
 
 async fn reads_own_process(vp: &Vp, argv: &[Vec<u8>]) -> bool {
@@ -2478,6 +2822,7 @@ pub(crate) async fn run_external_with(
             }
         }
     };
+    notice_done_jobs(vp);
     let st = match (waited, stop_text) {
         (Waited::Exited(st), _) => st,
         (Waited::Stopped(sig), Some(text)) => {
@@ -2666,6 +3011,31 @@ async fn spawn_program(
     let program = vp.abs_path(&spec.program);
     match vp.host().spawn(spec) {
         Ok(s) => Ok(s),
+        // A path that names no file is not found, as `execve` finds it (127).
+        Err(e)
+            if crate::host::RunInShell::is(&e)
+                && matches!(
+                    vp.host().stat(&program, true).await,
+                    Err(ref m) if m.kind() == std::io::ErrorKind::NotFound
+                ) =>
+        {
+            vp.error(&format!("{shown}: No such file or directory"))
+                .await;
+            Err(Ok(127))
+        }
+        // A file without execute permission is refused as `execve` refuses it.
+        Err(e)
+            if crate::host::RunInShell::is(&e)
+                && matches!(
+                    vp.host()
+                        .access(&program, crate::host::Access::Execute)
+                        .await,
+                    Ok(false)
+                ) =>
+        {
+            vp.error(&format!("{shown}: Permission denied")).await;
+            Err(Ok(126))
+        }
         Err(e) if crate::host::RunInShell::is(&e) => {
             Err(Box::pin(run_in_shell(vp, &program, script_argv, &shown)).await)
         }
@@ -2687,6 +3057,31 @@ async fn spawn_program(
     }
 }
 
+/// The interpreter a `#!` line names, by name (`/usr/bin/env python3 -u` gives
+/// `python3 -u`, `/usr/bin/python3` gives `python3`), with its arguments.
+fn shebang(source: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let line = source.strip_prefix(b"#!")?;
+    let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
+    let mut words = line
+        .split(u8::is_ascii_whitespace)
+        .filter(|w| !w.is_empty())
+        .map(<[u8]>::to_vec);
+    let first = words.next()?;
+    let base = |w: &[u8]| w.rsplit(|&b| b == b'/').next().unwrap_or(w).to_vec();
+    let mut out = vec![base(&first)];
+    if out[0] == b"env" {
+        let mut rest: Vec<Vec<u8>> = words.filter(|w| w.as_slice() != b"-S").collect();
+        if rest.is_empty() {
+            return None;
+        }
+        rest[0] = base(&rest[0]);
+        out = rest;
+    } else {
+        out.extend(words);
+    }
+    Some(out)
+}
+
 /// Runs a program file the host cannot start as a psh script (D1300), as bash runs a
 /// file `execve` rejects: in a subshell that starts afresh, as if a new shell ran the
 /// file (only exported variables, no functions, aliases, traps or options of ours), with
@@ -2706,6 +3101,22 @@ async fn run_in_shell(vp: &mut Vp, program: &[u8], argv: Vec<Vec<u8>>, shown: &s
         return Ok(126);
     }
     drop(file);
+    // A `#!` line naming another interpreter (`#!/usr/bin/env python3`) runs the file
+    // with that program, found by its name, as the kernel runs it; a shell's own runs here.
+    if let Some(mut interp) = shebang(&source) {
+        let shell = matches!(interp[0].as_slice(), b"sh" | b"bash" | b"psh");
+        if !shell {
+            let mut argv = argv.into_iter();
+            argv.next();
+            interp.push(if shown.contains('/') {
+                shown.as_bytes().to_vec()
+            } else {
+                program.to_vec()
+            });
+            interp.extend(argv);
+            return Box::pin(run_external(vp, interp, Vec::new())).await;
+        }
+    }
     if crate::invocation::binary_file(&source) {
         vp.error(&format!(
             "{shown}: cannot execute binary file: Exec format error"
@@ -2935,14 +3346,16 @@ async fn redirect_fd(vp: &mut Vp, code: &Rc<Code>, r: &Redirect, fd: u32) -> Res
                     body_error(vp, code, e, doc.error_subst).await;
                     return Ok(false);
                 }
-                match Box::pin(expand::expand_heredoc(vp, code, &doc.body)).await {
-                    Err(Unwind::Exit(_)) => return Ok(false),
-                    r => r?,
-                }
+                // An expansion error in the body abandons the command line or ends
+                // the shell, unless the command forks, which only fails
+                // (`cat <<EOF || …`).
+                Box::pin(expand::expand_heredoc(vp, code, &doc.body)).await?
             };
             if !doc.terminated {
-                // The input ended before the delimiter: the last line gets its newline.
-                if !body.is_empty() && !body.ends_with(b"\n") {
+                // The input ended before the delimiter: the last line gets its newline,
+                // whatever its expansion ends with (`$a` with a value that ends in one).
+                let text = code.ast.bytes(doc.body.span);
+                if !text.is_empty() && !text.ends_with(b"\n") {
                     body.push(b'\n');
                 }
             }
@@ -3366,6 +3779,7 @@ async fn subst(vp: &mut Vp, code: Rc<Code>, list: ListId) -> Result<(Vec<u8>, i3
     if vp.top {
         vp.sigs.child_ended(&vp.core);
     }
+    notice_done_jobs(vp);
     vp.status = status;
     if out.contains(&0) {
         vp.error("warning: command substitution: ignored null byte in input")
@@ -3561,7 +3975,9 @@ pub(crate) async fn command_subst_text(
             let inner = Rc::new(Code {
                 lines: Rc::new(psh_syntax::LineIndex::from_bytes(script)),
                 ast: Arc::new(ast),
-                line_base: code.line(offset) - 1,
+                // bash counts the body's lines from the line of the command it
+                // runs in, not from where the backquote opens.
+                line_base: vp.line.max(1) - 1,
                 arith: Default::default(),
                 flat: Default::default(),
             });

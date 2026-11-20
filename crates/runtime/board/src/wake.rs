@@ -8,10 +8,10 @@ use std::{
 
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_sync::{Atom, Notify};
-use nanocode_turnlog::LogHost;
+use nanocode_turnlog::{LogHost, ScopeRows};
 
 use crate::{
-    Board,
+    Board, BoardError, TaskId,
     sim::{Mutation, mutated},
 };
 
@@ -153,6 +153,13 @@ impl LogHost for Notifying {
         self.inner.scan(scope, from, to)
     }
 
+    fn scans<'a>(
+        &'a self,
+        scans: &'a [(&'a str, u64)],
+    ) -> StoreFuture<'a, Result<Vec<ScopeRows>, StoreError>> {
+        self.inner.scans(scans)
+    }
+
     fn load<'a>(
         &'a self,
         scope: &'a str,
@@ -186,12 +193,40 @@ pub fn payload(scope: &str, head: u64) -> String {
 
 impl Board {
     pub fn due_ms(&self) -> Option<u64> {
-        self.fold.due_ms()
+        let tasks = self
+            .fold
+            .next_due()
+            .filter(|_| !mutated(Mutation::WakeIgnoresDue));
+        self.fold.due_ms().into_iter().chain(tasks).min()
     }
 
     pub fn arm(&self, alarm: &dyn Alarm) -> Option<u64> {
-        let due = self.fold.due_ms()?;
+        let due = self.due_ms()?;
         alarm.arm(&self.scope, due);
         Some(due)
+    }
+
+    pub async fn next_ready(
+        &mut self,
+        wake: &dyn Wake,
+        timer: &dyn Timer,
+        labels: &BTreeMap<String, String>,
+        until_ms: u64,
+    ) -> Result<Option<TaskId>, BoardError> {
+        loop {
+            self.refresh().await?;
+            let now = timer.now_ms();
+            if let Some(id) = self.fold.pick(&self.writer, labels, now) {
+                return Ok(Some(id.clone()));
+            }
+            if now >= until_ms {
+                return Ok(None);
+            }
+            let wake_at = self
+                .due_ms()
+                .filter(|due| *due > now)
+                .map_or(until_ms, |due| due.min(until_ms));
+            wake.wait(&self.scope, self.fold.next() - 1, wake_at).await;
+        }
     }
 }

@@ -10,6 +10,7 @@ mod eval;
 pub(crate) mod hash;
 mod help;
 mod jobs;
+mod ldouble;
 mod mapfile;
 mod printf;
 pub(crate) mod read;
@@ -351,7 +352,7 @@ async fn echo(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             buf.push(b' ');
         }
         if escapes {
-            let d = decode(a, Dialect::Echo);
+            let d = decode(a, Dialect::Echo, vp.utf8());
             buf.extend_from_slice(&d.bytes);
             if d.stop {
                 return out(vp, "echo", &buf).await;
@@ -631,6 +632,10 @@ async fn unset(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             let name = String::from_utf8_lossy(&a[..open]).into_owned();
             let sub = crate::expand::expand_sub_text(vp, &a[open + 1..a.len() - 1]).await?;
             if let Err(msg) = vp.unset_elem(&name, &sub) {
+                if std::mem::take(&mut vp.sub_fatal) {
+                    vp.error(&msg).await;
+                    return Err(Unwind::Exit(1));
+                }
                 vp.error(&format!("unset: {msg}")).await;
                 status = 1;
             }
@@ -829,6 +834,9 @@ async fn loop_control(vp: &mut Vp, args: &[Vec<u8>], name: &str) -> R {
         },
     };
     let n = n.min(i64::from(vp.loops)) as u32;
+    // The loop it leaves (or goes on with) has the status of the builtin: 0, not that of
+    // the command before it.
+    vp.status = 0;
     Err(if name == "break" {
         Unwind::Break(n)
     } else {
@@ -1087,8 +1095,7 @@ pub(crate) fn shell_quote(v: &[u8], utf8: bool) -> Vec<u8> {
                 | b','
         ) || (b == b'#' && i == 0)
             // A tilde that would expand: first, or after `:` or `=`.
-            || (b == b'~' && (i == 0 || matches!(v[i - 1], b':' | b'=')))
-            || (b == b'=' && i == 0);
+            || (b == b'~' && (i == 0 || matches!(v[i - 1], b':' | b'=')));
         if special {
             out.push(b'\\');
         }

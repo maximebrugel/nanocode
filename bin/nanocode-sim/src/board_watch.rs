@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -13,8 +13,9 @@ use nanocode_board::{
     Board, Change, Entry, Event, EventId, Fold, Op, TaskId,
     sim::Mutation as BoardRule,
     wake::{Listening, Napping, Notifier, Notifying, Polling, Ring, Timer, Wake},
-    watch::{Filter, Handled, Handler, Key, Kind, Lease, Plan, Policy, Registered, Step},
+    watch::{self, Attempt, Filter, Handled, Handler, Key, Kind, Lease, Plan, Policy, Registered, Step},
 };
+use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_turnlog::LogHost;
 
 use super::{MS, World};
@@ -83,6 +84,7 @@ pub fn summary() -> String {
     )
 }
 
+#[derive(Clone)]
 struct Every {
     id: String,
     first_ms: u64,
@@ -219,11 +221,69 @@ impl Ring for Lossy {
     }
 }
 
+struct Early {
+    inner: Arc<dyn LogHost>,
+    clock: Arc<Clock>,
+    schedules: Vec<Every>,
+    broken: Arc<OnceLock<String>>,
+}
+
+impl Early {
+    fn early(&self, body: &str) -> Option<String> {
+        let event = serde_json::from_str::<Event>(body).ok()?;
+        let Op::Watch(Step::Fire { id, n }) = event.op else {
+            return None;
+        };
+        let every = self.schedules.iter().find(|every| every.id == id)?;
+        let now = self.clock.now_ns() / MS;
+        let due = match every.every_ms {
+            None if n > 0 => {
+                return Some(format!("one-off {id} fired again as fire {n} at {now} ms"));
+            }
+            None => every.first_ms,
+            Some(gap) => every.first_ms + gap * n,
+        };
+        (now < due)
+            .then(|| format!("{id} fired fire {n} at {now} ms, before its earliest time {due} ms"))
+    }
+}
+
+impl LogHost for Early {
+    fn scan<'a>(
+        &'a self,
+        scope: &'a str,
+        from: u64,
+        to: u64,
+    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
+        self.inner.scan(scope, from, to)
+    }
+
+    fn load<'a>(
+        &'a self,
+        scope: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
+        self.inner.load(scope)
+    }
+
+    fn append<'a>(
+        &'a self,
+        scope: &'a str,
+        rows: &'a [(u64, String)],
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        if let Some(early) = rows.iter().find_map(|(_, body)| self.early(body)) {
+            let _ = self.broken.set(early.clone());
+            return Box::pin(async move { Err(StoreError::Backend(early)) });
+        }
+        self.inner.append(scope, rows)
+    }
+}
+
 pub struct Watched {
     pub shape: Shape,
     waited: std::cell::RefCell<(usize, u64)>,
     notifier: Arc<Notifier>,
     ring: Arc<Lossy>,
+    broken: Arc<OnceLock<String>>,
 }
 
 impl Watched {
@@ -241,14 +301,46 @@ impl Watched {
             waited: std::cell::RefCell::new((0, 0)),
             notifier,
             ring,
+            broken: Arc::new(OnceLock::new()),
         }
     }
 
-    pub fn wrap(&self, host: Arc<dyn LogHost>) -> Arc<dyn LogHost> {
+    pub fn wrap(&self, host: Arc<dyn LogHost>, clock: &Arc<Clock>) -> Arc<dyn LogHost> {
+        let early = Arc::new(Early {
+            inner: host,
+            clock: Arc::clone(clock),
+            schedules: self.shape.schedules.clone(),
+            broken: Arc::clone(&self.broken),
+        });
         Arc::new(Notifying::new(
-            host,
+            early,
             Arc::clone(&self.ring) as Arc<dyn Ring>,
         ))
+    }
+
+    pub fn broken(&self) -> Option<String> {
+        self.broken.get().cloned()
+    }
+
+    fn audit(&self, fold: &Fold) {
+        let Some(watcher) = fold.marks().watchers().get(ECHO) else {
+            return;
+        };
+        let tries = self.shape.policy.tries;
+        let exhausted = watcher
+            .lanes
+            .iter()
+            .find_map(|(thread, lane)| match lane.attempt {
+                Attempt::Idle { tries: tried, .. } if tried >= tries => Some(format!(
+                    "{thread} idles after {tried} of {tries} tries instead of being buried"
+                )),
+                _ => None,
+            });
+        if let Some(broken) =
+            exhausted.or_else(|| ticks(&self.shape, fold, &BTreeMap::new(), false).err())
+        {
+            let _ = self.broken.set(broken);
+        }
     }
 }
 
@@ -301,6 +393,10 @@ fn scheduled(board: &Board, shape: &Shape) -> bool {
 }
 
 fn quiet(world: &World, board: &Board) -> bool {
+    world.watched.audit(board.fold());
+    if world.watched.broken.get().is_some() {
+        return true;
+    }
     let echoed = board
         .fold()
         .marks()
@@ -499,11 +595,22 @@ fn consolidating(world: &World) -> usize {
         .count()
 }
 
+fn joins(fold: &Fold, task: &TaskId) -> bool {
+    fold.task(task)
+        .is_some_and(|task| task.spec.labels.get("gate").map(String::as_str) == Some("join"))
+}
+
+/// A consolidate task's own ending, which every wait must report.
 fn awaited(fold: &Fold, entry: &Entry) -> bool {
-    entry.change.terminal()
-        && fold
-            .task(&entry.task)
-            .is_some_and(|task| task.spec.labels.get("gate").map(String::as_str) == Some("join"))
+    entry.change.terminal() && joins(fold, &entry.task)
+}
+
+/// An ending the wait may report: a filter's labels also match a task whose
+/// root carries them, and moves can leave a finished task under a
+/// consolidate task that became a root.
+fn admitted(fold: &Fold, entry: &Entry) -> bool {
+    awaited(fold, entry)
+        || entry.change.terminal() && joins(fold, &watch::root(fold.tasks(), &entry.task))
 }
 
 async fn waiter(world: &World, epoch: u64) {
@@ -534,10 +641,13 @@ async fn waiter(world: &World, epoch: u64) {
                 WOKEN.fetch_add(1, Ordering::SeqCst);
                 let from = after;
                 for entry in found {
-                    if entry.seq <= from || !awaited(board.fold(), &entry) {
+                    if entry.seq <= from || !admitted(board.fold(), &entry) {
                         world.oracle.borrow_mut().wrong.push(format!(
-                            "wait after row {from} returned {} {:?} on {}",
-                            entry.seq, entry.change, entry.task
+                            "wait after row {from} returned {} {:?} on {} under root {}",
+                            entry.seq,
+                            entry.change,
+                            entry.task,
+                            watch::root(board.fold().tasks(), &entry.task)
                         ));
                     }
                     after = after.max(entry.seq);
@@ -557,6 +667,18 @@ async fn waiter(world: &World, epoch: u64) {
         .iter()
         .filter(|entry| entry.seq <= after && awaited(board.fold(), entry))
         .map(|entry| (entry.seq, entry.task.clone()))
+        .collect::<BTreeSet<_>>();
+    // Endings admitted through a root may come and go as tasks move, so only
+    // consolidate tasks' own endings must all be seen.
+    let got = got
+        .into_iter()
+        .filter(|(seq, task)| {
+            board
+                .fold()
+                .entries()
+                .iter()
+                .any(|entry| entry.seq == *seq && entry.task == *task && awaited(board.fold(), entry))
+        })
         .collect::<BTreeSet<_>>();
     if want != got {
         world.oracle.borrow_mut().wrong.push(format!(
@@ -662,9 +784,10 @@ fn steps(
     for (seq, body) in rows {
         let event: Event = serde_json::from_str(body)
             .map_err(|error| format!("row {seq} is not an event: {error}"))?;
-        if !seen.insert(event.id.clone()) {
+        if seen.contains(&event.id) || !nanocode_board::access::owns(&event.by, &event.id) {
             continue;
         }
+        seen.insert(event.id.clone());
         now = now.max(event.at_ms);
         if fold.outcome(&event.id) != Some(&Ok(*seq)) {
             continue;
@@ -902,8 +1025,13 @@ fn echoes(world: &World, fold: &Fold) -> Result<(), String> {
     Ok(())
 }
 
-fn ticks(world: &World, fold: &Fold, cancelled: &BTreeMap<String, u64>) -> Result<(), String> {
-    for every in &world.watched.shape.schedules {
+fn ticks(
+    shape: &Shape,
+    fold: &Fold,
+    cancelled: &BTreeMap<String, u64>,
+    ended: bool,
+) -> Result<(), String> {
+    for every in &shape.schedules {
         let prefix = format!("fire/{}/", every.id);
         let fires = fold
             .entries()
@@ -946,7 +1074,8 @@ fn ticks(world: &World, fold: &Fold, cancelled: &BTreeMap<String, u64>) -> Resul
                 _ => slot + 1,
             };
         }
-        let more = !cancelled.contains_key(&every.id)
+        let more = ended
+            && !cancelled.contains_key(&every.id)
             && every.times.is_none_or(|times| count < times)
             && due(slot).is_some_and(|due| every.until_ms.is_none_or(|until| due <= until));
         if more {
@@ -963,5 +1092,5 @@ pub fn check(world: &World, rows: &[(u64, String)], fold: &Fold) -> Result<(), S
     let cancelled = steps(world, rows, fold)?;
     tallies(fold)?;
     echoes(world, fold)?;
-    ticks(world, fold, &cancelled)
+    ticks(&world.watched.shape, fold, &cancelled, true)
 }

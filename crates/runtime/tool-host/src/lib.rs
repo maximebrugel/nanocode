@@ -28,7 +28,7 @@ mod policy;
 mod selection;
 pub use nanocode_code_mode::CodeModeToolObservation;
 pub use pins::TextPins;
-pub use policy::{CodeModeToolPolicy, WorkspaceToolRouting};
+pub use policy::{CodeModeToolPolicy, FileAccess, WorkspaceToolRouting};
 #[cfg(not(target_family = "wasm"))]
 pub use selection::{AttachTarget, RemoteRunnerTools};
 pub use selection::{ToolExposure, ToolSource, Tools, ToolsBuildError, ToolsBuilder};

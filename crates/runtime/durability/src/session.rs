@@ -31,7 +31,12 @@ pub enum Admission<C = EncodedPayload, O = EncodedPayload> {
 
     Pending,
 
-    Completed { checkpoint: C, output: O },
+    /// `checkpoint` is `None` when the operation's checkpoint is the
+    /// session's head (its latest checkpoint) and no operation is in flight:
+    /// the state the opener restored, and kept current since, is that
+    /// checkpoint, so it is neither loaded nor decoded again. Build the
+    /// replayed boundary from the live state instead.
+    Completed { checkpoint: Option<C>, output: O },
 
     Failed { checkpoint: C, error: String },
 
@@ -69,7 +74,7 @@ enum StoredAdmission {
     Accepted,
     Pending,
     Completed {
-        checkpoint: EncodedPayload,
+        checkpoint: Option<EncodedPayload>,
         output: EncodedPayload,
     },
     Failed {
@@ -99,7 +104,7 @@ impl StoredAdmission {
             Self::Accepted => Ok(Admission::Accepted),
             Self::Pending => Ok(Admission::Pending),
             Self::Completed { checkpoint, output } => Ok(Admission::Completed {
-                checkpoint: checkpoint.decode()?,
+                checkpoint: checkpoint.map(|checkpoint| checkpoint.decode()).transpose()?,
                 output: output.decode()?,
             }),
             Self::Failed { checkpoint, error } => Ok(Admission::Failed {
@@ -1768,8 +1773,21 @@ impl Driver {
                     Ok(StoredAdmission::Pending)
                 }
                 OperationStatus::Completed { checkpoint, output } => {
+                    // The head with nothing in flight: the live state is this
+                    // checkpoint, so skip loading a second full copy of it.
+                    let head = self.claimed.is_empty()
+                        && self.state.first_pending_operation_where(|_| true).is_none()
+                        && self
+                            .state
+                            .latest_checkpoint()
+                            .is_some_and(|latest| latest.key() == checkpoint.key());
+                    let checkpoint = if head {
+                        None
+                    } else {
+                        Some(checkpoint.load(&mut *self.store, &self.state_id).await?)
+                    };
                     Ok(StoredAdmission::Completed {
-                        checkpoint: checkpoint.load(&mut *self.store, &self.state_id).await?,
+                        checkpoint,
                         output: output.load(&mut *self.store, &self.state_id).await?,
                     })
                 }
@@ -2863,14 +2881,14 @@ pub struct DurableSession {
 pub(crate) type LoadedCheckpoint = (EncodedPayload, Arc<HashSet<String>>);
 
 type HydratedPreload = (
-    serde_json::Value,
+    crate::Checkpoint,
     Option<Arc<HashSet<String>>>,
     Option<crate::Hydrated>,
 );
 
 struct CheckpointPreload {
     key: String,
-    checkpoint: serde_json::Value,
+    checkpoint: crate::Checkpoint,
     hydrated: Option<crate::Hydrated>,
     loaded: Option<LoadedCheckpoint>,
 }
@@ -3070,7 +3088,7 @@ impl DurableSession {
     pub(crate) fn preload_checkpoint(
         &self,
         key: String,
-        checkpoint: serde_json::Value,
+        checkpoint: crate::Checkpoint,
         loaded: Option<LoadedCheckpoint>,
         hydrated: Option<crate::Hydrated>,
     ) {
@@ -3093,7 +3111,7 @@ impl DurableSession {
         key: &str,
     ) -> Option<(serde_json::Value, Option<Arc<HashSet<String>>>)> {
         self.take_checkpoint_preload_hydrated(key)
-            .map(|(checkpoint, records, _)| (checkpoint, records))
+            .and_then(|(checkpoint, records, _)| Some((checkpoint.into_value().ok()?, records)))
     }
 
     pub fn take_checkpoint_preload_hydrated(&self, key: &str) -> Option<HydratedPreload> {
@@ -3316,6 +3334,7 @@ impl DurableSession {
             .load()
             .as_ref()
             .and_then(|preload| preload.loaded.clone());
+        let adopted = preloaded.as_ref().map(|(_, records)| Arc::clone(records));
         self.send(Command::AcquireAgent {
             initial,
             checkpoint,
@@ -3325,6 +3344,15 @@ impl DurableSession {
         })
         .await?;
         let acquired = receive(receiver).await?;
+        if let Some(memo) = self.store.payload_memo.as_deref() {
+            memo.release(
+                acquired.checkpoint.iter().map(EncodedPayload::key).chain(
+                    adopted
+                        .iter()
+                        .flat_map(|records| records.iter().map(String::as_str)),
+                ),
+            );
+        }
         let owner = DurableOwner {
             generation: acquired.generation,
             commands: self.commands.clone(),

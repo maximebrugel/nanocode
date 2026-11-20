@@ -16,6 +16,8 @@ pub(crate) struct ArrayItem {
     pub key: Option<Vec<u8>>,
     pub value: Vec<u8>,
     pub append: bool,
+    /// The element as bash shows it in a warning (`[""]=1`), when it has a key.
+    pub src: Option<Vec<u8>>,
 }
 
 impl Vp {
@@ -69,11 +71,35 @@ impl Vp {
     /// Evaluates an indexed subscript; negative counts from the end. `None` when it
     /// points before the start.
     pub(crate) fn resolve_index(&mut self, name: &str, sub: &[u8]) -> Result<Option<i64>, String> {
-        let i = crate::arith::eval(self, sub)?;
+        let i = self.sub_arith(sub)?;
         if i >= 0 {
             return Ok(Some(i));
         }
         Ok(self.max_index(name).map(|m| m + 1 + i).filter(|&i| i >= 0))
+    }
+
+    /// The arithmetic value of a subscript; an error in the expression itself marks
+    /// [`Vp::sub_fatal`].
+    pub(crate) fn sub_arith(&mut self, sub: &[u8]) -> Result<i64, String> {
+        crate::arith::eval(self, sub).inspect_err(|_| {
+            if self.arith_syntax {
+                self.sub_fatal = true;
+            }
+        })
+    }
+
+    /// Like [`Vp::resolve_index`] for a reference: a negative index counts from the
+    /// end of an indexed array only; on a scalar it points nowhere (bash).
+    pub(crate) fn resolve_read(&mut self, name: &str, sub: &[u8]) -> Result<Option<i64>, String> {
+        let i = self.sub_arith(sub)?;
+        if i >= 0 {
+            return Ok(Some(i));
+        }
+        Ok(match self.vars.get(name).map(|v| &v.value) {
+            Some(Value::Indexed(m)) => m.keys().next_back().map(|&m| m + 1 + i),
+            _ => None,
+        }
+        .filter(|&i| i >= 0))
     }
 
     /// `name[sub]=value` (or `+=`).
@@ -84,6 +110,7 @@ impl Vp {
         value: Vec<u8>,
         append: bool,
     ) -> Result<(), String> {
+        self.sub_fatal = false;
         let shown = name;
         let name = self.resolve(name).into_owned();
         if name.contains('[') {
@@ -125,7 +152,7 @@ impl Vp {
         Ok(())
     }
 
-    fn elem(&self, name: &str, i: i64) -> Option<Vec<u8>> {
+    pub(crate) fn elem(&self, name: &str, i: i64) -> Option<Vec<u8>> {
         match self.vars.get(name).map(|v| &v.value) {
             Some(Value::Indexed(m)) => m.get(&i).cloned(),
             Some(Value::Str(s)) if i == 0 => Some(s.clone()),
@@ -140,6 +167,7 @@ impl Vp {
         items: Vec<ArrayItem>,
         append: bool,
     ) -> Result<(), String> {
+        self.sub_fatal = false;
         let shown = name;
         let name = self.resolve(name).into_owned();
         if name.contains('[') {
@@ -157,12 +185,27 @@ impl Vp {
             let mut pending_key: Option<Vec<u8>> = None;
             for item in items {
                 let (key, value, app) = match item.key {
+                    // An empty key skips its element with a warning (bash).
+                    Some(k) if k.is_empty() => {
+                        let src = item.src.unwrap_or_else(|| {
+                            let mut t = b"[]=".to_vec();
+                            t.extend_from_slice(&item.value);
+                            t
+                        });
+                        self.arith_notes.push(format!(
+                            "{}: bad array subscript",
+                            String::from_utf8_lossy(&src)
+                        ));
+                        continue;
+                    }
                     Some(k) => (k, item.value, item.append),
+                    // A bad element is skipped with a warning; the rest are assigned (bash).
                     None if !pairs => {
-                        return Err(format!(
+                        self.arith_notes.push(format!(
                             "{name}: {}: must use subscript when assigning associative array",
                             String::from_utf8_lossy(&item.value)
                         ));
+                        continue;
                     }
                     None => match pending_key.take() {
                         Some(k) => (k, item.value, false),
@@ -199,13 +242,24 @@ impl Vp {
         let mut next = self.max_index(&name).map_or(0, |k| k + 1);
         for item in items {
             let i = match &item.key {
-                Some(k) => match self.resolve_index(&name, k)? {
-                    Some(i) => i,
-                    None => {
-                        return Err(format!(
-                            "{name}[{}]: bad array subscript",
-                            String::from_utf8_lossy(k)
+                // A bad subscript skips its element with a warning (bash).
+                Some(k) if k == b"@" || k == b"*" => {
+                    self.arith_notes.push(format!(
+                        "[{}]={}: cannot assign to non-numeric index",
+                        String::from_utf8_lossy(k),
+                        String::from_utf8_lossy(&item.value)
+                    ));
+                    continue;
+                }
+                Some(k) => match (k.is_empty(), self.resolve_index(&name, k)?) {
+                    (false, Some(i)) => i,
+                    _ => {
+                        self.arith_notes.push(format!(
+                            "[{}]={}: bad array subscript",
+                            String::from_utf8_lossy(k),
+                            String::from_utf8_lossy(&item.value)
                         ));
+                        continue;
                     }
                 },
                 None => next,
@@ -231,6 +285,7 @@ impl Vp {
     /// `${name[sub]}`: the element, `None` if unset. Errors for subscripts before the
     /// start of an indexed array.
     pub(crate) fn get_elem(&mut self, name: &str, sub: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        self.sub_fatal = false;
         let name = self.resolve(name).into_owned();
         match self.vars.get(&name).map(|v| &v.value) {
             Some(Value::Assoc(_)) if sub.is_empty() => {
@@ -239,12 +294,12 @@ impl Vp {
             Some(Value::Assoc(a)) => return Ok(a.get(sub).map(<[u8]>::to_vec)),
             None | Some(Value::Unset) => {
                 // Still evaluated, for its side effects and errors.
-                crate::arith::eval(self, sub)?;
+                self.sub_arith(sub)?;
                 return Ok(None);
             }
             _ => {}
         }
-        match self.resolve_index(&name, sub)? {
+        match self.resolve_read(&name, sub)? {
             Some(i) => Ok(self.elem(&name, i)),
             None => Err(format!("{name}: bad array subscript")),
         }
@@ -252,7 +307,12 @@ impl Vp {
 
     /// `unset name[sub]`.
     pub(crate) fn unset_elem(&mut self, name: &str, sub: &[u8]) -> Result<(), String> {
+        self.sub_fatal = false;
         let name = self.resolve(name).into_owned();
+        // An unset variable: nothing to do, and the subscript is not evaluated (bash).
+        if self.vars.get(&name).is_none() {
+            return Ok(());
+        }
         if self.vars.get(&name).is_some_and(|v| v.readonly) {
             return Err(format!("{name}: cannot unset: readonly variable"));
         }
@@ -273,7 +333,14 @@ impl Vp {
             }
             return Ok(());
         }
-        let Some(i) = self.resolve_index(&name, sub)? else {
+        let indexed = matches!(
+            self.vars.get(&name).map(|v| &v.value),
+            Some(Value::Indexed(_))
+        );
+        let Some(i) = self.resolve_read(&name, sub)? else {
+            if !indexed {
+                return Err(format!("{name}: not an array variable"));
+            }
             return Err(format!(
                 "[{}]: bad array subscript",
                 String::from_utf8_lossy(sub)
@@ -283,8 +350,8 @@ impl Vp {
             Some(Value::Indexed(m)) => {
                 m.remove(&i);
             }
-            Some(v @ Value::Str(_)) if i == 0 => *v = Value::Unset,
-            Some(Value::Unset) if i == 0 => {
+            // `unset 'a[0]'` on a scalar unsets it, as `unset a` does.
+            Some(Value::Str(_) | Value::Unset) if i == 0 => {
                 self.vars.remove(&name);
             }
             Some(Value::Str(_) | Value::Unset) => {

@@ -235,8 +235,7 @@ impl Exchange for NextExchange<'_> {
             headers: request.headers().clone(),
             body: request
                 .body()
-                .and_then(nanocode_http::Body::as_bytes)
-                .map(<[u8]>::to_vec)
+                .and_then(nanocode_http::Body::bytes)
                 .unwrap_or_default(),
         };
         let (status, headers, body, _) = self.next.send(sent).await?.into_parts();

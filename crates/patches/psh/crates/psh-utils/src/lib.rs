@@ -186,6 +186,24 @@ macro_rules! registry {
         run: util_fn!(lines::rev),
     },
     UtilEntry {
+        names: &["numfmt"],
+        mode: Mode::PathFallback,
+        destructive: false,
+        run: util_fn!(lines::numfmt),
+    },
+    UtilEntry {
+        names: &["tsort"],
+        mode: Mode::PathFallback,
+        destructive: false,
+        run: util_fn!(lines::tsort),
+    },
+    UtilEntry {
+        names: &["fmt"],
+        mode: Mode::PathFallback,
+        destructive: false,
+        run: util_fn!(lines::fmt),
+    },
+    UtilEntry {
         names: &["fold"],
         mode: Mode::PathFallback,
         destructive: false,
@@ -505,6 +523,7 @@ macro_rules! registry {
             "sha256sum",
             "sha384sum",
             "sha512sum",
+            "b2sum",
         ],
         mode: Mode::Always,
         destructive: false,

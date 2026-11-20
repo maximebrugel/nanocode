@@ -1,10 +1,11 @@
-//! `nl` with `-b -h -f` styles `a t n` (`pREGEX` falls through), `-n ln|rn|rz`, `-w -s
+//! `nl` with `-b -h -f` styles `a t n pBRE`, `-n ln|rn|rz`, `-w -s
 //! -v -i -l -p -d` and logical pages. Written for psh after GNU's documented behavior.
 //! Where GNU and BSD differ, GNU (D016): an unnumbered line is indented by the width
 //! plus the separator's length in spaces, section delimiter lines print as empty lines,
 //! and a last line without a newline gets one.
 
 use psh_engine::util::UtilCtx;
+use psh_regex::{ExecOptions, Options, Regex};
 
 use crate::common;
 use crate::opts::{Spec, both};
@@ -28,11 +29,11 @@ pub const SPEC: Spec = Spec {
     posix_order: false,
 };
 
-#[derive(Clone, Copy, PartialEq)]
 enum Style {
     All,
     NonEmpty,
     None,
+    Pattern(Regex),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -71,7 +72,19 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 b"t" => Style::NonEmpty,
                 b"n" => Style::None,
                 _ if v.starts_with(b"p") => {
-                    return textio::fall_through(ctx, argv, "numbering style 'pREGEX'").await;
+                    let opts = Options {
+                        extended: false,
+                        icase: false,
+                        newline: false,
+                        utf8: ctx.utf8(),
+                    };
+                    match Regex::new(&v[1..], opts) {
+                        Ok(re) => Style::Pattern(re),
+                        Err(e) => {
+                            ctx.error(e.message()).await;
+                            return 1;
+                        }
+                    }
                 }
                 _ => {
                     return common::usage(ctx, &format!("invalid {what} numbering style: {text}"))
@@ -163,7 +176,7 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 blanks = 0;
                 out.push(b'\n');
             } else {
-                let numbered = match styles[section] {
+                let numbered = match &styles[section] {
                     Style::All if line.is_empty() => {
                         blanks += 1;
                         if blanks >= join {
@@ -179,6 +192,7 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                     }
                     Style::NonEmpty => !line.is_empty(),
                     Style::None => false,
+                    Style::Pattern(re) => re.find(&line, ExecOptions::default()).is_some(),
                 };
                 if numbered {
                     let n = number;

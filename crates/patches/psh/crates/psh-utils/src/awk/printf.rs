@@ -232,12 +232,12 @@ pub fn format_one(env: &Env, out: &mut Vec<u8>, spec: &Spec, conv: u8, arg: &Val
             let n = arg.num();
             if !n.is_finite() {
                 let s = special_str(n);
-                let s = if n.is_sign_negative() || spec.plus {
-                    s
+                let s = if spec.plus && !s.starts_with('-') {
+                    format!("+{s}")
                 } else {
-                    &s[1..]
+                    s.to_string()
                 };
-                pad_num(out, spec, "", "", s, false);
+                pad_num(out, spec, "", "", &s, false);
                 return;
             }
             let t = n.trunc();
@@ -308,7 +308,7 @@ pub fn format_float(out: &mut Vec<u8>, spec: &Spec, conv: u8, n: f64) {
             };
             format!("{sign}nan")
         } else {
-            format!("{sign}{}", &s[1..])
+            format!("{sign}{}", s.trim_start_matches('-'))
         };
         let body = if conv.is_ascii_uppercase() {
             body.to_ascii_uppercase()

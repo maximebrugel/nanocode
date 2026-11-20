@@ -49,6 +49,11 @@ fn extensions() -> impl Iterator<Item = &'static Extension> {
         .chain(ADDED.get().copied().unwrap_or_default())
 }
 
+/// The dotted names of every compiled-in extension module, added ones included.
+pub fn extension_names() -> impl Iterator<Item = &'static str> {
+    extensions().map(|extension| extension.name)
+}
+
 thread_local! {
     static MODULES: RefCell<crate::address::AddressMap<usize>> = const { RefCell::new(crate::address::map()) };
     static STATES: RefCell<crate::address::AddressMap<usize>> = const { RefCell::new(crate::address::map()) };

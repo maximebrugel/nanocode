@@ -77,8 +77,7 @@ pub(crate) async fn post(
         headers: request.headers().clone(),
         body: request
             .body()
-            .and_then(nanocode_http::Body::as_bytes)
-            .map(<[u8]>::to_vec)
+            .and_then(nanocode_http::Body::bytes)
             .unwrap_or_default(),
     };
     layer
@@ -266,7 +265,7 @@ pub(crate) async fn post_with(
         method: nanocode_http::types::Method::POST,
         url: endpoint.to_owned(),
         headers,
-        body: body.into_bytes(),
+        body: body.into(),
     };
     layer
         .send(request, layer::Next::new(&TransportSender { transport }))
@@ -295,7 +294,7 @@ impl layer::Sender for TransportSender<'_> {
         request: layer::Request,
     ) -> layer::BoxFuture<'_, Result<layer::Response, layer::Error>> {
         Box::pin(async move {
-            let body = String::from_utf8(request.body).map_err(|_| {
+            let body = String::from_utf8(request.body.into()).map_err(|_| {
                 layer::Error::new("Messages request body is not UTF-8").unsent(true)
             })?;
             post_idle(

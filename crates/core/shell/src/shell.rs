@@ -48,6 +48,21 @@ fn utilities_without_git() -> &'static [UtilEntry] {
     ALL.get_or_init(|| with_host(psh_utils::WITHOUT_GIT))
 }
 
+#[must_use]
+pub fn has(name: &[u8], network: bool) -> bool {
+    let named = |known: &&str| known.as_bytes() == name;
+    let offline = !network
+        && crate::net::UTILITIES
+            .iter()
+            .any(|entry| entry.names.iter().any(named));
+    !offline
+        && (psh_engine::is_builtin(name)
+            || psh_engine::util::shells().iter().any(named)
+            || utilities()
+                .iter()
+                .any(|entry| entry.names.iter().any(named)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub fuel: u64,
@@ -66,6 +81,9 @@ pub enum Limit {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ended {
+    /// The script's exit status, or minus the signal whose default action ended it
+    /// (`kill -USR1 $$` untrapped): a process running the script would have died by
+    /// that signal, which a wait status reads as Python's `returncode` does.
     Exited(i32),
     Cancelled,
     Refused(Limit),
@@ -205,13 +223,14 @@ impl Shell {
             without.extend(unanswered);
         }
         let vfs = Rc::new(Vfs {
-            fs: config.fs,
+            fs: RefCell::new(config.fs),
             commands: config.commands,
             machine: config.machine,
             identity: config.identity,
             limits: config.limits,
             strict: config.strict,
             operations: Cell::new(0),
+            writes: Cell::new(0),
             changes: RefCell::new(Changes::default()),
             missing: RefCell::new(Vec::new()),
             refused: Cell::new(None),
@@ -224,6 +243,8 @@ impl Shell {
             left: Cell::new(0),
             slice: Cell::new(0),
             utilities,
+            timers: RefCell::new(None),
+            skipped: Cell::new(std::time::Duration::ZERO),
         });
         let stdin = Rc::new(Source::new(vfs.clone()));
         let stdout = Rc::new(Capture::new(config.limits.output));
@@ -355,7 +376,7 @@ impl Shell {
             (Some(what), _) => Ended::Unanswered(what),
             (None, Some(limit)) => Ended::Refused(limit),
             (None, None) if self.cancelled => Ended::Cancelled,
-            (None, None) => Ended::Exited(status),
+            (None, None) => Ended::Exited(self.engine.killed_by().map_or(status, |sig| -sig)),
         };
         Ran {
             ended,

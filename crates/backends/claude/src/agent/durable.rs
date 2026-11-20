@@ -103,7 +103,7 @@ impl Snapshot {
                 .filter(|message| !message.is_effort_update())
                 .map(|message| {
                     ResponseItem::message(
-                        match message.role {
+                        match message.role() {
                             Role::User => MessageRole::User,
                             Role::Assistant => MessageRole::Assistant,
                             Role::System => MessageRole::Developer,
@@ -291,7 +291,7 @@ impl Effect<'_> {
         &self,
         response: &mut MessageResponse,
         paged: bool,
-    ) -> Result<(JournalWrite, Option<Recorded>)> {
+    ) -> Result<JournalWrite> {
         #[derive(Serialize)]
         struct Receipt<'a> {
             content_record: EncodedPayload,
@@ -299,46 +299,33 @@ impl Effect<'_> {
             response: &'a MessageResponse,
         }
         if !paged {
-            return Ok((self.completion(response)?, None));
+            return self.completion(response);
         }
         let message = Message {
             role: Role::Assistant,
             content: std::mem::take(&mut response.content),
             output_config: None,
         };
-        let recorded = serde_json::to_string(&message).map(|json| {
-            let json = Arc::<str>::from(json);
-            Recorded {
-                record: EncodedPayload::from_json(Arc::clone(&json)),
-                json,
-            }
-        });
-        let output = recorded
+        let record = serde_json::to_string(&message)
+            .map(|json| EncodedPayload::from_json(Arc::from(json)));
+        let output = record
             .as_ref()
             .map_err(provider_error)
-            .and_then(|recorded| {
+            .and_then(|record| {
                 serde_json::value::to_raw_value(&Receipt {
-                    content_record: recorded.record.reference(),
+                    content_record: record.reference(),
                     response,
                 })
                 .map_err(provider_error)
             });
         response.content = message.content;
-        let recorded = recorded.map_err(provider_error)?;
-        Ok((
-            JournalWrite::Complete {
-                step_id: self.step.clone(),
-                output: output?,
-                records: vec![recorded.record.clone()],
-            },
-            Some(recorded),
-        ))
+        let record = record.map_err(provider_error)?;
+        Ok(JournalWrite::Complete {
+            step_id: self.step.clone(),
+            output: output?,
+            records: vec![record],
+        })
     }
-}
-
-pub(super) struct Recorded {
-    pub(super) json: Arc<str>,
-    pub(super) record: EncodedPayload,
 }
 
 #[derive(Default)]
@@ -687,6 +674,7 @@ impl State {
             cursor.snapshot.context = None;
             cursor.snapshot.conversation = std::mem::take(conversation);
             let mut paging = self.paging.take().unwrap_or_default();
+            paging.stored(self.policy.as_deref());
             let pooled = self.pool_template(cursor, &mut paging).await;
             let encoded =
                 pooled.and_then(|()| encode_cursor(cursor, self.pages_messages(), &mut paging));
@@ -762,9 +750,16 @@ impl State {
             .any(|write| matches!(write, JournalWrite::Advance(_)));
         policy.commit_writes(operation, writes, None).await?;
         if advanced {
+            self.committed();
             self.persistence_ready.notify_waiters();
         }
         Ok(())
+    }
+    fn committed(&self) {
+        if let Some(mut paging) = self.paging.take() {
+            paging.committed();
+            self.paging.put(paging);
+        }
     }
     pub(super) async fn settle(
         &self,
@@ -796,6 +791,7 @@ impl State {
         let mut snapshot = self.snapshot(&Conversation::default()).await?;
         snapshot.conversation = std::mem::take(conversation);
         let mut paging = self.paging.take().unwrap_or_default();
+        paging.stored(Some(&**policy));
         let checkpoint = encode_snapshot(&mut snapshot, policy.pages_messages(), &mut paging);
         self.paging.put(paging);
         *conversation = snapshot.conversation;
@@ -819,6 +815,8 @@ impl State {
             .await;
         if settled.is_err() {
             self.life.stop();
+        } else {
+            self.committed();
         }
         if let Some(turn) = self.steering.acquire().await.get_mut(&request.key) {
             turn.operation = None;
@@ -1168,18 +1166,25 @@ impl Detached {
             records.push(base.clone());
         }
         Ok(PagedConversation {
-            messages: paging.messages.page(&self.messages, unchanged, records)?,
+            messages: paging
+                .messages
+                .page(&self.messages, unchanged, records, paging.stored.as_ref())?,
             code_calls: {
                 let unchanged = paging.code_calls.unchanged(&self.code_calls);
                 paging
                     .code_calls
-                    .page(&self.code_calls, unchanged, records)?
+                    .page(&self.code_calls, unchanged, records, paging.stored.as_ref())?
             },
             compacted: if self.compacted.is_empty() {
                 None
             } else {
                 let unchanged = paging.compacted.unchanged(&self.compacted);
-                Some(paging.compacted.page(&self.compacted, unchanged, records)?)
+                Some(paging.compacted.page(
+                    &self.compacted,
+                    unchanged,
+                    records,
+                    paging.stored.as_ref(),
+                )?)
             },
             admitted_base: admitted_base.as_ref().map(EncodedPayload::reference),
             admitted_tool_ids: tools.recent.iter().cloned().collect(),
@@ -1209,11 +1214,19 @@ impl ToolIds {
         }
     }
 
-    fn tool_uses(message: &HistoryMessage) -> impl Iterator<Item = &str> {
-        message.content.iter().filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
+    fn tool_uses(message: &HistoryMessage) -> Vec<String> {
+        if message.role() != Role::Assistant || !message.mentions("tool_use") {
+            return Vec::new();
+        }
+        message
+            .view()
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn unlisted(&mut self, id: &str, admitted: &history::AdmittedIds) {
@@ -1232,7 +1245,8 @@ impl ToolIds {
     }
 
     fn list_message(&mut self, message: &HistoryMessage, admitted: &history::AdmittedIds) {
-        for id in Self::tool_uses(message) {
+        for id in &Self::tool_uses(message) {
+            let id = id.as_str();
             let count = self.listed.entry(id.into()).or_insert(0);
             *count += 1;
             if *count > 1 {
@@ -1250,7 +1264,8 @@ impl ToolIds {
     }
 
     fn unlist_message(&mut self, message: &HistoryMessage, admitted: &history::AdmittedIds) {
-        for id in Self::tool_uses(message) {
+        for id in &Self::tool_uses(message) {
+            let id = id.as_str();
             let Some(count) = self.listed.get_mut(id) else {
                 continue;
             };
@@ -1306,6 +1321,7 @@ struct TemplatePrompt<'a> {
 pub(super) trait Paged: Clone {
     fn same(&self, other: &Self) -> bool;
     fn record(&self) -> serde_json::Result<EncodedPayload>;
+    fn committed(&self) {}
 }
 
 impl Paged for HistoryMessage {
@@ -1315,6 +1331,10 @@ impl Paged for HistoryMessage {
 
     fn record(&self) -> serde_json::Result<EncodedPayload> {
         Self::record(self)
+    }
+
+    fn committed(&self) {
+        Self::committed(self);
     }
 }
 
@@ -1331,6 +1351,7 @@ impl Paged for history::CodeRound {
 pub(super) struct Pages<T> {
     items: Vec<T>,
     log: SequenceLog,
+    released: usize,
 }
 
 impl<T> Default for Pages<T> {
@@ -1338,6 +1359,7 @@ impl<T> Default for Pages<T> {
         Self {
             items: Vec::new(),
             log: SequenceLog::default(),
+            released: 0,
         }
     }
 }
@@ -1357,20 +1379,33 @@ impl<T: Paged> Pages<T> {
         items: &[T],
         unchanged: usize,
         records: &mut Vec<EncodedPayload>,
+        stored: Option<&HashSet<String>>,
     ) -> Result<Sequence> {
         self.log
             .sync(
                 unchanged,
                 items[unchanged..].iter().map(|item| {
-                    item.record()
-                        .map_err(nanocode_durability::Error::InvalidPayload)
+                    let record = item
+                        .record()
+                        .map_err(nanocode_durability::Error::InvalidPayload)?;
+                    Ok(match stored {
+                        Some(stored) if stored.contains(record.key()) => record.reference(),
+                        _ => record,
+                    })
                 }),
             )
             .map_err(provider_error)?;
         self.items.truncate(unchanged);
+        self.released = self.released.min(unchanged);
         self.items.extend_from_slice(&items[unchanged..]);
         records.extend(self.log.frontier().cloned());
         Ok(self.log.sequence())
+    }
+
+    fn committed(&mut self) {
+        self.items[self.released..].iter().for_each(T::committed);
+        self.released = self.items.len();
+        self.log.release();
     }
 }
 
@@ -1383,6 +1418,23 @@ pub(super) struct Paging {
     tools: ToolIds,
     template: Option<Arc<EncodedTemplate>>,
     pooled: Option<String>,
+    stored: Option<HashSet<String>>,
+}
+
+impl Paging {
+    fn stored(&mut self, policy: Option<&dyn ClaudeExecutionPolicy>) {
+        if let Some(stored) = policy.and_then(ClaudeExecutionPolicy::take_stored_records) {
+            self.stored = Some(stored);
+        }
+    }
+
+    fn committed(&mut self) {
+        self.stored = None;
+        self.messages.committed();
+        self.code_calls.committed();
+        self.compacted.committed();
+        self.pending.committed();
+    }
 }
 
 struct EncodedTemplate {
@@ -1432,12 +1484,7 @@ fn encode_snapshot(
     paging: &mut Paging,
 ) -> Result<EncodedState> {
     if !paged {
-        return snapshot
-            .conversation
-            .messages
-            .iter()
-            .try_for_each(HistoryMessage::cache_json)
-            .and_then(|()| serde_json::value::to_raw_value(&*snapshot))
+        return serde_json::value::to_raw_value(&*snapshot)
             .map(|json| EncodedState {
                 json,
                 records: Vec::new(),
@@ -1511,7 +1558,9 @@ fn paged_cursor(
     let mut records = Vec::new();
     let conversation = detached.page(&mut records, paging, false)?;
     let unchanged = paging.pending.unchanged(pending);
-    let pending = paging.pending.page(pending, unchanged, &mut records)?;
+    let pending = paging
+        .pending
+        .page(pending, unchanged, &mut records, paging.stored.as_ref())?;
     let template = template_record(prompt, paging)?;
     let inner = serde_json::value::to_raw_value(cursor).map_err(provider_error)?;
     let json = serde_json::value::to_raw_value(&PagedCursor {
@@ -1557,14 +1606,7 @@ fn encode_cursor(cursor: &mut Cursor, paged: bool, paging: &mut Paging) -> Resul
     let pending = std::mem::take(&mut cursor.pending);
     cursor.pending = pending[base.map_or(0, |_| shared)..].to_vec();
     cursor.pending_base = base;
-    let encoded = cursor
-        .snapshot
-        .conversation
-        .messages
-        .iter()
-        .chain(&cursor.pending)
-        .try_for_each(HistoryMessage::cache_json)
-        .and_then(|()| serde_json::value::to_raw_value(&*cursor));
+    let encoded = serde_json::value::to_raw_value(&*cursor);
     cursor.pending = pending;
     cursor.pending_base = None;
     encoded
@@ -1579,9 +1621,9 @@ fn turn_output(result: &TurnResult, last: Option<&HistoryMessage>) -> Result<Box
     let final_message = result.final_message();
     let record = last
         .filter(|message| {
-            message.role == Role::Assistant
+            message.role() == Role::Assistant
                 && !final_message.is_empty()
-                && text_of(message) == final_message
+                && text_of(&message.view()) == final_message
         })
         .map(HistoryMessage::record)
         .transpose()
@@ -1851,9 +1893,10 @@ impl Snapshot {
             )));
         }
         for message in &self.conversation.messages {
-            for block in &message.content {
+            let view = message.view();
+            for block in &view.content {
                 match block {
-                    ContentBlock::Text { text, .. } => items.push(match message.role {
+                    ContentBlock::Text { text, .. } => items.push(match message.role() {
                         Role::Assistant => TranscriptItem::Assistant(text.clone()),
                         Role::User => TranscriptItem::User(text.clone()),
                         Role::System => continue,

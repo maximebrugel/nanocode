@@ -126,6 +126,26 @@ pub(crate) fn sort_by_key(heap: &mut Heap, list: Obj, comparefn: Value) -> Resul
         for (k, v) in keyed {
             strings.push_out((heap.contiguous(k.as_string().unwrap_or(Str(0)))?, v));
         }
+        if matches!(comparator, Comparator::Locale(_)) && crate::EMBED {
+            // localeCompare is Intl's collation, not code-unit order.
+            let mut units: Vec<(Vec<u16>, Value)> = crate::buf::vec_with_capacity(strings.len());
+            for &(s, v) in &strings {
+                match heap.str_view(s) {
+                    Some(StrView::Latin1(x)) => units.push_out((x.iter().map(|&b| u16::from(b)).collect(), v)),
+                    _ => return Ok(false),
+                }
+            }
+            let cmp = crate::builtins::intl::locale_compare;
+            if descending {
+                crate::sort::sort_by(&mut units, |a, b| cmp(&b.0, &a.0) < 0);
+            } else {
+                crate::sort::sort_by(&mut units, |a, b| cmp(&a.0, &b.0) < 0);
+            }
+            for (i, (_, v)) in (0..).zip(units) {
+                heap.set_element_fast(list, i, v)?;
+            }
+            return Ok(true);
+        }
         let mut views: Vec<(StrView, Value)> = crate::buf::vec_with_capacity(strings.len());
         for &(s, v) in &strings {
             match heap.str_view(s) {
@@ -257,6 +277,18 @@ mod sort_state {
     pub const FLIPPED: i32 = 1;
     /// A comparison of `src[I]` and `src[J]` waits for its result.
     pub const PENDING: i32 = 2;
+    /// A short list, sorted the way V8 sorts it ([`super::small_step`]): the state then
+    /// holds one region of `m` values, and LO, I and J are V8's `start`, `left` and
+    /// `right`.
+    pub const SMALL: i32 = 4;
+    /// The leading run is descending (SMALL).
+    pub const DESCENDING: i32 = 8;
+    /// The leading run is counted; binary insertion runs (SMALL).
+    pub const INSERTING: i32 = 16;
+    /// Lists shorter than this are SMALL: V8's TimSort sorts them as one run (its minimum
+    /// run length is then the length), so the same comparisons give the same order even
+    /// when the comparator is inconsistent (`(a, b) => a - b` over mixed types).
+    pub const SMALL_LEN: u32 = 64;
 }
 
 /// `%SortStart(list)`: the state of a merge sort of the dense array `list` by
@@ -281,6 +313,9 @@ pub(crate) fn sort_start(heap: &mut Heap, list: Obj) -> Result<Obj, Fault> {
     vals[WIDTH as usize] = Value::int(1);
     vals[J as usize] = Value::int(m.min(1) as i32);
     vals[LIST as usize] = Value::object(list);
+    if m < SMALL_LEN {
+        vals[FLAGS as usize] = Value::int(SMALL);
+    }
     Ok(heap.new_array_from_values(None, &vals)?)
 }
 
@@ -295,6 +330,9 @@ pub(crate) fn sort_step(heap: &mut Heap, st: Obj, v: f64) -> Result<bool, Fault>
     let int = |heap: &Heap, slot: u32| heap.value_array_get(el, slot).as_int().unwrap_or(0);
     let (mut w, mut lo) = (int(heap, WIDTH) as u32, int(heap, LO) as u32);
     let (mut i, mut j, flags) = (int(heap, I) as u32, int(heap, J) as u32, int(heap, FLAGS));
+    if flags & SMALL != 0 {
+        return small_step(heap, el, m, flags, v);
+    }
     let (mut src, mut dst) = (HEAD, HEAD + m);
     if flags & FLIPPED != 0 {
         core::mem::swap(&mut src, &mut dst);
@@ -360,6 +398,111 @@ pub(crate) fn sort_step(heap: &mut Heap, st: Obj, v: f64) -> Result<bool, Fault>
     if let Some(list) = heap.value_array_get(el, LIST).as_object() {
         for t in 0..m {
             let x = heap.value_array_get(el, src + t);
+            heap.set_element_fast(list, t, x)?;
+        }
+    }
+    Ok(false)
+}
+
+/// [`sort_step`] for a SMALL list: V8's `CountAndMakeRun` over the whole list (comparing
+/// each element with the one before it, and reversing a strictly descending run), then
+/// `BinaryInsertionSort` of the rest (comparing the pivot with the middle of the sorted
+/// prefix), with the same comparisons in the same order and argument order.
+fn small_step(heap: &mut Heap, el: u32, m: u32, mut flags: i32, v: f64) -> Result<bool, Fault> {
+    use sort_state::*;
+    let int = |heap: &Heap, slot: u32| heap.value_array_get(el, slot).as_int().unwrap_or(0) as u32;
+    let get = |heap: &Heap, k: u32| heap.value_array_get(el, HEAD + k);
+    let (mut start, mut left, mut right) = (int(heap, LO), int(heap, I), int(heap, J));
+    // SortCompare's result is below zero (NaN counts as 0, so it is not).
+    let less = v < 0.0;
+    let mut pending = flags & PENDING != 0;
+    if flags & INSERTING == 0 {
+        if !pending {
+            if m < 2 {
+                return small_finish(heap, el, m);
+            }
+            start = 1;
+        } else {
+            // The pending comparison was (list[start], list[start - 1]).
+            if start == 1 && less {
+                flags |= DESCENDING;
+            }
+            let descending = flags & DESCENDING != 0;
+            if start == 1 || descending == less {
+                start += 1;
+            } else {
+                flags |= INSERTING;
+            }
+        }
+        if flags & INSERTING == 0 && start < m {
+            return small_ask(heap, el, flags, start, 0, 0, start, start - 1);
+        }
+        // The leading run is list[0 .. start).
+        if flags & DESCENDING != 0 {
+            let (mut a, mut b) = (0, start - 1);
+            while a < b {
+                let (x, y) = (get(heap, a), get(heap, b));
+                heap.value_array_set(el, HEAD + a, y);
+                heap.value_array_set(el, HEAD + b, x);
+                (a, b) = (a + 1, b - 1);
+            }
+        }
+        flags |= INSERTING;
+        pending = false;
+        (left, right) = (0, start);
+    }
+    if pending {
+        // The pending comparison was (pivot, list[mid]).
+        let mid = left + ((right - left) >> 1);
+        if less {
+            right = mid;
+        } else {
+            left = mid + 1;
+        }
+    }
+    loop {
+        if start >= m {
+            return small_finish(heap, el, m);
+        }
+        if left < right {
+            let mid = left + ((right - left) >> 1);
+            return small_ask(heap, el, flags, start, left, right, start, mid);
+        }
+        // Insert the pivot list[start] at left.
+        let pivot = get(heap, start);
+        let mut p = start;
+        while p > left {
+            let x = get(heap, p - 1);
+            heap.value_array_set(el, HEAD + p, x);
+            p -= 1;
+        }
+        heap.value_array_set(el, HEAD + left, pivot);
+        start += 1;
+        (left, right) = (0, start);
+    }
+}
+
+/// Saves a SMALL sort's position and asks for the comparison (list[a], list[b]).
+#[allow(clippy::too_many_arguments)]
+fn small_ask(heap: &mut Heap, el: u32, flags: i32, start: u32, left: u32, right: u32, a: u32, b: u32) -> Result<bool, Fault> {
+    use sort_state::*;
+    for (slot, x) in [(LO, start), (I, left), (J, right)] {
+        heap.value_array_set(el, slot, Value::int(x as i32));
+    }
+    heap.value_array_set(el, FLAGS, Value::int(flags | PENDING));
+    for (slot, at) in [(X, a), (X + 1, b)] {
+        let x = heap.value_array_get(el, HEAD + at);
+        heap.value_array_set(el, slot, x);
+    }
+    Ok(true)
+}
+
+/// Writes a SMALL sort's list back.
+fn small_finish(heap: &mut Heap, el: u32, m: u32) -> Result<bool, Fault> {
+    use sort_state::*;
+    if let Some(list) = heap.value_array_get(el, LIST).as_object() {
+        for t in 0..m {
+            let x = heap.value_array_get(el, HEAD + t);
             heap.set_element_fast(list, t, x)?;
         }
     }

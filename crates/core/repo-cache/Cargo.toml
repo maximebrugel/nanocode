@@ -1,0 +1,24 @@
+[package]
+name = "nanocode-repo-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A per-host git object store per repository with one worktree per agent, laid out as git lays it out, and content-addressed transfers between stores"
+autotests = false
+autobenches = false
+
+[dependencies]
+nanocode-bytes.workspace = true
+nanocode-digest.workspace = true
+nanocode-shell.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false

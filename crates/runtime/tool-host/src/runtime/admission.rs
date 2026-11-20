@@ -8,6 +8,8 @@ use std::{
 
 use nanocode_sync::{Atom, Signal};
 
+use crate::FileAccess;
+
 type OriginKey = Option<Arc<str>>;
 
 #[derive(Clone, Copy, Default)]
@@ -18,12 +20,18 @@ struct Origin {
 }
 
 #[derive(Clone, Default)]
-struct GateState {
+struct Path {
     exclusive: Option<u64>,
     shared: usize,
+    holders: HashMap<OriginKey, usize>,
+    waiting: VecDeque<Waiter>,
+}
+
+#[derive(Clone, Default)]
+struct GateState {
+    paths: HashMap<Arc<str>, Path>,
     origins: HashMap<OriginKey, Origin>,
     granted: HashMap<u64, u64>,
-    waiting: VecDeque<Waiter>,
     epochs: u64,
 }
 
@@ -35,78 +43,52 @@ struct Waiter {
     admitted: Arc<Signal>,
 }
 
-const CLOSER: u64 = 1 << 32;
-
-const SHARED: u64 = CLOSER - 1;
-
 #[derive(Default)]
 pub(super) struct AdmissionGate {
     state: Atom<GateState>,
     tokens: AtomicU64,
-    fast: AtomicU64,
 }
 
 pub(super) struct Admission<'gate> {
     gate: &'gate AdmissionGate,
-    grant: Grant,
-}
-
-enum Grant {
-    Fast,
-    Shared {
-        token: u64,
-        origin: OriginKey,
-        epoch: Option<u64>,
-    },
-    Exclusive {
-        token: u64,
-    },
-}
-
-impl Admission<'_> {
-    const fn granted(&mut self, granted: Option<u64>) {
-        if let Grant::Shared { epoch, .. } = &mut self.grant {
-            *epoch = granted;
-        }
-    }
+    path: Arc<str>,
+    token: u64,
+    origin: OriginKey,
+    epoch: Option<u64>,
 }
 
 impl Drop for Admission<'_> {
     fn drop(&mut self) {
-        match &self.grant {
-            Grant::Fast => self.gate.release_fast(),
-            Grant::Shared {
-                token,
-                origin,
-                epoch,
-            } => self.gate.release(*token, origin, *epoch),
-            Grant::Exclusive { token } => {
-                self.gate.release(*token, &None, None);
-                self.gate.fast.fetch_sub(CLOSER, Ordering::SeqCst);
-            }
-        }
+        self.gate
+            .release(&self.path, self.token, &self.origin, self.epoch);
     }
 }
 
-enum Entry {
-    Admitted(Option<u64>),
-    Wait,
+impl Path {
+    const fn admits(&self, exclusive: bool) -> bool {
+        self.exclusive.is_none() && (!exclusive || self.shared == 0)
+    }
+
+    fn idle(&self) -> bool {
+        self.exclusive.is_none() && self.shared == 0 && self.waiting.is_empty()
+    }
 }
 
 impl GateState {
-    fn admits(&self, exclusive: bool, fast: &AtomicU64) -> bool {
-        self.exclusive.is_none()
-            && (!exclusive || (self.shared == 0 && fast.load(Ordering::SeqCst) & SHARED == 0))
-    }
-
     const fn next_epoch(&mut self) -> u64 {
         self.epochs += 1;
         self.epochs
     }
 
-    fn admit(&mut self, token: u64, exclusive: bool, origin: &OriginKey) -> Option<u64> {
+    fn admit(
+        &mut self,
+        path: &Arc<str>,
+        token: u64,
+        exclusive: bool,
+        origin: &OriginKey,
+    ) -> Option<u64> {
         if exclusive {
-            self.exclusive = Some(token);
+            self.paths.entry(Arc::clone(path)).or_default().exclusive = Some(token);
             return None;
         }
         if !self.origins.contains_key(origin) {
@@ -124,136 +106,104 @@ impl GateState {
             return None;
         }
         entry.count += 1;
-        self.shared += 1;
+        let held = self.paths.entry(Arc::clone(path)).or_default();
+        held.shared += 1;
+        *held.holders.entry(origin.clone()).or_default() += 1;
         Some(entry.epoch)
     }
 
-    fn release_shared(&mut self, origin: &OriginKey, epoch: u64) {
+    fn release_shared(&mut self, path: &Arc<str>, origin: &OriginKey, epoch: u64) {
         let Some(entry) = self.origins.get_mut(origin) else {
             return;
         };
         if entry.epoch != epoch || entry.count == 0 {
             return;
         }
+        let Some(held) = self.paths.get_mut(path) else {
+            return;
+        };
+        let Some(count) = held.holders.get_mut(origin) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            held.holders.remove(origin);
+        }
+        held.shared -= 1;
         entry.count -= 1;
-        self.shared -= 1;
         if entry.count == 0 && !entry.yielded {
             self.origins.remove(origin);
         }
     }
 
-    fn advance(&mut self, fast: &AtomicU64) -> Vec<Arc<Signal>> {
+    fn advance(&mut self, path: &Arc<str>) -> Vec<Arc<Signal>> {
         let mut admitted = Vec::new();
-        while self
-            .waiting
-            .front()
-            .is_some_and(|next| self.admits(next.exclusive, fast))
+        while let Some(next) = self
+            .paths
+            .get_mut(path)
+            .filter(|held| {
+                held.waiting
+                    .front()
+                    .is_some_and(|next| held.admits(next.exclusive))
+            })
+            .and_then(|held| held.waiting.pop_front())
         {
-            let Some(next) = self.waiting.pop_front() else {
-                break;
-            };
-            if let Some(epoch) = self.admit(next.token, next.exclusive, &next.origin) {
+            if let Some(epoch) = self.admit(path, next.token, next.exclusive, &next.origin) {
                 self.granted.insert(next.token, epoch);
             }
             admitted.push(next.admitted);
+        }
+        if self.paths.get(path).is_some_and(Path::idle) {
+            self.paths.remove(path);
         }
         admitted
     }
 }
 
 impl AdmissionGate {
-    pub(super) async fn admit(&self, exclusive: bool, origin: Option<&str>) -> Admission<'_> {
-        if !exclusive && origin.is_none() && self.admit_fast() {
-            return Admission {
-                gate: self,
-                grant: Grant::Fast,
-            };
-        }
-        if exclusive {
-            self.fast.fetch_add(CLOSER, Ordering::SeqCst);
-        }
+    pub(super) async fn admit(&self, access: FileAccess, origin: Option<&str>) -> Admission<'_> {
+        let (path, exclusive) = match access {
+            FileAccess::Read(path) => (path, false),
+            FileAccess::Write(path) => (path, true),
+        };
+        let path: Arc<str> = Arc::from(path);
+        let origin: OriginKey = (!exclusive).then(|| origin.map(Arc::from)).flatten();
         let token = self.tokens.fetch_add(1, Ordering::Relaxed);
-        let origin: OriginKey = origin.map(Arc::from);
         let mut admission = Admission {
             gate: self,
-            grant: if exclusive {
-                Grant::Exclusive { token }
-            } else {
-                Grant::Shared {
-                    token,
-                    origin: origin.clone(),
-                    epoch: None,
-                }
-            },
+            path: Arc::clone(&path),
+            token,
+            origin: origin.clone(),
+            epoch: None,
         };
-        let immediate = self.state.update(|state| {
-            if state.waiting.is_empty() && state.admits(exclusive, &self.fast) {
-                Entry::Admitted(state.admit(token, exclusive, &origin))
-            } else {
-                Entry::Wait
-            }
-        });
-        if let Entry::Admitted(epoch) = immediate {
-            admission.granted(epoch);
-            return admission;
-        }
         let admitted = Arc::new(Signal::new());
         let entry = self.state.update(|state| {
-            if state.waiting.is_empty() && state.admits(exclusive, &self.fast) {
-                Entry::Admitted(state.admit(token, exclusive, &origin))
+            let free = state
+                .paths
+                .get(&path)
+                .is_none_or(|held| held.waiting.is_empty() && held.admits(exclusive));
+            if free {
+                Entry::Admitted(state.admit(&path, token, exclusive, &origin))
             } else {
-                state.waiting.push_back(Waiter {
-                    token,
-                    exclusive,
-                    origin: origin.clone(),
-                    admitted: Arc::clone(&admitted),
-                });
+                state
+                    .paths
+                    .entry(Arc::clone(&path))
+                    .or_default()
+                    .waiting
+                    .push_back(Waiter {
+                        token,
+                        exclusive,
+                        origin: origin.clone(),
+                        admitted: Arc::clone(&admitted),
+                    });
                 Entry::Wait
             }
         });
         match entry {
-            Entry::Admitted(epoch) => {
-                admission.granted(epoch);
-                admission
-            }
-            Entry::Wait => {
-                if self.fast.load(Ordering::SeqCst) & SHARED == 0 {
-                    self.advance();
-                }
-                admitted.wait().await;
-                admission
-            }
+            Entry::Admitted(epoch) => admission.epoch = epoch,
+            Entry::Wait => admitted.wait().await,
         }
-    }
-
-    fn admit_fast(&self) -> bool {
-        let mut current = self.fast.load(Ordering::SeqCst);
-        loop {
-            if current >= CLOSER || current & SHARED == SHARED {
-                return false;
-            }
-            match self.fast.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    fn release_fast(&self) {
-        let previous = self.fast.fetch_sub(1, Ordering::SeqCst);
-        if previous >= CLOSER && previous & SHARED == 1 {
-            self.advance();
-        }
-    }
-
-    fn advance(&self) {
-        let admitted = self.state.update(|state| state.advance(&self.fast));
-        admitted.iter().for_each(|admitted| admitted.fire());
+        admission
     }
 
     pub(super) fn observed(&self, origin: &str, observed: bool) {
@@ -269,30 +219,48 @@ impl AdmissionGate {
                 return Vec::new();
             }
             let epoch = state.next_epoch();
-            let entry = state.origins.entry(key.clone()).or_default();
-            let released = entry.count;
-            *entry = Origin {
-                count: 0,
-                epoch,
-                yielded: true,
-            };
-            state.shared -= released;
-            state.advance(&self.fast)
+            state.origins.insert(
+                key.clone(),
+                Origin {
+                    count: 0,
+                    epoch,
+                    yielded: true,
+                },
+            );
+            let released = state
+                .paths
+                .iter_mut()
+                .filter_map(|(path, held)| {
+                    held.shared -= held.holders.remove(&key)?;
+                    Some(Arc::clone(path))
+                })
+                .collect::<Vec<_>>();
+            released
+                .iter()
+                .flat_map(|path| state.advance(path))
+                .collect::<Vec<_>>()
         });
         admitted.iter().for_each(|admitted| admitted.fire());
     }
 
-    fn release(&self, token: u64, origin: &OriginKey, epoch: Option<u64>) {
+    fn release(&self, path: &Arc<str>, token: u64, origin: &OriginKey, epoch: Option<u64>) {
         let admitted = self.state.update(|state| {
-            state.waiting.retain(|waiter| waiter.token != token);
-            if state.exclusive == Some(token) {
-                state.exclusive = None;
+            if let Some(held) = state.paths.get_mut(path) {
+                held.waiting.retain(|waiter| waiter.token != token);
+                if held.exclusive == Some(token) {
+                    held.exclusive = None;
+                }
             }
             if let Some(epoch) = epoch.or_else(|| state.granted.remove(&token)) {
-                state.release_shared(origin, epoch);
+                state.release_shared(path, origin, epoch);
             }
-            state.advance(&self.fast)
+            state.advance(path)
         });
         admitted.iter().for_each(|admitted| admitted.fire());
     }
+}
+
+enum Entry {
+    Admitted(Option<u64>),
+    Wait,
 }

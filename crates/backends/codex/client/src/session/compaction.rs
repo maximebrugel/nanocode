@@ -496,21 +496,27 @@ pub fn truncate_middle_with_token_budget(text: &str, max_tokens: usize) -> Strin
     if max_tokens > 0 && text.len() <= max_bytes {
         return text.to_owned();
     }
-    if max_bytes == 0 {
-        return format!("…{} tokens truncated…", approx_tokens(text.len()));
+    let widest = truncation_marker(approx_tokens(text.len()));
+    if max_bytes <= widest.len() {
+        return widest;
     }
-    let left_budget = max_bytes / 2;
-    let right_budget = max_bytes - left_budget;
+    let kept = max_bytes - widest.len();
+    let left_budget = kept / 2;
+    let right_budget = kept - left_budget;
     let prefix_end = text.floor_char_boundary(left_budget);
     let suffix_start = text
         .ceil_char_boundary(text.len().saturating_sub(right_budget))
         .max(prefix_end);
-    let removed = approx_tokens(text.len().saturating_sub(max_bytes));
     format!(
-        "{}…{removed} tokens truncated…{}",
+        "{}{}{}",
         &text[..prefix_end],
+        truncation_marker(approx_tokens(suffix_start - prefix_end)),
         &text[suffix_start..]
     )
+}
+
+fn truncation_marker(removed_tokens: usize) -> String {
+    format!("…{removed_tokens} tokens truncated…")
 }
 
 #[must_use]

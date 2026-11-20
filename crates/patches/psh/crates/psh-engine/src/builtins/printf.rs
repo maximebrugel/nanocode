@@ -1,9 +1,10 @@
 //! `printf [-v var] format [arguments]`: the format is reused until the arguments are
-//! consumed; conversions `d i o u x X c s b q f F e E g G %`.
+//! consumed; conversions `d i o u x X c s b q f F e E g G a A %`.
 
 use crate::escape::{Dialect, decode};
 use crate::state::{R, Vp, is_name};
 
+use super::ldouble::{self, Ld};
 use super::{out, shell_quote};
 
 fn s(b: &[u8]) -> std::borrow::Cow<'_, str> {
@@ -68,22 +69,39 @@ pub(super) async fn printf(vp: &mut Vp, args: &[Vec<u8>]) -> R {
         next: 0,
         out: Vec::new(),
         errors: Vec::new(),
+        failed: false,
         stop: false,
+        huge: false,
         utf8: vp.utf8(),
     };
+    // bash reports a pass's errors as they happen and writes its output at the end of
+    // each pass through the format.
+    let mut status = 0;
+    let mut write_st = 0;
     loop {
         let before = f.next;
         f.run(format);
+        status |= i32::from(std::mem::take(&mut f.failed));
+        for e in std::mem::take(&mut f.errors) {
+            vp.error(&format!("printf: {e}")).await;
+        }
+        if f.huge {
+            vp.error("printf: cannot allocate memory").await;
+            return Err(crate::state::Unwind::Exit(2));
+        }
+        if var.is_none() && !f.out.is_empty() && write_st == 0 {
+            write_st = out(vp, "printf", &std::mem::take(&mut f.out)).await?;
+        }
         if f.stop || f.next >= f.args.len() || f.next == before {
             break;
         }
     }
-    let status = i32::from(!f.errors.is_empty());
-    for e in &f.errors {
-        vp.error(&format!("printf: {e}")).await;
-    }
     match var {
         Some(n) => {
+            // bash stores the result as a C string: it ends at the first NUL.
+            if let Some(end) = f.out.iter().position(|&b| b == 0) {
+                f.out.truncate(end);
+            }
             // `NAME` or `NAME[SUB]`, with the variable's attributes.
             let r = match n.split_once('[') {
                 Some((base, sub)) => {
@@ -99,28 +117,8 @@ pub(super) async fn printf(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             }
             Ok(status)
         }
-        None => {
-            let st = out(vp, "printf", &f.out).await?;
-            Ok(if st != 0 { st } else { status })
-        }
+        None => Ok(if write_st != 0 { write_st } else { status }),
     }
-}
-
-/// `%#q`: always single quotes (`'it'\''s'`), unless control characters need `$'…'`.
-fn single_quote(v: &[u8], utf8: bool) -> Vec<u8> {
-    if super::set::needs_ansi(v, utf8) {
-        return shell_quote(v, utf8);
-    }
-    let mut out = vec![b'\''];
-    for &b in v {
-        if b == b'\'' {
-            out.extend_from_slice(b"'\\''");
-        } else {
-            out.push(b);
-        }
-    }
-    out.push(b'\'');
-    out
 }
 
 /// `-v`'s target: a name, or a name with a non-empty subscript ending the word.
@@ -191,7 +189,11 @@ struct Formatter<'a> {
     next: usize,
     out: Vec<u8>,
     errors: Vec<String>,
+    /// An error (not only a warning) was reported in this pass.
+    failed: bool,
     stop: bool,
+    /// A width or precision too large to format: bash runs out of memory and exits.
+    huge: bool,
     utf8: bool,
 }
 
@@ -204,6 +206,10 @@ struct Spec {
     alt: bool,
     width: Option<usize>,
     prec: Option<usize>,
+    /// The precision was `*`, taken from an argument.
+    prec_star: bool,
+    /// The precision was a bare `.`, with no digits.
+    prec_bare: bool,
 }
 
 impl Formatter<'_> {
@@ -218,12 +224,13 @@ impl Formatter<'_> {
     /// An integer argument for a signed conversion (also `*` widths): clamped to
     /// the range of `i64` with an error, as `strtoimax` does.
     fn num_arg(&mut self) -> i64 {
-        let Some(a) = self.arg().map(<[u8]>::to_vec) else {
+        // A missing or empty argument is 0 (`strtoimax` stops at once, at the end).
+        let Some(a) = self.arg().map(<[u8]>::to_vec).filter(|a| !a.is_empty()) else {
             return 0;
         };
-        let n = parse_num(&a);
+        let n = parse_num(&a, self.utf8);
         if !n.ok {
-            self.errors.push(format!("{}: invalid number", s(&a)));
+            self.fail(invalid_number(&a));
         }
         let limit = if n.neg {
             1u128 << 63
@@ -231,8 +238,9 @@ impl Formatter<'_> {
             (1u128 << 63) - 1
         };
         if n.overflow || n.mag > limit {
-            self.errors
-                .push(format!("{}: Numerical result out of range", s(&a)));
+            if n.ok {
+                self.warn_range(&a);
+            }
             return if n.neg { i64::MIN } else { i64::MAX };
         }
         if n.neg {
@@ -242,47 +250,69 @@ impl Formatter<'_> {
         }
     }
 
+    /// A `*` width or precision: an `int`. bash clamps it to `int`'s range, except
+    /// when it is the last argument, which it truncates instead.
+    fn star_arg(&mut self) -> i64 {
+        let v = self.num_arg();
+        if self.next >= self.args.len() {
+            i64::from(v as i32)
+        } else {
+            v.clamp(i32::MIN.into(), i32::MAX.into())
+        }
+    }
+
     /// An integer argument for an unsigned conversion: negative values wrap around,
     /// as `strtoumax` does.
     fn unsigned_arg(&mut self) -> u64 {
-        let Some(a) = self.arg().map(<[u8]>::to_vec) else {
+        let Some(a) = self.arg().map(<[u8]>::to_vec).filter(|a| !a.is_empty()) else {
             return 0;
         };
-        let n = parse_num(&a);
+        let n = parse_num(&a, self.utf8);
         if !n.ok {
-            self.errors.push(format!("{}: invalid number", s(&a)));
+            self.fail(invalid_number(&a));
         }
         if n.overflow {
-            self.errors
-                .push(format!("{}: Numerical result out of range", s(&a)));
+            if n.ok {
+                self.warn_range(&a);
+            }
             return u64::MAX;
         }
         let v = n.mag as u64;
         if n.neg { v.wrapping_neg() } else { v }
     }
 
-    fn float_arg(&mut self) -> f64 {
-        match self.arg() {
-            None => 0.0,
-            Some(a) => {
-                let a = a.to_vec();
-                let t = s(&a);
-                let t = t.trim();
-                if let Some(c) = t.strip_prefix(['\'', '"']) {
-                    return c.chars().next().map_or(0.0, |c| f64::from(c as u32));
-                }
-                match t.parse::<f64>() {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let n = parse_num(&a);
-                        if !n.ok {
-                            self.errors.push(format!("{}: invalid number", s(&a)));
-                        }
-                        if n.neg { -(n.mag as f64) } else { n.mag as f64 }
-                    }
-                }
-            }
+    /// A floating-point argument, converted as `strtold` does: a `long double`.
+    fn float_arg(&mut self) -> Ld {
+        let zero = Ld::Fin(false, 0, 0);
+        let Some(a) = self.arg().map(<[u8]>::to_vec) else {
+            return zero;
+        };
+        if let Some(v) = char_code(&a, self.utf8) {
+            return Ld::from_u64(u64::from(v));
         }
+        if a.is_empty() {
+            return zero;
+        }
+        // What strtold converts of it, with an error for the rest (`2228e9x` is
+        // 2228e9), or a warning when it is out of range.
+        let p = ldouble::strtold(&a);
+        if p.used < a.len() {
+            self.fail(invalid_number(&a));
+        } else if p.erange {
+            self.warn_range(&a);
+        }
+        p.value
+    }
+
+    fn fail(&mut self, msg: String) {
+        self.failed = true;
+        self.errors.push(msg);
+    }
+
+    /// bash's warning for a number out of range: reported, but not an error.
+    fn warn_range(&mut self, a: &[u8]) {
+        self.errors
+            .push(format!("warning: {}: Numerical result out of range", s(a)));
     }
 
     fn run(&mut self, fmt: &[u8]) {
@@ -312,7 +342,7 @@ impl Formatter<'_> {
                     }
                 }
                 self.out
-                    .extend_from_slice(&decode(&fmt[i..j], Dialect::Printf).bytes);
+                    .extend_from_slice(&decode(&fmt[i..j], Dialect::Printf, self.utf8).bytes);
                 i = j;
                 continue;
             }
@@ -345,7 +375,7 @@ impl Formatter<'_> {
                 i += 1;
             }
             if i < fmt.len() && fmt[i] == b'*' {
-                let w = self.num_arg();
+                let w = self.star_arg();
                 if w < 0 {
                     spec.left = true;
                 }
@@ -363,32 +393,49 @@ impl Formatter<'_> {
             if i < fmt.len() && fmt[i] == b'.' {
                 i += 1;
                 if i < fmt.len() && fmt[i] == b'*' {
-                    spec.prec = Some(self.num_arg().max(0) as usize);
+                    // A negative `*` precision is as if none were given.
+                    let p = self.star_arg();
+                    spec.prec = usize::try_from(p).ok();
+                    spec.prec_star = true;
                     i += 1;
                 } else {
                     let st = i;
                     while i < fmt.len() && fmt[i].is_ascii_digit() {
                         i += 1;
                     }
+                    spec.prec_bare = i == st;
                     spec.prec = Some(s(&fmt[st..i]).parse().unwrap_or(0));
                 }
+            }
+            const HUGE: usize = i32::MAX as usize;
+            // A string conversion only cuts at its precision; a number pads to it.
+            let numeric = fmt[i..]
+                .iter()
+                .find(|b| !b"hlLqjzt".contains(b))
+                .is_some_and(|b| b"diouxXeEfFgGaA".contains(b));
+            if spec.width.unwrap_or(0) >= HUGE || (numeric && spec.prec.unwrap_or(0) >= HUGE) {
+                self.huge = true;
+                self.stop = true;
+                return;
             }
             if fmt.get(i) == Some(&b'(') {
                 // `%(strftime format)T`
                 let Some(close) = fmt[i..].iter().position(|&b| b == b')') else {
-                    self.errors
-                        .push(format!("`{}': missing format character", s(&fmt[start..])));
+                    self.fail(format!("`{}': missing format character", s(&fmt[start..])));
                     self.stop = true;
                     break;
                 };
-                let tfmt = fmt[i + 1..i + close].to_vec();
+                // An empty format is `%X` (bash).
+                let tfmt = match &fmt[i + 1..i + close] {
+                    [] => b"%X".to_vec(),
+                    t => t.to_vec(),
+                };
                 i += close + 1;
                 if fmt.get(i) != Some(&b'T') {
                     let shown = fmt
                         .get(i)
                         .map_or(String::new(), |&c| (c as char).to_string());
-                    self.errors
-                        .push(format!("`{shown}': invalid format character"));
+                    self.fail(format!("`{shown}': invalid format character"));
                     self.stop = true;
                     break;
                 }
@@ -401,8 +448,7 @@ impl Formatter<'_> {
                 i += 1;
             }
             let Some(&conv) = fmt.get(i) else {
-                self.errors
-                    .push(format!("`{}': missing format character", s(&fmt[start..])));
+                self.fail(format!("`{}': missing format character", s(&fmt[start..])));
                 self.stop = true;
                 break;
             };
@@ -414,16 +460,15 @@ impl Formatter<'_> {
     /// `%(fmt)T`: an argument of seconds since the epoch (`-1` or none: now, `-2`:
     /// when the shell started) formatted with `strftime`.
     fn time(&mut self, tfmt: &[u8], spec: &Spec) {
-        let t = match self.arg().map(<[u8]>::to_vec) {
-            None => self.now,
-            Some(a) if a.is_empty() => self.now,
-            Some(a) => {
-                let n = parse_num(&a);
-                if !n.ok {
-                    self.errors.push(format!("{}: invalid number", s(&a)));
-                }
-                let v = if n.neg { -(n.mag as i64) } else { n.mag as i64 };
-                if v == -1 || v == -2 { self.now } else { v }
+        // Only a missing argument means now: an empty one is 0, as for %d. A time
+        // localtime can't give a year for (one out of range warns) falls back to 0.
+        let t = if self.args.get(self.next).is_none() {
+            self.now
+        } else {
+            match self.num_arg() {
+                -1 | -2 => self.now,
+                v if !(-67_768_040_609_740_800..=67_768_036_191_676_799).contains(&v) => 0,
+                v => v,
             }
         };
         let utc = super::strftime::Zone::utc();
@@ -451,10 +496,11 @@ impl Formatter<'_> {
             self.out.extend(std::iter::repeat_n(b' ', fill));
         } else if spec.zero && numeric {
             // Zeros go after the sign or 0x prefix.
-            let split = if body.starts_with(b"0x") || body.starts_with(b"0X") {
-                2
+            let sign = usize::from(matches!(body.first(), Some(b'-' | b'+' | b' ')));
+            let split = if body[sign..].starts_with(b"0x") || body[sign..].starts_with(b"0X") {
+                sign + 2
             } else {
-                usize::from(matches!(body.first(), Some(b'-' | b'+' | b' ')))
+                sign
             };
             self.out.extend_from_slice(&body[..split]);
             self.out.extend(std::iter::repeat_n(b'0', fill));
@@ -469,30 +515,30 @@ impl Formatter<'_> {
         match conv {
             b's' | b'b' | b'q' | b'Q' => {
                 let mut a = self.arg().map(<[u8]>::to_vec).unwrap_or_default();
-                // `%Q`: the precision cuts the argument, before it is quoted.
+                // `%Q` (bash 5.2): a precision of digits cuts the argument before it
+                // is quoted and the quoted text is printed whole; a bare `.` prints
+                // nothing; a `*` precision is read but ignored. `#` changes nothing.
                 if conv == b'Q'
+                    && !spec.prec_star
+                    && !spec.prec_bare
                     && let Some(p) = spec.prec
                 {
                     a.truncate(p);
                 }
                 let utf8 = self.utf8;
-                let quote = |a: &[u8]| {
-                    if spec.alt {
-                        single_quote(a, utf8)
-                    } else {
-                        shell_quote(a, utf8)
-                    }
-                };
                 let mut body = match conv {
                     b's' => a,
-                    b'q' => quote(&a),
+                    b'q' => shell_quote(&a, utf8),
                     b'Q' => {
-                        let q = quote(&a);
+                        let mut q = shell_quote(&a, utf8);
+                        if spec.prec_bare {
+                            q.clear();
+                        }
                         self.pad(&q, spec, false);
                         return;
                     }
                     _ => {
-                        let d = decode(&a, Dialect::PercentB);
+                        let d = decode(&a, Dialect::PercentB, utf8);
                         if d.stop {
                             self.stop = true;
                         }
@@ -506,7 +552,8 @@ impl Formatter<'_> {
             }
             b'c' => {
                 let a = self.arg().map(<[u8]>::to_vec).unwrap_or_default();
-                let body: Vec<u8> = a.first().map(|b| vec![*b]).unwrap_or_default();
+                // An empty or missing argument is a NUL byte (bash).
+                let body = vec![a.first().copied().unwrap_or(0)];
                 self.pad(&body, spec, false);
             }
             b'd' | b'i' => {
@@ -545,6 +592,13 @@ impl Formatter<'_> {
                     while digits.len() < p {
                         digits.insert(0, '0');
                     }
+                    // C: a zero precision prints no digits for zero.
+                    if p == 0 && v == 0 {
+                        digits.clear();
+                    }
+                }
+                if spec.alt && conv == b'o' && v == 0 && digits.is_empty() {
+                    digits.push('0');
                 }
                 if spec.alt && v != 0 {
                     match conv {
@@ -557,92 +611,25 @@ impl Formatter<'_> {
                 let numeric = spec.prec.is_none();
                 self.pad(digits.as_bytes(), spec, numeric);
             }
-            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
+            b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => {
                 let v = self.float_arg();
-                let prec = spec.prec.unwrap_or(6);
-                let mut body = match conv {
-                    // `#` keeps the point even without decimals.
-                    b'f' | b'F' if spec.alt && prec == 0 && v.is_finite() => format!("{v:.0}."),
-                    b'f' | b'F' => format!("{v:.prec$}"),
-                    b'e' | b'E' if spec.alt && prec == 0 && v.is_finite() => {
-                        fmt_e(v, 0).replacen('e', ".e", 1)
-                    }
-                    b'e' | b'E' => fmt_e(v, prec),
-                    _ => fmt_g(v, prec, spec.alt),
-                };
-                if conv.is_ascii_uppercase() {
-                    body = body.to_uppercase();
+                let mut body = ldouble::format(v, conv, spec.prec, spec.alt);
+                if v.neg() {
+                    body.insert(0, '-');
+                } else if spec.plus {
+                    body.insert(0, '+');
+                } else if spec.space {
+                    body.insert(0, ' ');
                 }
-                if v >= 0.0 && !body.starts_with('-') {
-                    if spec.plus {
-                        body.insert(0, '+');
-                    } else if spec.space {
-                        body.insert(0, ' ');
-                    }
-                }
-                self.pad(body.as_bytes(), spec, true);
+                // inf and nan are padded with blanks, never zeros.
+                self.pad(body.as_bytes(), spec, v.is_finite());
             }
             other => {
-                self.errors
-                    .push(format!("`{}': invalid format character", other as char));
+                self.fail(format!("`{}': invalid format character", other as char));
                 self.stop = true;
             }
         }
     }
-}
-
-/// C's `%e`: `d.dddddde+XX`.
-fn fmt_e(v: f64, prec: usize) -> String {
-    if !v.is_finite() {
-        return if v.is_nan() {
-            "nan".into()
-        } else if v > 0.0 {
-            "inf".into()
-        } else {
-            "-inf".into()
-        };
-    }
-    let s = format!("{v:.prec$e}");
-    let (mant, exp) = s.split_once('e').unwrap_or((&s, "0"));
-    let exp: i32 = exp.parse().unwrap_or(0);
-    let sign = if exp < 0 { '-' } else { '+' };
-    format!("{mant}e{sign}{:02}", exp.abs())
-}
-
-/// C's `%g`: the shorter of `%e` and `%f` with `prec` significant digits, trailing
-/// zeros removed unless `#`.
-fn fmt_g(v: f64, prec: usize, alt: bool) -> String {
-    if !v.is_finite() {
-        return fmt_e(v, 0);
-    }
-    let p = if prec == 0 { 1 } else { prec };
-    let exp = if v == 0.0 {
-        0
-    } else {
-        let e = format!("{v:.*e}", p - 1);
-        e.split_once('e')
-            .and_then(|(_, x)| x.parse::<i32>().ok())
-            .unwrap_or(0)
-    };
-    let mut out = if exp < -4 || exp >= p as i32 {
-        fmt_e(v, p - 1)
-    } else {
-        let decimals = (p as i32 - 1 - exp).max(0) as usize;
-        format!("{v:.decimals$}")
-    };
-    if !alt {
-        let (num, suffix) = match out.find('e') {
-            Some(i) => (out[..i].to_string(), out[i..].to_string()),
-            None => (out.clone(), String::new()),
-        };
-        let num = if num.contains('.') {
-            num.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            num
-        };
-        out = format!("{num}{suffix}");
-    }
-    out
 }
 
 struct Num {
@@ -655,19 +642,45 @@ struct Num {
     ok: bool,
 }
 
+/// A `'c` or `"c` argument (the quote first, no blanks before it): the code of the
+/// character after the quote, as bash's `asciicode` does with `mbtowc`. In a UTF-8
+/// locale a valid multibyte character gives its code point; otherwise (or in the C
+/// locale) the first byte. Nothing after the quote is 0.
+fn char_code(a: &[u8], utf8: bool) -> Option<u32> {
+    let rest = a.strip_prefix(b"'").or_else(|| a.strip_prefix(b"\""))?;
+    let Some(&first) = rest.first() else {
+        return Some(0);
+    };
+    if utf8 && first >= 0x80 {
+        let n = match first {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => 0,
+        };
+        if let Some(c) = rest
+            .get(..n)
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|t| t.chars().next())
+        {
+            return Some(u32::from(c));
+        }
+    }
+    Some(u32::from(first))
+}
+
 /// Parses an integer argument like `strtoimax` with base 0, plus `'c` for a char code.
-fn parse_num(a: &[u8]) -> Num {
-    let t = s(a);
-    let t = t.trim_start();
-    if let Some(c) = t.strip_prefix(['\'', '"']) {
-        let v = c.chars().next().map_or(0, |c| u128::from(u32::from(c)));
+fn parse_num(a: &[u8], utf8: bool) -> Num {
+    if let Some(v) = char_code(a, utf8) {
         return Num {
             neg: false,
-            mag: v,
+            mag: u128::from(v),
             overflow: false,
             ok: true,
         };
     }
+    let t = s(a);
+    let t = t.trim_start();
     let (neg, body) = match t.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
@@ -698,5 +711,41 @@ fn parse_num(a: &[u8]) -> Num {
         mag,
         overflow,
         ok,
+    }
+}
+
+/// bash's `sh_invalidnum`: what kind of number the argument looked like.
+fn invalid_number(a: &[u8]) -> String {
+    let kind = match a {
+        [b'0', d, ..] if d.is_ascii_digit() => "invalid octal number",
+        [b'0', b'x', ..] => "invalid hex number",
+        _ => "invalid number",
+    };
+    format!("{}: {kind}", s(a))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{char_code, parse_num, shell_quote};
+
+    #[test]
+    fn char_constant_follows_the_locale() {
+        // `printf %d "'é"`: the code point in UTF-8, the first byte in C.
+        assert_eq!(char_code("'été'-x".as_bytes(), true), Some(0xE9));
+        assert_eq!(char_code("'été'-x".as_bytes(), false), Some(0xC3));
+        // An invalid sequence is its first byte even in UTF-8.
+        assert_eq!(char_code(b"'\xff", true), Some(0xFF));
+        assert_eq!(char_code(b"\"", true), Some(0));
+        // Blanks before the quote make it an ordinary (invalid) number.
+        assert_eq!(char_code(b" 'a", true), None);
+        assert_eq!(parse_num("'é".as_bytes(), false).mag, 0xC3);
+        assert!(!parse_num(b" 'a", false).ok);
+    }
+
+    #[test]
+    fn percent_q_leaves_a_leading_equals_alone() {
+        assert_eq!(shell_quote(b"=v", true), b"=v");
+        assert_eq!(shell_quote(b"=~", true), b"=\\~");
+        assert_eq!(shell_quote(b"~=", true), b"\\~=");
     }
 }

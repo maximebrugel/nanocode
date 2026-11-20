@@ -336,6 +336,7 @@ pub const IMMORTAL: isize = if size_of::<isize>() > size_of::<u32>() {
 };
 
 pub const TPFLAGS_HEAPTYPE: c_ulong = 1 << 9;
+pub const TPFLAGS_DISALLOW_INSTANTIATION: c_ulong = 1 << 7;
 pub const TPFLAGS_MANAGED_DICT: c_ulong = 1 << 4;
 pub const TPFLAGS_BASETYPE: c_ulong = 1 << 10;
 pub const TPFLAGS_READY: c_ulong = 1 << 12;

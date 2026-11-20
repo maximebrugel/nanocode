@@ -16,6 +16,9 @@ dependencies = [
 [[package]]
 name = "nanocode-bytes"
 version = "0.7.0"
+dependencies = [
+ "nanocode-sys",
+]
 
 [[package]]
 name = "nanocode-compression"
@@ -60,6 +63,7 @@ dependencies = [
 name = "psh"
 version = "0.0.0"
 dependencies = [
+ "nanocode-sys",
  "psh-classify",
  "psh-engine",
  "psh-os",

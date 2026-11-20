@@ -31,9 +31,11 @@ struct State {
     effects: BTreeMap<String, u64>,
     sent: BTreeMap<String, BTreeSet<u64>>,
     acked: BTreeMap<String, BTreeMap<u64, String>>,
-    seen: BTreeMap<String, BTreeSet<u64>>,
+    seen: BTreeMap<String, BTreeSet<(u64, u64)>>,
     cancelled: BTreeMap<String, BTreeSet<u64>>,
     receipts: BTreeSet<String>,
+    durable_receipts: BTreeMap<String, u64>,
+    epoch: u64,
     holds_receipts: bool,
     crash_pending: bool,
     violations: Vec<String>,
@@ -141,7 +143,12 @@ impl World {
 
     pub fn see(&self, label: &str, turn: u64) {
         self.with(|state| {
-            state.seen.entry(label.to_owned()).or_default().insert(turn);
+            let epoch = state.epoch;
+            state
+                .seen
+                .entry(label.to_owned())
+                .or_default()
+                .insert((epoch, turn));
         });
     }
 
@@ -150,7 +157,7 @@ impl World {
             state
                 .seen
                 .get(label)
-                .is_some_and(|seen| seen.contains(&turn))
+                .is_some_and(|seen| seen.contains(&(state.epoch, turn)))
         })
     }
 
@@ -173,6 +180,28 @@ impl World {
         if self.with(|state| state.receipts.insert(label.to_owned())) {
             self.trace(&format!("receipt {label}"));
         }
+    }
+
+    pub fn durable_receipt(&self, label: &str) {
+        self.with(|state| {
+            let epoch = state.epoch;
+            state
+                .durable_receipts
+                .entry(label.to_owned())
+                .or_insert(epoch);
+        });
+    }
+
+    pub fn durable_receipt_epoch(&self, label: &str) -> Option<u64> {
+        self.with(|state| state.durable_receipts.get(label).copied())
+    }
+
+    pub fn begin_epoch(&self, epoch: u64) {
+        self.with(|state| state.epoch = epoch);
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.with(|state| state.epoch)
     }
 
     pub fn receipted(&self, label: &str) -> bool {

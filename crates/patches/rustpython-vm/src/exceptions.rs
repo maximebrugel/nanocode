@@ -99,12 +99,21 @@ impl VirtualMachine {
     /// Print exception chain by calling sys.excepthook
     pub fn print_exception(&self, exc: &Py<PyBaseException>) {
         let vm = self;
-        let write_fallback = |exc, errstr| {
+        let write_fallback = |exc: &Py<PyBaseException>, errstr: &str| {
             if let Ok(stderr) = sys::get_stderr(vm) {
                 let mut stderr = py_io::PyWriter(stderr, vm);
                 // if this fails stderr might be closed -- ignore it
                 let _ = writeln!(stderr, "{errstr}");
-                let _ = self.write_exception(&mut stderr, exc);
+                // Format as the default excepthook does (source lines, carets), as
+                // CPython's PyErr_Display does; fall back to the native printer.
+                let shown = vm
+                    .import("traceback", 0)
+                    .and_then(|tb| tb.get_attr("_print_exception_bltin", vm))
+                    .and_then(|print| print.call((exc.as_object().to_owned(),), vm))
+                    .is_ok();
+                if !shown {
+                    let _ = self.write_exception(&mut stderr, exc);
+                }
             } else {
                 eprintln!("{errstr}\nlost sys.stderr");
                 let _ = self.write_exception(&mut py_io::IoWriter(io::stderr()), exc);
@@ -114,7 +123,7 @@ impl VirtualMachine {
             let (exc_type, exc_val, exc_tb) = vm.split_exception(exc.to_owned());
             if let Err(eh_exc) = excepthook.call((exc_type, exc_val, exc_tb), vm) {
                 write_fallback(&eh_exc, "Error in sys.excepthook:");
-                write_fallback(exc, "Original exception was:");
+                write_fallback(exc, "\nOriginal exception was:");
             }
         } else {
             write_fallback(exc, "missing sys.excepthook");

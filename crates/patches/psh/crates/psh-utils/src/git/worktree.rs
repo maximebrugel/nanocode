@@ -645,6 +645,8 @@ struct Scan<'w, 'r, 'a> {
     spec: &'w Pathspec,
     found: Vec<Vec<u8>>,
     rules: Rules,
+    /// Whether the .gitignore files met on the way apply.
+    ignores: bool,
 }
 
 impl Scan<'_, '_, '_> {
@@ -662,6 +664,7 @@ impl Scan<'_, '_, '_> {
         let names = self.work.later(fs.list(&full))?.unwrap_or_default();
         let mut pushed = false;
         if !hidden
+            && self.ignores
             && names.iter().any(|n| n == b".gitignore")
             && let Some(text) = self
                 .work
@@ -758,9 +761,12 @@ pub fn untracked(
     spec: &Pathspec,
     env: &dyn Fn(&[u8]) -> Option<Vec<u8>>,
 ) -> Res<Vec<Vec<u8>>> {
-    if mode == Untracked::No {
-        return Ok(Vec::new());
-    }
+    scan_untracked(work, mode, spec, env, true)
+}
+
+/// The ignore files outside the worktree that apply everywhere: the global one and
+/// info/exclude, outermost first.
+fn base_rules(work: &Work<'_, '_>, env: &dyn Fn(&[u8]) -> Option<Vec<u8>>) -> Res<Vec<Gitignore>> {
     let fs = work.repo.fs;
     let mut stack = Vec::new();
     let global = match work.repo.config.get("core.excludesfile") {
@@ -783,12 +789,67 @@ pub fn untracked(
     if let Some(text) = fs.read_opt(&join(&work.repo.common_dir, b"info/exclude"))? {
         stack.push(rules(b"", &text));
     }
+    Ok(stack)
+}
+
+/// Whether the ignore rules exclude a path (relative to the worktree's root), or a
+/// directory it is in, as git check-ignore says it. A tracked path is never ignored.
+pub fn ignored(
+    work: &Work<'_, '_>,
+    path: &[u8],
+    env: &dyn Fn(&[u8]) -> Option<Vec<u8>>,
+) -> Res<bool> {
+    if work.tracked_mode(path).is_some() {
+        return Ok(false);
+    }
+    let fs = work.repo.fs;
+    let mut stack = Rules {
+        stack: base_rules(work, env)?,
+    };
+    let mut start = 0;
+    loop {
+        let dir = if start == 0 { &path[..0] } else { &path[..start - 1] };
+        if let Some(text) = fs.read_opt(&join(&join(&work.root, dir), b".gitignore"))? {
+            stack.stack.push(rules(dir, &text));
+        }
+        let end = path[start..]
+            .iter()
+            .position(|&b| b == b'/')
+            .map_or(path.len(), |at| start + at);
+        let is_dir = end < path.len()
+            || fs
+                .stat_opt(&join(&work.root, path), true)?
+                .is_some_and(|meta| meta.kind == FileKind::Dir);
+        if stack.ignored(&path[..end], is_dir) {
+            return Ok(true);
+        }
+        if end == path.len() {
+            return Ok(false);
+        }
+        start = end + 1;
+    }
+}
+
+/// The untracked files, with the ignore files applied only when ignores is on (as
+/// ls-files --others lists them without --exclude-standard).
+pub fn scan_untracked(
+    work: &Work<'_, '_>,
+    mode: Untracked,
+    spec: &Pathspec,
+    env: &dyn Fn(&[u8]) -> Option<Vec<u8>>,
+    ignores: bool,
+) -> Res<Vec<Vec<u8>>> {
+    if mode == Untracked::No {
+        return Ok(Vec::new());
+    }
+    let stack = if ignores { base_rules(work, env)? } else { Vec::new() };
     let mut scan = Scan {
         work,
         mode,
         spec,
         found: Vec::new(),
         rules: Rules { stack },
+        ignores,
     };
     scan.walk(b"", true, false)?;
     // Every tracked file that is there was passed, when nothing limited the walk.

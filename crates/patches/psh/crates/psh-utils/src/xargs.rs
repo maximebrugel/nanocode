@@ -12,7 +12,7 @@
 
 use std::task::Poll;
 
-use psh_engine::util::{SpawnEnv, UtilChild, UtilCtx};
+use psh_engine::util::{STANDALONE_BUILTINS, SpawnEnv, UtilChild, UtilCtx};
 
 use crate::common;
 use crate::opts::{Spec, both, flag, long};
@@ -638,6 +638,7 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
     let lines_mode = o.max_lines.is_some();
     let replace_mode = o.replace.is_some();
     let mut args: Vec<Vec<u8>> = Vec::new();
+    let mut nul_warned = false;
     let mut size = base;
     let mut lines = 0usize;
     loop {
@@ -658,12 +659,21 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 g => g,
             }
         } else {
-            reader
+            let got = reader
                 .next_word(ctx, &input, lines_mode || replace_mode, replace_mode)
-                .await
+                .await;
+            if !nul_warned && matches!(&got, Got::Item(i) if i.contains(&0)) {
+                nul_warned = true;
+                ctx.error("WARNING: a NUL character occurred in the input.  It cannot be passed through in the argument list.  Did you mean to use the --null option?").await;
+            }
+            got
         };
         let flush = match got {
             Got::Error(msg) => {
+                // GNU runs the command with the items read so far, then fails.
+                if !args.is_empty() && !replace_mode {
+                    launch(ctx, &o, &command, &mut args, &mut runner, &mut names).await;
+                }
                 runner.wait_for(ctx, &mut names, 0).await;
                 ctx.error(&msg).await;
                 return 1;
@@ -753,6 +763,7 @@ async fn launch(
         }
         None => command.iter().cloned().chain(items).collect(),
     };
+    let argv = cut_at_nul(argv);
     if o.verbose {
         let mut text = argv
             .iter()
@@ -772,6 +783,20 @@ async fn launch(
         return;
     }
     let name = String::from_utf8_lossy(&argv[0]).into_owned();
+    // GNU xargs reports a command it cannot find in its own words and ends with 127,
+    // rather than as a shell's "command not found".
+    if !argv[0].contains(&b'/')
+        && !STANDALONE_BUILTINS
+            .iter()
+            .any(|b| b.as_bytes() == argv[0].as_slice())
+        && !ctx.is_utility(&argv[0]).await
+        && let Some(path) = ctx.var(b"PATH").map(<[u8]>::to_vec)
+        && ctx.search_path(&argv[0], &path).await.is_empty()
+    {
+        ctx.error(&format!("{name}: No such file or directory")).await;
+        runner.record(ctx, &name, 127).await;
+        return;
+    }
     let env = SpawnEnv {
         stdin: runner.stdin.clone(),
         ..SpawnEnv::default()
@@ -784,6 +809,18 @@ async fn launch(
         runner.children.push(child);
         names.push(name);
     }
+}
+
+/// Each argument up to its first NUL, as the kernel copies it to the program.
+fn cut_at_nul(argv: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    argv.into_iter()
+        .map(|mut a| {
+            if let Some(n) = a.iter().position(|&b| b == 0) {
+                a.truncate(n);
+            }
+            a
+        })
+        .collect()
 }
 
 fn replace_all(arg: &[u8], pat: &[u8], with: &[u8]) -> Vec<u8> {
@@ -802,4 +839,16 @@ fn replace_all(arg: &[u8], pat: &[u8], with: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn an_argument_ends_at_a_nul() {
+        let argv = vec![b"printf".to_vec(), b"a\0b".to_vec(), b"\0".to_vec(), b"c".to_vec()];
+        assert_eq!(
+            super::cut_at_nul(argv),
+            vec![b"printf".to_vec(), b"a".to_vec(), Vec::new(), b"c".to_vec()]
+        );
+    }
 }

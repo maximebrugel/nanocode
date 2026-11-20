@@ -45,7 +45,7 @@ pub async fn send_http(
             method: nanocode_http::types::Method::POST,
             url: request.endpoint().to_owned(),
             headers: request.http_headers()?,
-            body: body.as_bytes().to_vec(),
+            body: body.as_bytes().to_vec().into(),
         })
         .await?;
     let (status, headers, mut stream, _) = response.into_parts();

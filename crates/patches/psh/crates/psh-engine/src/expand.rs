@@ -64,6 +64,9 @@ pub(crate) struct Fields {
     text_only: bool,
     word: psh_syntax::Span,
     extglob: bool,
+    /// The piece being expanded is followed by an expansion or quoted text: a tilde
+    /// prefix running to its end is not one (`~$x`, `~"/a"` are literal, bash).
+    tilde_cut: bool,
 }
 
 fn is_ifs_ws(b: u8) -> bool {
@@ -110,6 +113,7 @@ impl Fields {
             text_only: false,
             word: psh_syntax::Span::default(),
             extglob: vp.opts.shopt(Shopt::Extglob),
+            tilde_cut: false,
         }
     }
 
@@ -455,7 +459,9 @@ fn seq(start: &str, end: &str, step: Option<&str>) -> Option<Vec<Vec<u8>>> {
             if (a <= b && i > b) || (a > b && i < b) {
                 break;
             }
-            out.push(vec![i as u8]);
+            // bash rescans the generated text, so a backslash quotes nothing and is
+            // removed, leaving an empty word ({Z..a}).
+            out.push(if i == i128::from(b'\\') { Vec::new() } else { vec![i as u8] });
             i = if a <= b { i + step_abs } else { i - step_abs };
         }
         return Some(out);
@@ -590,10 +596,82 @@ pub(crate) async fn expand_heredoc(
     body: &Word,
 ) -> Result<Vec<u8>, Unwind> {
     let mut f = Fields::new(vp, false);
-    let pieces: Vec<Piece> = body.parts.iter().map(Piece::Part).collect();
+    let mut pieces: Vec<Piece> = body.parts.iter().map(Piece::Part).collect();
+    join_continued_names(code, &mut pieces);
     expand_pieces(vp, code, &pieces, true, &mut f, Ctx::HereDoc).await?;
     f.finish_word();
     Ok(f.joined())
+}
+
+/// `'v'`, with each quote inside as `'\''`.
+fn single_quote(v: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'\''];
+    for &b in v {
+        match b {
+            b'\'' => out.extend_from_slice(b"'\\''"),
+            _ => out.push(b),
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+/// A value's length in characters (bytes without UTF-8).
+fn str_len(s: &[u8], utf8: bool) -> i64 {
+    match utf8 {
+        true => String::from_utf8_lossy(s).chars().count() as i64,
+        false => s.len() as i64,
+    }
+}
+
+/// In a here-doc body bash removes line continuations before it reads names, so
+/// `$a\<newline>b` names `ab`: a name takes in the literal text after continuations.
+fn join_continued_names(code: &Code, pieces: &mut Vec<Piece<'_>>) {
+    let name_char = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let only_conts = |s: u32, e: u32| {
+        s < e && {
+            let gap = code.ast.bytes(psh_syntax::Span { start: s, end: e });
+            gap.len().is_multiple_of(2) && gap.chunks(2).all(|c| c == b"\\\n")
+        }
+    };
+    let mut i = 0;
+    while i + 1 < pieces.len() {
+        let (mut name, mut end) = match &pieces[i] {
+            Piece::Part(WordPart {
+                kind: Part::Param(p),
+                span,
+            }) if !p.braced && p.name == ParamName::Var => {
+                (code.ast.bytes(p.name_span).to_vec(), span.end)
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut joined = false;
+        while let Some(Piece::Part(p)) = pieces.get(i + 1) {
+            if !matches!(p.kind, Part::Lit) || !only_conts(end, p.span.start) {
+                break;
+            }
+            let text = code.ast.bytes(p.span);
+            let n = text.iter().take_while(|b| name_char(b)).count();
+            if n == 0 {
+                break;
+            }
+            name.extend_from_slice(&text[..n]);
+            joined = true;
+            if n < text.len() {
+                pieces[i + 1] = Piece::Text(text[n..].to_vec());
+                break;
+            }
+            end = p.span.end;
+            pieces.remove(i + 1);
+        }
+        if joined {
+            pieces[i] = Piece::Var(name);
+        }
+        i += 1;
+    }
 }
 
 /// Where a word is: decides tilde expansion and a few quoting details.
@@ -622,26 +700,12 @@ fn expand_pieces<'a>(
 ) -> LocalBoxFuture<'a, Result<(), Unwind>> {
     Box::pin(async move {
         for (i, piece) in pieces.iter().enumerate() {
+            f.tilde_cut = match pieces.get(i + 1) {
+                Some(Piece::Var(_)) => true,
+                Some(Piece::Part(p)) => !matches!(p.kind, Part::Lit | Part::Brace(_)),
+                _ => false,
+            };
             match piece {
-                Piece::Text(t) if t == b"`" => {
-                    let mut rest = t.clone();
-                    for p in &pieces[i + 1..] {
-                        match p {
-                            Piece::Part(p) => rest.extend_from_slice(code.ast.bytes(p.span)),
-                            Piece::Text(t) => rest.extend_from_slice(t),
-                            Piece::Var(n) => {
-                                rest.push(b'$');
-                                rest.extend_from_slice(n);
-                            }
-                        }
-                    }
-                    vp.error(&format!(
-                        "bad substitution: no closing \"`\" in {}",
-                        String::from_utf8_lossy(&rest)
-                    ))
-                    .await;
-                    return Err(Unwind::Abort(1));
-                }
                 Piece::Text(t) if i == 0 && t.first() == Some(&b'~') => {
                     literal_with_tilde(vp, t, true, ctx, f);
                 }
@@ -827,7 +891,7 @@ fn param_op_now(
         (ParamPrefix::Length, ParamOp::None) => {
             let n = match &val {
                 Val::Str(s) if s.is_ascii() => s.len(),
-                Val::Str(s) => pattern::units(s, vp.utf8()).0.len(),
+                Val::Str(s) => pattern::unit_vec(s, vp.utf8()).len(),
                 _ => 0,
             };
             emit(f, n.to_string().as_bytes(), quoted);
@@ -1045,6 +1109,71 @@ pub(crate) fn words_now(
     Ok(f.out.into_iter().map(|x| x.text).collect())
 }
 
+/// Whether the assignment value `w` starts with a plain `$name` (or `"$name…`) of the
+/// variable it assigns, with no `$@` or `$*` after it: then `name=$name…` is
+/// `name+=…`, which `single_now_after` expands without copying the old value.
+pub(crate) fn leads_with_self(code: &Code, name: &str, w: &Word) -> bool {
+    let lead = |p: &WordPart| {
+        matches!(&p.kind, Part::Param(pp) if pp.name == ParamName::Var
+            && pp.index.is_none()
+            && pp.prefix == ParamPrefix::None
+            && matches!(pp.op, ParamOp::None)
+            && code.ast.text(pp.name_span) == name)
+    };
+    let at = |p: &WordPart| matches!(&p.kind, Part::Param(pp) if matches!(pp.name, ParamName::Special(b'@' | b'*')));
+    let Some((p, rest)) = w.parts.split_first() else {
+        return false;
+    };
+    let inner: &[WordPart] = match &p.kind {
+        _ if lead(p) => &[],
+        Part::Double(inner) if inner.first().is_some_and(lead) => &inner[1..],
+        _ => return false,
+    };
+    !inner.iter().any(at)
+        && !rest
+            .iter()
+            .any(|p| at(p) || matches!(&p.kind, Part::Double(i) if i.iter().any(at)))
+}
+
+/// `single_now` of an assignment value, without its leading `$name` when `skip`
+/// (`leads_with_self`).
+pub(crate) fn single_now_after(
+    vp: &mut Vp,
+    code: &Rc<Code>,
+    w: &Word,
+    skip: bool,
+) -> Result<Vec<u8>, String> {
+    if !skip {
+        return single_now(vp, code, w);
+    }
+    let mut f = Fields {
+        out: Vec::new(),
+        cur: Field::default(),
+        pending: Pending::None,
+        ifs: Vec::new(),
+        ifs_mb: Vec::new(),
+        split: false,
+        subst_status: None,
+        rep: false,
+        assign: true,
+        text_only: true,
+        word: w.span,
+        extglob: false,
+        tilde_cut: false,
+    };
+    let (p, rest) = w.parts.split_first().expect("leads_with_self");
+    if let Part::Double(inner) = &p.kind {
+        for p in &inner[1..] {
+            part_sync(vp, code, p, true, &mut f, Ctx::Word, false)?;
+        }
+    }
+    for p in rest {
+        part_sync(vp, code, p, false, &mut f, Ctx::Assign, false)?;
+    }
+    f.finish_word();
+    Ok(f.joined())
+}
+
 pub(crate) fn single_now(vp: &mut Vp, code: &Rc<Code>, w: &Word) -> Result<Vec<u8>, String> {
     let mut f = Fields {
         out: Vec::new(),
@@ -1059,6 +1188,7 @@ pub(crate) fn single_now(vp: &mut Vp, code: &Rc<Code>, w: &Word) -> Result<Vec<u
         text_only: true,
         word: w.span,
         extglob: false,
+        tilde_cut: false,
     };
     for (i, p) in w.parts.iter().enumerate() {
         part_sync(vp, code, p, false, &mut f, Ctx::Assign, i == 0)?;
@@ -1113,7 +1243,7 @@ fn tilde(vp: &Vp, name: &[u8]) -> Option<Vec<u8>> {
 /// Tilde expansion of unquoted literal text at the start of a word (and after `:` in
 /// assignments). `first` is whether the text starts the word.
 fn literal_with_tilde(vp: &Vp, text: &[u8], first: bool, ctx: Ctx, f: &mut Fields) {
-    if ctx == Ctx::HereDoc {
+    if ctx == Ctx::HereDoc || ctx == Ctx::Arith {
         f.quoted(text);
         return;
     }
@@ -1141,7 +1271,8 @@ fn literal_with_tilde(vp: &Vp, text: &[u8], first: bool, ctx: Ctx, f: &mut Field
             // Only a tilde prefix that ends the literal text or a slash counts; a
             // quoted char right after it (`~"x"`) makes it literal, which we cannot
             // see here, so text that ends this part is accepted.
-            if let Some(home) = tilde(vp, &rest[1..end]) {
+            let cut = end == rest.len() && f.tilde_cut;
+            if !cut && let Some(home) = tilde(vp, &rest[1..end]) {
                 f.quoted(&home);
                 rest = &rest[end..];
             }
@@ -1235,19 +1366,22 @@ async fn expand_part(
             // In a `${x-…}` operand and a here-document, bash unescapes the body as
             // outside double quotes (`\"` stays).
             let in_dq = quoted && ctx != Ctx::Operand && ctx != Ctx::HereDoc;
-            let body = psh_syntax::backtick_body(code.ast.text(part.span), in_dq);
-            let mut body = code.ast.restore_bytes(&body).into_owned();
-            // A backslash-newline in the body is a line continuation.
+            // A backslash-newline in the body is a line continuation, found before the
+            // body is unescaped: in `\\<newline>` the first backslash quotes the second.
+            let mut raw = code.ast.text(part.span).to_owned();
             let mut i = 0;
-            while i + 1 < body.len() {
-                if body[i] == b'\\' && body[i + 1] == b'\n' {
-                    body.drain(i..i + 2);
-                } else if body[i] == b'\\' {
+            while i + 1 < raw.len() {
+                let b = raw.as_bytes();
+                if b[i] == b'\\' && b[i + 1] == b'\n' {
+                    raw.drain(i..i + 2);
+                } else if b[i] == b'\\' {
                     i += 2;
                 } else {
                     i += 1;
                 }
             }
+            let body = psh_syntax::backtick_body(&raw, in_dq);
+            let body = code.ast.restore_bytes(&body).into_owned();
             let (out, st) = exec::command_subst_text(vp, code, &body, part.span.start).await?;
             f.subst_status = Some(st);
             emit(f, &out, quoted);
@@ -1307,7 +1441,31 @@ async fn expand_part(
                 .first()
                 .is_some_and(|w| w.text == b"let" || w.text == b"eval") =>
         {
-            let (items, st) = expand_array_lit(vp, code, lit).await?;
+            // For `let` the word is one arithmetic expression: its items are not
+            // split, and the whole word is one pattern (`let n=(1 * 1)` stays as it
+            // is unless nullglob or failglob is on, bash).
+            let is_let = f.out.first().is_some_and(|w| w.text == b"let");
+            let (items, st) = if is_let {
+                let mut items = Vec::new();
+                let mut st = None;
+                for e in &lit.elems {
+                    let key = match &e.key {
+                        Some(k) => Some(expand_single(vp, code, k, Ctx::Word).await?.0),
+                        None => None,
+                    };
+                    let (value, s) = expand_single(vp, code, &e.value, Ctx::Arith).await?;
+                    st = s.or(st);
+                    items.push(crate::arrays::ArrayItem {
+                        key,
+                        value,
+                        append: e.append,
+                        src: None,
+                    });
+                }
+                (items, st)
+            } else {
+                expand_array_lit(vp, code, lit).await?
+            };
             f.subst_status = st.or(f.subst_status);
             let mut text = b"(".to_vec();
             for (i, item) in items.iter().enumerate() {
@@ -1322,7 +1480,11 @@ async fn expand_part(
                 text.extend_from_slice(&item.value);
             }
             text.push(b')');
-            f.quoted(&text);
+            if is_let {
+                f.literal(&text);
+            } else {
+                f.quoted(&text);
+            }
         }
         Part::Array(_) => {
             for op in *b"=+" {
@@ -1415,7 +1577,7 @@ fn expand_text(
         Part::AnsiC => {
             let open = text.iter().position(|&b| b == b'\'').unwrap_or(1);
             let inner = &text[open + 1..text.len() - 1];
-            let mut v = psh_syntax::decode_ansi_c(inner);
+            let mut v = psh_syntax::decode_ansi_c_in(inner, vp.utf8());
             if let Some(nul) = v.iter().position(|&b| b == 0) {
                 v.truncate(nul);
             }
@@ -1443,9 +1605,10 @@ fn is_at(p: &WordPart) -> bool {
         Part::Param(p) => {
             let at = p.name == ParamName::Special(b'@') || matches!(p.index, Some(Subscript::At));
             match p.prefix {
-                // `"${!a[@]}"`: the keys, also possibly none.
+                // `"${!a[@]}"`: the keys, and `"${!pre@}"`: the names, also possibly none.
                 ParamPrefix::Indirect => {
-                    matches!(p.index, Some(Subscript::At)) && matches!(p.op, ParamOp::None)
+                    (matches!(p.index, Some(Subscript::At)) && matches!(p.op, ParamOp::None))
+                        || matches!(p.op, ParamOp::Names { star: false })
                 }
                 ParamPrefix::Length => false,
                 ParamPrefix::None => {
@@ -1473,8 +1636,10 @@ fn is_at(p: &WordPart) -> bool {
 /// The status a fatal expansion error (`${x?}`, `set -u`) ends the shell with: 127
 /// under `-c` unless errexit is on, else 1, as bash 5.3 does.
 pub(crate) fn expansion_exit_status(vp: &Vp) -> i32 {
-    // Only the shell itself: a subshell (`( )`, `$( )`, a pipeline stage) ends with 1.
-    if vp.opts.dash_c && !vp.opts.get(SetOpt::Errexit) && vp.top {
+    // Only the shell itself, or the forked child of a pipeline stage or job that is one
+    // simple command (bash's copy of the shell): a subshell (`( )`, `$( )`, a compound
+    // stage) ends with 1.
+    if vp.opts.dash_c && !vp.opts.get(SetOpt::Errexit) && (vp.top || vp.own_simple.is_some()) {
         127
     } else {
         1
@@ -1762,6 +1927,50 @@ async fn param(
             },
             Ok((name, None)) => {
                 vp.refresh_dynamic(&name);
+                // `${#a[@]}` counts the elements without copying them: a loop testing
+                // it against a large array was quadratic.
+                if p.prefix == ParamPrefix::Length
+                    && matches!(p.op, ParamOp::None)
+                    && matches!(p.index, Some(Subscript::At | Subscript::Star))
+                {
+                    let n = vp.vars.get(&name).map_or(0, crate::vars::Var::count);
+                    emit(f, n.to_string().as_bytes(), quoted);
+                    return Ok(());
+                }
+                // `${#a[-9]}` before the start of an indexed array or scalar abandons the
+                // command line (bash), where `${a[-9]}` only warns.
+                if p.prefix == ParamPrefix::Length
+                    && matches!(p.op, ParamOp::None)
+                    && let Some(Subscript::Expr(w)) = &p.index
+                    && matches!(
+                        vp.vars.get(&name).map(|v| &v.value),
+                        Some(crate::vars::Value::Indexed(_) | crate::vars::Value::Str(_))
+                    )
+                {
+                    let (sub, _) = expand_single(vp, code, w, Ctx::Arith).await?;
+                    match crate::arith::expanding!(vp, |vp| vp.resolve_read(&name, &sub))? {
+                        Ok(Some(i)) => {
+                            let utf8 = vp.utf8();
+                            let n = vp
+                                .elem(&name, i)
+                                .map_or(0, |s| pattern::units(&s, utf8).0.len());
+                            emit(f, n.to_string().as_bytes(), quoted);
+                            return Ok(());
+                        }
+                        Ok(None) => {
+                            let msg = format!("{}]: bad array subscript", code.ast.text(w.span));
+                            vp.error(&msg).await;
+                            return Err(Unwind::Abort(1));
+                        }
+                        Err(msg) => {
+                            vp.error(&msg).await;
+                            return Err(match std::mem::take(&mut vp.sub_fatal) {
+                                true => Unwind::Exit(1),
+                                false => Unwind::Abort(1),
+                            });
+                        }
+                    }
+                }
                 lookup_var(vp, code, &name, &p.index).await?
             }
             Err(msg) => {
@@ -1797,7 +2006,7 @@ async fn param(
             let utf8 = vp.utf8();
             let n = match &val {
                 Val::Unset => 0,
-                Val::Str(s) => pattern::units(s, utf8).0.len(),
+                Val::Str(s) => pattern::unit_vec(s, utf8).len(),
                 Val::List(l, _) => l.len(),
             };
             emit(f, n.to_string().as_bytes(), quoted);
@@ -2039,8 +2248,15 @@ async fn param(
                     } else {
                         String::from_utf8_lossy(&msg).into_owned()
                     };
+                    // bash names the parameter as written, subscript and all (`a[0]`).
+                    let sub = match &p.index {
+                        None => String::new(),
+                        Some(Subscript::At) => "[@]".into(),
+                        Some(Subscript::Star) => "[*]".into(),
+                        Some(Subscript::Expr(w)) => format!("[{}]", code.ast.text(w.span)),
+                    };
                     vp.error(&format!(
-                        "{}{}: {msg}",
+                        "{}{}{sub}: {msg}",
                         if via.is_some() { "!" } else { "" },
                         String::from_utf8_lossy(name_text)
                     ))
@@ -2130,6 +2346,19 @@ async fn param(
                         }
                     }
                 }
+                // `${s[@]:off}` of a scalar: no word at all once the offset is past
+                // its end (bash slices it as a one-element array there).
+                None if matches!(p.index, Some(Subscript::At))
+                    && match &val {
+                        Val::Str(s) => off > str_len(s, utf8),
+                        Val::List(items, false) if items.len() == 1 => {
+                            off > str_len(&items[0], utf8)
+                        }
+                        _ => false,
+                    } =>
+                {
+                    Val::List(Vec::new(), false)
+                }
                 None => map_val(val, |s| match substring(s, off, len, utf8) {
                     Ok(v) => v,
                     Err(e) => {
@@ -2151,23 +2380,37 @@ async fn param(
             let op = *op;
             let any = Pattern::new(b"?", utf8);
             match op {
-                b'Q' | b'E' | b'U' | b'L' | b'u' | b'P' => {
+                b'P' => {
+                    // Decoded, then expanded like a prompt under `promptvars`.
+                    let val = match val {
+                        Val::Unset => Val::Unset,
+                        Val::Str(s) => Val::Str(crate::builtins::set::prompt(vp, &s).await),
+                        Val::List(l, star) => {
+                            let mut out = Vec::with_capacity(l.len());
+                            for s in &l {
+                                out.push(crate::builtins::set::prompt(vp, s).await);
+                            }
+                            Val::List(out, star)
+                        }
+                    };
+                    emit_val(vp, f, val, quoted)
+                }
+                b'Q' | b'E' | b'U' | b'L' | b'u' => {
                     let val = match (&val, op) {
                         // `@Q` of nothing is nothing, not `''`.
                         (Val::Unset, _) => Val::Unset,
                         _ => map_val(val, |s| match op {
                             b'Q' => quote(s, utf8),
-                            b'E' => psh_syntax::decode_ansi_c(s),
+                            b'E' => psh_syntax::decode_ansi_c_in(s, utf8),
                             b'U' => change_case(s, CaseKind::UpperAll, &any, utf8),
                             b'L' => change_case(s, CaseKind::LowerAll, &any, utf8),
-                            b'P' => prompt(vp, s),
                             _ => change_case(s, CaseKind::UpperFirst, &any, utf8),
                         }),
                     };
                     emit_val(vp, f, val, quoted)
                 }
                 b'A' | b'a' | b'K' | b'k' => {
-                    let val = transform_var(vp, code, p, op, val, via.as_deref());
+                    let val = transform_var(vp, code, p, op, val, via.as_deref(), quoted);
                     emit_val(vp, f, val, quoted)
                 }
                 _ => bad(vp).await,
@@ -2175,6 +2418,52 @@ async fn param(
         }
         ParamOp::Names { .. } => bad(vp).await,
     }
+}
+
+/// Split `s` on the bytes of `ifs` that are outside its quoted parts (`"…"`,
+/// `'…'`, `$'…'`) and parentheses, dropping empty fields.
+fn split_outside_quotes(s: &[u8], ifs: &[u8]) -> Vec<Vec<u8>> {
+    let mut words = Vec::new();
+    let mut cur = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        let close = match b {
+            b'"' => Some(b'"'),
+            b'\'' => Some(b'\''),
+            b'$' if s.get(i + 1) == Some(&b'\'') => Some(b'\''),
+            _ => None,
+        };
+        if let Some(c) = close {
+            let escapes = b != b'\'';
+            let st = i;
+            i += if b == b'$' { 2 } else { 1 };
+            while i < s.len() && s[i] != c {
+                i += if escapes && s[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(s.len());
+            cur.extend_from_slice(&s[st..i]);
+            continue;
+        }
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0 && ifs.contains(&b) {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(b);
+        }
+        i += 1;
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
 }
 
 /// `${x@A}`, `@a`, `@K`, `@k`: transformations that need the variable, not only
@@ -2186,8 +2475,9 @@ fn transform_var(
     op: u8,
     val: Val,
     via: Option<&[u8]>,
+    quoted: bool,
 ) -> Val {
-    use crate::builtins::declare::{declaration, value_quote};
+    use crate::builtins::declare::{declaration, key_quote, value_quote};
     let mut name = match p.name {
         ParamName::Var => vp.resolve(code.ast.text(p.name_span)).into_owned(),
         _ => String::new(),
@@ -2220,6 +2510,13 @@ fn transform_var(
                 if f == "-" { String::new() } else { f }
             });
             match val {
+                // An array declared but never assigned still shows its attributes once;
+                // an assigned empty one shows nothing.
+                Val::List(items, _)
+                    if items.is_empty() && var.as_ref().is_some_and(|v| v.declared_only) =>
+                {
+                    Val::Str(flags.into_bytes())
+                }
                 Val::List(items, st) => Val::List(
                     items.iter().map(|_| flags.clone().into_bytes()).collect(),
                     st,
@@ -2236,11 +2533,25 @@ fn transform_var(
                 };
             };
             if list && var.is_array() {
+                // Quoted, `"${x[@]@A}"` is the declaration split on IFS outside its
+                // quotes (`declare`, the flags, the assignment); `[*]` or unquoted,
+                // one text.
                 let mut d = declaration(&name, &var, vp.utf8());
                 d.pop();
-                return Val::Str(d);
+                if !quoted || star {
+                    return Val::Str(d);
+                }
+                let ifs = vp.var("IFS").map_or(b" \t\n".to_vec(), <[u8]>::to_vec);
+                return Val::List(split_outside_quotes(&d, &ifs), false);
             }
             let flags = var.flags();
+            // `${x[@]@A}` of a scalar is `${x@A}`.
+            let val = match val {
+                Val::List(mut l, _) if list && l.len() == 1 => {
+                    Val::Str(l.pop().unwrap_or_default())
+                }
+                v => v,
+            };
             let Val::Str(s) = val else {
                 // An array without element 0: its declaration alone.
                 return if var.is_array() && !list {
@@ -2276,12 +2587,20 @@ fn transform_var(
                 return Val::List(pairs.into_iter().flat_map(|(k, v)| [k, v]).collect(), star);
             }
             let assoc = var.as_ref().is_some_and(|v| v.is_assoc());
+            // An empty associative array's `@K` is no word at all.
+            if assoc && pairs.is_empty() {
+                return Val::List(Vec::new(), false);
+            }
             let mut out = Vec::new();
             for (i, (k, v)) in pairs.iter().enumerate() {
                 if i > 0 {
                     out.push(b' ');
                 }
-                out.extend_from_slice(k);
+                if assoc {
+                    out.extend_from_slice(&key_quote(k, vp.utf8()));
+                } else {
+                    out.extend_from_slice(k);
+                }
                 out.push(b' ');
                 out.extend_from_slice(&value_quote(v, vp.utf8()));
             }
@@ -2337,6 +2656,17 @@ pub(crate) fn prompt(vp: &Vp, s: &[u8]) -> Vec<u8> {
                 }
             }
             b'[' | b']' => {}
+            b'0'..=b'7' => {
+                // `\nnn`: up to three octal digits.
+                let mut n = u32::from(c - b'0');
+                let mut k = 1;
+                while k < 3 && i < s.len() && (b'0'..=b'7').contains(&s[i]) {
+                    n = n * 8 + u32::from(s[i] - b'0');
+                    i += 1;
+                    k += 1;
+                }
+                out.push((n & 0xff) as u8);
+            }
             _ => {
                 out.push(b'\\');
                 out.push(c);
@@ -2388,7 +2718,11 @@ async fn element(vp: &mut Vp, name: &str, sub: &[u8]) -> Result<Val, Unwind> {
         }
         Err(msg) => {
             vp.error(&msg).await;
-            Err(Unwind::Abort(1))
+            // A subscript that is not arithmetic ends the script (bash).
+            match std::mem::take(&mut vp.sub_fatal) {
+                true => Err(Unwind::Exit(1)),
+                false => Err(Unwind::Abort(1)),
+            }
         }
     }
 }
@@ -2602,39 +2936,47 @@ pub(crate) fn quote(s: &[u8], utf8: bool) -> Vec<u8> {
 }
 
 fn change_case(s: &[u8], kind: CaseKind, pat: &Pattern, utf8: bool) -> Vec<u8> {
-    let text = String::from_utf8_lossy(s);
-    let mut out = String::new();
+    let mut out = Vec::with_capacity(s.len());
     let all = matches!(
         kind,
         CaseKind::UpperAll | CaseKind::LowerAll | CaseKind::ToggleAll
     );
-    for (i, ch) in text.chars().enumerate() {
-        let mut buf = [0u8; 4];
-        let applies = (all || i == 0) && pat.matches(ch.encode_utf8(&mut buf).as_bytes(), utf8);
-        if !applies {
-            out.push(ch);
-            continue;
-        }
-        // Like towupper/towlower: only one-char mappings (ß stays ß).
-        let one = |m: &mut dyn Iterator<Item = char>| {
-            let v: Vec<char> = m.collect();
-            if v.len() == 1 { v[0] } else { ch }
-        };
-        let up = || one(&mut ch.to_uppercase());
-        let down = || one(&mut ch.to_lowercase());
-        out.push(match kind {
-            CaseKind::UpperFirst | CaseKind::UpperAll => up(),
-            CaseKind::LowerFirst | CaseKind::LowerAll => down(),
-            CaseKind::ToggleFirst | CaseKind::ToggleAll => {
-                if ch.is_uppercase() {
-                    down()
-                } else {
-                    up()
-                }
+    // Bytes that are not valid UTF-8 stay as they are, one character each.
+    let mut i = 0;
+    for chunk in s.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            let mut buf = [0u8; 4];
+            let enc = ch.encode_utf8(&mut buf).as_bytes();
+            let applies = (all || i == 0) && pat.matches(enc, utf8);
+            i += 1;
+            if !applies || (!utf8 && !ch.is_ascii()) {
+                out.extend_from_slice(enc);
+                continue;
             }
-        });
+            // Like towupper/towlower: only one-char mappings (ß stays ß).
+            let one = |m: &mut dyn Iterator<Item = char>| {
+                let v: Vec<char> = m.collect();
+                if v.len() == 1 { v[0] } else { ch }
+            };
+            let up = || one(&mut ch.to_uppercase());
+            let down = || one(&mut ch.to_lowercase());
+            let c = match kind {
+                CaseKind::UpperFirst | CaseKind::UpperAll => up(),
+                CaseKind::LowerFirst | CaseKind::LowerAll => down(),
+                CaseKind::ToggleFirst | CaseKind::ToggleAll => {
+                    if ch.is_uppercase() {
+                        down()
+                    } else {
+                        up()
+                    }
+                }
+            };
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+        i += chunk.invalid().len();
+        out.extend_from_slice(chunk.invalid());
     }
-    out.into_bytes()
+    out
 }
 
 fn map_val(val: Val, mut f: impl FnMut(&[u8]) -> Vec<u8>) -> Val {
@@ -3038,6 +3380,7 @@ pub(crate) async fn expand_array_lit(
                     key: Some(key),
                     value,
                     append: e.append,
+                    src: Some(code.ast.bytes(e.span).to_vec()),
                 });
             }
             None => {
@@ -3048,6 +3391,7 @@ pub(crate) async fn expand_array_lit(
                         key: None,
                         value: field.text,
                         append: false,
+                        src: None,
                     });
                 }
             }
@@ -3105,17 +3449,50 @@ pub(crate) async fn expand_decl_args(
                 Some(l) => (l.to_vec(), true),
                 None => (lhs, false),
             };
-            let (items, st) = expand_array_lit(vp, code, &lit).await?;
+            let (mut items, st) = expand_array_lit(vp, code, &lit).await?;
             status = st.or(status);
+            // declare gets the elements as words, which bash quotes when it warns.
+            for item in &mut items {
+                if let Some(k) = &item.key {
+                    let mut t = b"[".to_vec();
+                    t.extend_from_slice(&single_quote(k));
+                    t.extend_from_slice(if item.append { b"]+=" } else { b"]=" });
+                    t.extend_from_slice(&single_quote(&item.value));
+                    item.src = Some(t);
+                }
+            }
             args.push(DeclArg::Array {
                 name: lhs,
                 append,
                 items,
             });
         } else if assignment_like(code, w) {
-            let (v, st) = expand_single(vp, code, w, Ctx::Assign).await?;
-            status = st.or(status);
-            args.push(DeclArg::from_word(v));
+            // Brace expansion applies (`local a={1..3}` is `local a=1 a=2 a=3`, bash).
+            // The words it makes are no longer assignments, so they expand as command
+            // words do (`"${a[@]}"` splits) before each is read as an argument.
+            let expanded = brace_expand(code, &w.parts);
+            if expanded.len() > 1 {
+                let mut f = Fields::new(vp, true);
+                f.word = w.span;
+                for pieces in expanded {
+                    expand_pieces(vp, code, &pieces, false, &mut f, Ctx::Word).await?;
+                    f.finish_word();
+                }
+                glob_fields(vp, &mut f).await?;
+                status = f.subst_status.or(status);
+                args.extend(f.out.into_iter().map(|f| DeclArg::from_word(f.text)));
+                continue;
+            }
+            for pieces in expanded {
+                let mut f = Fields::new(vp, false);
+                f.assign = true;
+                f.text_only = true;
+                f.word = w.span;
+                expand_pieces(vp, code, &pieces, false, &mut f, Ctx::Assign).await?;
+                f.finish_word();
+                status = f.subst_status.or(status);
+                args.push(DeclArg::from_word(f.joined()));
+            }
         } else {
             let f = expand_words(vp, code, std::slice::from_ref(w)).await?;
             status = f.subst_status.or(status);

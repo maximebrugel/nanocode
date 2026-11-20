@@ -1454,7 +1454,7 @@ function TypedArrayPrototypeWith(this: Value, index: Value, value: Value): Obj {
  * %TypedArray%.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] ), 23.2.3.32.
  * @builtin %TypedArray%.prototype.toLocaleString
  */
-function TypedArrayPrototypeToLocaleString(this: Value): Str {
+function TypedArrayPrototypeToLocaleString(this: Value, locales?: Value, options?: Value): Str {
   const o: Obj = ValidateTypedArray(this);
   const len: f64 = TALength(o);
   if (!ArrayJoinEnter(o)) {
@@ -1468,7 +1468,7 @@ function TypedArrayPrototypeToLocaleString(this: Value): Str {
       }
       const v: Value = TypedArrayGet(o, k);
       if (v !== undefined) {
-        r += ToString(Call(GetV(v, "toLocaleString"), v));
+        r += ToString(Call(GetV(v, "toLocaleString"), v, locales, options));
       }
     }
   } finally {

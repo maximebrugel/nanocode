@@ -29,7 +29,10 @@ pub use catalog::{
 };
 pub use catalog::{BranchBoundary, InitialSettings, SessionRecord};
 pub use child_journal::{JournalClaim, JournalSeed};
-pub use format::{AdmittedTurn, Advanced, CheckpointFormat, FormatFuture, Hydrated, Previous};
+pub use format::{
+    AdmittedTurn, Advanced, Checkpoint, CheckpointFormat, FormatFuture, Hydrated, Previous,
+    RenderCheckpoint,
+};
 pub use kept_checkpoints::{ChildPreload, ChildReuse};
 pub use memory::MemoryStore;
 pub use nanocode_agent_core::backend::{ContinuationAhead, Prefetched};

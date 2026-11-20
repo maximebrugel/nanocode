@@ -1,16 +1,18 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
+use nanocode_bytes::Bytes;
 use nanocode_code_mode::{
     Tool, ToolContext, ToolDefinition, ToolOutput,
     code_mode::LocalCells,
     embedded::{HandCalls, HostFuture, nested_tool_input, tool_not_available},
 };
-use nanocode_hands::{
-    ChunkError, Chunks, Fetch, GetError, PutError, Sha256Digest, Stored, receive,
-};
+use nanocode_hands::{ChunkError, Chunks, Fetch, GetError, PutError, Sha256Digest, Stored};
 use serde_json::Value;
 
-use crate::Workspace;
+use crate::{
+    Workspace,
+    sim::{self, Mutation},
+};
 
 #[derive(Clone)]
 pub struct WorkspaceHost {
@@ -100,12 +102,36 @@ impl WorkspaceHost {
         chunks: &mut dyn Chunks,
         sha256: Sha256Digest,
     ) -> Result<Stored, PutError> {
-        let (bytes, stored) = receive(chunks, sha256, self.bytes_max).await?;
-        let written = self.files.write(&self.path(path), &bytes).await;
-        written.map_err(|reason| PutError::Uncertain {
+        let failed = |reason: String| PutError::Io {
+            reason: reason.into(),
+        };
+        let uploading = self.files.upload(&self.path(path), sha256.0).await;
+        let uploading = uploading.map_err(failed)?;
+        let mut size_bytes: u64 = 0;
+        while let Some(chunk) = chunks.next().await.map_err(PutError::Source)? {
+            size_bytes += chunk.len() as u64;
+            if size_bytes > self.bytes_max {
+                return Err(PutError::TooLarge {
+                    bytes_max: self.bytes_max,
+                });
+            }
+            uploading.push(chunk).await.map_err(failed)?;
+        }
+        let actual = Sha256Digest(uploading.sealed().await.map_err(failed)?);
+        if actual != sha256 {
+            return Err(PutError::ShaMismatch {
+                expected: sha256,
+                actual,
+            });
+        }
+        let committed = uploading.commit().await;
+        committed.map_err(|reason| PutError::Uncertain {
             reason: reason.into(),
         })?;
-        Ok(stored)
+        Ok(Stored {
+            size_bytes,
+            sha256: actual,
+        })
     }
 
     pub async fn get(
@@ -113,17 +139,17 @@ impl WorkspaceHost {
         path: &str,
         chunk_bytes: NonZeroUsize,
     ) -> Result<Fetch<'static>, GetError> {
-        let read = self.files.read(&self.path(path)).await;
-        let bytes = read
+        let download = self.files.download(&self.path(path)).await;
+        let download = download
             .map_err(|reason| GetError::Io {
                 reason: reason.into(),
             })?
             .ok_or(GetError::NotFound)?;
         Ok(Fetch {
-            size_bytes: bytes.len() as u64,
-            sha256: Sha256Digest::of(&bytes),
+            size_bytes: download.bytes.len() as u64,
+            sha256: Sha256Digest(download.sha256),
             chunks: Box::new(Slices {
-                bytes,
+                bytes: download.bytes,
                 sent: 0,
                 chunk_bytes,
             }),
@@ -132,7 +158,7 @@ impl WorkspaceHost {
 }
 
 struct Slices {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     sent: usize,
     chunk_bytes: NonZeroUsize,
 }
@@ -173,6 +199,11 @@ impl HandCalls for WorkspaceHost {
 impl nanocode_hands::Workspace for WorkspaceHost {
     fn runs(&self, tool: &str) -> bool {
         Self::runs(self, tool)
+    }
+
+    fn has(&self, command: &str) -> bool {
+        (self.files.has(command) || sim::mutated(Mutation::HasEverything))
+            && !sim::mutated(Mutation::HasNothing)
     }
 
     fn run<'a>(

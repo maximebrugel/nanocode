@@ -46,6 +46,22 @@ struct Inner {
     writers: usize,
     read_wakers: Vec<Waker>,
     write_wakers: Vec<Waker>,
+    /// A vproc writing a pipe that still holds bytes first lets the other tasks run
+    /// once, as a reading process runs while the writer goes on: `head -3` has taken
+    /// its lines and gone by the writer's next one, which meets the closed pipe
+    /// (SIGPIPE) as with bash, rather than the writer filling the buffer before the
+    /// reader runs. Set while the writer waits that turn.
+    yielded: bool,
+    /// Set when a program that bash forks (an in-process utility, `cat f` in
+    /// `(cat f; echo x) | head -3`) starts or ends with bytes still in the pipe: in
+    /// bash the child starts, and the shell waits for its exit, while the reader takes
+    /// its lines and may exit. So the next write first lets the reader run until it
+    /// took them or left (the write then meets the closed pipe, SIGPIPE), a bounded
+    /// number of rounds in case the reader never reads.
+    handoff: Option<u32>,
+    /// The stages at a pipeline's start gate that look at this pipe ([`Watch`]):
+    /// woken when a reader or writer starts waiting on it.
+    watchers: Vec<Waker>,
     /// The OS pipe once materialized: (read end, write end), each dropped when the
     /// engine's last reader or writer goes.
     os: Option<(OsEnd, OsEnd)>,
@@ -77,6 +93,9 @@ pub(crate) fn pipe() -> (PipeReader, PipeWriter) {
         writers: 1,
         read_wakers: Vec::new(),
         write_wakers: Vec::new(),
+        yielded: false,
+        handoff: None,
+        watchers: Vec::new(),
         os: None,
     }));
     (PipeReader(inner.clone()), PipeWriter(inner))
@@ -94,6 +113,9 @@ pub(crate) fn preloaded(data: &[u8]) -> PipeReader {
         writers: 0,
         read_wakers: Vec::new(),
         write_wakers: Vec::new(),
+        yielded: false,
+        handoff: None,
+        watchers: Vec::new(),
         os: None,
     })))
 }
@@ -203,6 +225,36 @@ impl Drop for Feed {
     }
 }
 
+/// A look at a pipe that holds neither end: a stage at its pipeline's start gate
+/// watches the pipes it reads and writes, to go on when the stage at the other end
+/// waits on it before that stage's own gate (`echo x | echo "$(cat)"`).
+pub(crate) struct Watch(Rc<RefCell<Inner>>);
+
+impl Watch {
+    /// Whether a vproc waits to read this (empty) pipe, or to write it (full);
+    /// otherwise `cx` is woken when one starts to.
+    pub(crate) fn poll_waited_on(&self, cx: &mut Context<'_>) -> bool {
+        let mut p = self.0.borrow_mut();
+        if (!p.read_wakers.is_empty() && p.buf.is_empty()) || !p.write_wakers.is_empty() {
+            return true;
+        }
+        register(&mut p.watchers, cx.waker());
+        false
+    }
+}
+
+impl PipeReader {
+    pub(crate) fn watch(&self) -> Watch {
+        Watch(self.0.clone())
+    }
+}
+
+impl PipeWriter {
+    pub(crate) fn watch(&self) -> Watch {
+        Watch(self.0.clone())
+    }
+}
+
 impl PipeReader {
     /// See [`os_end`].
     pub(crate) fn os_end(&self, host: &dyn Host) -> Option<Rc<dyn HostFile>> {
@@ -260,6 +312,7 @@ impl PipeReader {
             return Poll::Ready(Ok(0));
         }
         register(&mut p.read_wakers, cx.waker());
+        wake_all(&mut p.watchers);
         Poll::Pending
     }
 }
@@ -286,10 +339,23 @@ impl PipeReader {
     }
 }
 
+/// How many scheduler rounds a write after a forked program's output waits at most
+/// for the reader to take it ([`Inner::handoff`]).
+const HANDOFF_ROUNDS: u32 = 64;
+
 impl PipeWriter {
     /// See [`os_end`].
     pub(crate) fn os_end(&self, host: &dyn Host) -> Option<Rc<dyn HostFile>> {
         os_end(&self.0, false, host)
+    }
+
+    /// A program that bash forks starts or ended writing this pipe: see
+    /// [`Inner::handoff`].
+    pub(crate) fn hand_off(&self) {
+        let mut p = self.0.borrow_mut();
+        if p.readers > 0 && p.os.is_none() && !p.buf.is_empty() {
+            p.handoff = Some(0);
+        }
     }
 
     pub(crate) fn poll_write(&self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
@@ -329,8 +395,23 @@ impl PipeWriter {
         let space = PIPE_CAPACITY.saturating_sub(p.buf.len());
         if space == 0 {
             register(&mut p.write_wakers, cx.waker());
+            wake_all(&mut p.watchers);
             return Poll::Pending;
         }
+        if let Some(rounds) = p.handoff {
+            if p.buf.is_empty() || rounds >= HANDOFF_ROUNDS {
+                p.handoff = None;
+            } else {
+                p.handoff = Some(rounds + 1);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+        if !p.buf.is_empty() && !std::mem::replace(&mut p.yielded, true) {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        p.yielded = false;
         let n = space.min(data.len());
         p.buf.extend(&data[..n]);
         wake_all(&mut p.read_wakers);
@@ -361,5 +442,71 @@ impl Drop for PipeWriter {
             release(&mut p);
             wake_all(&mut p.read_wakers);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::{Script, Shell, Step, testhost::TestHost};
+
+    /// Runs `source` in `/w` (holding the file `a`) at every budget and latency.
+    fn check(source: &str, expected: &[u8]) {
+        for latency in [false, true] {
+            for budget in [1, 1000] {
+                let host = Rc::new(TestHost::new());
+                host.set_latency(latency);
+                host.fs.write_file("/w/a", b"");
+                let mut shell = Shell::new(host.config());
+                shell.start(Script::command(&format!("cd /w; {source}")));
+                let status = loop {
+                    match shell.step(budget) {
+                        Step::Done(status) => break status,
+                        Step::Yield | Step::Blocked => {}
+                        Step::Idle => panic!("{source}: idle before completion"),
+                    }
+                };
+                let at = format!("{source}: latency={latency}, budget={budget}");
+                assert_eq!(status, 0, "{at}");
+                assert_eq!(host.stderr(), b"", "{at}");
+                assert_eq!(host.stdout(), expected, "{at}");
+            }
+        }
+    }
+
+    #[test]
+    fn stages_open_their_redirections_before_any_command_runs() {
+        // A compound's words are expanded after the gate.
+        check(
+            r#"{ echo *; } | { read x; echo "$x"; } > out; read y < out; echo "$y""#,
+            b"a out\n",
+        );
+        check(
+            r#"f() { echo *; }; f | { read x; echo "$x"; } > out; read y < out; echo "$y""#,
+            b"a out\n",
+        );
+    }
+
+    #[test]
+    fn a_stage_that_reads_before_its_gate_does_not_hold_the_pipeline() {
+        check(r#"echo hi | echo "<$(read l; echo "$l")>""#, b"<hi>\n");
+        check(r#"echo hi | x=$(read l; echo "$l") ; echo done"#, b"done\n");
+    }
+
+    #[test]
+    fn a_path_that_names_no_file_is_not_found() {
+        check(
+            "a/b/c.txt 2>/dev/null; echo $?; ./nope 2>/dev/null; echo $?",
+            b"127\n127\n",
+        );
+    }
+
+    #[test]
+    fn a_writer_meets_the_pipe_its_reader_closed() {
+        check(
+            "set -o pipefail; for i in 1 2 3 4; do echo $i; done | { read a; echo $a; }; echo $?",
+            b"1\n141\n",
+        );
     }
 }

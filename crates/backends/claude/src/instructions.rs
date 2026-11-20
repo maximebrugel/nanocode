@@ -21,7 +21,7 @@ const HEADLESS_BASH_LINES: [&str; 3] = [
 ];
 const HEADLESS_EXEC_LINES: [&str; 2] = [
     "\n- Nanocode extension: a call to a name missing from `ALL_TOOLS`",
-    "\n- Nanocode extension: an image file the cell's calls create or change",
+    "\n- Nanocode extension: `image` takes an image file's path",
 ];
 const HEADLESS_EXEC_GLOBALS: [&str; 4] = [
     "`audio(",

@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::steer::SteerOp;
 use crate::tasks::{TaskOp, resolve};
 use crate::{
     Entry, EventId, Fold, Op, Phase, Rejection, Task, TaskId,
@@ -18,10 +19,11 @@ pub enum Can {
     Sync,
     Rank,
     Manage,
+    Plan,
 }
 
 impl Can {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Read,
         Self::Post,
         Self::React,
@@ -29,13 +31,17 @@ impl Can {
         Self::Sync,
         Self::Rank,
         Self::Manage,
+        Self::Plan,
     ];
 
     pub const fn implies(self, other: Self) -> bool {
         self as u8 == other as u8
             || matches!(self, Self::Manage)
             || (matches!(other, Self::Read)
-                && matches!(self, Self::React | Self::Label | Self::Sync | Self::Rank))
+                && matches!(
+                    self,
+                    Self::React | Self::Label | Self::Sync | Self::Rank | Self::Plan
+                ))
     }
 }
 
@@ -235,6 +241,8 @@ pub struct Access {
     posters: BTreeMap<TaskId, Actor>,
     #[serde(with = "crate::pairs")]
     holders: BTreeMap<TaskId, Actor>,
+    #[serde(default, with = "crate::pairs")]
+    epochs: BTreeMap<u32, u64>,
 }
 
 impl Access {
@@ -244,7 +252,12 @@ impl Access {
             grants: BTreeMap::new(),
             posters: BTreeMap::new(),
             holders: BTreeMap::new(),
+            epochs: BTreeMap::new(),
         }
+    }
+
+    pub fn epoch(&self, partition: u32) -> u64 {
+        self.epochs.get(&partition).copied().unwrap_or(0)
     }
 
     pub fn owner(&self) -> Option<&str> {
@@ -259,35 +272,36 @@ impl Access {
         self.posters.get(task)
     }
 
-    fn decide(&self, actor: &Actor, target: &str, everyone: bool) -> BTreeSet<Can> {
-        let mut found = Vec::new();
-        for grant in self.grants.values() {
-            let Some(close) = closeness(&grant.who, actor) else {
-                continue;
-            };
-            if close == 0 && !everyone {
-                continue;
-            }
-            for (pattern, cans) in &grant.can {
-                if let Some(rank) = reach(pattern, target) {
-                    found.push((rank, close, cans));
-                }
-            }
-        }
+    fn found<'a>(
+        &'a self,
+        actor: &'a Actor,
+        target: &'a str,
+        everyone: bool,
+    ) -> impl Iterator<Item = (((u8, usize), u8), &'a [Can])> + 'a {
+        self.grants
+            .values()
+            .filter_map(move |grant| {
+                closeness(&grant.who, actor)
+                    .filter(|close| *close != 0 || everyone)
+                    .map(|close| (grant, close))
+            })
+            .flat_map(move |(grant, close)| {
+                grant.can.iter().filter_map(move |(pattern, cans)| {
+                    reach(pattern, target).map(|rank| ((rank, close), cans.as_slice()))
+                })
+            })
+    }
+
+    fn decide(&self, actor: &Actor, target: &str, everyone: bool, can: Can) -> bool {
+        let gives = |cans: &[Can]| cans.iter().any(|held| held.implies(can));
         if mutated(Mutation::SpecificityIgnored) {
-            return found
-                .iter()
-                .flat_map(|(_, _, cans)| cans.iter().copied())
-                .collect();
+            return self.found(actor, target, everyone).any(|(_, cans)| gives(cans));
         }
-        let Some(best) = found.iter().map(|(rank, close, _)| (*rank, *close)).max() else {
-            return BTreeSet::new();
+        let Some(best) = self.found(actor, target, everyone).map(|(spot, _)| spot).max() else {
+            return false;
         };
-        found
-            .iter()
-            .filter(|(rank, close, _)| (*rank, *close) == best)
-            .flat_map(|(_, _, cans)| cans.iter().copied())
-            .collect()
+        self.found(actor, target, everyone)
+            .any(|(spot, cans)| spot == best && gives(cans))
     }
 
     fn holds(&self, actor: &Actor, target: &str, can: Can, everyone: bool) -> bool {
@@ -300,9 +314,7 @@ impl Access {
         {
             return false;
         }
-        self.decide(actor, target, everyone)
-            .iter()
-            .any(|held| held.implies(can))
+        self.decide(actor, target, everyone, can)
     }
 
     pub fn may(&self, actor: &Actor, channel: &str, can: Can) -> bool {
@@ -377,6 +389,9 @@ impl Access {
             Op::Claim { task, .. } => {
                 self.holders.insert(task.clone(), actor);
             }
+            Op::Epoch { partition, epoch } => {
+                self.epochs.insert(*partition, *epoch);
+            }
             Op::Tasks(TaskOp::Batch { name, tasks }) => {
                 for task in resolve(name, tasks) {
                     self.posters.insert(task.id, actor.clone());
@@ -399,6 +414,7 @@ impl Fold {
     pub fn admit(&self, by: &str, at_ms: u64, op: &Op) -> Result<(), Rejection> {
         self.authorize(by, op)?;
         self.check(at_ms, op)?;
+        self.intended(by, op)?;
         self.assigned(by, op)
     }
 
@@ -424,6 +440,7 @@ impl Fold {
         }
         match op {
             Op::Charter {} => Ok(()),
+            Op::Epoch { .. } => access.need(&actor, "*", Can::Manage),
             Op::Post { task } => {
                 if let Some(parent) = &task.parent
                     && !access.reads(&actor, &parent.0)
@@ -447,6 +464,7 @@ impl Fold {
             Op::Renew { task, claim, .. }
             | Op::Release { task, claim, .. }
             | Op::Finish { task, claim, .. }
+            | Op::Steer(SteerOp::Heed { task, claim, .. })
             | Op::Tasks(TaskOp::Block {
                 task,
                 claim: Some(claim),
@@ -506,7 +524,7 @@ impl Fold {
                 }
                 Ok(())
             }
-            Op::Reply { task, .. } => {
+            Op::Reply { task, .. } | Op::Steer(SteerOp::Send { task, .. }) => {
                 access.see(&actor, task)?;
                 access.need(&actor, &task.0, Can::Post)
             }

@@ -347,6 +347,71 @@ pub(crate) async fn zone(vp: &Vp) -> Zone {
 
 /// The zone a `TZ` value names (`None`: unset, the system's `/etc/localtime`), or `None`
 /// when nothing could be read (no zone files, as in wasm, and no POSIX rule).
+/// Common zone names with the POSIX rule their zone files end with (tzdata 2025).
+const ZONES: &[(&[u8], &[u8])] = &[
+    (b"America/New_York", b"EST5EDT,M3.2.0,M11.1.0"),
+    (b"America/Chicago", b"CST6CDT,M3.2.0,M11.1.0"),
+    (b"America/Denver", b"MST7MDT,M3.2.0,M11.1.0"),
+    (b"America/Phoenix", b"MST7"),
+    (b"America/Los_Angeles", b"PST8PDT,M3.2.0,M11.1.0"),
+    (b"America/Anchorage", b"AKST9AKDT,M3.2.0,M11.1.0"),
+    (b"Pacific/Honolulu", b"HST10"),
+    (b"America/Toronto", b"EST5EDT,M3.2.0,M11.1.0"),
+    (b"America/Vancouver", b"MST7"),
+    (b"America/Mexico_City", b"CST6"),
+    (b"America/Sao_Paulo", b"<-03>3"),
+    (b"America/Argentina/Buenos_Aires", b"<-03>3"),
+    (b"America/Bogota", b"<-05>5"),
+    (b"America/Lima", b"<-05>5"),
+    (b"America/Santiago", b"<-04>4<-03>,M9.1.6/24,M4.1.6/24"),
+    (b"Europe/London", b"GMT0BST,M3.5.0/1,M10.5.0"),
+    (b"Europe/Dublin", b"GMT0IST,M3.5.0/1,M10.5.0"),
+    (b"Europe/Lisbon", b"WET0WEST,M3.5.0/1,M10.5.0"),
+    (b"Europe/Paris", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Berlin", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Madrid", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Rome", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Amsterdam", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Brussels", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Zurich", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Vienna", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Stockholm", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Oslo", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Copenhagen", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Warsaw", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Prague", b"CET-1CEST,M3.5.0,M10.5.0/3"),
+    (b"Europe/Athens", b"EET-2EEST,M3.5.0/3,M10.5.0/4"),
+    (b"Europe/Helsinki", b"EET-2EEST,M3.5.0/3,M10.5.0/4"),
+    (b"Europe/Kyiv", b"EET-2EEST,M3.5.0/3,M10.5.0/4"),
+    (b"Europe/Istanbul", b"<+03>-3"),
+    (b"Europe/Moscow", b"MSK-3"),
+    (b"Africa/Cairo", b"EET-2EEST,M4.5.5/0,M10.5.4/24"),
+    (b"Africa/Johannesburg", b"SAST-2"),
+    (b"Africa/Lagos", b"WAT-1"),
+    (b"Africa/Nairobi", b"EAT-3"),
+    (b"Asia/Dubai", b"<+04>-4"),
+    (b"Asia/Karachi", b"PKT-5"),
+    (b"Asia/Kolkata", b"IST-5:30"),
+    (b"Asia/Dhaka", b"<+06>-6"),
+    (b"Asia/Bangkok", b"<+07>-7"),
+    (b"Asia/Jakarta", b"WIB-7"),
+    (b"Asia/Singapore", b"<+08>-8"),
+    (b"Asia/Hong_Kong", b"HKT-8"),
+    (b"Asia/Shanghai", b"CST-8"),
+    (b"Asia/Taipei", b"CST-8"),
+    (b"Asia/Manila", b"PST-8"),
+    (b"Asia/Seoul", b"KST-9"),
+    (b"Asia/Tokyo", b"JST-9"),
+    (b"Australia/Perth", b"AWST-8"),
+    (b"Australia/Adelaide", b"ACST-9:30ACDT,M10.1.0,M4.1.0/3"),
+    (b"Australia/Brisbane", b"AEST-10"),
+    (b"Australia/Sydney", b"AEST-10AEDT,M10.1.0,M4.1.0/3"),
+    (b"Australia/Melbourne", b"AEST-10AEDT,M10.1.0,M4.1.0/3"),
+    (b"Pacific/Auckland", b"NZST-12NZDT,M9.5.0,M4.1.0/3"),
+    (b"Asia/Jerusalem", b"IST-2IDT,M3.4.4/26,M10.5.0"),
+    (b"Asia/Tehran", b"<+0330>-3:30"),
+];
+
 pub(crate) async fn load(host: &dyn crate::Host, tz: Option<&[u8]>) -> Option<Zone> {
     let files: Vec<Vec<u8>> = match tz {
         None => vec![b"/etc/localtime".to_vec()],
@@ -386,8 +451,12 @@ pub(crate) async fn load(host: &dyn crate::Host, tz: Option<&[u8]>) -> Option<Zo
             }
         }
     }
-    if let Some(t) = tz
-        && let Some(rule) = parse_rule(t.strip_prefix(b":").unwrap_or(t))
+    // Without zone files (a sandbox), common zone names still resolve, by the
+    // current rule their zone file ends with.
+    let name = tz.map(|t| t.strip_prefix(b":").unwrap_or(t));
+    let known = name.and_then(|n| ZONES.iter().find(|(z, _)| *z == n).map(|(_, r)| *r));
+    if let Some(t) = known.or(name)
+        && let Some(rule) = parse_rule(t)
     {
         return Some(Zone {
             transitions: Vec::new(),

@@ -9,12 +9,12 @@ use std::{
 use nanocode_sync::{Atom, Map};
 use serde_json::Value;
 
-use crate::{EncodedPayload, Hydrated, Previous};
+use crate::{Checkpoint, EncodedPayload, Hydrated, Previous};
 
 #[derive(Clone)]
 pub(crate) struct KeptCheckpoint {
     pub(crate) key: String,
-    pub(crate) checkpoint: Value,
+    pub(crate) checkpoint: Checkpoint,
     pub(crate) payload: EncodedPayload,
     pub(crate) records: HashSet<String>,
     pub(crate) hydrated: Option<Hydrated>,
@@ -128,6 +128,10 @@ impl KeptCheckpoints {
             decoded: self.decoded.load(Ordering::Relaxed),
         }
     }
+}
+
+pub(crate) fn checkpoint_bytes(checkpoint: &Checkpoint) -> usize {
+    checkpoint.value().map_or(0, |value| value_bytes(&value))
 }
 
 pub(crate) fn value_bytes(value: &Value) -> usize {

@@ -75,11 +75,6 @@ impl Big {
         self.limbs[0] as u64 | (self.limbs[1] as u64) << 32
     }
 
-    /// True if the value fits in a `u64`.
-    pub(crate) fn fits_u64(&self) -> bool {
-        self.len <= 2
-    }
-
     /// `self = self * m + a`.
     pub(crate) fn mul_add_small(&mut self, m: u32, a: u32) {
         let mut carry = a as u64;

@@ -1,5 +1,8 @@
 mod board;
-pub use board::{BoardAgents, BoardCoordination, BoardStats, Coordination};
+pub use board::{
+    BoardAgents, BoardCoordination, BoardStats, Coordination, DISPATCH_LABEL, DISPATCH_POLL_MS,
+    DISPATCH_POSTER, DISPATCH_ROLE, Dispatching, HostedView, dispatch_policy, dispatch_scope,
+};
 mod capacity;
 mod diagnostics;
 mod durable;
@@ -14,6 +17,8 @@ mod message;
 mod model;
 mod platform;
 mod policy;
+mod pool;
+pub use pool::{Ended, PoolClock, SubagentPool};
 mod roster;
 mod routing;
 mod runtime;

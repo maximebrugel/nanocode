@@ -195,18 +195,14 @@ mod _datetime {
 
     fn check_date_args(year: i32, month: i32, day: i32, vm: &VirtualMachine) -> PyResult<()> {
         if !(MINYEAR..=MAXYEAR).contains(&year) {
-            return Err(
-                vm.new_value_error(format!("year must be in {MINYEAR}..{MAXYEAR}, not {year}"))
-            );
+            return Err(vm.new_value_error(format!("year {year} is out of range")));
         }
         if !(1..=12).contains(&month) {
-            return Err(vm.new_value_error(format!("month must be in 1..12, not {month}")));
+            return Err(vm.new_value_error("month must be in 1..12"));
         }
         let dim = days_in_month(year, month);
         if day < 1 || day > dim {
-            return Err(vm.new_value_error(format!(
-                "day {day} must be in range 1..{dim} for month {month} in year {year}"
-            )));
+            return Err(vm.new_value_error("day is out of range for month"));
         }
         Ok(())
     }
@@ -220,16 +216,16 @@ mod _datetime {
         vm: &VirtualMachine,
     ) -> PyResult<()> {
         if !(0..=23).contains(&h) {
-            return Err(vm.new_value_error(format!("hour must be in 0..23, not {h}")));
+            return Err(vm.new_value_error("hour must be in 0..23"));
         }
         if !(0..=59).contains(&m) {
-            return Err(vm.new_value_error(format!("minute must be in 0..59, not {m}")));
+            return Err(vm.new_value_error("minute must be in 0..59"));
         }
         if !(0..=59).contains(&s) {
-            return Err(vm.new_value_error(format!("second must be in 0..59, not {s}")));
+            return Err(vm.new_value_error("second must be in 0..59"));
         }
         if !(0..=999_999).contains(&us) {
-            return Err(vm.new_value_error(format!("microsecond must be in 0..999999, not {us}")));
+            return Err(vm.new_value_error("microsecond must be in 0..999999"));
         }
         if fold != 0 && fold != 1 {
             return Err(vm.new_value_error(format!("fold must be either 0 or 1, not {fold}")));

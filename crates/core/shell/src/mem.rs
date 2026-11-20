@@ -1,5 +1,5 @@
 use crate::{
-    fs::{FileSystem, Kind, Remove, Reply, Stat, Write, normalize},
+    fs::{FileSystem, Kind, Links, Remove, Reply, Stat, Write, normalize},
     machine::Machine,
 };
 use nanocode_bytes::{Bytes, BytesMut};
@@ -10,12 +10,15 @@ const FILE_MODE: u32 = 0o644;
 const DIR_MODE: u32 = 0o755;
 const LINK_MODE: u32 = 0o777;
 
+/// A file's content and attributes, shared by every name hard links give it.
+struct Inode {
+    data: Bytes,
+    mode: u32,
+    mtime_ns: i64,
+}
+
 enum Node {
-    File {
-        data: Bytes,
-        mode: u32,
-        mtime_ns: i64,
-    },
+    File(Rc<RefCell<Inode>>),
     Dir {
         children: BTreeMap<Vec<u8>, Self>,
         mode: u32,
@@ -28,18 +31,25 @@ enum Node {
 }
 
 impl Node {
-    const fn stat(&self) -> Stat {
+    fn file(data: Bytes, mode: u32, mtime_ns: i64) -> Self {
+        Self::File(Rc::new(RefCell::new(Inode {
+            data,
+            mode,
+            mtime_ns,
+        })))
+    }
+
+    fn stat(&self) -> Stat {
         match self {
-            Self::File {
-                data,
-                mode,
-                mtime_ns,
-            } => Stat {
-                kind: Kind::File,
-                size: data.len() as u64,
-                mode: *mode,
-                mtime_ns: *mtime_ns,
-            },
+            Self::File(inode) => {
+                let inode = inode.borrow();
+                Stat {
+                    kind: Kind::File,
+                    size: inode.data.len() as u64,
+                    mode: inode.mode,
+                    mtime_ns: inode.mtime_ns,
+                }
+            }
             Self::Dir { mode, mtime_ns, .. } => Stat {
                 kind: Kind::Dir,
                 size: 0,
@@ -106,21 +116,14 @@ impl MemFs {
         let Node::Dir { children, .. } = node else {
             return Err(io::ErrorKind::NotADirectory.into());
         };
-        children.insert(
-            name.to_vec(),
-            Node::File {
-                data,
-                mode: FILE_MODE,
-                mtime_ns,
-            },
-        );
+        children.insert(name.to_vec(), Node::file(data, FILE_MODE, mtime_ns));
         Ok(())
     }
 
     pub fn get(&self, path: &[u8]) -> io::Result<Bytes> {
         let path = self.resolve(&normalize(path), true)?;
         match find(&self.root.borrow(), &parts(&path)) {
-            Some(Node::File { data, .. }) => Ok(data.clone()),
+            Some(Node::File(inode)) => Ok(inode.borrow().data.clone()),
             Some(Node::Dir { .. }) => Err(io::ErrorKind::IsADirectory.into()),
             Some(Node::Link { .. }) | None => missing(),
         }
@@ -265,11 +268,13 @@ impl FileSystem for MemFs {
         Reply::Now(self.resolve(path, true).and_then(|path| {
             self.within(&path, |children, name, now| {
                 match children.get_mut(name) {
-                    Some(Node::File {
-                        data: held,
-                        mtime_ns,
-                        ..
-                    }) => {
+                    Some(Node::File(inode)) => {
+                        let mut inode = inode.borrow_mut();
+                        let Inode {
+                            data: held,
+                            mtime_ns,
+                            ..
+                        } = &mut *inode;
                         match how {
                             Write::New => return Err(io::ErrorKind::AlreadyExists.into()),
                             Write::Replace => *held = Bytes::copy_from_slice(data),
@@ -286,14 +291,8 @@ impl FileSystem for MemFs {
                     Some(Node::Dir { .. }) => return Err(io::ErrorKind::IsADirectory.into()),
                     Some(Node::Link { .. }) => return missing(),
                     None => {
-                        children.insert(
-                            name.to_vec(),
-                            Node::File {
-                                data: Bytes::copy_from_slice(data),
-                                mode: FILE_MODE,
-                                mtime_ns: now,
-                            },
-                        );
+                        let file = Node::file(Bytes::copy_from_slice(data), FILE_MODE, now);
+                        children.insert(name.to_vec(), file);
                     }
                 }
                 Ok(())
@@ -418,10 +417,47 @@ impl FileSystem for MemFs {
         }))
     }
 
+    fn hard_link(&self, existing: &[u8], link: &[u8]) -> Reply<()> {
+        let shared = self.resolve(existing, false).and_then(|path| {
+            match find(&self.root.borrow(), &parts(&path)) {
+                Some(Node::File(inode)) => Ok(inode.clone()),
+                Some(Node::Dir { .. }) => Err(io::ErrorKind::PermissionDenied.into()),
+                Some(Node::Link { .. }) => Err(io::ErrorKind::Unsupported.into()),
+                None => missing(),
+            }
+        });
+        Reply::Now(shared.and_then(|inode| {
+            self.within(link, |children, name, _now| {
+                if children.contains_key(name) {
+                    return Err(io::ErrorKind::AlreadyExists.into());
+                }
+                children.insert(name.to_vec(), Node::File(inode));
+                Ok(())
+            })
+        }))
+    }
+
+    fn links(&self, path: &[u8], follow: bool) -> Option<Links> {
+        let path = self.resolve(path, follow).ok()?;
+        let root = self.root.borrow();
+        let Some(Node::File(inode)) = find(&root, &parts(&path)) else {
+            return None;
+        };
+        let names = Rc::strong_count(inode) as u64;
+        (names > 1).then_some(Links {
+            group: Rc::as_ptr(inode) as usize as u64,
+            names,
+        })
+    }
+
     fn set_mode(&self, path: &[u8], mode: u32) -> Reply<()> {
         Reply::Now(self.resolve(path, true).and_then(|path| {
             match find_mut(&mut self.root.borrow_mut(), &parts(&path)) {
-                Some(Node::File { mode: held, .. } | Node::Dir { mode: held, .. }) => {
+                Some(Node::File(inode)) => {
+                    inode.borrow_mut().mode = mode;
+                    Ok(())
+                }
+                Some(Node::Dir { mode: held, .. }) => {
                     *held = mode;
                     Ok(())
                 }
@@ -433,11 +469,11 @@ impl FileSystem for MemFs {
     fn set_mtime(&self, path: &[u8], mtime_ns: i64) -> Reply<()> {
         Reply::Now(self.resolve(path, true).and_then(|path| {
             match find_mut(&mut self.root.borrow_mut(), &parts(&path)) {
-                Some(
-                    Node::File { mtime_ns: held, .. }
-                    | Node::Dir { mtime_ns: held, .. }
-                    | Node::Link { mtime_ns: held, .. },
-                ) => {
+                Some(Node::File(inode)) => {
+                    inode.borrow_mut().mtime_ns = mtime_ns;
+                    Ok(())
+                }
+                Some(Node::Dir { mtime_ns: held, .. } | Node::Link { mtime_ns: held, .. }) => {
                     *held = mtime_ns;
                     Ok(())
                 }

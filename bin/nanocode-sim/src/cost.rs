@@ -94,7 +94,7 @@ pub struct CostStats {
 }
 
 impl CostStats {
-    const fn add(&mut self, other: &Self) {
+    pub const fn add(&mut self, other: &Self) {
         self.seeds += other.seeds;
         self.agents += other.agents;
         self.untasked += other.untasked;

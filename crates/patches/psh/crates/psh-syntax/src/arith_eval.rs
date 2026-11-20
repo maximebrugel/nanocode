@@ -23,6 +23,9 @@ pub enum ArithIndex<'a> {
     Num(i64),
     /// The key of an associative array: the subscript text as written.
     Key(&'a [u8]),
+    /// An indexed array's subscript that is empty (`a[]`, or `a[$k]` with `k` empty):
+    /// read as element 0, but a store to it is a bad subscript that stores nothing.
+    Empty,
 }
 
 /// A variable's value as the evaluator reads it.
@@ -176,7 +179,12 @@ impl<E: ArithEnv> Evaluator<'_, E> {
         } else if sub.iter().any(|&b| matches!(b, b'$' | b'`'))
             && let Some(expanded) = self.env.expand_subscript(sub).map_err(EvalError::Env)?
         {
-            Ok(Some(ArithIndex::Num(self.text(&expanded)?)))
+            match expanded.iter().all(u8::is_ascii_whitespace) {
+                true => Ok(Some(ArithIndex::Empty)),
+                false => Ok(Some(ArithIndex::Num(self.text(&expanded)?))),
+            }
+        } else if sub.iter().all(u8::is_ascii_whitespace) {
+            Ok(Some(ArithIndex::Empty))
         } else {
             Ok(Some(ArithIndex::Num(self.text(sub)?)))
         }
@@ -245,8 +253,15 @@ impl<E: ArithEnv> Evaluator<'_, E> {
                 if *post { old } else { new }
             }
             ArithKind::Binary { op, lhs, rhs } => match op {
-                BinOp::And => (self.expr(lhs, text)? != 0 && self.expr(rhs, text)? != 0) as i64,
-                BinOp::Or => (self.expr(lhs, text)? != 0 || self.expr(rhs, text)? != 0) as i64,
+                BinOp::And | BinOp::Or => {
+                    let a = self.expr(lhs, text)? != 0;
+                    if a == (*op == BinOp::And) {
+                        (self.expr(rhs, text)? != 0) as i64
+                    } else {
+                        self.skipped(rhs, text)?;
+                        a as i64
+                    }
+                }
                 BinOp::Comma => {
                     self.expr(lhs, text)?;
                     self.expr(rhs, text)?
@@ -263,8 +278,11 @@ impl<E: ArithEnv> Evaluator<'_, E> {
                 otherwise,
             } => {
                 if self.expr(cond, text)? != 0 {
-                    self.expr(then, text)?
+                    let v = self.expr(then, text)?;
+                    self.skipped(otherwise, text)?;
+                    v
                 } else {
+                    self.skipped(then, text)?;
                     self.expr(otherwise, text)?
                 }
             }
@@ -281,6 +299,86 @@ impl<E: ArithEnv> Evaluator<'_, E> {
                 };
                 self.store(target, text, new)?;
                 new
+            }
+            ArithKind::Fail { expr, error } => {
+                self.expr(expr, text)?;
+                return Err(EvalError::Arith {
+                    error: error.clone(),
+                    text: text.to_vec(),
+                });
+            }
+        })
+    }
+}
+
+impl<E: ArithEnv> Evaluator<'_, E> {
+    /// Walks a branch bash does not evaluate (the dead side of `&&`, `||` and `?:`),
+    /// as bash's `noeval` does: variables read as 0, nothing is assigned and division
+    /// by 0 is not an error, but a negative exponent still is (`1 ? 1 : 2 ** -3`).
+    fn skipped(&mut self, e: &ArithExpr, text: &[u8]) -> Result<i64, EvalError<E::Error>> {
+        if self.nest >= MAX_NEST {
+            return Err(err(ArithErrorKind::RecursionLevel, e.span.start, text));
+        }
+        self.nest += 1;
+        let r = self.skipped_inner(e, text);
+        self.nest -= 1;
+        r
+    }
+
+    fn skipped_inner(&mut self, e: &ArithExpr, text: &[u8]) -> Result<i64, EvalError<E::Error>> {
+        let lenient = |op: BinOp, a: i64, b: i64, rhs: &ArithExpr| {
+            let b = if matches!(op, BinOp::Div | BinOp::Rem) && b == 0 { 1 } else { b };
+            binary(op, a, b, rhs, text)
+        };
+        Ok(match &e.kind {
+            ArithKind::Num(n) => *n,
+            ArithKind::Var(_) => 0,
+            ArithKind::Unary { op, expr } => {
+                let v = self.skipped(expr, text)?;
+                match op {
+                    UnaryOp::Plus => v,
+                    UnaryOp::Minus => v.wrapping_neg(),
+                    UnaryOp::Not => (v == 0) as i64,
+                    UnaryOp::BitNot => !v,
+                }
+            }
+            ArithKind::IncDec { inc, post, .. } => match (post, inc) {
+                (true, _) => 0,
+                (false, true) => 1,
+                (false, false) => -1,
+            },
+            ArithKind::Binary { op, lhs, rhs } => {
+                let a = self.skipped(lhs, text)?;
+                let b = self.skipped(rhs, text)?;
+                match op {
+                    BinOp::And => (a != 0 && b != 0) as i64,
+                    BinOp::Or => (a != 0 || b != 0) as i64,
+                    BinOp::Comma => b,
+                    _ => lenient(*op, a, b, rhs)?,
+                }
+            }
+            ArithKind::Cond {
+                cond,
+                then,
+                otherwise,
+            } => {
+                let c = self.skipped(cond, text)?;
+                let t = self.skipped(then, text)?;
+                let o = self.skipped(otherwise, text)?;
+                if c != 0 { t } else { o }
+            }
+            ArithKind::Assign { op, value, .. } => {
+                let v = self.skipped(value, text)?;
+                match op {
+                    Some(op) => lenient(*op, 0, v, value)?,
+                    None => v,
+                }
+            }
+            ArithKind::Fail { error, .. } => {
+                return Err(EvalError::Arith {
+                    error: error.clone(),
+                    text: text.to_vec(),
+                });
             }
         })
     }
@@ -366,4 +464,58 @@ pub fn plain_decimal(v: &[u8]) -> Option<i64> {
         n = n * 10 + (d - b'0') as i64;
     }
     Some(if neg { -n } else { n })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Variables that are all unset, and assignments that fail the test.
+    struct Empty;
+
+    impl ArithEnv for Empty {
+        type Error = ();
+        fn is_assoc(&mut self, _: &[u8]) -> bool {
+            false
+        }
+        fn get(&mut self, _: &[u8], _: Option<ArithIndex<'_>>) -> Result<Option<Vec<u8>>, ()> {
+            Ok(None)
+        }
+        fn set(&mut self, _: &[u8], _: Option<ArithIndex<'_>>, _: i64) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    fn eval(s: &str) -> Result<i64, EvalError<()>> {
+        eval_arith(s.as_bytes(), &mut Empty)
+    }
+
+    #[test]
+    fn a_dead_branch_assigns_nothing_and_divides_by_zero_freely() {
+        assert_eq!(eval("1 ? 1 : (n = 2)"), Ok(1));
+        assert_eq!(eval("0 && n++"), Ok(0));
+        assert_eq!(eval("1 || 1 / 0"), Ok(1));
+        assert_eq!(eval("0 ? 1 % 0 : 3"), Ok(3));
+        assert_eq!(eval("1 ? 1 : 2 ** n"), Ok(1));
+    }
+
+    #[test]
+    fn syntax_errors_read_as_bash_5_2_words_them() {
+        let e = eval("1 +").unwrap_err();
+        assert_eq!(
+            e.bash_text().as_deref(),
+            Some("1 +: syntax error: operand expected (error token is \"+\")")
+        );
+    }
+
+    #[test]
+    fn a_dead_branch_still_refuses_a_negative_exponent() {
+        for s in ["1 ? 1 : 2 ** -3", "7 ? 1 : 2 ** --n", "0 && 2 ** -1", "1 || 0 ? 2 ** -1 : 0"] {
+            let e = eval(s).unwrap_err();
+            assert!(
+                matches!(&e, EvalError::Arith { error, .. } if error.kind == ArithErrorKind::NegativeExponent),
+                "{s}: {e:?}"
+            );
+        }
+    }
 }

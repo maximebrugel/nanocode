@@ -19,6 +19,11 @@ impl Blob {
         }
     }
 
+    /// A blob whose digest the caller already computed over `bytes`.
+    pub(crate) const fn hashed(digest: Digest, bytes: Bytes) -> Self {
+        Self { digest, bytes }
+    }
+
     pub fn verified(digest: Digest, bytes: Bytes) -> Result<Self, Failure> {
         let blob = Self::new(bytes);
         if blob.digest == digest {

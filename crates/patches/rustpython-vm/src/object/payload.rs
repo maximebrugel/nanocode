@@ -83,6 +83,18 @@ pub trait PyPayload: MaybeTraverse + PyThreadingConstraint + Sized + 'static {
     /// which is created untracked and tracked lazily only on escape.
     const NEW_REF_UNTRACKED: bool = false;
 
+    /// Whether `PyRef::new_ref` asks [`Self::gc_start_untracked`] if a new,
+    /// dict-less, non-heap-type instance may start untracked by the GC.
+    const GC_TRACK_LAZILY: bool = false;
+
+    /// For `GC_TRACK_LAZILY` types: return `true` to leave the new object
+    /// `zelf` untracked. The type then must track it itself as soon as it
+    /// could become part of a reference cycle.
+    #[inline(always)]
+    fn gc_start_untracked(_zelf: &crate::Py<Self>) -> bool {
+        false
+    }
+
     /// Whether this type has a freelist. Types with freelists require
     /// immediate (non-deferred) GC untracking during dealloc to prevent
     /// race conditions when the object is reused.
@@ -90,6 +102,12 @@ pub trait PyPayload: MaybeTraverse + PyThreadingConstraint + Sized + 'static {
 
     /// Maximum number of objects to keep in the freelist.
     const MAX_FREELIST: usize = 0;
+
+    /// Whether an instance whose class is exactly `Self::class` never has a
+    /// `__del__`, weak references, an instance dict or slots, children to
+    /// clear, or GC tracking, so deallocating it only has to recycle or free
+    /// its memory. Lets `default_dealloc` skip those checks for it.
+    const EXACT_IS_LEAF: bool = false;
 
     /// Try to push a dead object onto this type's freelist for reuse.
     /// Returns true if the object was stored (caller must NOT free the memory).

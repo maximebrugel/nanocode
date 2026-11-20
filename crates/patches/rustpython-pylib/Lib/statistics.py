@@ -1249,11 +1249,9 @@ class NormalDist:
 
     def samples(self, n, *, seed=None):
         "Generate *n* samples for a given mean and standard deviation."
-        rnd = random.random if seed is None else random.Random(seed).random
-        inv_cdf = _normal_dist_inv_cdf
-        mu = self._mu
-        sigma = self._sigma
-        return [inv_cdf(rnd(), mu, sigma) for _ in repeat(None, n)]
+        gauss = random.gauss if seed is None else random.Random(seed).gauss
+        mu, sigma = self._mu, self._sigma
+        return [gauss(mu, sigma) for _ in repeat(None, n)]
 
     def pdf(self, x):
         "Probability density function.  P(x <= X < x+dx) / dx"

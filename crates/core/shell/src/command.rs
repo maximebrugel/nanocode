@@ -1,7 +1,7 @@
 use crate::{
     answers,
     file::{Capture, Source},
-    fs::{FileSystem, Remove, Reply, Stat, Write, normalize},
+    fs::{FileSystem, Kind, Links, Remove, Reply, Stat, Write, normalize},
     host::{Host, Vfs},
     shell::{Limit, Limits},
 };
@@ -15,10 +15,14 @@ use std::{
     rc::Rc,
     sync::Arc,
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 
 pub trait Commands {
     fn has(&self, name: &[u8]) -> bool;
+    fn names(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
     fn run(&self, call: Call) -> Pin<Box<dyn Future<Output = i32>>>;
 }
 
@@ -123,6 +127,21 @@ impl Session {
         Arc::new(move || control.as_ref().is_some_and(ControlHandle::cancelled))
     }
 
+    /// Runs `child` over the file system `over` builds on top of this
+    /// shell's own, for a caller that holds its own copy of some files, such
+    /// as Python copying them in from a file system that answers later.
+    pub fn run_over(
+        &self,
+        child: Child,
+        over: impl FnOnce(Rc<dyn FileSystem>) -> Rc<dyn FileSystem>,
+    ) -> io::Result<Exited> {
+        let files = over(self.0.fs());
+        let kept = self.0.fs.replace(files);
+        let exited = self.run(child);
+        self.0.fs.replace(kept);
+        exited
+    }
+
     pub fn run(&self, child: Child) -> io::Result<Exited> {
         let vfs = &self.0;
         let mut argv = child.argv;
@@ -167,33 +186,12 @@ impl Session {
         });
         let known = vfs.missing.borrow().len();
         let mut charged = 0;
-        let status = loop {
-            let left = vfs.left.get();
-            let slice =
-                u32::try_from(left).map_or(vfs.slice.get(), |left| left.min(vfs.slice.get()));
-            if left == 0 {
-                vfs.refuse(Limit::Fuel);
-            }
-            if slice == 0 || vfs.control.get().is_some_and(ControlHandle::cancelled) {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            let step = engine.step(slice);
-            let spent = engine.spent();
-            vfs.children.set(vfs.children.get() + spent - charged);
-            vfs.left.set(left.saturating_sub(spent - charged));
-            charged = spent;
-            match step {
-                psh_engine::Step::Done(status) => break status,
-                psh_engine::Step::Yield => {}
-                psh_engine::Step::Blocked | psh_engine::Step::Idle => {
-                    vfs.lacks(&name);
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "this shell cannot wait for a command that Python starts",
-                    ));
-                }
-            }
-        };
+        let outer = vfs.timers.replace(Some(Vec::new()));
+        let skipped = vfs.skipped.get();
+        let status = self.drive(&mut engine, &name, &mut charged);
+        vfs.timers.replace(outer);
+        vfs.skipped.set(skipped);
+        let status = status?;
         if status == NOT_FOUND && vfs.missing.borrow()[known..].contains(&name) {
             return Err(io::ErrorKind::NotFound.into());
         }
@@ -205,7 +203,106 @@ impl Session {
             stderr,
         })
     }
+
+    fn drive(
+        &self,
+        engine: &mut psh_engine::Shell,
+        name: &[u8],
+        charged: &mut u64,
+    ) -> io::Result<i32> {
+        let vfs = &self.0;
+        loop {
+            let left = vfs.left.get();
+            let slice =
+                u32::try_from(left).map_or(vfs.slice.get(), |left| left.min(vfs.slice.get()));
+            if left == 0 {
+                vfs.refuse(Limit::Fuel);
+            }
+            if slice == 0 || vfs.control.get().is_some_and(ControlHandle::cancelled) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let step = engine.step(slice);
+            let spent = engine.spent();
+            vfs.children.set(vfs.children.get() + spent - *charged);
+            vfs.left.set(left.saturating_sub(spent - *charged));
+            *charged = spent;
+            match step {
+                psh_engine::Step::Done(status) => return Ok(status),
+                psh_engine::Step::Yield => {}
+                psh_engine::Step::Blocked if self.wait_timers() => {}
+                psh_engine::Step::Blocked | psh_engine::Step::Idle => {
+                    vfs.lacks(name);
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "this shell cannot wait for a command that Python starts",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Waits until the soonest sleep of a blocked command is due and wakes
+    /// the sleeps that are, or returns false when nothing but a timer could
+    /// unblock it. Where the platform cannot wait in place (wasm), the shell's
+    /// clock skips ahead to that deadline instead, so sleeps and timeouts end
+    /// in the order they would have, only sooner.
+    fn wait_timers(&self) -> bool {
+        let vfs = &self.0;
+        let timers = vfs
+            .timers
+            .borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let Some(soonest) = timers.iter().map(|(until, _)| *until).min() else {
+            return false;
+        };
+        if CAN_WAIT {
+            wait_until(vfs, soonest, || {
+                vfs.control.get().is_some_and(ControlHandle::cancelled)
+            });
+        } else {
+            skip_to(vfs, soonest);
+        }
+        let now = vfs.now();
+        for (until, waker) in timers {
+            if until <= now {
+                waker.wake();
+            } else if let Some(left) = vfs.timers.borrow_mut().as_mut() {
+                left.push((until, waker));
+            }
+        }
+        true
+    }
 }
+
+const CAN_WAIT: bool = cfg!(not(target_family = "wasm"));
+
+/// Moves the shell's clock on to a deadline it is behind.
+fn skip_to(vfs: &Vfs, until: Duration) {
+    let behind = until.saturating_sub(vfs.now());
+    vfs.skipped.set(vfs.skipped.get().saturating_add(behind));
+}
+
+/// Waits until the deadline or until stop says to (the run loop then sees
+/// the cancellation).
+#[cfg(not(target_family = "wasm"))]
+fn wait_until(vfs: &Vfs, until: Duration, stop: impl Fn() -> bool) {
+    const POLL: Duration = Duration::from_millis(20);
+    loop {
+        if stop() {
+            return;
+        }
+        let left = until.saturating_sub(vfs.now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(POLL));
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn wait_until(_: &Vfs, _: Duration, _: impl Fn() -> bool) {}
 
 struct Tracked(Rc<Vfs>);
 
@@ -224,6 +321,10 @@ impl FileSystem for Tracked {
 
     fn list(&self, path: &[u8]) -> Reply<Vec<Vec<u8>>> {
         self.0.list(&normalize(path))
+    }
+
+    fn list_kinds(&self, path: &[u8]) -> Reply<Vec<(Vec<u8>, Option<Kind>)>> {
+        self.0.list_kinds(&normalize(path))
     }
 
     fn mkdir(&self, path: &[u8], mode: u32) -> Reply<()> {
@@ -246,12 +347,24 @@ impl FileSystem for Tracked {
         self.0.read_link(&normalize(path))
     }
 
+    fn hard_link(&self, existing: &[u8], link: &[u8]) -> Reply<()> {
+        self.0.hard_link(&normalize(existing), normalize(link))
+    }
+
+    fn links(&self, path: &[u8], follow: bool) -> Option<Links> {
+        self.0.fs().links(&normalize(path), follow)
+    }
+
     fn set_mode(&self, path: &[u8], mode: u32) -> Reply<()> {
         self.0.set_mode(&normalize(path), mode)
     }
 
     fn set_mtime(&self, path: &[u8], mtime_ns: i64) -> Reply<()> {
         self.0.set_mtime(&normalize(path), mtime_ns)
+    }
+
+    fn answers_now(&self) -> bool {
+        self.0.fs().answers_now()
     }
 }
 

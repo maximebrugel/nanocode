@@ -135,7 +135,7 @@ fn spec_format_bytes(
                     Err(vm.new_type_error(format!(
                         "%{} format: an integer is required, not {}",
                         spec.format_type.to_char(),
-                        obj.class().name()
+                        obj.class().slot_name()
                     )))
                 }
             }
@@ -241,7 +241,7 @@ fn spec_format_string(
                     Err(vm.new_type_error(format!(
                         "%{} format: an integer is required, not {}",
                         spec.format_type.to_char(),
-                        obj.class().name()
+                        obj.class().slot_name()
                     )))
                 }
             }

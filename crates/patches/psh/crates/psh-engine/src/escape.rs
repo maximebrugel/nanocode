@@ -30,7 +30,9 @@ fn hex(b: u8) -> Option<u32> {
     (b as char).to_digit(16)
 }
 
-pub(crate) fn decode(s: &[u8], dialect: Dialect) -> Decoded {
+/// `utf8`: the locale's encoding; outside UTF-8 a `\u`/`\U` escape past ASCII stays
+/// an escape (`\u00E9`), as bash prints what it cannot convert.
+pub(crate) fn decode(s: &[u8], dialect: Dialect, utf8: bool) -> Decoded {
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
@@ -108,8 +110,12 @@ pub(crate) fn decode(s: &[u8], dialect: Dialect) -> Decoded {
                 if n == 0 {
                     out.push(b'\\');
                     out.push(c);
-                } else {
+                } else if utf8 || v < 0x80 {
                     push_char(&mut out, v);
+                } else if v < 0x1_0000 {
+                    out.extend_from_slice(format!("\\u{v:04X}").as_bytes());
+                } else {
+                    out.extend_from_slice(format!("\\U{v:08X}").as_bytes());
                 }
             }
             _ => {

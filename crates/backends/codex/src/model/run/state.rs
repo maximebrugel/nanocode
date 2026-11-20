@@ -115,13 +115,19 @@ impl ConversationState {
     }
 
     pub(super) fn prepare_replay_images(&mut self) -> bool {
-        let mut history = self.managed.flattened_history();
-        let history_changed = nanocode_code_mode::image::prepare_history_images(&mut history);
+        // Copy the history only when it holds an image to prepare: a resumed
+        // history is otherwise held twice while the agent opens.
+        let mut history = nanocode_code_mode::image::history_has_images(self.managed.history())
+            .then(|| self.managed.flattened_history());
+        let history_changed = history
+            .as_mut()
+            .is_some_and(|history| nanocode_code_mode::image::prepare_history_images(history));
         let context_changed = nanocode_code_mode::image::prepare_history_images(
             std::slice::from_mut(Arc::make_mut(&mut self.canonical_context)),
         );
         let changed = history_changed || context_changed;
         if changed {
+            let history = history.unwrap_or_else(|| self.managed.flattened_history());
             self.managed.replace_prepared_history(history);
         }
         changed

@@ -169,6 +169,19 @@ mod trashcan {
 /// Equivalent to subtype_dealloc.
 pub(super) unsafe fn default_dealloc<T: PyPayload>(obj: *mut PyObject) {
     let obj_ref = unsafe { &*(obj as *const PyObject) };
+    // An exact leaf instance has nothing to finalize, clear or untrack: it
+    // only goes back to the freelist or is freed, under the same
+    // published-object rule as the general path below.
+    if T::EXACT_IS_LEAF
+        && core::ptr::eq(obj_ref.class(), T::class(crate::vm::Context::genesis()))
+        && !obj_ref.0.ref_count.is_published()
+    {
+        debug_assert!(!obj_ref.is_gc_tracked());
+        if !(T::HAS_FREELIST && unsafe { T::freelist_push(obj) }) {
+            unsafe { Py::dealloc(obj as *mut Py<T>) };
+        }
+        return;
+    }
     if let Err(()) = obj_ref.drop_slow_inner() {
         return; // resurrected by __del__
     }
@@ -331,9 +344,9 @@ pub(crate) type GcOwner = u16;
 /// current. Every interpreter collects these.
 pub(crate) const GC_NO_OWNER: GcOwner = 0;
 
-/// `gc_refs` of an object a running collection has proved reachable. One past
-/// the largest count [`PyObject::start_gc_refs`] stores, so no real count can
-/// be taken for it.
+/// `gc_refs` of a candidate whose strong count is too large to hold: one past
+/// the largest count [`PyObject::start_gc_refs`] stores, which no subtraction
+/// takes down, so the candidate is a root.
 pub(crate) const GC_REACHABLE: u32 = u32::MAX;
 
 /// Link implementation for GC intrusive linked list tracking
@@ -459,9 +472,10 @@ pub struct Py<T> {
     /// Sits in what would otherwise be padding, so it costs no space.
     pub(super) gc_owner: PyAtomic<GcOwner>,
     /// The count a running collection is working with: the strong count with
-    /// the references held from inside the candidate set taken off, or
-    /// [`GC_REACHABLE`] once the object has been proved reachable. Only
-    /// meaningful while `gc_bits` has [`GcBits::COLLECTING`].
+    /// the references held from inside the candidate set taken off (or
+    /// [`GC_REACHABLE`] when it did not fit), and then, once the roots are
+    /// known, the object's index among the candidates. Only meaningful while
+    /// `gc_bits` has [`GcBits::COLLECTING`].
     pub(super) gc_refs: PyAtomic<u32>,
     /// Intrusive linked list pointers for GC generational tracking
     pub(super) gc_pointers: Pointers<PyObject>,
@@ -1419,6 +1433,37 @@ impl<T: PyPayload> FreeList<T> {
     }
 }
 
+impl<T: PyPayload> FreeList<T> {
+    /// Push `obj` onto the thread-local list in `cell` unless it already
+    /// holds `max` entries. Works on the list in place: moving the `Vec` out
+    /// of the `Cell` and back on every call cost more than the push.
+    ///
+    /// # Safety
+    /// `obj` must be a dead husk of `T` as `PyPayload::freelist_push`
+    /// requires. Nothing here can reenter the interpreter, so no other access
+    /// to `cell` overlaps this one.
+    #[inline(always)]
+    pub(crate) unsafe fn push_in(cell: &core::cell::Cell<Self>, obj: *mut PyObject, max: usize) -> bool {
+        let list = unsafe { &mut *cell.as_ptr() };
+        if list.items.len() < max {
+            list.items.push(obj);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pop a husk from the thread-local list in `cell`, in place.
+    ///
+    /// # Safety
+    /// As for `push_in`.
+    #[inline(always)]
+    pub(crate) unsafe fn pop_in(cell: &core::cell::Cell<Self>) -> Option<NonNull<PyObject>> {
+        let list = unsafe { &mut *cell.as_ptr() };
+        list.items.pop().map(|p| unsafe { NonNull::new_unchecked(p) })
+    }
+}
+
 impl<T: PyPayload> Default for FreeList<T> {
     fn default() -> Self {
         Self::new()
@@ -1987,15 +2032,12 @@ impl PyObject {
             .store(refs.saturating_sub(1), Ordering::Relaxed);
     }
 
-    /// Mark the object reachable, answering whether this call was the one that
-    /// did it.
+    /// Replace the count, once the running collection has read off whether
+    /// this candidate is a root, with its index among the candidates, which
+    /// the reachability walk looks its referents and its mark up by.
     #[inline]
-    pub(crate) fn mark_gc_reachable(&self) -> bool {
-        if self.0.gc_refs.load(Ordering::Relaxed) == GC_REACHABLE {
-            return false;
-        }
-        self.0.gc_refs.store(GC_REACHABLE, Ordering::Relaxed);
-        true
+    pub(crate) fn set_gc_candidate_index(&self, idx: u32) {
+        self.0.gc_refs.store(idx, Ordering::Relaxed);
     }
 
     /// Leave the candidate set, whatever the collection concluded.
@@ -2057,11 +2099,8 @@ impl PyObject {
 
                 let del_method = zelf.get_class_attr(identifier!(vm, __del__)).unwrap();
                 if let Err(e) = slot_del(zelf, vm) {
-                    let msg = del_method
-                        .repr(vm)
-                        .ok()
-                        .map(|r| format!("Exception ignored while calling deallocator {r}"));
-                    vm.run_unraisable(e, msg, del_method);
+                    // CPython 3.12 reports a failing __del__ as "Exception ignored in: <repr>".
+                    vm.run_unraisable(e, None, del_method);
                 }
 
                 // Undo the temporary resurrection. Always remove both
@@ -2182,6 +2221,15 @@ impl PyObject {
         unsafe { &*ptr }
     }
 
+    /// Whether this object is tracked by the GC now or may become tracked
+    /// (`_PyObject_GC_MAY_BE_TRACKED`): it is tracked, or its payload can
+    /// hold references. A dict stays untracked only while every key and
+    /// value it holds answers `false`.
+    #[inline(always)]
+    pub(crate) fn gc_may_be_tracked(&self) -> bool {
+        self.0.vtable.trace.is_some() || self.is_gc_tracked()
+    }
+
     /// _PyObject_GC_IS_TRACKED
     pub fn is_gc_tracked(&self) -> bool {
         GcBits::from_bits_retain(self.0.gc_bits.load(Ordering::Relaxed)).contains(GcBits::TRACKED)
@@ -2219,11 +2267,8 @@ impl PyObject {
                 if let Err(e) = slot_del(self, vm)
                     && let Some(del_method) = self.get_class_attr(identifier!(vm, __del__))
                 {
-                    let msg = del_method
-                        .repr(vm)
-                        .ok()
-                        .map(|r| format!("Exception ignored while calling deallocator {r}"));
-                    vm.run_unraisable(e, msg, del_method);
+                    // CPython 3.12 reports a failing __del__ as "Exception ignored in: <repr>".
+                    vm.run_unraisable(e, None, del_method);
                 }
             });
             let _ = result;
@@ -2729,6 +2774,28 @@ impl<T: PyPayload> PyRef<T> {
 }
 
 impl<T: PyPayload + crate::object::MaybeTraverse + core::fmt::Debug> PyRef<T> {
+    /// `new_ref` for an untracked payload whose freelist holds only husks of
+    /// exact `T::class` instances: a popped husk already has the right class,
+    /// so the class reference is neither cloned nor compared.
+    #[inline(always)]
+    pub(crate) fn new_exact_untracked(payload: T, ctx: &crate::vm::Context) -> Self {
+        debug_assert!(!<T as crate::object::MaybeTraverse>::HAS_TRAVERSE);
+        if let Some(cached) = unsafe { T::freelist_pop(&payload) } {
+            let inner = cached.as_ptr() as *mut Py<T>;
+            unsafe {
+                debug_assert!(core::ptr::eq(&*(*inner).typ, T::class(ctx)));
+                core::ptr::write(&mut (*inner).ref_count, RefCount::new());
+                (*inner).gc_bits.store(0, Ordering::Relaxed);
+                core::ptr::drop_in_place(&mut (*inner).payload);
+                core::ptr::write(&mut (*inner).payload, payload);
+            }
+            return Self {
+                ptr: unsafe { NonNull::new_unchecked(inner) },
+            };
+        }
+        Self::new_ref(payload, T::class(ctx).to_owned(), None)
+    }
+
     #[inline(always)]
     pub fn new_ref(payload: T, typ: crate::builtins::PyTypeRef, dict: Option<PyDictRef>) -> Self {
         let has_dict = dict.is_some();
@@ -2770,8 +2837,15 @@ impl<T: PyPayload + crate::object::MaybeTraverse + core::fmt::Debug> PyRef<T> {
         // - heap type (all heap type instances are GC-tracked, like Py_TPFLAGS_HAVE_GC)
         // unless the payload opts out via NEW_REF_UNTRACKED (e.g. call frames,
         // which are tracked lazily only on escape).
+        // Exact dicts holding only atomic values start untracked too
+        // (`GC_TRACK_LAZILY`); they are tracked on the first store that
+        // could make them part of a cycle.
         if (<T as crate::object::MaybeTraverse>::HAS_TRAVERSE || has_dict || is_heaptype)
             && !T::NEW_REF_UNTRACKED
+            && !(T::GC_TRACK_LAZILY
+                && !has_dict
+                && !is_heaptype
+                && T::gc_start_untracked(unsafe { ptr.as_ref() }))
         {
             // Tracks under the interpreter running now and collects if this
             // allocation pushed gen0 past its threshold.

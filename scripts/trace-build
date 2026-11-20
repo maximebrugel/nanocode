@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""trace-build: record a build as a graph of actions by tracing it (build systems a la trace).
+
+Runs a command under strace -f -y and cuts it into actions: each execve of a compiler driver
+(cc, gcc, clang, ...) that isn't already inside one starts an action holding that process and
+all its children (cc, cc1, as, ...). Everything else belongs to action 0, the driver.
+
+  inputs   files an action read that existed before the build or that an earlier action wrote
+  outputs  files it wrote and left behind; files it wrote and then unlinked (cc's /tmp/cc*.s) or
+           read back after writing are internal
+  versions every write makes a new version of its path (path#1, path#2, ...): SSA for files, so
+           a read names the exact version it saw and the action that made it
+  key      sha256 over the argv, cwd and each input's path and content hash, with --root and
+           --rewrite prefixes replaced by fixed names, so the same action from another checkout
+           has the same key; an input another action wrote hashes as that action's key
+
+Usage: scripts/trace-build [--root DIR] [--rewrite PATH=NAME]... [--drivers cc,clang]
+                           [--graph out.json] [--keep-trace F] [--check-depfiles] -- COMMAND...
+The graph is JSON: {"actions": [{"id", "argv", "cwd", "pids", "inputs", "outputs", "deps",
+"key"}], "command"}. --check-depfiles compares each action that wrote a -MD/-MF depfile with the
+headers it read.
+"""
+import argparse, ast, hashlib, json, os, re, subprocess, sys, tempfile
+
+LINE = re.compile(r'^(\d+)\s+(.*)$')
+CALL = re.compile(r'^([a-z0-9_]+)\((.*)\)\s+=\s+(.*)$', re.S)
+FD = re.compile(r'^(-?\d+|AT_FDCWD)(?:<(.*)>)?$', re.S)
+TRACED = 'process,open,openat,creat,rename,renameat,renameat2,unlink,unlinkat,chdir,fchdir'
+
+
+def split_args(text):
+    """Splits strace's argument text on top-level commas, keeping quotes, [] and {} whole."""
+    out, depth, cur, quote, esc = [], 0, [], False, False
+    for ch in text:
+        if quote:
+            cur.append(ch)
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                quote = False
+            continue
+        if ch == '"':
+            quote = True
+        elif ch in '[{(':
+            depth += 1
+        elif ch in ']})':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            out.append(''.join(cur).strip())
+            cur = []
+            continue
+        cur.append(ch)
+    if cur:
+        out.append(''.join(cur).strip())
+    return out
+
+
+def string(token):
+    """Decodes a quoted strace string ("..." possibly followed by ... when cut)."""
+    token = token.strip()
+    if token.endswith('...'):
+        token = token[:-3]
+    if not token.startswith('"'):
+        return None
+    try:
+        return ast.literal_eval('b' + token).decode('utf-8', 'surrogateescape')
+    except (ValueError, SyntaxError):
+        return token.strip('"')
+
+
+def strings(token):
+    token = token.strip()
+    if not token.startswith('['):
+        return []
+    return [s for s in (string(t) for t in split_args(token[1:-1])) if s is not None]
+
+
+def fd_path(token):
+    """The path -y prints for an fd argument or return value (3</path>), or None."""
+    m = FD.match(token.strip())
+    return m.group(2) if m else None
+
+
+def parse(trace):
+    """Yields (pid, syscall, args, ret) from strace -f output, joining unfinished/resumed halves."""
+    pending = {}
+    with open(trace, errors='surrogateescape') as f:
+        for raw in f:
+            m = LINE.match(raw.rstrip('\n'))
+            if not m:
+                continue
+            pid, rest = int(m.group(1)), m.group(2)
+            if rest.startswith('+++') or rest.startswith('---'):
+                continue
+            if rest.endswith('<unfinished ...>'):
+                pending[pid] = rest[:-len('<unfinished ...>')].rstrip()
+                continue
+            if rest.startswith('<...'):
+                head = pending.pop(pid, None)
+                if head is None:
+                    continue
+                rest = head + rest.split('resumed>', 1)[1]
+            c = CALL.match(rest)
+            if c:
+                yield pid, c.group(1), split_args(c.group(2)), c.group(3)
+
+
+def retval(ret):
+    head = ret.split(' ', 1)[0]
+    m = FD.match(head) if not ret.startswith('-1') else None
+    if ret.startswith('-1') or ret.startswith('?'):
+        return None, None
+    m = FD.match(ret.split(' (')[0].strip())
+    if m and m.group(1) != 'AT_FDCWD':
+        return int(m.group(1)), m.group(2)
+    return 0, None
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return 'missing'
+
+
+def build_graph(trace, root_pid, start_cwd, drivers, rewrite):
+    events = list(parse(trace))
+    # Pass 1: the process tree. A child's events can come before its parent's clone returns,
+    # so parents are read from every clone/fork result first.
+    parent = {}
+    for pid, name, args, ret in events:
+        if name in ('clone', 'clone3', 'fork', 'vfork'):
+            child, _ = retval(ret)
+            if child:
+                parent[child] = pid
+    cwd = {root_pid: start_cwd}
+    action_of = {}
+    actions = [{'id': 0, 'argv': ['<driver>'], 'cwd': start_cwd, 'pids': [root_pid],
+                'reads': [], 'writes': [], 'unlinked': set()}]
+    version = {}   # path -> latest version number
+    writer = {}    # (path, n) -> action id
+
+    def owner(pid):
+        if pid not in action_of:
+            p = parent.get(pid)
+            action_of[pid] = owner(p) if p is not None and p != pid else 0
+            if pid not in cwd:
+                cwd[pid] = cwd.get(p, start_cwd)
+        return action_of[pid]
+
+    def resolve(pid, path, dirfd=None):
+        if path is None:
+            return None
+        if os.path.isabs(path):
+            return os.path.normpath(path)
+        base = fd_path(dirfd) if dirfd and not dirfd.startswith('AT_FDCWD') else None
+        return os.path.normpath(os.path.join(base or cwd.get(pid, start_cwd), path))
+
+    def skip(path):
+        return path is None or path.startswith(('/proc/', '/dev/', '/sys/')) or path in ('/dev', '/proc')
+
+    def wrote(a, path):
+        n = version.get(path, 0) + 1
+        version[path] = n
+        writer[(path, n)] = a
+        actions[a]['writes'].append((path, n))
+        actions[a]['unlinked'].discard(path)
+
+    # Pass 2: events in order.
+    for pid, name, args, ret in events:
+        a = owner(pid)
+        if name == 'execve' or name == 'execveat':
+            rv, _ = retval(ret)
+            if rv is None:
+                continue
+            argv = strings(args[1]) if len(args) > 1 else []
+            exe = os.path.basename(string(args[0]) or '')
+            if a == 0 and (exe in drivers or (argv and os.path.basename(argv[0]) in drivers)):
+                a = len(actions)
+                actions.append({'id': a, 'argv': argv, 'cwd': cwd.get(pid, start_cwd), 'pids': [pid],
+                                'reads': [], 'writes': [], 'unlinked': set()})
+                action_of[pid] = a
+            elif pid not in actions[a]['pids']:
+                actions[a]['pids'].append(pid)
+        elif name in ('open', 'openat', 'creat'):
+            fd, path = retval(ret)
+            if fd is None:
+                continue
+            flags = args[2] if name == 'openat' and len(args) > 2 else (args[1] if len(args) > 1 else '')
+            if 'O_DIRECTORY' in flags:
+                continue
+            if path is None:
+                path = resolve(pid, string(args[1] if name == 'openat' else args[0]),
+                               args[0] if name == 'openat' else None)
+            if skip(path) or os.path.isdir(path):
+                continue
+            if name == 'creat' or any(f in flags for f in ('O_WRONLY', 'O_RDWR', 'O_CREAT', 'O_TRUNC')):
+                wrote(a, path)
+            else:
+                actions[a]['reads'].append((path, version.get(path, 0)))
+        elif name in ('rename', 'renameat', 'renameat2'):
+            if retval(ret)[0] is None:
+                continue
+            if name == 'rename':
+                src, dst = resolve(pid, string(args[0])), resolve(pid, string(args[1]))
+            else:
+                src, dst = resolve(pid, string(args[1]), args[0]), resolve(pid, string(args[3]), args[2])
+            if skip(dst):
+                continue
+            actions[a]['unlinked'].add(src)
+            wrote(a, dst)
+        elif name in ('unlink', 'unlinkat'):
+            if retval(ret)[0] is None or (name == 'unlinkat' and 'AT_REMOVEDIR' in ''.join(args[2:])):
+                continue
+            path = resolve(pid, string(args[0])) if name == 'unlink' else resolve(pid, string(args[1]), args[0])
+            actions[a]['unlinked'].add(path)
+        elif name == 'chdir':
+            if retval(ret)[0] is not None:
+                cwd[pid] = resolve(pid, string(args[0]))
+        elif name == 'fchdir':
+            if retval(ret)[0] is not None and fd_path(args[0]):
+                cwd[pid] = fd_path(args[0])
+
+    def portable(text):
+        for prefix, token in rewrite:
+            text = text.replace(prefix, token)
+        return text
+
+    # Keys in action order: an input another action wrote hashes as that action's key.
+    hashes, out = {}, []
+    for act in actions:
+        own = {(p, n) for p, n in act['writes']}
+        written = {p for p, _ in act['writes']}
+        inputs, deps = {}, set()
+        for path, n in act['reads']:
+            if (path, n) in own or (n and writer.get((path, n)) == act['id']):
+                continue
+            if n == 0 and path in written:
+                pass  # read before this action rewrote it: still an input
+            label = f'{path}#{n}'
+            if n:
+                w = writer[(path, n)]
+                deps.add(w)
+                inputs[label] = 'action:' + out[w]['key'] if w < len(out) else 'action:%d' % w
+            else:
+                if path not in hashes:
+                    hashes[path] = file_hash(path)
+                inputs[label] = hashes[path]
+        outputs = []
+        for path, n in act['writes']:
+            if path in act['unlinked'] or version.get(path) != n and writer.get((path, version.get(path))) == act['id']:
+                continue
+            outputs.append(f'{path}#{n}')
+        h = hashlib.sha256()
+        h.update(json.dumps([[portable(x) for x in act['argv']], portable(act['cwd'])]).encode('utf-8', 'surrogateescape'))
+        for label in sorted(inputs, key=portable):
+            h.update(portable(label).encode('utf-8', 'surrogateescape') + b'\0' + inputs[label].encode() + b'\n')
+        out.append({'id': act['id'], 'argv': act['argv'], 'cwd': act['cwd'], 'pids': act['pids'],
+                    'inputs': sorted(inputs), 'outputs': sorted(set(outputs)),
+                    'deps': sorted(deps - {act['id']}), 'key': h.hexdigest()})
+    return out
+
+
+def depfile_check(actions):
+    """For actions that wrote a depfile (-MF F, or -MD next to -o), compares its prerequisites
+    with the files the action read; returns (checked, matching, examples of mismatches)."""
+    checked = matching = 0
+    bad = []
+    for act in actions[1:]:
+        argv = act['argv']
+        dep = None
+        if '-MF' in argv and argv.index('-MF') + 1 < len(argv):
+            dep = argv[argv.index('-MF') + 1]
+        elif '-MD' in argv and '-o' in argv:
+            dep = os.path.splitext(argv[argv.index('-o') + 1])[0] + '.d'
+        if not dep:
+            continue
+        dep = os.path.normpath(os.path.join(act['cwd'], dep))
+        try:
+            text = open(dep, errors='surrogateescape').read().replace('\\\n', ' ')
+        except OSError:
+            continue
+        listed = {os.path.realpath(os.path.join(act['cwd'], w)) for w in text.split(':', 1)[1].split()}
+        read = {os.path.realpath(i.rsplit('#', 1)[0]) for i in act['inputs']}
+        read = {p for p in read if p.endswith(('.h', '.c', '.cc', '.cpp', '.inc', '.def')) or p in listed}
+        checked += 1
+        if listed == read:
+            matching += 1
+        elif len(bad) < 3:
+            bad.append({'action': act['id'], 'depfile_only': sorted(listed - read)[:5],
+                        'trace_only': sorted(read - listed)[:5]})
+    return checked, matching, bad
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--root', action='append', default=[])
+    ap.add_argument('--rewrite', action='append', default=[])
+    ap.add_argument('--drivers', default='cc,gcc,clang,c++,g++,clang++,cc1,x86_64-linux-gnu-gcc')
+    ap.add_argument('--graph', default='-')
+    ap.add_argument('--keep-trace')
+    ap.add_argument('--from-trace', help='read an existing strace -f -y log instead of running')
+    ap.add_argument('--check-depfiles', action='store_true')
+    ap.add_argument('command', nargs=argparse.REMAINDER)
+    opts = ap.parse_args()
+    command = opts.command[1:] if opts.command[:1] == ['--'] else opts.command
+    rewrite = [(os.path.realpath(r), '@root') for r in opts.root]
+    rewrite += [tuple(r.split('=', 1)) for r in opts.rewrite]
+    rewrite.sort(key=lambda r: -len(r[0]))
+    drivers = set(opts.drivers.split(','))
+    status = 0
+    if opts.from_trace:
+        trace = opts.from_trace
+        root_pid = int(next(LINE.match(l).group(1) for l in open(trace) if LINE.match(l)))
+    else:
+        if not command:
+            ap.error('give a command after --')
+        trace = opts.keep_trace or tempfile.mkstemp(prefix='trace-build-', suffix='.strace')[1]
+        proc = subprocess.run(['strace', '-f', '-y', '-qq', '-s', '65535', '-e', 'trace=' + TRACED,
+                               '-o', trace] + command)
+        status = proc.returncode
+        root_pid = int(next(LINE.match(l).group(1) for l in open(trace) if LINE.match(l)))
+    try:
+        actions = build_graph(trace, root_pid, os.getcwd(), drivers, rewrite)
+    finally:
+        if not opts.keep_trace and not opts.from_trace:
+            os.unlink(trace)
+    graph = {'command': command, 'actions': actions}
+    text = json.dumps(graph, indent=1)
+    if opts.graph == '-':
+        print(text)
+    else:
+        with open(opts.graph, 'w') as f:
+            f.write(text)
+    summary = {'actions': len(actions) - 1, 'driver_inputs': len(actions[0]['inputs']),
+               'outputs': sum(len(a['outputs']) for a in actions[1:]),
+               'edges': sum(len(a['deps']) for a in actions)}
+    if opts.check_depfiles:
+        checked, matching, bad = depfile_check(actions)
+        summary.update(depfiles_checked=checked, depfiles_matching=matching, mismatches=bad)
+    print(json.dumps(summary), file=sys.stderr)
+    sys.exit(status)
+
+
+if __name__ == '__main__':
+    main()

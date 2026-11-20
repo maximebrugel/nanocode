@@ -23,6 +23,10 @@ pub use crate::host::Access;
 
 mod blocking;
 mod nested;
+
+pub fn shells() -> &'static [&'static str] {
+    nested::ENTRY.names
+}
 pub use blocking::{
     BlockingOptions, IN_FLIGHT, INLINE_INPUT_LIMIT, INLINE_OUTPUT_LIMIT, Stderr, Stdin, Stdout,
     SyncCtx, SyncFile, SyncFiles, SyncFn, SyncWriter,
@@ -289,6 +293,18 @@ async fn run_with(
             // What is still buffered goes out now; a utility that cares about a
             // failing final write flushes itself before returning.
             let _ = ctx.flush().await;
+            // A program that wrote a pipe whose reader left dies of SIGPIPE (141), as
+            // `cat f` in `{ echo 1; sleep 1; cat f; } | head -1`, unless the shell
+            // ignores the signal, which its children inherit.
+            let pipe = crate::host::SIGPIPE;
+            let ignored = ctx
+                .vp
+                .traps
+                .action(crate::builtins::trap::TrapKey::Signal(pipe))
+                .is_some_and(|a| a.is_empty());
+            if ctx.write_error == Some(io::ErrorKind::BrokenPipe) && !ignored {
+                return Ok(128 + pipe);
+            }
             Ok(status)
         }
         // The shell is ending, or the signal ended the utility as it would have ended
@@ -458,6 +474,14 @@ impl UtilFile {
         }
     }
 
+    /// A regular file's device, inode and size (`HostFile::identity`).
+    pub fn identity(&self) -> Option<(u64, u64, u64)> {
+        match &*self.file {
+            FdObj::File(file) => file.identity(),
+            FdObj::PipeRead(_) | FdObj::PipeWrite(_) => None,
+        }
+    }
+
     pub async fn read_to_end(&self, out: &mut Vec<u8>) -> io::Result<()> {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -523,6 +547,15 @@ impl UtilCtx<'_> {
 
     fn fd(&self, n: u32) -> Option<Fd> {
         self.vp.fd(n)
+    }
+
+    /// Descriptor `n`'s device, inode and size, when it is a regular file the host
+    /// can tell.
+    pub fn fd_identity(&self, n: u32) -> Option<(u64, u64, u64)> {
+        match self.fd(n).as_deref() {
+            Some(FdObj::File(f)) => f.identity(),
+            _ => None,
+        }
     }
 
     pub fn seek_stdin(&self, pos: io::SeekFrom) -> Option<io::Result<u64>> {
@@ -653,6 +686,30 @@ impl UtilCtx<'_> {
         Ok(UtilFile {
             file: Rc::new(FdObj::File(file)),
         })
+    }
+
+    /// Writes the leading files of `files` (paths against the cwd) in one step where
+    /// the host has one ([`crate::host::Host::write_files`]): how many it wrote. It
+    /// stops before one of the shell's own descriptors.
+    pub async fn write_files(
+        &self,
+        files: &[crate::host::WholeFile<'_>],
+        dir_mode: u32,
+    ) -> io::Result<usize> {
+        let paths: Vec<Vec<u8>> = files
+            .iter()
+            .take_while(|file| crate::exec::dev_fd(file.path).is_none())
+            .map(|file| self.path(file.path))
+            .collect();
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let files: Vec<crate::host::WholeFile<'_>> = files
+            .iter()
+            .zip(&paths)
+            .map(|(file, path)| crate::host::WholeFile { path, ..*file })
+            .collect();
+        self.vp.host().write_files(&files, dir_mode).await
     }
 
     /// `stat` (`follow`) or `lstat`.
@@ -832,6 +889,12 @@ impl UtilCtx<'_> {
     /// Whether `name` runs as one of psh's utilities here: what `which` reports.
     pub async fn is_utility(&self, name: &[u8]) -> bool {
         lookup(self.vp, name).await.is_some()
+    }
+
+    /// In a sandbox, the program in /usr/bin that the utility or builtin `name` stands
+    /// in for, when `path` has /usr/bin (what `type -P` shows for it).
+    pub async fn stand_in(&self, name: &[u8], path: &[u8]) -> Option<Vec<u8>> {
+        crate::builtins::hash::stand_in(self.vp, name, Some(path)).await
     }
 
     /// Every program named `name` (no slash) in the directories of `path`, in order:

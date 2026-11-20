@@ -1,3 +1,4 @@
 HAVE_LIBZ
 PILLOW_VERSION="13.0.0"
 write(fd,buf,count)=_Py_write(fd,buf,count)
+HAVE_LIBJPEG

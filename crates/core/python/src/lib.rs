@@ -3,6 +3,8 @@ mod host;
 mod imports;
 mod kiwisolver;
 mod matplotlib;
+#[cfg(not(target_family = "wasm"))]
+mod native;
 mod psh;
 mod shell;
 mod sitedata;
@@ -12,7 +14,7 @@ use std::{collections::BTreeSet, io, rc::Rc, sync::Arc, time::Duration};
 
 use rustpython_vm::{
     AsObject, Interpreter, PyObjectRef, PyResult, Settings, VirtualMachine,
-    builtins::{PyBaseExceptionRef, PyDictRef},
+    builtins::{PyBaseExceptionRef, PyBytes, PyCode, PyDictRef},
     common::rc::PyRc,
     frozen::FrozenLib,
     function::IntoFuncArgs,
@@ -97,6 +99,39 @@ pub trait Files {
             .min(data.len());
         let end = start.saturating_add(len).min(data.len());
         Ok(data[start..end].to_vec())
+    }
+
+    fn set_mode(&self, _path: &[u8], _mode: u32) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn set_mtime(&self, _path: &[u8], _mtime_ns: i64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// The entry at a path itself: a symlink rather than what it points at.
+    fn lstat(&self, path: &[u8]) -> io::Result<Stat> {
+        self.stat(path)
+    }
+
+    fn symlink(&self, _target: &[u8], _link: &[u8]) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    fn read_link(&self, _path: &[u8]) -> io::Result<Vec<u8>> {
+        Err(io::ErrorKind::InvalidInput.into())
+    }
+
+    /// Makes `link` another name of the file `existing` (not following a symlink
+    /// there), so a change through either shows through both.
+    fn hard_link(&self, _existing: &[u8], _link: &[u8]) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// The hard-link group of the file at `path` and how many names it has, or
+    /// `None` when it has only its own.
+    fn links(&self, _path: &[u8], _follow: bool) -> Option<(u64, u64)> {
+        None
     }
 
     fn ranged(&self) -> bool {
@@ -202,10 +237,40 @@ pub struct Ran {
     pub ended: Ended,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// The order the program wrote stdout and stderr in, as (fd, length) runs over
+    /// them; empty when unknown, which segments reads as all stdout then all stderr.
+    pub order: Vec<(u8, usize)>,
     pub changes: Changes,
     pub steps: u64,
     pub held: Held,
     pub kept: Kept,
+}
+
+impl Ran {
+    /// stdout and stderr as (fd, bytes) runs in the order the program wrote them, so
+    /// 2>&1 keeps CPython's order (stderr line-buffered, stdout flushed later).
+    #[must_use]
+    pub fn segments(&self) -> Vec<(u8, &[u8])> {
+        let mut out = Vec::new();
+        let (mut at_out, mut at_err) = (0_usize, 0_usize);
+        for &(fd, len) in &self.order {
+            let (bytes, at) = if fd == 2 {
+                (&self.stderr, &mut at_err)
+            } else {
+                (&self.stdout, &mut at_out)
+            };
+            let end = (*at).saturating_add(len).min(bytes.len());
+            out.push((fd, &bytes[*at..end]));
+            *at = end;
+        }
+        if at_out < self.stdout.len() {
+            out.push((1, &self.stdout[at_out..]));
+        }
+        if at_err < self.stderr.len() {
+            out.push((2, &self.stderr[at_err..]));
+        }
+        out
+    }
 }
 
 enum Program {
@@ -219,10 +284,13 @@ enum Program {
 struct Invocation {
     program: Program,
     argv: Vec<String>,
+    /// -u: stdout written through, not held until it fills or the program ends.
+    unbuffered: bool,
 }
 
 fn invocation(args: &[String]) -> Result<Invocation, String> {
     let mut rest = args.iter();
+    let mut unbuffered = false;
     while let Some(arg) = rest.next() {
         let program = match arg.as_str() {
             "-c" => {
@@ -239,7 +307,11 @@ fn invocation(args: &[String]) -> Result<Invocation, String> {
                 rest.next();
                 continue;
             }
-            "-u" | "-B" | "-E" | "-s" | "-S" | "-I" | "-O" | "-OO" | "-q" | "-b" | "-P" => continue,
+            "-u" => {
+                unbuffered = true;
+                continue;
+            }
+            "-B" | "-E" | "-s" | "-S" | "-I" | "-O" | "-OO" | "-q" | "-b" | "-P" => continue,
             option if option.starts_with('-') => return Err(format!("Unknown option: {option}")),
             path => Program::File(path.to_owned()),
         };
@@ -251,16 +323,23 @@ fn invocation(args: &[String]) -> Result<Invocation, String> {
         let argv = std::iter::once(first.to_owned())
             .chain(rest.cloned())
             .collect();
-        return Ok(Invocation { program, argv });
+        return Ok(Invocation {
+            program,
+            argv,
+            unbuffered,
+        });
     }
     Ok(Invocation {
         program: Program::Stdin,
         argv: vec![String::new()],
+        unbuffered,
     })
 }
 
 enum Prepared {
     Source(String, String),
+    /// A compiled .pyc: its marshalled code after the 16-byte header, and its path.
+    Compiled(Vec<u8>, String),
     Module(String),
     Exited(i32),
 }
@@ -337,6 +416,7 @@ impl Python {
             ended: Ended::Exited(2),
             stdout: Vec::new(),
             stderr: format!("python3: {message}\n").into_bytes(),
+            order: Vec::new(),
             changes: Changes::default(),
             steps: 0,
             held: Held::default(),
@@ -377,10 +457,14 @@ impl Python {
             ended: match state.refused {
                 _ if state.cancelled => Ended::Cancelled,
                 Some(limit) => Ended::Refused(limit),
-                None => ended,
+                // A process's status is one byte, as in exit() below.
+                None => state
+                    .exited
+                    .map_or(ended, |code| Ended::Exited(code & 0xff)),
             },
             stdout: state.stdout,
             stderr: state.stderr,
+            order: state.order,
             changes: state.changes,
             steps,
             held: state.held_at_refusal,
@@ -400,11 +484,26 @@ impl Python {
             }
         };
         region::enter(cfg!(debug_assertions));
-        let (source, name) = match prepared {
-            Prepared::Source(source, name) => (source, name),
+        let (source, name, compiled) = match prepared {
+            Prepared::Source(source, name) => (source, name, None),
+            Prepared::Compiled(code, name) => (String::new(), name, Some(code)),
             Prepared::Module(module) => {
                 let missing = self.missing(vm, "_absent", vm.ctx.new_str(module.as_str()).into());
                 if vm.stopped.borrow().is_some() {
+                    return Ended::Exited(1);
+                }
+                // A module that is no package of the standard library is missing as
+                // CPython says it is (status 1), not a gap of this shell.
+                if !missing.is_empty() && missing.iter().all(|missing| missing.why == Why::Package) {
+                    let said = if module.contains('.') {
+                        format!(
+                            "/usr/bin/python3: Error while finding module specification for {module:?} (ModuleNotFoundError: {})\n",
+                            missing[0].error
+                        )
+                    } else {
+                        format!("/usr/bin/python3: No module named {module}\n")
+                    };
+                    host::print(&said);
                     return Ended::Exited(1);
                 }
                 if !missing.is_empty() {
@@ -432,11 +531,46 @@ impl Python {
             return Ended::Needs(missing);
         }
         let result = vm.new_scope_with_main().and_then(|scope| {
-            if let Program::File(path) = &invocation.program {
-                let path = vm.ctx.new_str(path.as_str());
-                scope.globals.set_item("__file__", path.into(), vm)?;
+            if let Program::File(_) = &invocation.program {
+                // CPython 3.12 names a script by its path joined to the working
+                // directory, unnormalized ("./x.py" stays), in __file__ and in its
+                // tracebacks; a directory runs as its __main__.py.
+                let path = name.as_str();
+                let os = vm.import("os", 0)?;
+                let cwd = os.get_attr("getcwd", vm)?.call((), vm)?;
+                let path = os
+                    .get_attr("path", vm)?
+                    .get_attr("join", vm)?
+                    .call((cwd, vm.ctx.new_str(path)), vm)?
+                    .str(vm)?
+                    .to_string();
+                scope
+                    .globals
+                    .set_item("__file__", vm.ctx.new_str(path.as_str()).into(), vm)?;
+                if let Some(compiled) = &compiled {
+                    // CPython 3.12 runs a .pyc's code object itself as __main__, with
+                    // __cached__ None.
+                    scope
+                        .globals
+                        .set_item("__cached__", vm.ctx.none(), vm)?;
+                    let code = vm
+                        .import("marshal", 0)?
+                        .get_attr("loads", vm)?
+                        .call((vm.ctx.new_bytes(compiled.clone()),), vm)?
+                        .downcast::<PyCode>()
+                        .map_err(|_| {
+                            vm.new_runtime_error("Bad code object in .pyc file".to_owned())
+                        })?;
+                    return vm.run_code_obj(code, scope);
+                }
+                return vm.run_string(scope, &source, &path);
             }
-            vm.run_string(scope, &source, &name)
+            // CPython 3.12 keeps no source for a program from -c or stdin, so its
+            // tracebacks name the lines without showing them: skip linecache.
+            let code = vm
+                .compile(&source, rustpython_vm::compiler::Mode::Exec, &name)
+                .map_err(|err| err.into_pyexception(vm, Some(&source)))?;
+            vm.run_code_obj(code, scope)
         });
         Ended::Exited(self.exit(vm, result.err()))
     }
@@ -458,8 +592,19 @@ impl Python {
             let scope = Scope::with_builtins(None, self.boot.clone(), vm);
             vm.run_code_obj(vm.ctx.new_code(code), scope)?;
         }
+        // CPython 3.12 runs a directory by its __main__.py with the directory
+        // first on sys.path, and a module from -m with the working directory there.
+        let directory = match &invocation.program {
+            Program::File(path) => matches!(
+                host::source(path),
+                Err(error) if error.kind() == io::ErrorKind::IsADirectory
+            ),
+            _ => false,
+        };
         let first = match &invocation.program {
+            Program::File(path) if directory => path.as_str(),
             Program::File(path) => path.rfind('/').map_or(".", |cut| &path[..cut.max(1)]),
+            Program::Module(_) => ".",
             _ => "",
         };
         let argv: Vec<PyObjectRef> = invocation
@@ -468,7 +613,11 @@ impl Python {
             .map(|arg| vm.ctx.new_str(arg.as_str()).into())
             .collect();
         let first = vm.ctx.new_str(first);
-        self.call(vm, "_start", (vm.ctx.new_list(argv), first))?;
+        self.call(
+            vm,
+            "_start",
+            (vm.ctx.new_list(argv), first, invocation.unbuffered),
+        )?;
         let decoded = |source: Vec<u8>, name: &str| match String::from_utf8(source) {
             Ok(source) => Prepared::Source(source, name.to_owned()),
             Err(_) => {
@@ -479,7 +628,57 @@ impl Python {
         Ok(match &invocation.program {
             Program::Command(code) => Prepared::Source(code.clone(), "<string>".to_owned()),
             Program::Stdin => decoded(host::input(), "<stdin>"),
+            Program::File(path) if directory => {
+                let main = format!("{}/__main__.py", path.trim_end_matches('/'));
+                match host::source(&main) {
+                    Ok(source) => decoded(source, &main),
+                    Err(_) => {
+                        let shown = vm
+                            .import("os", 0)?
+                            .get_attr("path", vm)?
+                            .get_attr("abspath", vm)?
+                            .call((vm.ctx.new_str(path.as_str()),), vm)?
+                            .str(vm)?
+                            .to_string();
+                        host::print(&format!(
+                            "python3: can't find '__main__' module in {shown:?}
+"
+                        ));
+                        Prepared::Exited(1)
+                    }
+                }
+            }
             Program::File(path) => match host::source(path) {
+                // A zip archive runs its __main__ with the archive first on sys.path.
+                Ok(source) if source.starts_with(b"PK\x03\x04") => Prepared::Source(
+                    format!(
+                        "__import__('sys').path.__setitem__(0, {path:?}); __import__('runpy')._run_module_as_main('__main__', False)\n"
+                    ),
+                    path.clone(),
+                ),
+                // CPython 3.12 runs a .pyc (by its name, or by the magic number's
+                // b"\r\n" on a file that is no UTF-8 text) as compiled code, and
+                // refuses one whose magic number is another version's.
+                Ok(source)
+                    if path.ends_with(".pyc")
+                        || (source.get(2..4) == Some(&b"\r\n"[..])
+                            && std::str::from_utf8(&source).is_err()) =>
+                {
+                    let magic = vm
+                        .import("importlib.util", 0)?
+                        .get_attr("util", vm)?
+                        .get_attr("MAGIC_NUMBER", vm)?;
+                    let magic = magic
+                        .downcast_ref::<PyBytes>()
+                        .map(|magic| magic.as_bytes().to_vec())
+                        .unwrap_or_default();
+                    if source.len() < 4 || source[..4] != magic[..] {
+                        host::print("RuntimeError: Bad magic number in .pyc file\n");
+                        Prepared::Exited(1)
+                    } else {
+                        Prepared::Compiled(source.get(16..).unwrap_or_default().to_vec(), path.clone())
+                    }
+                }
                 Ok(source) => decoded(source, path),
                 Err(error) => {
                     host::print(&format!(
@@ -533,6 +732,11 @@ impl Python {
     fn exit(&self, vm: &VirtualMachine, error: Option<PyBaseExceptionRef>) -> i32 {
         let stopped = host::ending();
         vm.set_limiter(Some(PyRc::new(host::Budget) as PyRc<dyn Limiter>));
+        // CPython flushes sys.stdout before it prints an uncaught exception, so a
+        // traceback follows what the program printed before it in 2>&1 output.
+        if error.is_some() && !stopped {
+            let _ = self.call(vm, "_flush", ());
+        }
         let code = match error {
             Some(_) if stopped => 0,
             Some(error) if error.fast_isinstance(vm.ctx.exceptions.keyboard_interrupt) => {
@@ -547,7 +751,9 @@ impl Python {
         {
             vm.print_exception(&error);
         }
-        code.cast_signed()
+        // A process's status is one byte: sys.exit(256) ends with 0, sys.exit(-1)
+        // with 255.
+        (code & 0xff).cast_signed()
     }
 }
 

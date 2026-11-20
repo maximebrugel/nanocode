@@ -323,16 +323,46 @@ impl Index {
             }
             end = slash;
         }
-        match self.find(&entry.path) {
-            Ok(at) => self.entries[at] = entry,
-            Err(at) => self.entries.insert(at, entry),
-        }
+        let stages = self.stages(&entry.path);
+        self.entries.splice(stages, [entry]);
     }
 
-    pub fn remove(&mut self, path: &[u8]) -> Option<IndexEntry> {
-        let at = self.find(path).ok()?;
+    /// The entries of a path: one, or its unmerged stages.
+    fn stages(&self, path: &[u8]) -> std::ops::Range<usize> {
+        let start = self
+            .entries
+            .partition_point(|e| e.path.as_slice() < path);
+        let len = self.entries[start..]
+            .iter()
+            .take_while(|e| e.path == path)
+            .count();
+        start..start + len
+    }
+
+    /// Puts a path's unmerged versions in (stages 1 to 3: base, ours, theirs) in
+    /// place of what the index had for it.
+    pub fn set_unmerged(&mut self, path: &[u8], versions: &[Option<(u32, Oid)>; 3]) {
         self.touched(path);
-        Some(self.entries.remove(at))
+        let stages = self.stages(path);
+        let mut entries = Vec::with_capacity(versions.len());
+        for (k, version) in versions.iter().enumerate() {
+            if let Some((mode, oid)) = version {
+                let mut entry = IndexEntry::new(path.to_vec(), *mode, *oid);
+                entry.stage = k as u8 + 1;
+                entries.push(entry);
+            }
+        }
+        self.entries.splice(stages, entries);
+    }
+
+    /// Takes a path out, every stage of it; the first entry it had.
+    pub fn remove(&mut self, path: &[u8]) -> Option<IndexEntry> {
+        let stages = self.stages(path);
+        if stages.is_empty() {
+            return None;
+        }
+        self.touched(path);
+        self.entries.drain(stages).next()
     }
 
     /// The file as git writes it: version 2, or 3 when an entry needs the flags only

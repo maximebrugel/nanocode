@@ -407,6 +407,7 @@ impl AgentDriver {
                     let Some(command) = Box::pin(accept_execution_command(
                         &self.execution,
                         &self.checkpoints,
+                        latest_fork_checkpoint.as_ref(),
                         &self.spawner.config,
                         default_thinking,
                         command,
@@ -454,6 +455,7 @@ impl AgentDriver {
                 let Some(command) = Box::pin(accept_idle_route(
                     &self.execution,
                     &self.checkpoints,
+                    latest_fork_checkpoint.as_ref(),
                     &self.spawner.config,
                     default_thinking,
                     command,
@@ -787,6 +789,7 @@ impl AgentDriver {
                                         Some(command) => match Box::pin(accept_execution_command(
                                             &self.execution,
                                             &self.checkpoints,
+                                            latest_fork_checkpoint.as_ref(),
                                             &self.spawner.config,
                                             default_thinking,
                                             command,
@@ -853,6 +856,7 @@ impl AgentDriver {
                                             }) = Box::pin(accept_idle_route(
                                                 &self.execution,
                                                 &self.checkpoints,
+                                                latest_fork_checkpoint.as_ref(),
                                                 &self.spawner.config,
                                                 default_thinking,
                                                 command,
@@ -1430,6 +1434,7 @@ impl AgentDriver {
                             Some(command) => match Box::pin(accept_execution_command(
                                 &self.execution,
                                 &self.checkpoints,
+                                latest_fork_checkpoint.as_ref(),
                                 &self.spawner.config,
                                 default_thinking,
                                 command,
@@ -1620,6 +1625,7 @@ impl AgentDriver {
                                     let routed = Box::pin(accept_idle_route(
                                         &self.execution,
                                         &self.checkpoints,
+                                        latest_fork_checkpoint.as_ref(),
                                         &self.spawner.config,
                                         default_thinking,
                                         Command::RoutePrompt { key: route_key, prompt, request_id, cancel_on_admission, parent, events, turn_result, route_result },
@@ -2384,9 +2390,26 @@ fn settle_cancelled_queued_turn(
     }
 }
 
+/// The boundary of a replayed turn: decoded from its checkpoint, or, when the
+/// turn wrote the durable head, the live committed session (shared history).
+fn replayed_boundary(
+    checkpoints: &Arc<CheckpointSource>,
+    snapshot: Option<SessionSnapshot>,
+    live: Option<&Arc<CommittedSession>>,
+    model: Model,
+    thinking: Thinking,
+    service_tier: ServiceTier,
+) -> Option<TurnBoundary> {
+    match snapshot {
+        Some(snapshot) => Some(checkpoints.replayed(snapshot, model, thinking, service_tier)),
+        None => live.map(|committed| checkpoints.live(Arc::clone(committed), thinking, service_tier)),
+    }
+}
+
 async fn accept_execution_command(
     execution: &Execution,
     checkpoints: &Arc<CheckpointSource>,
+    live: Option<&Arc<CommittedSession>>,
     config: &ModelConfig,
     default_thinking: Thinking,
     command: Command,
@@ -2514,12 +2537,14 @@ async fn accept_execution_command(
                 turn_id: None,
                 final_message: output.final_message,
                 usage: Some(output.usage),
-                boundary: Some(checkpoints.replayed(
+                boundary: replayed_boundary(
+                    checkpoints,
                     snapshot,
+                    live,
                     config.model,
                     replay_thinking,
                     service_tier.unwrap_or(config.service_tier),
-                )),
+                ),
             })));
             None
         }
@@ -2571,6 +2596,7 @@ async fn accept_execution_command(
 async fn accept_idle_route(
     execution: &Execution,
     checkpoints: &Arc<CheckpointSource>,
+    live: Option<&Arc<CommittedSession>>,
     config: &ModelConfig,
     default_thinking: Thinking,
     command: Command,
@@ -2714,12 +2740,14 @@ async fn accept_idle_route(
                 turn_id: None,
                 final_message: output.final_message,
                 usage: Some(output.usage),
-                boundary: Some(checkpoints.replayed(
+                boundary: replayed_boundary(
+                    checkpoints,
                     snapshot,
+                    live,
                     config.model,
                     default_thinking,
                     config.service_tier,
-                )),
+                ),
             })));
             None
         }

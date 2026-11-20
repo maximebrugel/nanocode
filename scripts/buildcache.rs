@@ -919,7 +919,11 @@ fn clone(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 fn touch(path: &Path) -> io::Result<()> {
-    fs::File::options().write(true).open(path)?.set_modified(SystemTime::now())
+    stamp(path, SystemTime::now())
+}
+
+fn stamp(path: &Path, time: SystemTime) -> io::Result<()> {
+    fs::File::options().write(true).open(path)?.set_modified(time)
 }
 
 struct Roots(Vec<(Vec<u8>, &'static [u8])>);
@@ -1033,6 +1037,9 @@ fn restore(
     roots: &Roots,
     command: &[u8],
 ) -> io::Result<()> {
+    // Restored outputs carry the time this rustc invocation started, as a real compile's
+    // outputs would relative to its dependencies, not the time each file finished copying.
+    let started = SystemTime::now();
     let entry = &fs::canonicalize(entry)?;
     if kind == Kind::Workspace
         && (fs::read(entry.join("inputs"))? != inputs || !sources_match(&fs::read(entry.join("sources"))?, roots))
@@ -1053,10 +1060,14 @@ fn restore(
         .split(|byte| *byte == b'\n')
         .filter(|name| !name.is_empty() && !entry.join("files").join(OsStr::from_bytes(name)).exists())
         .collect();
-    let source = if lazy.is_empty() || entry.parent().and_then(Path::parent).is_some_and(|cache| cache.join("lazy.failed").exists()) {
+    // Placeholders are only handed to cargo when their pack answers now: a placeholder whose
+    // pack is gone can only be rebuilt behind cargo's back, after cargo has already judged its
+    // unit fresh. Without a reachable pack the unit compiles normally instead.
+    let cache = entry.parent().and_then(Path::parent).unwrap_or(Path::new(""));
+    let source = if lazy.is_empty() || lazy_failed(cache) {
         None
     } else {
-        Some(fs::read(entry.join("source"))?)
+        Some(fs::read(entry.join("source"))?).filter(|source| reachable(cache, source))
     };
     if !lazy.is_empty() && (source.is_none() || !lazy.iter().all(|name| is_library(name))) {
         return Err(io::Error::other("not fetched"));
@@ -1067,13 +1078,12 @@ fn restore(
         if name.as_bytes().ends_with(b".d") {
             fs::write(&destination, roots.show(&fs::read(file.path())?))?;
         } else {
-            if fs::symlink_metadata(&destination).is_ok() {
-                fs::remove_file(&destination)?;
-            }
-            if fs::hard_link(file.path(), &destination).is_err() {
-                fs::copy(file.path(), &destination)?;
-            }
-            touch(&destination)?;
+            // A private copy, never a hard link: cargo compares output mtimes across units, and a
+            // link shares its mtime with the cache entry and every other target directory that
+            // restored it, so another build's restore would make this one's outputs look newer
+            // than their dependents and turn the next no-op build into a rebuild.
+            clone(&file.path(), &destination)?;
+            stamp(&destination, started)?;
         }
     }
     for name in &lazy {
@@ -1191,6 +1201,38 @@ fn lazy_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// How long a failed lazy fetch keeps lazy restores off before a build probes the packs again.
+const LAZY_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+fn lazy_failed(cache: &Path) -> bool {
+    fs::metadata(cache.join("lazy.failed"))
+        .and_then(|data| data.modified())
+        .is_ok_and(|time| time.elapsed().map_or(true, |age| age < LAZY_RETRY))
+}
+
+/// Whether a lazy pack can be fetched right now, read as its first byte. A miss turns lazy
+/// restores off for every unit until LAZY_RETRY passes.
+fn reachable(cache: &Path, source: &[u8]) -> bool {
+    let found = if let Some(path) = source.strip_prefix(b"file://") {
+        Path::new(OsStr::from_bytes(path)).is_file()
+    } else if source.starts_with(b"/") {
+        Path::new(OsStr::from_bytes(source)).is_file()
+    } else {
+        Command::new("curl")
+            .args(["-sfL", "-r", "0-0", "-o", "/dev/null", "--max-time", "20", "--"])
+            .arg(OsStr::from_bytes(source))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !found {
+        let _ = fs::write(cache.join("lazy.failed"), b"");
+    }
+    found
+}
+
 fn url_of(template: &[u8], directory: &str, key: &str) -> Vec<u8> {
     let template = String::from_utf8_lossy(template);
     if template.contains("{key}") {
@@ -1204,7 +1246,7 @@ fn url_of(template: &[u8], directory: &str, key: &str) -> Vec<u8> {
 
 fn indexed(cache: &Path, directory: &str, key: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let root = cache.parent()?;
-    if root.join("build/lazy.failed").exists() {
+    if lazy_failed(cache) {
         return None;
     }
     let source = url_of(fs::read(root.join("remote/url")).ok()?.trim_ascii(), directory, key);
@@ -1579,7 +1621,7 @@ fn library_directories(args: &[OsString]) -> Vec<PathBuf> {
 }
 
 fn materialize(cache: &Path, args: &[OsString]) {
-    let directories = library_directories(args);
+    let mut directories = library_directories(args);
     if placeholders(&directories).is_empty() {
         return;
     }
@@ -1588,6 +1630,23 @@ fn materialize(cache: &Path, args: &[OsString]) {
     };
     if lock.lock().is_err() {
         return;
+    }
+    // A placeholder's own dependencies may be placeholders in directories this unit never names
+    // (rustc finds transitive crates through each unit's -L dependency= list), so fetch or
+    // rebuild the whole closure, or the rebuild of a direct dependency fails on a 0-byte crate.
+    loop {
+        let mut more: Vec<PathBuf> = Vec::new();
+        for placeholder in placeholders(&directories) {
+            for directory in library_directories(&command_args(&placeholder.command).1) {
+                if !directories.contains(&directory) && !more.contains(&directory) {
+                    more.push(directory);
+                }
+            }
+        }
+        if more.is_empty() {
+            break;
+        }
+        directories.extend(more);
     }
     let found = placeholders(&directories);
     let mut sources: Vec<&[u8]> = found.iter().map(|placeholder| placeholder.source.as_slice()).collect();
@@ -1636,6 +1695,7 @@ fn materialize(cache: &Path, args: &[OsString]) {
     }
     let _ = fs::remove_dir_all(&staging);
     if missed.is_empty() {
+        let _ = fs::remove_file(cache.join("lazy.failed"));
         return;
     }
     let _ = fs::write(cache.join("lazy.failed"), b"");
@@ -1643,9 +1703,13 @@ fn materialize(cache: &Path, args: &[OsString]) {
     let mut commands: Vec<&[u8]> = missed.iter().map(|placeholder| placeholder.command.as_slice()).collect();
     commands.sort();
     commands.dedup();
+    // Rebuild in rounds: a unit whose rebuild fails while others still build is retried in the
+    // next round, since it may have failed on a transitive dependency that was still a
+    // placeholder. Only when a round builds nothing are the remaining outputs removed, so cargo
+    // finds them missing and compiles those units itself.
     while !commands.is_empty() {
         let lazy = placeholders(&directories);
-        let (ready, waiting): (Vec<&[u8]>, Vec<&[u8]>) = commands.iter().partition(|command| {
+        let (ready, mut waiting): (Vec<&[u8]>, Vec<&[u8]>) = commands.iter().partition(|command| {
             !command_args(command).1.windows(2).any(|pair| {
                 pair[0] == "--extern"
                     && pair[1].as_bytes().iter().position(|byte| *byte == b'=').is_some_and(|at| {
@@ -1654,7 +1718,7 @@ fn materialize(cache: &Path, args: &[OsString]) {
                     })
             })
         });
-        let (ready, stuck) = if ready.is_empty() { (Vec::new(), waiting.clone()) } else { (ready, Vec::new()) };
+        let ready = if ready.is_empty() { std::mem::take(&mut waiting) } else { ready };
         let width = std::thread::available_parallelism().map_or(1, usize::from);
         let built: Vec<bool> = ready
             .chunks(width)
@@ -1665,16 +1729,27 @@ fn materialize(cache: &Path, args: &[OsString]) {
                 })
             })
             .collect();
-        let settled = ready.iter().zip(built).chain(stuck.iter().map(|command| (command, false)));
-        for (command, built) in settled {
-            for placeholder in missed.iter().filter(|placeholder| placeholder.command.as_slice() == *command) {
-                let _ = fs::remove_file(lazy_path(&placeholder.file));
-                if !built {
-                    let _ = fs::remove_file(&placeholder.file);
+        let mut failed: Vec<&[u8]> = Vec::new();
+        for (command, built) in ready.iter().zip(built) {
+            if built {
+                for placeholder in missed.iter().filter(|placeholder| placeholder.command.as_slice() == *command) {
+                    let _ = fs::remove_file(lazy_path(&placeholder.file));
                 }
+            } else {
+                failed.push(command);
             }
         }
-        commands = if stuck.is_empty() { waiting } else { Vec::new() };
+        if failed.len() == ready.len() {
+            for command in failed.iter().chain(&waiting) {
+                for placeholder in missed.iter().filter(|placeholder| placeholder.command.as_slice() == *command) {
+                    let _ = fs::remove_file(&placeholder.file);
+                    let _ = fs::remove_file(lazy_path(&placeholder.file));
+                }
+            }
+            break;
+        }
+        waiting.extend(failed);
+        commands = waiting;
     }
 }
 

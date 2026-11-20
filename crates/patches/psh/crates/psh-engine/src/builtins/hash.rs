@@ -87,6 +87,35 @@ pub(crate) async fn hashed(vp: &Vp, name: &[u8]) -> Option<Vec<u8>> {
     check(vp, name, path, vp.hash.dot.iter().any(|n| n == name)).await
 }
 
+/// Builtins a real system also has as programs in /usr/bin (coreutils, procps).
+const PROGRAM_BUILTINS: &[&[u8]] = &[
+    b"[", b"echo", b"false", b"kill", b"printf", b"pwd", b"test", b"true",
+];
+
+/// Where the program a sandbox's psh utility (or a builtin a real system also has as a
+/// program) stands in for would be, when `path` (else `PATH`) has /usr/bin: a sandbox has
+/// no program files, but scripts that ask `type -a`, `type -P`, `hash` or `which` expect
+/// one there, as on a real system. Running that path runs the utility, as the host
+/// resolves its programs to /usr/bin.
+pub(crate) async fn stand_in(vp: &Vp, name: &[u8], path: Option<&[u8]>) -> Option<Vec<u8>> {
+    if !vp.core.utilities.sandbox || name.is_empty() || name.contains(&b'/') {
+        return None;
+    }
+    let path = path.map_or_else(|| current_path(vp), <[u8]>::to_vec);
+    if !vp
+        .host()
+        .path_entries(&path)
+        .iter()
+        .any(|d| d.as_slice() == b"/usr/bin")
+    {
+        return None;
+    }
+    if !PROGRAM_BUILTINS.contains(&name) && crate::util::lookup(vp, name).await.is_none() {
+        return None;
+    }
+    Some([b"/usr/bin/".as_slice(), name].concat())
+}
+
 pub(crate) async fn names_program(vp: &Vp, name: &[u8]) -> bool {
     !vp.hash.utility.iter().any(|n| n == name) && hashed(vp, name).await.is_some()
 }
@@ -168,11 +197,14 @@ pub(crate) async fn search(vp: &Vp, name: &[u8], path: Option<&[u8]>) -> Option<
 
 type Searched = Option<(Vec<u8>, bool)>;
 
+/// A PATH search: name, PATH, cwd and result.
+type LastSearch = (Vec<u8>, Vec<u8>, Vec<u8>, Searched);
+
 thread_local! {
     /// The last `PATH` search a utility lookup made: (name, `PATH`, cwd, result). The
     /// run that follows the lookup takes it to fill the table instead of searching
     /// again (each miss is a `stat` per `PATH` entry, slow on some file systems).
-    static SEARCHED: std::cell::RefCell<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Searched)>> =
+    static SEARCHED: std::cell::RefCell<Option<LastSearch>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -440,9 +472,20 @@ pub(super) async fn hash(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             Some((p, dot)) if executable(vp, &p).await => Some((p, dot)),
             _ => None,
         };
-        match found {
-            Some((p, dot)) => table(vp).insert_dot(n, p, 0, dot),
-            None => {
+        // A sandbox's utility is remembered at the path it stands in for, and still
+        // runs as the utility.
+        let standing = match found {
+            Some(_) => None,
+            None => stand_in(vp, n, None).await,
+        };
+        match (found, standing) {
+            (Some((p, dot)), _) => table(vp).insert_dot(n, p, 0, dot),
+            (None, Some(p)) => {
+                let t = table(vp);
+                t.insert(n, p, 0);
+                t.utility.push(n.to_vec());
+            }
+            (None, None) => {
                 table(vp).remove(n);
                 vp.error(&format!("hash: {}: not found", s(n))).await;
                 status = 1;

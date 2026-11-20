@@ -4,13 +4,13 @@ use crate::{
     store::{Batch, Blob, Failure, Store},
 };
 use nanocode_durability_core::StoreFuture;
-use nanocode_sync::Atom;
+use nanocode_sync::{Atom, OrdMap};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Default)]
 struct Held {
-    heads: BTreeMap<String, Manifest>,
-    blobs: BTreeMap<Digest, (Blob, u64)>,
+    heads: OrdMap<String, Manifest>,
+    blobs: OrdMap<Digest, (Blob, u64)>,
 }
 
 #[derive(Default)]
@@ -47,7 +47,11 @@ impl Store for MemStore {
         let result = self.held.modify(|held| {
             let mut head = held.heads.get(workspace).cloned().unwrap_or_default();
             if head.version() != change.base && mutated(Mutation::LostUpdate) {
-                let mut entries = head.entries().clone();
+                let mut entries: BTreeMap<String, _> = head
+                    .entries()
+                    .iter()
+                    .map(|(path, entry)| (path.clone(), entry.clone()))
+                    .collect();
                 for (path, entry) in &change.entries {
                     match entry {
                         Some(entry) => entries.insert(path.clone(), entry.clone()),

@@ -33,7 +33,9 @@ pub enum ExecutionAdmission {
     Resume,
 
     Completed {
-        snapshot: SessionSnapshot,
+        /// None: the replayed operation wrote the durable head and nothing is
+        /// in flight, so the live committed session is its snapshot.
+        snapshot: Option<SessionSnapshot>,
 
         output: ExecutionOutput,
     },
@@ -466,7 +468,7 @@ pub(crate) enum AdmittedExecution {
     Resume,
     Completed {
         output: ExecutionOutput,
-        snapshot: SessionSnapshot,
+        snapshot: Option<SessionSnapshot>,
     },
     Failed {
         error: String,

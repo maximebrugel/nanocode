@@ -1,8 +1,9 @@
 //! `which [-as] NAME...`: where a command name is. The first executable on `PATH` (with
 //! `-a` every one), so `$(which env)` stays a path that runs; a name only psh's
 //! utility provides prints `NAME: shell builtin` (D1200); with `-a` that line comes
-//! first, before the `PATH` hits. A name with a slash is printed when it is an
-//! executable file.
+//! first, before the `PATH` hits. In a sandbox, which has no programs, a utility (or a
+//! builtin such as `echo`) is the program in /usr/bin it stands in for, when `PATH` has
+//! /usr/bin. A name with a slash is printed when it is an executable file.
 //! `-s` prints nothing. Status 1 when a name is not found (or no name is given), as
 //! both GNU-userland (debianutils) and BSD `which` do.
 
@@ -37,9 +38,13 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 hits.push(name.clone());
             }
         } else if !name.is_empty() {
-            let utility = ctx.is_utility(name).await;
             let programs = ctx.search_path(name, &path).await;
-            if utility && (all || programs.is_empty()) {
+            if programs.is_empty()
+                && let Some(p) = ctx.stand_in(name, &path).await
+            {
+                // A sandbox has no programs: its utilities stand in for those in /usr/bin.
+                hits.push(p);
+            } else if ctx.is_utility(name).await && (all || programs.is_empty()) {
                 let mut line = name.clone();
                 line.extend_from_slice(b": shell builtin");
                 hits.push(line);

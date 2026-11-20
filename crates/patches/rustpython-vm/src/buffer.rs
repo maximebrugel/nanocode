@@ -608,7 +608,7 @@ impl FormatSpec {
                 vm,
                 format!(
                     "pack expected {} items for packing (got {})",
-                    self.codes.len(),
+                    self.arg_count,
                     args.len()
                 ),
             ));

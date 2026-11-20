@@ -28,7 +28,7 @@ pub const SPEC: Spec = Spec {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Check {
-    /// Report disorder among lines that end up unpaired (GNU's default).
+    /// Report disorder once some line was unpairable (GNU's default).
     Default,
     /// Any disorder is fatal.
     Strict,
@@ -112,6 +112,7 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
     let mut totals = [0u64; 3];
     let mut out = Vec::new();
     let mut status = 0;
+    let mut seen_unpairable = false;
 
     for (k, side) in sides.iter_mut().enumerate() {
         if let Err(e) = advance(ctx, side, &cmp).await {
@@ -131,27 +132,6 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                 Ordering::Equal => 2,
             },
         };
-        // Disorder is reported when it matters: always with --check-order, for an
-        // unpaired line by default.
-        for (k, s) in sides.iter_mut().enumerate() {
-            if s.disordered
-                && !s.reported
-                && check != Check::Off
-                && (col == k || check == Check::Strict)
-            {
-                s.reported = true;
-                if let Err(e) = ctx.write(&out).await {
-                    return common::write_failed(ctx, &e).await;
-                }
-                out.clear();
-                ctx.error(&format!("file {} is not in sorted order", k + 1))
-                    .await;
-                if check == Check::Strict {
-                    return 1;
-                }
-                status = 1;
-            }
-        }
         totals[col] += 1;
         if show[col] {
             out.extend_from_slice(&prefixes[col]);
@@ -168,10 +148,31 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
             1 => &[1],
             _ => &[0, 1],
         };
+        seen_unpairable |= col != 2;
         for &k in which {
             if let Err(e) = advance(ctx, &mut sides[k], &cmp).await {
                 common::file_error(ctx, &p.operands[k], &e).await;
                 return 1;
+            }
+            // Like GNU, a line is checked as it is read: always with --check-order,
+            // by default only once some line was unpairable.
+            let s = &mut sides[k];
+            if s.disordered
+                && !s.reported
+                && check != Check::Off
+                && (check == Check::Strict || seen_unpairable)
+            {
+                s.reported = true;
+                if let Err(e) = ctx.write(&out).await {
+                    return common::write_failed(ctx, &e).await;
+                }
+                out.clear();
+                ctx.error(&format!("file {} is not in sorted order", k + 1))
+                    .await;
+                if check == Check::Strict {
+                    return 1;
+                }
+                status = 1;
             }
         }
         if out.len() >= 32 * 1024 {
@@ -218,7 +219,10 @@ async fn advance(
             }
             s.has_prev = true;
         }
-        None => s.done = true,
+        None => {
+            s.done = true;
+            s.disordered = false;
+        }
     }
     Ok(())
 }

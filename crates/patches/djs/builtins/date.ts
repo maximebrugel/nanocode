@@ -434,27 +434,42 @@ function DatePrototypeToISOString(this: Value): Str {
 }
 
 /**
- * Date.prototype.toLocaleString ( ).
+ * Date.prototype.toLocaleString ( [ locales [ , options ] ] ), ECMA-402 21.1.
  * @builtin Date.prototype.toLocaleString
+ * @length 0
  */
-function DatePrototypeToLocaleString(this: Value): Str {
-  return DateFormat(DateValue(this), 3, 3);
+function DatePrototypeToLocaleString(this: Value, locales?: Value, options?: Value): Str {
+  const t: f64 = DateValue(this);
+  if (IntlEnabled()) {
+    return IntlDateToLocaleString(t, locales, options, "any", "all");
+  }
+  return DateFormat(t, 3, 3);
 }
 
 /**
- * Date.prototype.toLocaleDateString ( ).
+ * Date.prototype.toLocaleDateString ( [ locales [ , options ] ] ), ECMA-402 21.1.
  * @builtin Date.prototype.toLocaleDateString
+ * @length 0
  */
-function DatePrototypeToLocaleDateString(this: Value): Str {
-  return DateFormat(DateValue(this), 3, 1);
+function DatePrototypeToLocaleDateString(this: Value, locales?: Value, options?: Value): Str {
+  const t: f64 = DateValue(this);
+  if (IntlEnabled()) {
+    return IntlDateToLocaleString(t, locales, options, "date", "date");
+  }
+  return DateFormat(t, 3, 1);
 }
 
 /**
- * Date.prototype.toLocaleTimeString ( ).
+ * Date.prototype.toLocaleTimeString ( [ locales [ , options ] ] ), ECMA-402 21.1.
  * @builtin Date.prototype.toLocaleTimeString
+ * @length 0
  */
-function DatePrototypeToLocaleTimeString(this: Value): Str {
-  return DateFormat(DateValue(this), 3, 2);
+function DatePrototypeToLocaleTimeString(this: Value, locales?: Value, options?: Value): Str {
+  const t: f64 = DateValue(this);
+  if (IntlEnabled()) {
+    return IntlDateToLocaleString(t, locales, options, "time", "time");
+  }
+  return DateFormat(t, 3, 2);
 }
 
 /**

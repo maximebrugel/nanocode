@@ -42,7 +42,6 @@ pub enum Failure {
 }
 
 pub struct Inflater {
-    window_bits: i32,
     state: Inflate,
 }
 
@@ -53,7 +52,6 @@ impl Inflater {
             Format::Zlib => WINDOW_BITS,
         };
         Inflater {
-            window_bits,
             state: Self::start(window_bits),
         }
     }
@@ -63,7 +61,7 @@ impl Inflater {
     }
 
     pub fn reset(&mut self) {
-        self.state = Self::start(self.window_bits);
+        self.state.reset();
     }
 
     pub fn inflate(

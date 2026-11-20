@@ -1,9 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+use crate::sim::{Mutation, mutated};
+
 const MINUTE_MS: i64 = 60_000;
 const DAY_MINUTES: i64 = 1_440;
 const CYCLE_DAYS: i64 = 146_097;
 const MAX_OFFSET_MINUTES: i16 = 23 * 60 + 59;
+const MONTHS: [&str; 12] = [
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+];
+const WEEKDAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -48,7 +54,7 @@ pub struct Cron {
     any_weekday: bool,
 }
 
-fn field(text: &str, low: u32, high: u32) -> Result<u64, String> {
+fn field(text: &str, low: u32, high: u32, names: &[&str]) -> Result<u64, String> {
     let mut bits = 0u64;
     for item in text.split(',') {
         let (base, step) = match item.split_once('/') {
@@ -62,9 +68,11 @@ fn field(text: &str, low: u32, high: u32) -> Result<u64, String> {
             None => (item, 1),
         };
         let number = |value: &str| {
-            value
-                .parse::<u32>()
-                .ok()
+            names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(value))
+                .map(|at| at as u32 + low + u32::from(mutated(Mutation::CronNamesShifted)))
+                .or_else(|| value.parse::<u32>().ok())
                 .filter(|value| (low..=high).contains(value))
                 .ok_or_else(|| format!("{value:?} is outside {low}-{high}"))
         };
@@ -114,12 +122,12 @@ impl Cron {
         let [minute, hour, day, month, weekday] = fields[..] else {
             return Err(format!("{} fields, not 5", fields.len()));
         };
-        let weekdays = field(weekday, 0, 7)?;
+        let weekdays = field(weekday, 0, 7, &WEEKDAYS)?;
         Ok(Self {
-            minutes: field(minute, 0, 59)?,
-            hours: field(hour, 0, 23)? as u32,
-            days: field(day, 1, 31)? as u32,
-            months: field(month, 1, 12)? as u16,
+            minutes: field(minute, 0, 59, &[])?,
+            hours: field(hour, 0, 23, &[])? as u32,
+            days: field(day, 1, 31, &[])? as u32,
+            months: field(month, 1, 12, &MONTHS)? as u16,
             weekdays: ((weekdays | weekdays >> 7) & 0x7f) as u8,
             any_day: day.starts_with('*'),
             any_weekday: weekday.starts_with('*'),

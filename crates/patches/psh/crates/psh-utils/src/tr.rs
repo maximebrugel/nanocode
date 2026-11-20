@@ -26,7 +26,7 @@ pub const SPEC: Spec = Spec {
         both('t', "truncate-set1"),
         flag('u'),
     ],
-    posix_order: false,
+    posix_order: true,
 };
 
 /// Raw bytes that are not part of valid UTF-8 (and octal escapes above 0x7f) in

@@ -51,6 +51,24 @@ impl ClientBuilder {
         }
     }
 
+    pub fn tls_built_in_root_certs(self, enabled: bool) -> Self {
+        Self {
+            builder: self.builder.tls_built_in_root_certs(enabled),
+        }
+    }
+
+    pub fn add_root_certificates_pem(self, pem: &[u8]) -> Self {
+        Self {
+            builder: self.builder.add_root_certificates_pem(pem),
+        }
+    }
+
+    pub fn add_root_certificates_pem_file(self, path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            builder: self.builder.add_root_certificates_pem_file(path),
+        }
+    }
+
     pub fn build(self) -> Result<Client> {
         let client = self.builder.build()?;
         let (jobs, mut queue) = mpsc::unbounded_channel::<Job>();

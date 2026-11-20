@@ -727,7 +727,7 @@ const HEADLESS_EXEC_DROPPED_LINES: [&str; 6] = [
     "- `notify(",
     "- `yield_control()`",
     "- Nanocode extension: a call to a name missing from `ALL_TOOLS`",
-    "- Nanocode extension: an image file the cell's calls create or change",
+    "- Nanocode extension: `image` takes an image file's path",
 ];
 const HEADLESS_EXEC_GLOBALS: [&str; 4] = [
     "`audio(",

@@ -65,8 +65,8 @@ const SENT: Dialects = [
     "INSERT INTO nanocode_hand_requests (session_id, call_id, id, key, runtime, turn_id, reply) VALUES ($1::text, $2::text, $3::text, $4::text, $5::text, $6::text, NULL) ON CONFLICT (session_id, call_id) DO UPDATE SET id = excluded.id, key = excluded.key, runtime = excluded.runtime, turn_id = excluded.turn_id, reply = NULL",
 ];
 const REPLIED: Dialects = [
-    "UPDATE nanocode_hand_requests SET reply = ?4 WHERE key = ?1 AND runtime = ?2 AND id = ?3",
-    "UPDATE nanocode_hand_requests SET reply = $4::text WHERE key = $1::text AND runtime = $2::text AND id = $3::text",
+    "UPDATE nanocode_hand_requests SET reply = ?4 WHERE key = ?1 AND runtime = ?2 AND id = ?3 AND reply IS NULL",
+    "UPDATE nanocode_hand_requests SET reply = $4::text WHERE key = $1::text AND runtime = $2::text AND id = $3::text AND reply IS NULL",
 ];
 const PENDING: Dialects = [
     "SELECT id FROM nanocode_hand_requests WHERE key = ?1 AND runtime = ?2 AND reply IS NULL",

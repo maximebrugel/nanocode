@@ -601,3 +601,27 @@ elif _can_use('poll'):
     DefaultSelector = PollSelector
 else:
     DefaultSelector = SelectSelector
+
+
+# Cooperative threads (see _thread): select() lets queued threads run before it
+# blocks, so an event loop can wait on a thread (run_in_executor, asyncio.run's
+# executor shutdown) that would otherwise only run once the loop ends.
+_thread_yield = getattr(__import__('_thread'), '_yield', None)
+if _thread_yield is not None:
+    def _cooperative_select(select):
+        def wrapper(self, timeout=None):
+            # A thread that ran may have queued work for the caller (with no
+            # self-pipe to wake select()), so then only poll.
+            if _thread_yield():
+                timeout = 0
+            return select(self, timeout)
+        wrapper.__name__ = select.__name__
+        wrapper.__qualname__ = select.__qualname__
+        wrapper.__doc__ = select.__doc__
+        return wrapper
+
+    for _cls in {c for c in list(globals().values()) if isinstance(c, type)}:
+        if (issubclass(_cls, BaseSelector) and 'select' in _cls.__dict__
+                and not getattr(_cls.select, '__isabstractmethod__', False)):
+            _cls.select = _cooperative_select(_cls.select)
+    del _cls

@@ -20,12 +20,20 @@ bench = false
 nanocode-agent.workspace = true
 nanocode-agent-host.workspace = true
 nanocode-backend-codex.workspace = true
+nanocode-bytes.workspace = true
 nanocode-durability.workspace = true
+nanocode-durability-core.workspace = true
+nanocode-http.workspace = true
 nanocode-platform.workspace = true
+nanocode-python.workspace = true
+nanocode-shell.workspace = true
 nanocode-store-jsonl.workspace = true
 nanocode-sync.workspace = true
 nanocode-tool-runtime.workspace = true
+nanocode-workspace.workspace = true
+nanocode-workspace-fs.workspace = true
 nanocode-tui = { path = "../../crates/tui", version = "0.7.0" }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 nanocode-executor.workspace = true

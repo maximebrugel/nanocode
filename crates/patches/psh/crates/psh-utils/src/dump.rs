@@ -143,7 +143,7 @@ pub async fn xxd(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
     if reverse {
         if plain {
             let digits: Vec<u8> = data.iter().copied().filter(u8::is_ascii_hexdigit).collect();
-            for pair in digits.chunks_exact(2) {
+            for pair in digits.as_chunks::<2>().0 {
                 let text = std::str::from_utf8(pair).unwrap_or("00");
                 out.push(u8::from_str_radix(text, 16).unwrap_or(0));
             }
@@ -172,7 +172,7 @@ pub async fn xxd(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
                     .copied()
                     .filter(u8::is_ascii_hexdigit)
                     .collect();
-                for (k, pair) in digits.chunks_exact(2).enumerate() {
+                for (k, pair) in digits.as_chunks::<2>().0.iter().enumerate() {
                     let text = std::str::from_utf8(pair).unwrap_or("00");
                     let byte = u8::from_str_radix(text, 16).unwrap_or(0);
                     if at + k < out.len() {

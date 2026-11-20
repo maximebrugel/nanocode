@@ -9,7 +9,7 @@ use std::{
 };
 
 use djs_embed::{
-    Builder, CallId, HostCall, HostFn, Instance, Limits, Snapshot, Source, Throw, Value as JsValue,
+    Builder, CallId, HostCall, Instance, Limits, Snapshot, Source, Throw, Value as JsValue,
 };
 use nanocode_platform::Instant;
 use nanocode_sync::{Atom, Slot};
@@ -107,14 +107,7 @@ fn build(
     runs: PreludeRuns,
 ) -> Result<Snapshot, Unprepared> {
     let Some(source) = prelude else {
-        let builder = crate::setup::per_cell().map_err(bootstrap_error)?;
-        let shared = match Snapshot::from_static(builder.clone(), PER_CELL_IMAGE) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                nanocode_trace::warn!(%error, "the build-time Code Mode snapshot did not load; building it");
-                stored(builder)?
-            }
-        };
+        let shared = per_cell_snapshot()?;
         let limits = Limits {
             memory: CELL_MEMORY.load(Ordering::Relaxed),
             fuel: u64::MAX,
@@ -139,17 +132,29 @@ fn build(
             .map_err(|error| bootstrap_error(error.to_string()));
     };
     let definitions = Definitions::AtSetup(&tools.definitions);
-    let mut builder = crate::setup::builder(&definitions, runs == PreludeRuns::AtSetup);
-    for (id, name) in crate::bytes::HOST_FNS {
-        builder = builder.host_fn(HostFn::sync(id, name));
-    }
-    let builder = builder
+    let builder = crate::setup::builder(&definitions, runs == PreludeRuns::AtSetup)
         .source(Source::script(
             PRELUDE_SCRIPT,
             format!("globalThis.__nanocodePrelude = function (tools, call, callSync) {{\n{source}\n}};\n"),
         ))
         .source(crate::setup::bootstrap(&definitions).map_err(bootstrap_error)?);
-    stored(builder)
+    stored(crate::setup::node(builder))
+}
+
+fn per_cell_snapshot() -> Result<Snapshot, Unprepared> {
+    static SHARED: OnceLock<Snapshot> = OnceLock::new();
+    if let Some(snapshot) = SHARED.get() {
+        return Ok(snapshot.clone());
+    }
+    let builder = crate::setup::per_cell().map_err(bootstrap_error)?;
+    let snapshot = match Snapshot::from_static(builder.clone(), PER_CELL_IMAGE) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            nanocode_trace::warn!(%error, "the build-time Code Mode snapshot did not load; building it");
+            stored(builder)?
+        }
+    };
+    Ok(SHARED.get_or_init(|| snapshot).clone())
 }
 
 fn bootstrap_error(message: String) -> Unprepared {
@@ -191,6 +196,7 @@ fn compile(builder: Builder) -> Result<Snapshot, Unprepared> {
 
 pub(crate) struct Prepared {
     tools: Weak<CellTools>,
+    definitions: Box<str>,
     prelude: Option<Arc<str>>,
     snapshot: Snapshot,
     spares: Box<[Slot<Instance>]>,
@@ -287,29 +293,48 @@ pub(crate) fn prepared(
     static SNAPSHOTS: OnceLock<Atom<Snapshots>> = OnceLock::new();
     let snapshots = SNAPSHOTS.get_or_init(Atom::default);
     let find = |list: &Snapshots| {
-        list.iter()
-            .find(|prepared| {
-                std::ptr::eq(prepared.tools.as_ptr(), Arc::as_ptr(tools))
-                    && prepared.prelude.as_deref() == prelude.map(|prelude| &**prelude)
-            })
-            .cloned()
+        list.iter().position(|prepared| {
+            (std::ptr::eq(prepared.tools.as_ptr(), Arc::as_ptr(tools))
+                || *prepared.definitions == *tools.definitions)
+                && prepared.prelude.as_deref() == prelude.map(|prelude| &**prelude)
+        })
     };
-    if let Some(prepared) = snapshots.read(find) {
-        return Ok(prepared);
+    let found = snapshots.read(|list| {
+        find(list).map(|at| (at + 1 == list.len(), Arc::clone(&list[at])))
+    });
+    match found {
+        Some((true, prepared)) => return Ok(prepared),
+        Some((false, _)) => {
+            let recent = snapshots.update(|list| {
+                find(list).map(|at| {
+                    let prepared = list.remove(at);
+                    list.push(Arc::clone(&prepared));
+                    prepared
+                })
+            });
+            if let Some(prepared) = recent {
+                return Ok(prepared);
+            }
+        }
+        None => {}
     }
     let spares = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let prepared = Arc::new(Prepared {
         tools: Arc::downgrade(tools),
+        definitions: tools.definitions.clone().into_boxed_str(),
         prelude: prelude.cloned(),
         snapshot: with_prelude(tools, prelude)?,
         spares: (0..spares).map(|_| Slot::default()).collect(),
     });
-    Ok(snapshots.update(|list| {
-        find(list).unwrap_or_else(|| {
+    Ok(snapshots.update(|list| match find(list) {
+        Some(at) => Arc::clone(&list[at]),
+        None => {
+            let recent = list.pop();
             list.retain(|prepared| prepared.tools.strong_count() > 0);
+            list.extend(recent);
             list.push(Arc::clone(&prepared));
             Arc::clone(&prepared)
-        })
+        }
     }))
 }
 

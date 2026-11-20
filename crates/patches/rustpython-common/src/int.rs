@@ -3,6 +3,9 @@ use nanocode_numeric::{One, ToPrimitive, Zero};
 
 #[must_use]
 pub fn true_div(numerator: &BigInt, denominator: &BigInt) -> f64 {
+    if numerator.is_zero() {
+        return if denominator.sign() == Sign::Minus { -0.0 } else { 0.0 };
+    }
     match nanocode_numeric::rational_to_f64(numerator, denominator) {
         // returned value is $t::MAX but still less than the original
         (val, core::cmp::Ordering::Less) if val == f64::MAX => f64::INFINITY,

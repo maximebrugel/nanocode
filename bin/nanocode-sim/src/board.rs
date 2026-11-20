@@ -14,6 +14,7 @@ use nanocode_board::{
     Applied, Board, BoardError, ClaimId, EventId, NewTask, Op, Outcome, Phase, Rejection, Say,
     TaskId,
     sim::{self as board_sim, Mutation as BoardRule},
+    stage::Stage,
     watch::Step,
 };
 use nanocode_durability_core::{StoreError, StoreFuture};
@@ -27,8 +28,12 @@ use crate::{
 
 #[path = "board_access.rs"]
 mod access;
+#[path = "board_deliver.rs"]
+mod deliver;
 #[path = "board_due.rs"]
 mod due;
+#[path = "board_intent.rs"]
+mod intent;
 #[path = "board_messages.rs"]
 mod messages;
 #[path = "board_tasks.rs"]
@@ -79,6 +84,7 @@ pub enum BoardMutation {
     RelabelKeepsUnset,
     RankUnchecked,
     NextIgnoresRank,
+    SpreadIgnoresTier,
     MoveUnchecked,
     MoveAllowsCycle,
     MoveKeepsChildren,
@@ -87,10 +93,13 @@ pub enum BoardMutation {
     AckSkipsFold,
     ResumeSkipsRows,
     SnapshotSkipsRows,
+    SnapshotLosesDedupe,
     DueIgnored,
     DueFiresTwice,
     RecurrenceSkipsOnRestart,
     AttemptsNotCounted,
+    WakeIgnoresDue,
+    CronNamesShifted,
     EditsByAnyone,
     TombstonesEditable,
     RepliesNest,
@@ -111,11 +120,13 @@ pub enum BoardMutation {
     CursorInclusive,
     SaysUnchecked,
     MessagesLeak,
+    FencedUnsettled,
     Watch(BoardRule),
+    Deliver(BoardRule),
 }
 
 impl BoardMutation {
-    const ALL: [Self; 67] = [
+    const ALL: [Self; 72] = [
         Self::None,
         Self::ClaimIgnoresLease,
         Self::ClaimIgnoresNeeds,
@@ -151,6 +162,7 @@ impl BoardMutation {
         Self::RelabelKeepsUnset,
         Self::RankUnchecked,
         Self::NextIgnoresRank,
+        Self::SpreadIgnoresTier,
         Self::MoveUnchecked,
         Self::MoveAllowsCycle,
         Self::MoveKeepsChildren,
@@ -159,10 +171,13 @@ impl BoardMutation {
         Self::AckSkipsFold,
         Self::ResumeSkipsRows,
         Self::SnapshotSkipsRows,
+        Self::SnapshotLosesDedupe,
         Self::DueIgnored,
         Self::DueFiresTwice,
         Self::RecurrenceSkipsOnRestart,
         Self::AttemptsNotCounted,
+        Self::WakeIgnoresDue,
+        Self::CronNamesShifted,
         Self::EditsByAnyone,
         Self::TombstonesEditable,
         Self::RepliesNest,
@@ -183,12 +198,15 @@ impl BoardMutation {
         Self::CursorInclusive,
         Self::SaysUnchecked,
         Self::MessagesLeak,
+        Self::FencedUnsettled,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .chain(watching::ALL.map(Self::Watch))
+            .chain(intent::ALL.map(Self::Watch))
+            .chain(deliver::ALL.map(Self::Deliver))
             .find(|mutation| mutation.name() == name)
     }
 
@@ -229,6 +247,7 @@ impl BoardMutation {
             Self::RelabelKeepsUnset => "relabel_keeps_unset",
             Self::RankUnchecked => "rank_unchecked",
             Self::NextIgnoresRank => "next_ignores_rank",
+            Self::SpreadIgnoresTier => "spread_ignores_tier",
             Self::MoveUnchecked => "move_unchecked",
             Self::MoveAllowsCycle => "move_allows_cycle",
             Self::MoveKeepsChildren => "move_keeps_children",
@@ -237,10 +256,13 @@ impl BoardMutation {
             Self::AckSkipsFold => "ack_skips_fold",
             Self::ResumeSkipsRows => "resume_skips_rows",
             Self::SnapshotSkipsRows => "snapshot_skips_rows",
+            Self::SnapshotLosesDedupe => "snapshot_loses_dedupe",
             Self::DueIgnored => "due_ignored",
             Self::DueFiresTwice => "due_fires_twice",
             Self::RecurrenceSkipsOnRestart => "recurrence_skips_on_restart",
             Self::AttemptsNotCounted => "attempts_not_counted",
+            Self::WakeIgnoresDue => "wake_ignores_due",
+            Self::CronNamesShifted => "cron_names_shifted",
             Self::EditsByAnyone => "edits_by_anyone",
             Self::TombstonesEditable => "tombstones_editable",
             Self::RepliesNest => "replies_nest",
@@ -261,7 +283,12 @@ impl BoardMutation {
             Self::CursorInclusive => "cursor_inclusive",
             Self::SaysUnchecked => "says_unchecked",
             Self::MessagesLeak => "messages_leak",
-            Self::Watch(rule) => watching::name(rule),
+            Self::FencedUnsettled => "fenced_unsettled",
+            Self::Watch(rule) => match intent::name(rule) {
+                Some(name) => name,
+                None => watching::name(rule),
+            },
+            Self::Deliver(rule) => deliver::name(rule),
         }
     }
 
@@ -271,6 +298,8 @@ impl BoardMutation {
             .skip(1)
             .copied()
             .chain(watching::ALL.map(Self::Watch))
+            .chain(intent::ALL.map(Self::Watch))
+            .chain(deliver::ALL.map(Self::Deliver))
             .map(|mutation| mutation.name())
             .collect::<Vec<_>>()
             .join("|")
@@ -310,6 +339,7 @@ impl BoardMutation {
             Self::RelabelKeepsUnset => BoardRule::RelabelKeepsUnset,
             Self::RankUnchecked => BoardRule::RankUnchecked,
             Self::NextIgnoresRank => BoardRule::NextIgnoresRank,
+            Self::SpreadIgnoresTier => BoardRule::SpreadIgnoresTier,
             Self::MoveUnchecked => BoardRule::MoveUnchecked,
             Self::MoveAllowsCycle => BoardRule::MoveAllowsCycle,
             Self::MoveKeepsChildren => BoardRule::MoveKeepsChildren,
@@ -318,10 +348,13 @@ impl BoardMutation {
             Self::AckSkipsFold => BoardRule::AckSkipsFold,
             Self::ResumeSkipsRows => BoardRule::ResumeSkipsRows,
             Self::SnapshotSkipsRows => BoardRule::SnapshotSkipsRows,
+            Self::SnapshotLosesDedupe => BoardRule::SnapshotLosesDedupe,
             Self::DueIgnored => BoardRule::DueIgnored,
             Self::DueFiresTwice => BoardRule::DueFiresTwice,
             Self::RecurrenceSkipsOnRestart => BoardRule::RecurrenceSkipsOnRestart,
             Self::AttemptsNotCounted => BoardRule::AttemptsNotCounted,
+            Self::WakeIgnoresDue => BoardRule::WakeIgnoresDue,
+            Self::CronNamesShifted => BoardRule::CronNamesShifted,
             Self::EditsByAnyone => BoardRule::EditsByAnyone,
             Self::TombstonesEditable => BoardRule::TombstonesEditable,
             Self::RepliesNest => BoardRule::RepliesNest,
@@ -342,7 +375,8 @@ impl BoardMutation {
             Self::CursorInclusive => BoardRule::CursorInclusive,
             Self::SaysUnchecked => BoardRule::SaysUnchecked,
             Self::MessagesLeak => BoardRule::MessagesLeak,
-            Self::Watch(rule) => rule,
+            Self::FencedUnsettled => BoardRule::FencedUnsettled,
+            Self::Watch(rule) | Self::Deliver(rule) => rule,
             Self::None | Self::CursorBeforeEffect | Self::EffectBeforeCursor => BoardRule::None,
         }
     }
@@ -378,6 +412,9 @@ pub struct BoardStats {
     pub due_runs: u64,
     pub due_retries: u64,
     pub due_restarts: u64,
+    pub deliveries: u64,
+    pub redeliveries: u64,
+    pub delivery_takeovers: u64,
 }
 
 impl BoardStats {
@@ -410,6 +447,9 @@ impl BoardStats {
         self.due_runs += other.due_runs;
         self.due_retries += other.due_retries;
         self.due_restarts += other.due_restarts;
+        self.deliveries += other.deliveries;
+        self.redeliveries += other.redeliveries;
+        self.delivery_takeovers += other.delivery_takeovers;
     }
 }
 
@@ -430,6 +470,7 @@ struct Shape {
     prs: Vec<u64>,
     hooks: Vec<Hook>,
     cancel: Option<(TaskId, u64)>,
+    cancel_early: bool,
     crashes: Vec<u64>,
     deadline_ms: u64,
     stable: bool,
@@ -512,6 +553,27 @@ impl Shape {
             }
         }
         let tasks = tasks::Plan::of(seed, &mut plan, workers, lease_ms);
+        let mut later = Rng::derive(seed, "board early cancel");
+        let cancel_early = later.chance(700_000);
+        let posted = plan
+            .iter()
+            .filter(|task| {
+                task.labels["step"] == "fix"
+                    && !task
+                        .parent
+                        .as_ref()
+                        .is_some_and(|lane| tasks.batched.contains(lane))
+            })
+            .map(|task| task.id.clone())
+            .collect::<Vec<_>>();
+        let cancel = cancel.or_else(|| {
+            (!posted.is_empty() && later.chance(700_000)).then(|| {
+                (
+                    posted[later.pick(posted.len())].clone(),
+                    later.range(0, lease_ms * 4),
+                )
+            })
+        });
         Self {
             seed,
             tasks,
@@ -531,6 +593,7 @@ impl Shape {
             prs,
             hooks,
             cancel,
+            cancel_early,
             crashes,
             stable: Rng::derive(seed, "board identity").chance(500_000),
         }
@@ -572,6 +635,7 @@ pub(crate) struct FaultLog {
     pub(crate) latency_ms: u64,
     pub(crate) faults: AtomicU64,
     pub(crate) conflicts: AtomicU64,
+    pub(crate) fenced: AtomicU64,
 }
 
 impl FaultLog {
@@ -635,6 +699,10 @@ impl LogHost for FaultLog {
         Box::pin(async move {
             self.clock.sleep(self.delay()).await;
             if self.roll(|rng| rng.chance(self.before_ppm)) {
+                if self.fenced.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+                    self.faults.fetch_add(1, Ordering::SeqCst);
+                    return Err(StoreError::Fenced);
+                }
                 return Err(self.injected("append before"));
             }
             let appended = self.inner.append(scope, rows).await;
@@ -699,6 +767,9 @@ impl World {
     }
 
     async fn nap(&self, ms: u64) {
+        if !self.oracle.borrow().wrong.is_empty() {
+            std::future::pending::<()>().await;
+        }
         self.clock.sleep(Duration::from_nanos(ms * MS)).await;
     }
 
@@ -706,7 +777,7 @@ impl World {
         loop {
             let host = self
                 .watched
-                .wrap(Arc::clone(&self.host) as Arc<dyn LogHost>);
+                .wrap(Arc::clone(&self.host) as Arc<dyn LogHost>, &self.clock);
             match Board::open(host, SCOPE, access::identity(writer)).await {
                 Ok(board) => {
                     self.resume(board.writer()).await;
@@ -788,6 +859,15 @@ impl World {
             }
             Ok(applied) => Sent::Applied(applied.seq),
             Err(BoardError::Rejected(_) | BoardError::Dropped(_)) => Sent::Rejected,
+            Err(BoardError::Unsettled {
+                error: StoreError::Fenced,
+                ..
+            }) => {
+                oracle.wrong.push(format!(
+                    "{id} was fenced, which writes nothing, but the board reported it unsettled"
+                ));
+                Sent::Unsettled
+            }
             Err(BoardError::Unsettled { .. } | BoardError::Corrupt { .. }) => Sent::Unsettled,
             Err(BoardError::Store(_)) => Sent::Failed,
         };
@@ -854,6 +934,15 @@ async fn lead(world: &World, epoch: u64) {
                 }
             }
         }
+        if world.shape.cancel_early
+            && world
+                .shape
+                .cancel
+                .as_ref()
+                .is_some_and(|(cancel, _)| *cancel == task.id)
+        {
+            replan(world, &mut board, &task.id).await;
+        }
         if world.shape.tasks.batched.contains(&task.id) {
             tasks::post_batch(world, &mut board, &task.id).await;
         }
@@ -867,26 +956,33 @@ async fn lead(world: &World, epoch: u64) {
         && !*world.cancelled.borrow()
     {
         world.nap(after_ms).await;
-        loop {
-            match world
-                .submit(
-                    &mut board,
-                    Op::Cancel {
-                        task: task.clone(),
-                        reason: "lead replanned".to_owned(),
-                    },
-                )
-                .await
-            {
-                Ok(_) | Err(BoardError::Rejected(_)) => break,
-                Err(error) => {
-                    world.note(&error);
-                    world.nap(world.shape.poll_ms).await;
-                }
+        replan(world, &mut board, &task).await;
+    }
+}
+
+async fn replan(world: &World, board: &mut Board, task: &TaskId) {
+    if *world.cancelled.borrow() {
+        return;
+    }
+    loop {
+        match world
+            .submit(
+                board,
+                Op::Cancel {
+                    task: task.clone(),
+                    reason: "lead replanned".to_owned(),
+                },
+            )
+            .await
+        {
+            Ok(_) | Err(BoardError::Rejected(_)) => break,
+            Err(error) => {
+                world.note(&error);
+                world.nap(world.shape.poll_ms).await;
             }
         }
-        world.cancelled.replace(true);
     }
+    world.cancelled.replace(true);
 }
 
 #[derive(Clone, Debug)]
@@ -1039,7 +1135,10 @@ impl Worker<'_> {
                 .await;
             return;
         }
-        let outcome = if self.rng.chance(shape.fail_ppm) {
+        let failed = self.rng.chance(shape.fail_ppm)
+            || (tasks::waits(self.board.fold(), &task)
+                && self.rng.chance(shape.tasks.wait_fail_ppm));
+        let outcome = if failed {
             Outcome::Failed(format!("{task} failed under {claim}"))
         } else {
             Outcome::Done(format!("{task} by {claim}"))
@@ -1074,6 +1173,18 @@ async fn worker(world: &World, index: u64, epoch: u64) {
             continue;
         }
         if world.planned(&worker.board) {
+            return;
+        }
+        let now = world.now_ms();
+        let fold = worker.board.fold();
+        if let Some(id) = fold.tasks().iter().find_map(|(id, task)| {
+            (matches!(task.stage(now), Stage::Lapsed)
+                && matches!(fold.claimable(id, now), Err(Rejection::Held { .. })))
+            .then(|| id.clone())
+        }) {
+            world.oracle.borrow_mut().wrong.push(format!(
+                "{id} lapsed by {now} ms but the board still refuses its claim as held"
+            ));
             return;
         }
         let mode = world.shape.tasks.modes[index as usize];
@@ -1123,6 +1234,8 @@ async fn worker(world: &World, index: u64, epoch: u64) {
             .submit(Op::Claim {
                 task: task.clone(),
                 lease_ms: world.shape.lease_ms,
+                fence: None,
+                cap: None,
             })
             .await
         else {
@@ -1174,12 +1287,12 @@ async fn watcher(world: &World, epoch: u64) {
                 match world.mutation {
                     BoardMutation::CursorBeforeEffect => {
                         world.watch.borrow_mut().cursor = cursor + 1;
-                        world.nap(rng.range(0, world.shape.step_ms)).await;
+                        world.nap(rng.range(0, world.shape.lease_ms)).await;
                         world.watch.borrow_mut().consumed.push(item);
                     }
                     BoardMutation::EffectBeforeCursor => {
                         world.watch.borrow_mut().consumed.push(item);
-                        world.nap(rng.range(0, world.shape.step_ms)).await;
+                        world.nap(rng.range(0, world.shape.lease_ms)).await;
                         world.watch.borrow_mut().cursor = cursor + 1;
                     }
                     _ => {
@@ -1244,6 +1357,7 @@ impl Expect {
 
 struct Reference {
     tasks: BTreeMap<String, (Option<String>, Vec<String>, Expect)>,
+    posts: BTreeMap<String, NewTask>,
     grants: BTreeMap<String, Vec<(u64, String)>>,
     finishes: BTreeMap<String, u64>,
     replies: BTreeMap<String, Vec<String>>,
@@ -1301,8 +1415,10 @@ impl Reference {
         match op {
             Op::Post { task } => {
                 let known = |id: &TaskId| self.tasks.contains_key(&id.0);
-                if self.tasks.contains_key(&task.id.0)
-                    || task.parent.as_ref().is_some_and(|parent| !known(parent))
+                if self.tasks.contains_key(&task.id.0) {
+                    return self.posts.get(&task.id.0) == Some(&task);
+                }
+                if task.parent.as_ref().is_some_and(|parent| !known(parent))
                     || task.needs.iter().any(|need| !known(need))
                 {
                     return false;
@@ -1313,6 +1429,7 @@ impl Reference {
                     .chain(&task.needs)
                     .any(|above| self.dooms(&above.0));
                 self.terms(&task);
+                self.posts.insert(task.id.0.clone(), task.clone());
                 self.tasks.insert(
                     task.id.0.clone(),
                     (
@@ -1326,7 +1443,7 @@ impl Reference {
                 }
                 true
             }
-            Op::Claim { task, lease_ms } => {
+            Op::Claim { task, lease_ms, .. } => {
                 let Some((_, needs, phase)) = self.tasks.get(&task.0) else {
                     return false;
                 };
@@ -1428,9 +1545,9 @@ impl Reference {
             | Op::Relabel { .. }
             | Op::Rank { .. }
             | Op::Sync { .. } => false,
-            Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => true,
+            Op::Grant { .. } | Op::Revoke { .. } | Op::Epoch { .. } | Op::Charter {} => true,
             Op::Say { .. } => false,
-            Op::Watch(_) => false,
+            Op::Watch(_) | Op::Steer(_) => false,
         }
     }
 
@@ -1491,6 +1608,7 @@ impl Reference {
     fn of(rows: &[(u64, String)]) -> Result<Self, String> {
         let mut model = Self {
             tasks: BTreeMap::new(),
+            posts: BTreeMap::new(),
             grants: BTreeMap::new(),
             finishes: BTreeMap::new(),
             replies: BTreeMap::new(),
@@ -1636,8 +1754,16 @@ fn resumes(rows: &[(u64, String)]) -> Result<(), String> {
     for cut in [0, rows.len() / 3, rows.len() / 2, rows.len()] {
         let held = fold(&rows[..cut])?;
         let held = if cut % 2 == 0 {
-            nanocode_board::Fold::restore(&held.snapshot())
-                .map_err(|error| format!("restore a snapshot of {cut} rows: {error}"))?
+            let compact = nanocode_board::Fold::restore(&held.snapshot())
+                .map_err(|error| format!("restore a compact snapshot of {cut} rows: {error}"))?;
+            let json = nanocode_board::Fold::restore(held.snapshot_json().as_bytes())
+                .map_err(|error| format!("restore a JSON snapshot of {cut} rows: {error}"))?;
+            if compact != json {
+                return Err(format!(
+                    "compact and JSON snapshots of {cut} rows restore different folds"
+                ));
+            }
+            compact
         } else {
             held
         };
@@ -1730,14 +1856,23 @@ fn check(world: &World, rows: &[(u64, String)]) -> Result<BoardStats, String> {
         }
     }
     let mut landed = BTreeMap::new();
+    let mut posts = BTreeMap::new();
     for (seq, body) in rows {
         let event: nanocode_board::Event = serde_json::from_str(body)
             .map_err(|error| format!("row {seq} is not an event: {error}"))?;
+        if let Op::Post { task } = &event.op {
+            posts.insert(*seq, task.clone());
+        }
         landed.entry(event.id.0).or_insert(*seq);
     }
     for (id, sent) in &oracle.sent {
         match (sent, landed.get(id)) {
             (Sent::Applied(seq), Some(at)) if seq == at => {}
+            (Sent::Applied(seq), Some(at))
+                if seq < at
+                    && posts
+                        .get(seq)
+                        .is_some_and(|task| posts.get(at) == Some(task)) => {}
             (Sent::Applied(seq), at) => {
                 return Err(format!(
                     "{id} was applied at row {seq} but the log holds it at {at:?}"
@@ -1803,6 +1938,7 @@ pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
         latency_ms: shape.latency_ms,
         faults: AtomicU64::new(0),
         conflicts: AtomicU64::new(0),
+        fenced: AtomicU64::new(0),
     });
     let world = World {
         mutation,
@@ -1874,7 +2010,9 @@ pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
             }
             Ended::Crashed => world.oracle.borrow_mut().stats.crashes += 1,
             Ended::Stuck => {
-                wrong = Some(format!("epoch {number} got stuck"));
+                if world.oracle.borrow().wrong.is_empty() {
+                    wrong = Some(format!("epoch {number} got stuck"));
+                }
                 break;
             }
         }
@@ -1889,8 +2027,13 @@ pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
     let indexed = indexes(&rows);
     let resumed = resumes(&rows);
     let due = due::run(seed);
+    let intended = intent::run(seed).map(|_| ());
+    let delivered = deliver::run(seed);
     board_sim::mutate(BoardRule::None);
-    for wrong in [live, indexed, resumed].into_iter().filter_map(Result::err) {
+    for wrong in [live, indexed, resumed, intended]
+        .into_iter()
+        .filter_map(Result::err)
+    {
         world.oracle.borrow_mut().wrong.push(wrong);
     }
     let mut digest = fnv(FNV_OFFSET, described.as_bytes());
@@ -1898,10 +2041,17 @@ pub fn simulate(seed: u64, mutation: BoardMutation) -> BoardOutcome {
         digest = fnv(digest, &seq.to_le_bytes());
         digest = fnv(digest, body.as_bytes());
     }
-    let verdict = wrong
+    let verdict = world
+        .watched
+        .broken()
+        .or(wrong)
         .map_or_else(|| check(&world, &rows), Err)
         .and_then(|mut stats| {
             let due = due?;
+            let delivered = delivered?;
+            stats.deliveries = delivered.posted;
+            stats.redeliveries = delivered.again;
+            stats.delivery_takeovers = delivered.takeovers;
             stats.due_runs = due.runs;
             stats.due_retries = due.retries;
             stats.due_restarts = due.restarts;

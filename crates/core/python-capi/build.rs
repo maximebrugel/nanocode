@@ -1,5 +1,8 @@
 use std::{
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
+    hash::{DefaultHasher, Hasher},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
@@ -302,6 +305,188 @@ fn is_cxx(path: &Path) -> bool {
         .is_some_and(|extension| extension == "cpp" || extension == "cc" || extension == "cxx")
 }
 
+/// A 128-bit key over everything the archive is built from.
+struct Key([DefaultHasher; 2]);
+
+impl Key {
+    fn new() -> Self {
+        let mut hashers = [DefaultHasher::new(), DefaultHasher::new()];
+        hashers[1].write(b"nanocode-python-capi");
+        Self(hashers)
+    }
+
+    fn add(&mut self, bytes: &[u8]) {
+        for hasher in &mut self.0 {
+            hasher.write_usize(bytes.len());
+            hasher.write(bytes);
+        }
+    }
+
+    /// Adds every file below dir by its path under root and its content, in sorted order.
+    fn tree(&mut self, root: &Path, dir: &Path) {
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            let name = path.strip_prefix(root).unwrap_or(&path).to_owned();
+            self.add(name.as_os_str().as_encoded_bytes());
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_dir() => {
+                    self.add(b"/");
+                    self.tree(root, &path);
+                }
+                Ok(meta) if meta.is_symlink() => {
+                    let to = fs::read_link(&path).unwrap_or_default();
+                    self.add(to.as_os_str().as_encoded_bytes());
+                }
+                _ => self.add(&fs::read(&path).unwrap_or_default()),
+            }
+        }
+    }
+
+    fn finish(&self) -> String {
+        format!("{:016x}{:016x}", self.0[0].finish(), self.0[1].finish())
+    }
+}
+
+const CACHED: [&str; 2] = ["libnanocode_python_capi_ext.a", "extensions.rs"];
+
+/// Where a build with these inputs keeps its archive and extension table: a directory under
+/// $NANOCODE_CAPI_CACHE (default ~/.cache/nanocode/capi) named by a hash of the sources, this
+/// script, the compiler's path and version, the target and the variables the compiler reads.
+/// Also returns the object cache directory beside it and a key over the toolchain alone, which
+/// the per-source object cache starts from.
+/// None when caching is off (NANOCODE_CAPI_CACHE=0) or the compiler can't say its version.
+fn cache_entry(
+    root: &Path,
+    compiler: &OsStr,
+    target: &str,
+    host: &str,
+    families: &[&str],
+    apple: Option<&(String, PathBuf)>,
+) -> Option<(PathBuf, PathBuf, String)> {
+    let base = match env::var_os("NANOCODE_CAPI_CACHE") {
+        Some(dir) if dir.is_empty() || dir == "0" => return None,
+        Some(dir) => PathBuf::from(dir),
+        None => env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?
+            .join("nanocode")
+            .join("capi"),
+    };
+    let version = Command::new(compiler)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?
+        .stdout;
+    let mut key = Key::new();
+    key.add(target.as_bytes());
+    key.add(host.as_bytes());
+    key.add(families.join(",").as_bytes());
+    key.add(compiler.as_encoded_bytes());
+    key.add(&version);
+    if let Some((triple, sysroot)) = apple {
+        key.add(triple.as_bytes());
+        key.add(sysroot.as_os_str().as_encoded_bytes());
+    }
+    for name in [
+        "CPATH",
+        "C_INCLUDE_PATH",
+        "CPLUS_INCLUDE_PATH",
+        "SDKROOT",
+        "CCC_OVERRIDE_OPTIONS",
+    ] {
+        key.add(env::var_os(name).unwrap_or_default().as_encoded_bytes());
+    }
+    let toolchain = key.finish();
+    key.add(&fs::read(root.join("build.rs")).ok()?);
+    for dir in ["c", "lib", "ext", "cxx", "include"] {
+        key.add(dir.as_bytes());
+        key.tree(root, &root.join(dir));
+    }
+    Some((base.join(key.finish()), base.join("objects"), toolchain))
+}
+
+/// Writes bytes to path through a temporary file beside it renamed into place, so readers see
+/// a whole file or none.
+fn write_atomic(path: &Path, bytes: &[u8]) {
+    let tmp = path.with_extension(format!(
+        "tmp{}-{:?}",
+        std::process::id(),
+        thread::current().id()
+    ));
+    if fs::write(&tmp, bytes).is_err() || fs::rename(&tmp, path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// The files a -MD depfile lists after its target, other than the source itself.
+fn depfile_inputs(text: &str, source: &Path) -> Vec<String> {
+    let body = text.replace("\\\n", " ");
+    let body = body.split_once(": ").map_or("", |(_, rest)| rest);
+    let source = source.display().to_string();
+    let mut inputs: Vec<String> = Vec::new();
+    for word in body.split_whitespace() {
+        if word != source && !inputs.iter().any(|seen| seen == word) {
+            inputs.push(word.to_owned());
+        }
+    }
+    inputs
+}
+
+/// Copies a cached archive and table into out; Some(whether it needs the C++ runtime) on a hit.
+fn restore(entry: &Path, out: &Path) -> Option<bool> {
+    let cxx = fs::read(entry.join("cxx")).ok()?;
+    for name in CACHED {
+        fs::copy(entry.join(name), out.join(name)).ok()?;
+    }
+    Some(cxx == b"1")
+}
+
+/// Saves the archive and table built in out under entry: written beside it, then renamed into
+/// place, so a reader sees a whole entry or none.
+fn save(entry: &Path, out: &Path, cxx_runtime: bool) {
+    let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
+        return;
+    };
+    let staging = parent.join(format!(
+        ".{}-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let written = fs::create_dir_all(&staging).is_ok()
+        && CACHED
+            .iter()
+            .all(|name| fs::copy(out.join(name), staging.join(name)).is_ok())
+        && fs::write(staging.join("cxx"), if cxx_runtime { "1" } else { "0" }).is_ok();
+    if !written || fs::rename(&staging, entry).is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+}
+
+/// Tells cargo to link the archive in out, and the C++ and Windows libraries it needs.
+fn link(out: &Path, cxx_runtime: bool, wasm: bool, windows: bool) {
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=nanocode_python_capi_ext");
+    if cxx_runtime && !wasm {
+        if env::var("CARGO_CFG_TARGET_VENDOR").is_ok_and(|vendor| vendor == "apple") {
+            println!("cargo:rustc-link-lib=c++");
+        } else if !windows {
+            println!("cargo:rustc-link-lib=stdc++");
+        }
+    }
+    if env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|target_env| target_env == "msvc") {
+        println!("cargo:rustc-link-lib=oldnames");
+        println!("cargo:rustc-link-lib=gdi32");
+        println!("cargo:rustc-link-lib=user32");
+    }
+}
+
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
@@ -341,6 +526,37 @@ fn main() {
     let runtime = root.join("cxx");
     println!("cargo:rerun-if-changed=cxx");
     let apple = apple(&target);
+    // About 500 C and C++ files compile below. What they make depends only on the inputs
+    // cache_entry hashes, so a build whose inputs another build already compiled copies its
+    // archive and table instead.
+    println!("cargo:rerun-if-env-changed=NANOCODE_CAPI_CACHE");
+    let cache = cache_entry(&root, &compiler, &target, &host, &families, apple.as_ref());
+    let entry = cache.as_ref().map(|(entry, _, _)| entry.clone());
+    if let Some(cxx_runtime) = entry.as_deref().and_then(|entry| restore(entry, &out)) {
+        link(&out, cxx_runtime, wasm, windows);
+        return;
+    }
+    // On an archive miss each source is still looked up on its own, as ccache's direct mode
+    // does: objects/<key1>/deps lists the headers that source's last compile read (from its -MD
+    // depfile), and objects/<key1>/<key2>.o is the object, where key1 covers the toolchain, the
+    // arguments (with the crate and OUT_DIR written as @root and @out) and the source, and key2
+    // the listed headers' contents. Misses compile through $NANOCODE_CC_LAUNCHER (such as
+    // sccache) when it is set.
+    println!("cargo:rerun-if-env-changed=NANOCODE_CC_LAUNCHER");
+    let launcher = env::var_os("NANOCODE_CC_LAUNCHER").filter(|launcher| !launcher.is_empty());
+    let object_cache = cache.as_ref().map(|(_, objects, toolchain)| (objects, toolchain));
+    let (hits, misses) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let (root_text, out_text) = (root.display().to_string(), out.display().to_string());
+    let portable = |text: &str| text.replace(&out_text, "@out").replace(&root_text, "@root");
+    let local = |text: &str| text.replace("@out", &out_text).replace("@root", &root_text);
+    let headers_key = |deps: &str| {
+        let mut key = Key::new();
+        for line in deps.lines() {
+            key.add(line.as_bytes());
+            key.add(&fs::read(local(line)).unwrap_or_else(|_| b"\0missing".to_vec()));
+        }
+        key.finish()
+    };
     let compile = |source: &Path, object: &Path, defines: &[String]| {
         let mut command = Command::new(&compiler);
         if let Some((triple, sysroot)) = &apple {
@@ -380,7 +596,12 @@ fn main() {
                 command.arg("-D_GNU_SOURCE");
             }
         }
+        // Objects name their sources through __FILE__ and debug info; mapping the crate and
+        // OUT_DIR to fixed names makes them the same from any checkout, so a cached archive
+        // never carries another worktree's paths.
         command
+            .arg(format!("-ffile-prefix-map={}=/nanocode/python-capi", root.display()))
+            .arg(format!("-ffile-prefix-map={}=/nanocode/out", out.display()))
             .args([
                 "-O2",
                 "-DNDEBUG",
@@ -396,10 +617,56 @@ fn main() {
             .arg(source)
             .arg("-o")
             .arg(object);
+        let depfile = object.with_extension("d");
+        let slot = object_cache.map(|(objects, toolchain)| {
+            let mut key = Key::new();
+            key.add(toolchain.as_bytes());
+            for arg in command.get_args() {
+                let arg = arg.to_string_lossy();
+                if arg == object.to_string_lossy() {
+                    key.add(b"@object");
+                } else {
+                    key.add(portable(&arg).as_bytes());
+                }
+            }
+            key.add(&fs::read(source).unwrap_or_default());
+            objects.join(key.finish())
+        });
+        if let Some(slot) = &slot
+            && let Ok(deps) = fs::read_to_string(slot.join("deps"))
+            && fs::copy(slot.join(format!("{}.o", headers_key(&deps))), object).is_ok()
+        {
+            hits.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        command.arg("-MD").arg("-MF").arg(&depfile);
+        let mut command = match &launcher {
+            Some(launcher) => {
+                let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
+                let mut wrapped = Command::new(launcher);
+                wrapped.arg(&compiler).args(args);
+                wrapped
+            }
+            None => command,
+        };
         let status = command
             .status()
             .unwrap_or_else(|error| panic!("{}: {error}", compiler.to_string_lossy()));
         assert!(status.success(), "compiling {} failed", source.display());
+        misses.fetch_add(1, Ordering::Relaxed);
+        if let Some(slot) = &slot
+            && let Ok(text) = fs::read_to_string(&depfile)
+            && fs::create_dir_all(slot).is_ok()
+        {
+            let deps: String = depfile_inputs(&text, source)
+                .iter()
+                .map(|path| portable(path) + "\n")
+                .collect();
+            if let Ok(bytes) = fs::read(object) {
+                write_atomic(&slot.join(format!("{}.o", headers_key(&deps))), &bytes);
+                write_atomic(&slot.join("deps"), deps.as_bytes());
+            }
+        }
     };
     let mut cxx_runtime = false;
     // Every C and C++ source below goes into one work list, compiled by NUM_JOBS workers that
@@ -633,24 +900,21 @@ fn main() {
         built.sort_by_key(|(index, _)| *index);
         objects.extend(built.into_iter().map(|(_, object)| object));
     }
+    if object_cache.is_some() {
+        println!(
+            "cargo:warning=python-capi object cache: {} hits, {} misses",
+            hits.load(Ordering::Relaxed),
+            misses.load(Ordering::Relaxed)
+        );
+    }
     fs::write(out.join("libnanocode_python_capi_ext.a"), archive(&objects)).expect("the archive");
     fs::write(
         out.join("extensions.rs"),
         format!("unsafe extern \"C\" {{\n{table}{arities}}}\n\npub static EXTENSIONS: &[Extension] = &[\n{entries}];\n\npub fn arity_tables() -> Vec<*const usize> {{\n    vec![\n{tables}    ]\n}}\n"),
     )
     .expect("the extension table");
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=nanocode_python_capi_ext");
-    if cxx_runtime && !wasm {
-        if env::var("CARGO_CFG_TARGET_VENDOR").is_ok_and(|vendor| vendor == "apple") {
-            println!("cargo:rustc-link-lib=c++");
-        } else if !windows {
-            println!("cargo:rustc-link-lib=stdc++");
-        }
+    if let Some(entry) = &entry {
+        save(entry, &out, cxx_runtime);
     }
-    if env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|target_env| target_env == "msvc") {
-        println!("cargo:rustc-link-lib=oldnames");
-        println!("cargo:rustc-link-lib=gdi32");
-        println!("cargo:rustc-link-lib=user32");
-    }
+    link(&out, cxx_runtime, wasm, windows);
 }

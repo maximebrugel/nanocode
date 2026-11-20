@@ -95,7 +95,7 @@ pub(super) fn list_sessions(
         let home = host::home_dir(args.home.as_deref())?;
         let (store, _) = host::open_store(&home).await?;
         if let Some(id) = &args.session {
-            let transcript = store.load(id).await?.transcript;
+            let transcript = store.load(id).await?.into_transcript()?;
             let printed = print_transcript(&transcript);
             store.flush().await?;
             return Ok(unless_closed(printed)?);

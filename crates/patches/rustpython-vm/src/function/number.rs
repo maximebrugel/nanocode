@@ -42,7 +42,7 @@ impl TryFromObject for ArgIntoComplex {
     fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
         // We do not care if it was already a complex.
         let (value, _) = obj.try_complex(vm)?.ok_or_else(|| {
-            vm.new_type_error(format!("must be real number, not {}", obj.class().name()))
+            vm.new_type_error(format!("must be real number, not {}", obj.class().slot_name()))
         })?;
         Ok(Self { value })
     }

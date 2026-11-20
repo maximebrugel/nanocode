@@ -3,8 +3,8 @@
 //! Decimal input is correctly rounded: Clinger's fast path for short inputs, then the
 //! Eisel-Lemire algorithm (ported from Rust's `core::num::dec2flt`, MIT/Apache-2.0), then an
 //! exact big integer slow path. Power-of-two radixes are converted exactly. Other radixes
-//! (only reachable through `parseInt`) follow qjs: about 128 bits worth of leading digits are
-//! kept and the rest truncated, then the result is rounded exactly.
+//! (only reachable through `parseInt`) are folded into a double 32 bits of digits at a time,
+//! as V8 does.
 
 use super::CodeUnit;
 use super::big::Big;
@@ -435,32 +435,22 @@ fn radix_digits_value(digits: &mut dyn Iterator<Item = u32>, radix: u32) -> f64 
         }
         return round_to_f64(Big::from_u64(acc), exp, sticky);
     }
-    // Like qjs: keep the leading digits that fit in 128 bits, drop (not round) the others.
-    let max_digits = {
-        let mut n = 0;
-        let mut p = 1u128;
-        while let Some(next) = p.checked_mul(radix as u128) {
-            p = next;
-            n += 1;
-        }
-        n
-    };
-    let mut acc = DigitAcc::new(radix);
-    let mut extra = 0u32;
+    // Like V8 (the spec lets other radixes approximate): digits go into a 32-bit part while
+    // its multiplier stays within 0xFFFFFFFF / 36, and each part is folded into the double
+    // result with one multiply and one add, each rounded.
+    const MULTIPLIER_MAX: u64 = 0xFFFF_FFFF / 36;
+    let (mut result, mut part, mut multiplier) = (0.0f64, 0u64, 1u64);
     for c in digits {
-        if acc.n < max_digits {
-            acc.push(c);
+        let m = multiplier * radix as u64;
+        if m > MULTIPLIER_MAX {
+            result = result * multiplier as f64 + part as f64;
+            (part, multiplier) = (0, radix as u64);
         } else {
-            extra = extra.saturating_add(1);
+            multiplier = m;
         }
+        part = part * radix as u64 + c as u64;
     }
-    // With r^(digits - 1) >= 2^1025 the value overflows; testing with floor(log2(r)) keeps
-    // the exact computation below within the big integer capacity.
-    let total = acc.n.saturating_add(extra);
-    if total > 0 && (total - 1).saturating_mul(31 - radix.leading_zeros()) >= 1025 {
-        return f64::INFINITY;
-    }
-    scale_to_f64(acc.finish(), 0, radix, extra as i32, false)
+    result * multiplier as f64 + part as f64
 }
 
 /// End of the run of radix-`radix` digits (and `_` if `sep`) starting at `start`.

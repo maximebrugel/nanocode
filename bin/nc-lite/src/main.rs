@@ -11,8 +11,11 @@ use nanocode_store_jsonl::{JsonlArchiver, JsonlStore};
 use nanocode_tool_runtime::{ToolExposure, Tools};
 use serde::Deserialize;
 
+mod fetch;
 mod markdown;
+mod sqlite;
 mod tui;
+mod workspace;
 
 const PROMPT: &str = include_str!("../prompt.md");
 const DEFAULT_MODEL: &str = "luna";
@@ -23,8 +26,8 @@ type Nanocode = nanocode_agent::Runtime<Defaults>;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 const HELP: &str = "nc-lite: nanocode with one harness and plain tools
-usage: nc-lite [--continue] [--ephemeral] [--home DIR] [--base-url URL] [-m MODEL]
-       nc-lite exec [--continue] [--ephemeral] [--home DIR] [--base-url URL] [-m MODEL] PROMPT
+usage: nc-lite [--continue] [--ephemeral] [--home DIR] [--base-url URL] [-m MODEL] [--workspace SQLITE|mem:]
+       nc-lite exec [--continue] [--ephemeral] [--home DIR] [--base-url URL] [-m MODEL] [--workspace SQLITE|mem:] PROMPT
        nc-lite sessions [--home DIR]
        nc-lite --version";
 
@@ -43,6 +46,7 @@ struct Config {
     model: String,
     ephemeral: bool,
     continue_last: bool,
+    workspace: Option<workspace::Backing>,
 }
 
 fn args() -> Result<(Command, Config, Option<String>)> {
@@ -69,6 +73,7 @@ fn args() -> Result<(Command, Config, Option<String>)> {
         model: DEFAULT_MODEL.into(),
         ephemeral: false,
         continue_last: false,
+        workspace: None,
     };
     let mut prompt = None;
     if matches!(command, Command::Version | Command::Help) {
@@ -81,6 +86,10 @@ fn args() -> Result<(Command, Config, Option<String>)> {
             "-m" | "--model" => config.model = it.next().ok_or("-m needs a value")?,
             "--ephemeral" => config.ephemeral = true,
             "-c" | "--continue" => config.continue_last = true,
+            "--workspace" => {
+                let value = it.next().ok_or("--workspace needs a SQLite path or mem:")?;
+                config.workspace = Some(workspace::Backing::parse(value));
+            }
             _ => prompt = Some(arg),
         }
     }
@@ -159,11 +168,14 @@ impl Lite {
             .responses_gateway(gateway)
             .model(model)
             .build()?;
-        let tools = Tools::builder()
-            .exposure(ToolExposure::DirectOnly)
-            .web_search(false)
-            .image_generation(false)
-            .build()?;
+        let tools = match &config.workspace {
+            Some(backing) => workspace::tools(backing, std::env::current_dir()?).await?,
+            None => Tools::builder()
+                .exposure(ToolExposure::DirectOnly)
+                .web_search(false)
+                .image_generation(false)
+                .build()?,
+        };
         let (store, archiver) = if config.ephemeral {
             (None, None)
         } else {

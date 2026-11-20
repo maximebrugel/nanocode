@@ -5,6 +5,8 @@ use super::block::BlockBuffer;
 pub(super) const BLOCK_BYTES: usize = 128;
 pub(super) const OUTPUT_BYTES: usize = 64;
 pub(super) const SHA384_OUTPUT_BYTES: usize = 48;
+pub(super) const SHA512_224_OUTPUT_BYTES: usize = 28;
+pub(super) const SHA512_256_OUTPUT_BYTES: usize = 32;
 const SCHEDULE_WORDS: usize = 80;
 
 pub(super) const SHA384_INITIAL_STATE: [u64; 8] = [
@@ -16,6 +18,30 @@ pub(super) const SHA384_INITIAL_STATE: [u64; 8] = [
     0x8eb4_4a87_6858_1511,
     0xdb0c_2e0d_64f9_8fa7,
     0x47b5_481d_befa_4fa4,
+];
+
+/// SHA-512/224 initial hash value (FIPS 180-4, 5.3.6.1).
+pub(super) const SHA512_224_INITIAL_STATE: [u64; 8] = [
+    0x8c3d_37c8_1954_4da2,
+    0x73e1_9966_89dc_d4d6,
+    0x1dfa_b7ae_32ff_9c82,
+    0x679d_d514_582f_9fcf,
+    0x0f6d_2b69_7bd4_4da8,
+    0x77e3_6f73_04c4_8942,
+    0x3f9d_85a8_6a1d_36c8,
+    0x1112_e6ad_91d6_92a1,
+];
+
+/// SHA-512/256 initial hash value (FIPS 180-4, 5.3.6.2).
+pub(super) const SHA512_256_INITIAL_STATE: [u64; 8] = [
+    0x2231_2194_fc2b_f72c,
+    0x9f55_5fa3_c84c_64c2,
+    0x2393_b86b_6f53_b151,
+    0x9638_7719_5940_eabd,
+    0x9628_3ee2_a88e_ffe3,
+    0xbe5e_1e25_5386_3992,
+    0x2b01_99fc_2c85_b8aa,
+    0x0eb7_2ddc_81c5_2ca2,
 ];
 
 pub(super) const SHA512_INITIAL_STATE: [u64; 8] = [

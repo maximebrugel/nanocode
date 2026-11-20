@@ -14,6 +14,7 @@ use crate::value::{Obj, Value};
 pub const ABSENT_GLOBALS: &[&str] = &[
     "ArrayBuffer",
     "AsyncDisposableStack",
+    "Atomics",
     "BigInt",
     "BigInt64Array",
     "BigUint64Array",
@@ -27,6 +28,7 @@ pub const ABSENT_GLOBALS: &[&str] = &[
     "Int32Array",
     "Int8Array",
     "Iterator",
+    "SharedArrayBuffer",
     "SuppressedError",
     "Uint16Array",
     "Uint32Array",
@@ -37,7 +39,7 @@ pub const ABSENT_GLOBALS: &[&str] = &[
 
 /// The globals of the builtins only `embed` builds have (`// @embed-only`, D3175): full
 /// builds without `embed` (the wasm modules) name them like [`ABSENT_GLOBALS`].
-pub const EMBED_GLOBALS: &[&str] = &["TextDecoder", "TextEncoder"];
+pub const EMBED_GLOBALS: &[&str] = &["TextDecoder", "TextEncoder", "WebAssembly"];
 
 /// The realm slots of the families the slim build leaves out (D2411): `undefined` there.
 const SLIM_LEAVES_OUT: &[Intrinsic] = &[
@@ -64,6 +66,7 @@ const SLIM_LEAVES_OUT: &[Intrinsic] = &[
     Intrinsic::WeakRefProto,
     Intrinsic::FinalizationRegistryProto,
     Intrinsic::BigIntProto,
+    Intrinsic::SharedArrayBufferProto,
 ];
 
 /// Intrinsics, by index into `Realm::INTRINSICS`.
@@ -198,9 +201,14 @@ pub enum Intrinsic {
     /// registry a hidden object from module key to module record and the traps the
     /// prototype of the namespace handlers; undefined until the first module loads.
     Modules,
+    /// %SharedArrayBuffer.prototype% (builtins/sharedarraybuffer.ts).
+    SharedArrayBufferProto,
+    /// %IntlSegmentsPrototype% and %IntlSegmentIteratorPrototype% (builtins/intl.ts).
+    IntlSegmentsProto,
+    IntlSegmentIteratorProto,
 }
 
-const INTRINSIC_COUNT: u32 = Intrinsic::Modules as u32 + 1;
+const INTRINSIC_COUNT: u32 = Intrinsic::IntlSegmentIteratorProto as u32 + 1;
 
 impl Intrinsic {
     /// The intrinsic prototype of the constructor `name`, if the realm has one: the
@@ -231,6 +239,7 @@ impl Intrinsic {
             "Promise" => Intrinsic::PromiseProto,
             "Date" => Intrinsic::DateProto,
             "ArrayBuffer" => Intrinsic::ArrayBufferProto,
+            "SharedArrayBuffer" => Intrinsic::SharedArrayBufferProto,
             "%TypedArray%" => Intrinsic::TypedArrayProto,
             "Int8Array" => Intrinsic::Int8ArrayProto,
             "Uint8Array" => Intrinsic::Uint8ArrayProto,
@@ -249,6 +258,8 @@ impl Intrinsic {
             "Iterator" => Intrinsic::IteratorProto,
             "IteratorHelper" => Intrinsic::IteratorHelperProto,
             "WrapForValidIterator" => Intrinsic::WrapForValidIteratorProto,
+            "IntlSegments" => Intrinsic::IntlSegmentsProto,
+            "IntlSegmentIterator" => Intrinsic::IntlSegmentIteratorProto,
             "DisposableStack" => Intrinsic::DisposableStackProto,
             "AsyncDisposableStack" => Intrinsic::AsyncDisposableStackProto,
             "SuppressedError" => Intrinsic::SuppressedErrorProto,
@@ -388,6 +399,7 @@ pub(crate) fn init(heap: &mut Heap) -> Result<(), HeapError> {
         Intrinsic::RegExpStringIteratorProto,
         Intrinsic::IteratorHelperProto,
         Intrinsic::WrapForValidIteratorProto,
+        Intrinsic::IntlSegmentIteratorProto,
     ] {
         let p = heap.new_object(Some(iterator_proto))?;
         set(heap, i, Value::object(p));
@@ -441,6 +453,8 @@ pub(crate) fn init(heap: &mut Heap) -> Result<(), HeapError> {
         Intrinsic::AsyncDisposableStackProto,
         Intrinsic::WeakRefProto,
         Intrinsic::FinalizationRegistryProto,
+        Intrinsic::SharedArrayBufferProto,
+        Intrinsic::IntlSegmentsProto,
     ] {
         let p = heap.new_object(Some(object_proto))?;
         set(heap, i, Value::object(p));

@@ -243,7 +243,7 @@ pub(crate) trait AnyStr {
                     func_name,
                     py_type_name,
                     py_type_name,
-                    o.class(),
+                    o.class().slot_name(),
                 )
             },
             vm,

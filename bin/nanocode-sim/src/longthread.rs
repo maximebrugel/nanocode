@@ -1,11 +1,8 @@
 use std::{
+    cell::{Cell, RefCell},
     collections::BTreeSet,
     ops::Range,
     process::ExitCode,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
 };
 
 use nanocode::tool_contract::ToolContext;
@@ -51,7 +48,7 @@ impl LongThreadMutation {
             .iter()
             .map(|mutation| mutation.name())
             .collect::<Vec<_>>()
-            .join(",")
+            .join("|")
     }
 }
 
@@ -79,13 +76,21 @@ struct Work {
     output: usize,
 }
 
-static CALLS: AtomicU64 = AtomicU64::new(0);
-static READS: AtomicU64 = AtomicU64::new(0);
-static STATE: Mutex<State> = Mutex::new(State {
-    mutation: LongThreadMutation::None,
-    named: BTreeSet::new(),
-    answers: Vec::new(),
-});
+thread_local! {
+    static CALLS: Cell<u64> = const { Cell::new(0) };
+    static READS: Cell<u64> = const { Cell::new(0) };
+    static STATE: RefCell<State> = const {
+        RefCell::new(State {
+            mutation: LongThreadMutation::None,
+            named: BTreeSet::new(),
+            answers: Vec::new(),
+        })
+    };
+}
+
+fn bump(counter: &'static std::thread::LocalKey<Cell<u64>>) {
+    counter.with(|count| count.set(count.get() + 1));
+}
 
 struct State {
     mutation: LongThreadMutation,
@@ -94,9 +99,7 @@ struct State {
 }
 
 fn state<T>(f: impl FnOnce(&mut State) -> T) -> T {
-    f(&mut STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    STATE.with_borrow_mut(f)
 }
 
 fn images(text: &str) -> impl Iterator<Item = &str> {
@@ -113,7 +116,7 @@ async fn read(file_path: String) -> std::io::Result<String> {
 }
 
 fn missing(file_path: &str) -> std::io::Result<String> {
-    READS.fetch_add(1, Ordering::Relaxed);
+    bump(&READS);
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!("{file_path} does not exist"),
@@ -122,7 +125,7 @@ fn missing(file_path: &str) -> std::io::Result<String> {
 
 #[nanocode::tool(name = "sh", description = "Run a command")]
 async fn sh(command: String) -> std::io::Result<String> {
-    CALLS.fetch_add(1, Ordering::Relaxed);
+    bump(&CALLS);
     let history = state(|state| {
         let history = if state.mutation == LongThreadMutation::RereadHistory {
             state.named.iter().cloned().collect::<Vec<_>>()
@@ -148,7 +151,7 @@ async fn sh(command: String) -> std::io::Result<String> {
 
 #[nanocode::tool(name = "t", description = "Answer a key")]
 async fn t(k: String) -> std::io::Result<String> {
-    CALLS.fetch_add(1, Ordering::Relaxed);
+    bump(&CALLS);
     Ok(state(|state| {
         state.answers.push(format!("t:{k}"));
         if state.mutation == LongThreadMutation::GrowingOutput {
@@ -210,8 +213,8 @@ fn simulate(seed: u64, mutation: LongThreadMutation) -> Outcome {
         ..LongThreadStats::default()
     };
     let mut digest = fnv(FNV_OFFSET, shape.as_bytes());
-    CALLS.store(0, Ordering::Relaxed);
-    READS.store(0, Ordering::Relaxed);
+    CALLS.set(0);
+    READS.set(0);
     let clock = Clock::new();
     crate::host::enter(seed, &clock);
     state(|state| {
@@ -247,7 +250,7 @@ fn simulate(seed: u64, mutation: LongThreadMutation) -> Outcome {
         } else {
             filler(&mut rng, index)
         };
-        let (calls, reads) = (CALLS.load(Ordering::Relaxed), READS.load(Ordering::Relaxed));
+        let (calls, reads) = (CALLS.get(), READS.get());
         let call = format!("cell-{index}");
         let result = block(
             seed,
@@ -271,8 +274,8 @@ fn simulate(seed: u64, mutation: LongThreadMutation) -> Outcome {
             }
         };
         let work = Work {
-            calls: CALLS.load(Ordering::Relaxed) - calls,
-            reads: READS.load(Ordering::Relaxed) - reads,
+            calls: CALLS.get() - calls,
+            reads: READS.get() - reads,
             output,
         };
         stats.cells += 1;

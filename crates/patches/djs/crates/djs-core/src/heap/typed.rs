@@ -95,7 +95,7 @@ impl Kind {
 }
 
 /// ToInt32-style modular conversion of a Number to an integer of `bits` bits.
-fn to_int_bits(n: f64) -> u64 {
+pub(crate) fn to_int_bits(n: f64) -> u64 {
     if !n.is_finite() {
         return 0;
     }
@@ -321,7 +321,10 @@ impl Heap {
     /// view sees length 0. False if `b` is not an ArrayBuffer.
     pub fn detach_buffer(&mut self, b: Obj) -> bool {
         // An immutable buffer cannot be detached (the caller's TypeError).
-        if self.object_class(b) != ObjectClass::ArrayBuffer || self.buffer_immutable(b) {
+        if self.object_class(b) != ObjectClass::ArrayBuffer
+            || self.buffer_immutable(b)
+            || self.buffer_shared(b)
+        {
             return false;
         }
         self.set_object_slot(b, 0, Value::UNDEFINED);
@@ -339,6 +342,12 @@ impl Heap {
     /// Whether an ArrayBuffer is resizable (its slot 1 holds the maximum byte length).
     pub fn buffer_resizable(&self, b: Obj) -> bool {
         self.object_slot(b, 1).is_number()
+    }
+
+    /// IsSharedArrayBuffer: a SharedArrayBuffer keeps its Atomics waiter list (an
+    /// internal Record) in slot 2, which no other ArrayBuffer has.
+    pub fn buffer_shared(&self, b: Obj) -> bool {
+        self.object_slot_count(b) > 2 && self.object_slot(b, 2).as_object().is_some()
     }
 
     /// IsImmutableBuffer (the immutable ArrayBuffer proposal, D1970).

@@ -32,6 +32,8 @@ pub trait Remote {
 const ZERO: Oid = Oid([0; 20]);
 const ABBREV: usize = 7;
 const SUMMARY_WIDTH: usize = 2 * ABBREV + 3;
+const GIT_PACK_WINDOW_DEFAULT: usize = 10;
+const GIT_PACK_DEPTH_DEFAULT: usize = 50;
 const UPLOAD: &str = "git-upload-pack";
 const RECEIVE: &str = "git-receive-pack";
 const COMMANDS: [&str; 5] = ["clone", "fetch", "pull", "push", "ls-remote"];
@@ -45,6 +47,7 @@ const MODE_LINK: u32 = 0o120000;
 const MODE_GITLINK: u32 = 0o160000;
 const LACKS: &str = "git that reaches repositories other than over HTTP";
 const MERGES: &str = "git that merges histories: it only moves a branch forward";
+const INFINITE_DEPTH: u32 = 0x7fff_ffff;
 
 struct Invocation {
     cwd: Vec<u8>,
@@ -274,31 +277,51 @@ async fn advertised(remote: &dyn Remote, url: &str, service: &str) -> Res<Advert
     parse_advert(&answer.body, service).map_err(Error::Io)
 }
 
-async fn upload(
-    remote: &dyn Remote,
-    url: &str,
-    advert: &Advert,
-    wants: &[Oid],
-    haves: &[Oid],
-) -> Res<Vec<u8>> {
+struct Want<'a> {
+    wants: &'a [Oid],
+    haves: &'a [Oid],
+    shallow: &'a [Oid],
+    depth: Option<u32>,
+}
+
+struct Uploaded {
+    pack: Vec<u8>,
+    shallow: Vec<Oid>,
+    unshallow: Vec<Oid>,
+}
+
+async fn upload(remote: &dyn Remote, url: &str, advert: &Advert, want: &Want<'_>) -> Res<Uploaded> {
+    if (want.depth.is_some() || !want.shallow.is_empty()) && !advert.has("shallow") {
+        return Err(Error::Fatal(
+            "Server does not support shallow clients".to_string(),
+        ));
+    }
     let mut caps = Vec::new();
-    if advert.has("ofs-delta") {
-        caps.push("ofs-delta".to_string());
+    for cap in ["ofs-delta", "include-tag"] {
+        if advert.has(cap) {
+            caps.push(cap.to_string());
+        }
     }
     if advert.caps.iter().any(|c| c.starts_with("agent=")) {
         caps.push(format!("agent={}", agent()));
     }
     let mut body = Vec::new();
-    for (i, want) in wants.iter().enumerate() {
+    for (i, oid) in want.wants.iter().enumerate() {
         let line = if i == 0 && !caps.is_empty() {
-            format!("want {} {}\n", want.hex(), caps.join(" "))
+            format!("want {} {}\n", oid.hex(), caps.join(" "))
         } else {
-            format!("want {}\n", want.hex())
+            format!("want {}\n", oid.hex())
         };
         pkt::line(&mut body, line.as_bytes());
     }
+    for oid in want.shallow {
+        pkt::line(&mut body, format!("shallow {}\n", oid.hex()).as_bytes());
+    }
+    if let Some(depth) = want.depth {
+        pkt::line(&mut body, format!("deepen {depth}\n").as_bytes());
+    }
     pkt::flush(&mut body);
-    for have in haves {
+    for have in want.haves {
         pkt::line(&mut body, format!("have {}\n", have.hex()).as_bytes());
     }
     pkt::line(&mut body, b"done\n");
@@ -320,10 +343,21 @@ async fn upload(
     };
     let answer = exchange(remote, url, call).await?;
     let mut reader = Reader::new(&answer.body);
+    let mut shallow = Vec::new();
+    let mut unshallow = Vec::new();
+    let bad = || Error::Io(corrupt("the remote sent a malformed shallow line"));
     loop {
         match reader.next()? {
             Pkt::Data(line) => {
                 let line = line.strip_suffix(b"\n").unwrap_or(line);
+                if let Some(hex) = line.strip_prefix(b"shallow ") {
+                    shallow.push(Oid::from_hex(hex).ok_or_else(bad)?);
+                    continue;
+                }
+                if let Some(hex) = line.strip_prefix(b"unshallow ") {
+                    unshallow.push(Oid::from_hex(hex).ok_or_else(bad)?);
+                    continue;
+                }
                 if let Some(why) = line.strip_prefix(b"ERR ") {
                     return Err(Error::Fatal(format!(
                         "remote error: {}",
@@ -341,15 +375,119 @@ async fn upload(
             Pkt::End => return Err(Error::Io(corrupt("the remote sent no pack"))),
         }
     }
-    Ok(reader.rest().to_vec())
+    Ok(Uploaded {
+        pack: reader.rest().to_vec(),
+        shallow,
+        unshallow,
+    })
+}
+
+fn parents_of(body: &[u8]) -> Vec<Oid> {
+    body.split(|&b| b == b'\n')
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.strip_prefix(b"parent "))
+        .filter_map(Oid::from_hex)
+        .collect()
+}
+
+fn missing(pack: &[u8], indexed: &Indexed, tips: &[Oid], shallow: &[Oid]) -> Res<Vec<Oid>> {
+    let mut cut = HashSet::new();
+    for oid in shallow {
+        if let Some((Kind::Commit, body)) = indexed.read(pack, oid)? {
+            cut.extend(parents_of(&body));
+        }
+    }
+    Ok(indexed
+        .outside(tips)
+        .into_iter()
+        .filter(|oid| !cut.contains(oid))
+        .collect())
+}
+
+fn pack_count(pack: &[u8]) -> usize {
+    pack.get(8..12)
+        .map_or(0, |n| u32::from_be_bytes([n[0], n[1], n[2], n[3]]) as usize)
+}
+
+fn shallow_op(common: &[u8], shallow: &[Oid]) -> Op {
+    let path = join(common, b"shallow");
+    if shallow.is_empty() {
+        return Op::Remove(path);
+    }
+    let text: String = shallow
+        .iter()
+        .map(|oid| format!("{}\n", oid.hex()))
+        .collect();
+    Op::Write {
+        path,
+        data: text.into_bytes(),
+        mode: Mode::Plain,
+    }
+}
+
+fn without_packed(text: &[u8], names: &[String]) -> Option<Vec<u8>> {
+    let mut kept = Vec::with_capacity(text.len());
+    let (mut dropped, mut found) = (false, false);
+    for line in text.split_inclusive(|&b| b == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if body.first() == Some(&b'^') {
+            if !dropped {
+                kept.extend_from_slice(line);
+            }
+            continue;
+        }
+        dropped = body.len() > 41 && names.iter().any(|n| &body[41..] == n.as_bytes());
+        found |= dropped;
+        if !dropped {
+            kept.extend_from_slice(line);
+        }
+    }
+    found.then_some(kept)
+}
+
+fn delete_ops(local: &Local, names: &[String]) -> Vec<Op> {
+    let mut ops = Vec::new();
+    for name in names {
+        ops.push(ref_op(&local.common, name, None));
+        ops.push(Op::Remove(join(
+            &local.common,
+            format!("logs/{name}").as_bytes(),
+        )));
+        let mut dir = name.as_str();
+        while let Some((up, _)) = dir.rsplit_once('/') {
+            if up.matches('/').count() < 3 {
+                break;
+            }
+            ops.push(Op::Rmdir(join(&local.common, up.as_bytes())));
+            ops.push(Op::Rmdir(join(
+                &local.common,
+                format!("logs/{up}").as_bytes(),
+            )));
+            dir = up;
+        }
+    }
+    if let Some(kept) = local
+        .packed
+        .as_deref()
+        .and_then(|text| without_packed(text, names))
+    {
+        ops.push(Op::Write {
+            path: join(&local.common, b"packed-refs"),
+            data: kept,
+            mode: Mode::Plain,
+        });
+    }
+    ops
 }
 
 fn incomplete() -> Error {
     Error::Fatal("remote did not send all necessary objects".to_string())
 }
 
-fn received(pack: &[u8], wants: &[Oid]) -> Res<Indexed> {
-    let indexed = pack::index(pack).map_err(|e| {
+/// Indexes a received pack; `keep` keeps its objects for a caller that reads them all.
+fn received(pack: &[u8], wants: &[Oid], keep: bool) -> Res<Indexed> {
+    let index = if keep { pack::index_keeping } else { pack::index };
+    let indexed = index(pack).map_err(|e| {
         Error::Fatal(format!(
             "index-pack failed: {}",
             psh_engine::host::error_text(&e)
@@ -411,6 +549,10 @@ struct Local {
     head: Option<String>,
     head_oid: Option<Oid>,
     present: Vec<bool>,
+    shallow: Vec<Oid>,
+    packed: Option<Vec<u8>>,
+    symbolic: Vec<String>,
+    work_tree: Option<Vec<u8>>,
 }
 
 impl Local {
@@ -458,6 +600,7 @@ enum Job {
         tips: Vec<Oid>,
         known: Vec<Oid>,
         checks: Vec<(Oid, Oid)>,
+        ofs_delta: bool,
     },
 }
 
@@ -517,8 +660,9 @@ fn probe(ctx: &mut SyncCtx, (job, sent): (Job, Sent)) -> i32 {
             tips,
             known,
             checks,
+            ofs_delta,
         } => Repo::discover(&fs, &cwd, &env, &overrides)
-            .and_then(|repo| objects(&repo, &tips, &known, &checks)),
+            .and_then(|repo| objects(&repo, &tips, &known, &checks, ofs_delta)),
     };
     if !matches!(&found, Err(Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock) {
         let _ = sent.send(found);
@@ -562,14 +706,32 @@ fn local_probe(
         .iter()
         .map(|oid| repo.odb.has(oid))
         .collect::<io::Result<_>>()?;
+    let mut shallow: Vec<Oid> = fs
+        .read_opt(&join(&repo.common_dir, b"shallow"))?
+        .unwrap_or_default()
+        .split(|&b| b == b'\n')
+        .filter_map(Oid::from_hex)
+        .collect();
+    crate::order::sort(&mut shallow);
+    let refs = repo.refs("refs/")?;
+    let mut symbolic = Vec::new();
+    for (name, _) in &refs {
+        if matches!(repo.read_ref(name)?, Some(repo::RefValue::Symbolic(_))) {
+            symbolic.push(name.clone());
+        }
+    }
     Ok(Found::Local(Local {
         common: repo.common_dir.clone(),
         git_dir: repo.git_dir.clone(),
         config: repo.config.entries.clone(),
-        refs: repo.refs("refs/")?,
+        refs,
         head: repo.head_ref()?,
         head_oid: repo.head()?,
         present,
+        shallow,
+        packed: fs.read_opt(&join(&repo.common_dir, b"packed-refs"))?,
+        symbolic,
+        work_tree: repo.work_tree.clone(),
     }))
 }
 
@@ -578,35 +740,63 @@ fn reach(
     root: Oid,
     skip: &HashSet<Oid>,
     seen: &mut HashSet<Oid>,
-    out: Option<&mut Vec<(Kind, Data)>>,
+    out: Option<&mut Vec<(Kind, Data, u32)>>,
 ) -> Res<()> {
     let mut out = out;
-    let mut stack = vec![root];
-    while let Some(tree) = stack.pop() {
+    let mut stack = vec![(root, 0)];
+    while let Some((tree, name)) = stack.pop() {
         if skip.contains(&tree) || !seen.insert(tree) {
             continue;
         }
         let (kind, data) = repo.object(&tree)?;
         for entry in parse_tree(&data)? {
+            let hash = pack::name_hash(&entry.name);
             match entry.mode {
-                MODE_TREE => stack.push(entry.oid),
+                MODE_TREE => stack.push((entry.oid, hash)),
                 MODE_GITLINK => {}
                 _ if skip.contains(&entry.oid) || !seen.insert(entry.oid) => {}
                 _ => {
                     if let Some(out) = out.as_deref_mut() {
-                        out.push(repo.object(&entry.oid)?);
+                        let (kind, data) = repo.object(&entry.oid)?;
+                        out.push((kind, data, hash));
                     }
                 }
             }
         }
         if let Some(out) = out.as_deref_mut() {
-            out.push((kind, data));
+            out.push((kind, data, name));
         }
     }
     Ok(())
 }
 
-fn objects(repo: &Repo<'_>, tips: &[Oid], known: &[Oid], checks: &[(Oid, Oid)]) -> Res<Found> {
+fn deltas(config: &repo::Config, ofs_delta: bool) -> Res<pack::Deltas> {
+    let number = |key: &str, default: usize| match config.get(key) {
+        None => Ok(default),
+        Some(text) => text
+            .parse()
+            .map_err(|_| Error::Fatal(format!("bad numeric config value '{text}' for '{key}'"))),
+    };
+    if !ofs_delta {
+        return Ok(pack::Deltas {
+            window: 0,
+            depth: 0,
+        });
+    }
+    Ok(pack::Deltas {
+        window: number("pack.window", GIT_PACK_WINDOW_DEFAULT)?,
+        depth: number("pack.depth", GIT_PACK_DEPTH_DEFAULT)?,
+    })
+}
+
+fn objects(
+    repo: &Repo<'_>,
+    tips: &[Oid],
+    known: &[Oid],
+    checks: &[(Oid, Oid)],
+    ofs_delta: bool,
+) -> Res<Found> {
+    let deltas = deltas(&repo.config, ofs_delta)?;
     let mut results = Vec::new();
     for (old, new) in checks {
         let has = repo.odb.has(old)?;
@@ -637,7 +827,7 @@ fn objects(repo: &Repo<'_>, tips: &[Oid], known: &[Oid], checks: &[(Oid, Oid)]) 
             stack.extend(repo.commit(&commit)?.parents.iter().copied());
         }
     }
-    let mut out: Vec<(Kind, Data)> = Vec::new();
+    let mut out: Vec<(Kind, Data, u32)> = Vec::new();
     let mut trees = Vec::new();
     let mut boundary = Vec::new();
     let mut seen = HashSet::new();
@@ -669,7 +859,7 @@ fn objects(repo: &Repo<'_>, tips: &[Oid], known: &[Oid], checks: &[(Oid, Oid)]) 
             Kind::Blob => {}
         }
         if kind != Kind::Tree {
-            out.push((kind, data));
+            out.push((kind, data, 0));
         }
     }
     for commit in boundary {
@@ -680,9 +870,16 @@ fn objects(repo: &Repo<'_>, tips: &[Oid], known: &[Oid], checks: &[(Oid, Oid)]) 
     for tree in trees {
         reach(repo, tree, &excluded, &mut kept, Some(&mut out))?;
     }
-    let borrowed: Vec<(Kind, &[u8])> = out.iter().map(|(kind, data)| (*kind, &data[..])).collect();
+    let borrowed: Vec<pack::Object<'_>> = out
+        .iter()
+        .map(|(kind, data, name)| pack::Object {
+            kind: *kind,
+            data,
+            name: *name,
+        })
+        .collect();
     Ok(Found::Objects {
-        pack: pack::write(&borrowed),
+        pack: pack::write(&borrowed, deltas),
         checks: results,
     })
 }
@@ -801,15 +998,148 @@ fn specs_of(local: &Local, target: &Target) -> Vec<Spec> {
     }
 }
 
+fn unmap_spec(spec: &Spec, name: &str) -> Option<String> {
+    match spec.dst.split_once('*') {
+        Some((head, tail)) => {
+            let middle = name.strip_prefix(head)?.strip_suffix(tail)?;
+            let (src_head, src_tail) = spec.src.split_once('*')?;
+            Some(format!("{src_head}{middle}{src_tail}"))
+        }
+        None if spec.dst == name => Some(spec.src.clone()),
+        None => None,
+    }
+}
+
+fn full_dst(dst: &str, src: &str) -> String {
+    if dst.starts_with("refs/") {
+        return dst.to_string();
+    }
+    match src.strip_prefix("refs/tags/") {
+        Some(_) => format!("refs/tags/{dst}"),
+        None => format!("refs/heads/{dst}"),
+    }
+}
+
 struct Update {
     from: String,
     to: Option<String>,
+    force: bool,
+    head: bool,
     old: Option<Oid>,
     new: Oid,
 }
 
 struct Fetched {
     heads: Vec<(String, Oid)>,
+    rejected: bool,
+}
+
+#[derive(Default)]
+struct FetchOptions {
+    quiet: bool,
+    depth: Option<u32>,
+    prune: Option<bool>,
+    update_head_ok: bool,
+}
+
+fn chosen_refs(
+    advert: &Advert,
+    specs: &[Spec],
+    explicit: &[String],
+) -> Res<(Vec<Update>, Vec<Spec>)> {
+    let mut updates = Vec::new();
+    let mut wild = Vec::new();
+    let update = |from: &str, oid: Oid, to: Option<String>, force: bool| Update {
+        from: from.to_string(),
+        to: to.filter(|to| safe_ref(to)),
+        force,
+        head: true,
+        old: None,
+        new: oid,
+    };
+    let forced = |name: &str| {
+        specs
+            .iter()
+            .find(|spec| map_spec(spec, name).is_some())
+            .is_some_and(|spec| spec.force)
+    };
+    if explicit.is_empty() {
+        for (name, oid) in &advert.refs {
+            if let Some(to) = mapped(specs, name) {
+                updates.push(update(name, *oid, Some(to), forced(name)));
+            }
+        }
+        return Ok((updates, Vec::new()));
+    }
+    for arg in explicit {
+        let spec = parse_spec(arg);
+        if spec.src.contains('*') {
+            if !spec.dst.contains('*') {
+                return Err(Error::Fatal(format!("invalid refspec '{arg}'")));
+            }
+            for (name, oid) in &advert.refs {
+                if let Some(to) = map_spec(&spec, name) {
+                    updates.push(update(name, *oid, Some(to), spec.force));
+                }
+            }
+            wild.push(spec);
+            continue;
+        }
+        let found = [
+            spec.src.clone(),
+            format!("refs/{}", spec.src),
+            format!("refs/tags/{}", spec.src),
+            format!("refs/heads/{}", spec.src),
+        ]
+        .into_iter()
+        .find_map(|name| advert.get(&name).map(|oid| (name, oid)));
+        let Some((name, oid)) = found else {
+            return Err(Error::Fatal(format!(
+                "couldn't find remote ref {}",
+                spec.src
+            )));
+        };
+        if spec.dst.is_empty() {
+            updates.push(update(&name, oid, mapped(specs, &name), forced(&name)));
+            continue;
+        }
+        let to = full_dst(&spec.dst, &name);
+        if !safe_ref(&to) {
+            return Err(Error::Fatal(format!("invalid refspec '{arg}'")));
+        }
+        updates.push(update(&name, oid, Some(to), spec.force));
+    }
+    let mut extra: Vec<Update> = Vec::new();
+    for u in &updates {
+        let Some(to) = mapped(specs, &u.from).filter(|to| safe_ref(to)) else {
+            continue;
+        };
+        let taken = |list: &[Update]| list.iter().any(|o| o.to.as_ref() == Some(&to));
+        if !taken(&updates) && !taken(&extra) {
+            extra.push(Update {
+                head: false,
+                ..update(&u.from, u.new, Some(to.clone()), forced(&u.from))
+            });
+        }
+    }
+    updates.append(&mut extra);
+    Ok((updates, wild))
+}
+
+fn stale(local: &Local, advert: &Advert, specs: &[Spec]) -> Vec<String> {
+    local
+        .refs
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !local.symbolic.contains(name))
+        .filter(|name| {
+            specs
+                .iter()
+                .find_map(|spec| unmap_spec(spec, name))
+                .is_some_and(|src| advert.get(&src).is_none())
+        })
+        .cloned()
+        .collect()
 }
 
 async fn fetch(
@@ -819,79 +1149,69 @@ async fn fetch(
     first: &Local,
     target: &Target,
     explicit: &[String],
-    quiet: bool,
+    options: &FetchOptions,
 ) -> Res<Fetched> {
     let shown = clean(&target.url);
     let advert = advertised(remote, &target.url, UPLOAD).await?;
     let specs = specs_of(first, target);
-    let mut chosen: Vec<(String, Oid)> = Vec::new();
-    if explicit.is_empty() {
-        for (name, oid) in &advert.refs {
-            if mapped(&specs, name).is_some() {
-                chosen.push((name.clone(), *oid));
-            }
-        }
-    } else {
-        for arg in explicit {
-            if arg.contains(':') {
-                return Err(Error::Lacks(
-                    format!("'fetch' of '{arg}'"),
-                    "git that fetches into a named reference",
-                ));
-            }
-            let found = [
-                arg.clone(),
-                format!("refs/{arg}"),
-                format!("refs/tags/{arg}"),
-                format!("refs/heads/{arg}"),
-            ]
-            .into_iter()
-            .find_map(|name| advert.get(&name).map(|oid| (name, oid)));
-            match found {
-                Some(found) => chosen.push(found),
-                None => return Err(Error::Fatal(format!("couldn't find remote ref {arg}"))),
-            }
-        }
-    }
-    let mut updates: Vec<Update> = chosen
-        .iter()
-        .map(|(name, oid)| Update {
-            from: name.clone(),
-            to: mapped(&specs, name).filter(|to| safe_ref(to)),
-            old: None,
-            new: *oid,
-        })
-        .collect();
+    let (mut updates, wild) = chosen_refs(&advert, &specs, explicit)?;
+    let shallow_mode = options.depth.is_some() || !first.shallow.is_empty();
+    let mut follow: Vec<Update> = Vec::new();
     if explicit.is_empty() {
         for (name, oid) in &advert.refs {
             if name.starts_with("refs/tags/") && !name.ends_with("^{}") && safe_ref(name) {
-                updates.push(Update {
+                follow.push(Update {
                     from: name.clone(),
                     to: Some(name.clone()),
+                    force: false,
+                    head: true,
                     old: None,
                     new: *oid,
                 });
             }
         }
     }
+    if !shallow_mode {
+        updates.append(&mut follow);
+    }
+    if !options.update_head_ok
+        && let Some(head) = &first.head
+        && let Some(work) = &first.work_tree
+        && updates.iter().any(|u| u.to.as_ref() == Some(head))
+    {
+        return Err(Error::Fatal(format!(
+            "refusing to fetch into branch '{head}' checked out at '{}'",
+            String::from_utf8_lossy(work)
+        )));
+    }
     let mut asked: Vec<Oid> = Vec::new();
-    for update in &updates {
+    for update in updates.iter().chain(&follow) {
         if !asked.contains(&update.new) {
             asked.push(update.new);
         }
     }
     let second = local(ctx, inv, asked.clone()).await?;
-    for update in &mut updates {
+    for update in updates.iter_mut().chain(follow.iter_mut()) {
         update.old = update.to.as_deref().and_then(|to| second.get_ref(to));
     }
     updates.retain(|u| !(u.from.starts_with("refs/tags/") && u.old.is_some()));
-    let wants: Vec<Oid> = asked
-        .iter()
-        .zip(&second.present)
-        .filter(|(oid, present)| !**present && updates.iter().any(|u| u.new == **oid))
-        .map(|(oid, _)| *oid)
-        .collect();
+    follow.retain(|u| u.old.is_none());
+    let present = |oid: &Oid| {
+        asked
+            .iter()
+            .zip(&second.present)
+            .any(|(asked, present)| asked == oid && *present)
+    };
+    let mut wants: Vec<Oid> = Vec::new();
+    for update in &updates {
+        let needed = options.depth.is_some() || !present(&update.new);
+        if needed && !wants.contains(&update.new) {
+            wants.push(update.new);
+        }
+    }
+    let must: Vec<Oid> = wants.iter().filter(|oid| !present(oid)).copied().collect();
     let mut plan = Plan::default();
+    let mut in_pack: Vec<Oid> = Vec::new();
     if !wants.is_empty() {
         let mut haves: Vec<Oid> = Vec::new();
         for (_, oid) in &second.refs {
@@ -899,25 +1219,112 @@ async fn fetch(
                 haves.push(*oid);
             }
         }
-        let data = upload(remote, &target.url, &advert, &wants, &haves).await?;
-        let indexed = received(&data, &wants)?;
-        let outside = indexed.outside(&wants);
+        let want = Want {
+            wants: &wants,
+            haves: &haves,
+            shallow: &second.shallow,
+            depth: options.depth,
+        };
+        let got = upload(remote, &target.url, &advert, &want).await?;
+        let data = got.pack;
+        let indexed = received(&data, &must, false)?;
+        let mut next = second.shallow.clone();
+        for oid in got.shallow {
+            if !next.contains(&oid) {
+                next.push(oid);
+            }
+        }
+        next.retain(|oid| !got.unshallow.contains(oid));
+        crate::order::sort(&mut next);
+        let outside = missing(&data, &indexed, &wants, &next)?;
         if !outside.is_empty() {
             let third = local(ctx, inv, outside).await?;
             if third.present.iter().any(|present| !present) {
                 return Err(incomplete());
             }
         }
-        plan.ops
-            .extend(pack_ops(&join(&second.common, b"objects"), data, &indexed));
+        in_pack.extend(
+            follow
+                .iter()
+                .filter(|u| indexed.kind(&u.new).is_some())
+                .map(|u| u.new),
+        );
+        if next != second.shallow {
+            plan.ops.push(shallow_op(&second.common, &next));
+        }
+        if pack_count(&data) > 0 {
+            plan.ops
+                .extend(pack_ops(&join(&second.common, b"objects"), data, &indexed));
+        }
     }
+    follow.retain(|u| present(&u.new) || in_pack.contains(&u.new));
+    updates.append(&mut follow);
+    let checks: Vec<(Oid, Oid)> = updates
+        .iter()
+        .filter(|u| u.to.is_some())
+        .filter_map(|u| u.old.filter(|old| *old != u.new).map(|old| (old, u.new)))
+        .collect();
+    let mut forward: Vec<(Oid, Oid)> = Vec::new();
+    if !checks.is_empty() {
+        write::apply(ctx, std::mem::take(&mut plan)).await?;
+        let job = Job::Objects {
+            cwd: inv.cwd.clone(),
+            overrides: inv.overrides.clone(),
+            tips: Vec::new(),
+            known: Vec::new(),
+            checks: checks.clone(),
+            ofs_delta: false,
+        };
+        let Found::Objects {
+            checks: results, ..
+        } = ask(ctx, job).await?
+        else {
+            return Err(Error::Exit(128));
+        };
+        forward.extend(
+            checks
+                .iter()
+                .zip(results)
+                .filter(|(_, (_, ff))| *ff)
+                .map(|(check, _)| *check),
+        );
+    }
+    let prune = options.prune.unwrap_or_else(|| {
+        let named = target
+            .name
+            .as_ref()
+            .and_then(|name| first.get(&format!("remote.{name}.prune")));
+        named
+            .or_else(|| first.get("fetch.prune"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    });
+    let pruned = if !prune {
+        Vec::new()
+    } else if explicit.is_empty() {
+        stale(&second, &advert, &specs)
+    } else {
+        stale(&second, &advert, &wild)
+    };
     let mut lines = String::new();
     let width = updates
         .iter()
         .filter(|u| u.old != Some(u.new))
         .map(|u| short(&u.from).len())
+        .chain((!pruned.is_empty()).then_some("(none)".len()))
         .max()
         .unwrap_or(0);
+    for name in &pruned {
+        lines.push_str(&summary_line(
+            '-',
+            "[deleted]",
+            "(none)",
+            short(name),
+            width,
+            "",
+        ));
+    }
+    plan.ops.extend(delete_ops(&second, &pruned));
+    let mut rejected = false;
     for update in &updates {
         let Some(to) = &update.to else {
             continue;
@@ -925,26 +1332,40 @@ async fn fetch(
         if update.old == Some(update.new) {
             continue;
         }
-        plan.ops.push(ref_op(&second.common, to, Some(update.new)));
-        let (flag, summary) = match update.old {
-            None if to.starts_with("refs/tags/") => ('*', "[new tag]".to_string()),
-            None if update.from.starts_with("refs/heads/") => ('*', "[new branch]".to_string()),
-            None => ('*', "[new ref]".to_string()),
-            Some(old) => (' ', format!("{}..{}", abbrev(&old), abbrev(&update.new))),
+        let (flag, summary, note) = match update.old {
+            None if to.starts_with("refs/tags/") => ('*', "[new tag]".to_string(), ""),
+            None if update.from.starts_with("refs/heads/") => ('*', "[new branch]".to_string(), ""),
+            None => ('*', "[new ref]".to_string(), ""),
+            Some(old) if forward.contains(&(old, update.new)) => (
+                ' ',
+                format!("{}..{}", abbrev(&old), abbrev(&update.new)),
+                "",
+            ),
+            Some(old) if update.force => (
+                '+',
+                format!("{}...{}", abbrev(&old), abbrev(&update.new)),
+                "  (forced update)",
+            ),
+            Some(_) => ('!', "[rejected]".to_string(), "  (non-fast-forward)"),
         };
+        if flag == '!' {
+            rejected = true;
+        } else {
+            plan.ops.push(ref_op(&second.common, to, Some(update.new)));
+        }
         lines.push_str(&summary_line(
             flag,
             &summary,
             short(&update.from),
             short(to),
             width,
-            "",
+            note,
         ));
     }
     let upstream = first.branch().and_then(|b| local_merge(first, b, target));
     let mut fetch_head = String::new();
     for (i, update) in updates.iter().enumerate() {
-        if update.from.starts_with("refs/tags/") && explicit.is_empty() {
+        if !update.head || (update.from.starts_with("refs/tags/") && explicit.is_empty()) {
             continue;
         }
         let merge = if explicit.is_empty() {
@@ -968,11 +1389,21 @@ async fn fetch(
         mode: Mode::Plain,
     });
     write::apply(ctx, plan).await?;
-    if !quiet && !lines.is_empty() {
-        say(ctx, &format!("From {}\n{lines}", base(&shown))).await;
+    if !lines.is_empty() && (!options.quiet || rejected) {
+        let text = format!("From {}\n{lines}", base(&shown));
+        if rejected {
+            ctx.error_raw(text.as_bytes()).await;
+        } else {
+            say(ctx, &text).await;
+        }
     }
     Ok(Fetched {
-        heads: updates.iter().map(|u| (u.from.clone(), u.new)).collect(),
+        heads: updates
+            .iter()
+            .filter(|u| u.head)
+            .map(|u| (u.from.clone(), u.new))
+            .collect(),
+        rejected,
     })
 }
 
@@ -986,23 +1417,58 @@ fn local_merge(local: &Local, branch: &str, target: &Target) -> Option<String> {
         .map(str::to_string)
 }
 
+fn depth_arg(text: &str) -> Res<u32> {
+    match text.parse::<u32>() {
+        Ok(depth) if depth > 0 && depth <= INFINITE_DEPTH => Ok(depth),
+        _ => Err(Error::Fatal(format!(
+            "depth {text} is not a positive number"
+        ))),
+    }
+}
+
 async fn fetch_command(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> Res<i32> {
-    let mut quiet = false;
+    let mut options = FetchOptions::default();
+    let mut unshallow = false;
     let mut positional = Vec::new();
-    for arg in &inv.args {
+    let mut i = 0;
+    while let Some(arg) = inv.args.get(i) {
         match arg.as_str() {
-            "-q" | "--quiet" => quiet = true,
-            "--no-tags" | "--tags" | "-t" | "--prune" | "-p" | "--no-prune" | "-v"
-            | "--verbose" | "--progress" | "--no-progress" => {}
+            "-q" | "--quiet" => options.quiet = true,
+            "--prune" | "-p" => options.prune = Some(true),
+            "--no-prune" => options.prune = Some(false),
+            "--update-head-ok" | "-u" => options.update_head_ok = true,
+            "--unshallow" => unshallow = true,
+            "--depth" => {
+                i += 1;
+                let value = inv.args.get(i).ok_or_else(|| super::option("fetch", arg))?;
+                options.depth = Some(depth_arg(value)?);
+            }
+            a if a.starts_with("--depth=") => options.depth = Some(depth_arg(&a[8..])?),
+            "--no-tags" | "--tags" | "-t" | "-v" | "--verbose" | "--progress" | "--no-progress" => {
+            }
             a if a.starts_with('-') => return Err(super::option("fetch", a)),
             _ => positional.push(arg.clone()),
         }
+        i += 1;
     }
     let first = local(ctx, inv, Vec::new()).await?;
+    if unshallow {
+        if options.depth.is_some() {
+            return Err(Error::Fatal(
+                "options '--depth' and '--unshallow' cannot be used together".to_string(),
+            ));
+        }
+        if first.shallow.is_empty() {
+            return Err(Error::Fatal(
+                "--unshallow on a complete repository does not make sense".to_string(),
+            ));
+        }
+        options.depth = Some(INFINITE_DEPTH);
+    }
     let target = target(&first, positional.first().map(String::as_str), "fetch")?;
     let explicit = positional.get(1..).unwrap_or_default();
-    fetch(ctx, remote, inv, &first, &target, explicit, quiet).await?;
-    Ok(0)
+    let fetched = fetch(ctx, remote, inv, &first, &target, explicit, &options).await?;
+    Ok(if fetched.rejected { 1 } else { 0 })
 }
 
 async fn pull(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> Res<i32> {
@@ -1044,7 +1510,14 @@ async fn pull(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> R
     } else {
         None
     };
-    let fetched = fetch(ctx, remote, inv, &first, &target, explicit, quiet).await?;
+    let options = FetchOptions {
+        quiet,
+        ..FetchOptions::default()
+    };
+    let fetched = fetch(ctx, remote, inv, &first, &target, explicit, &options).await?;
+    if fetched.rejected {
+        return Ok(1);
+    }
     let theirs = match &merge {
         Some(merge) => fetched
             .heads
@@ -1211,6 +1684,9 @@ fn worktree(
 
 async fn clone(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> Res<i32> {
     let mut quiet = false;
+    let mut depth = None;
+    let mut single = None;
+    let mut no_tags = false;
     let mut branch: Option<String> = None;
     let mut positional = Vec::new();
     let mut i = 0;
@@ -1221,9 +1697,16 @@ async fn clone(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> 
                 i += 1;
                 branch = inv.args.get(i).cloned();
             }
-            "--" => {}
-            "-v" | "--verbose" | "--progress" | "--no-progress" | "--single-branch"
-            | "--no-tags" => {}
+            "--depth" => {
+                i += 1;
+                let value = inv.args.get(i).ok_or_else(|| super::option("clone", arg))?;
+                depth = Some(depth_arg(value)?);
+            }
+            a if a.starts_with("--depth=") => depth = Some(depth_arg(&a[8..])?),
+            "--single-branch" => single = Some(true),
+            "--no-single-branch" => single = Some(false),
+            "--no-tags" => no_tags = true,
+            "--" | "-v" | "--verbose" | "--progress" | "--no-progress" => {}
             a if a.starts_with("--branch=") => branch = Some(a[9..].to_string()),
             a if a.starts_with('-') => return Err(super::option("clone", a)),
             _ => positional.push(arg.clone()),
@@ -1264,24 +1747,28 @@ async fn clone(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> 
     }
     let shown = clean(&url);
     let advert = advertised(remote, &url, UPLOAD).await?;
-    let mut config = format!(
-        "[remote \"origin\"]\n\turl = {shown}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
-    );
-    let heads: Vec<(String, Oid)> = advert
+    let single = single.unwrap_or(depth.is_some());
+    let mut heads: Vec<(String, Oid)> = advert
         .refs
         .iter()
         .filter(|(name, _)| name.starts_with("refs/heads/") && safe_ref(name))
         .cloned()
         .collect();
-    let tags: Vec<(String, Oid)> = advert
+    let mut tags: Vec<(String, Oid)> = advert
         .refs
         .iter()
         .filter(|(name, _)| {
-            name.starts_with("refs/tags/") && !name.ends_with("^{}") && safe_ref(name)
+            !no_tags && name.starts_with("refs/tags/") && !name.ends_with("^{}") && safe_ref(name)
         })
         .cloned()
         .collect();
     let head_oid = advert.get("HEAD");
+    let mut config = format!(
+        "[remote \"origin\"]\n\turl = {shown}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+    );
+    if no_tags {
+        config.push_str("\ttagOpt = --no-tags\n");
+    }
     if heads.is_empty() && tags.is_empty() && head_oid.is_none() {
         plan.ops.push(Op::Append {
             path: join(&git_dir, b"config"),
@@ -1324,10 +1811,21 @@ async fn clone(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> 
             (_, None) => None,
         },
     };
+    if single {
+        let only = checkout.as_ref().and_then(|(name, _)| name.clone());
+        heads.retain(|(name, _)| Some(name) == only.as_ref());
+        if let Some(name) = &only {
+            let short = &name["refs/heads/".len()..];
+            config = config.replace(
+                "+refs/heads/*:refs/remotes/origin/*",
+                &format!("+{name}:refs/remotes/origin/{short}"),
+            );
+        }
+    }
     let mut wants: Vec<Oid> = Vec::new();
     for oid in heads
         .iter()
-        .chain(&tags)
+        .chain(tags.iter().filter(|_| !single))
         .map(|(_, oid)| *oid)
         .chain(checkout.as_ref().map(|(_, oid)| *oid))
     {
@@ -1335,10 +1833,26 @@ async fn clone(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> 
             wants.push(oid);
         }
     }
-    let data = upload(remote, &url, &advert, &wants, &[]).await?;
-    let indexed = received(&data, &wants)?;
-    if !indexed.outside(&wants).is_empty() {
+    let want = Want {
+        wants: &wants,
+        haves: &[],
+        shallow: &[],
+        depth,
+    };
+    let got = upload(remote, &url, &advert, &want).await?;
+    let data = got.pack;
+    let indexed = received(&data, &wants, true)?;
+    let mut shallow = got.shallow;
+    crate::order::sort(&mut shallow);
+    shallow.dedup();
+    if !missing(&data, &indexed, &wants, &shallow)?.is_empty() {
         return Err(incomplete());
+    }
+    if single {
+        tags.retain(|(_, oid)| indexed.kind(oid).is_some());
+    }
+    if !shallow.is_empty() {
+        plan.ops.push(shallow_op(&git_dir, &shallow));
     }
     let mut checkout_ops = Vec::new();
     let mut index = None;
@@ -1438,6 +1952,10 @@ fn resolve_src(local: &Local, src: &str) -> Option<(String, Oid)> {
     .find_map(|name| local.get_ref(&name).map(|oid| (name, oid)))
 }
 
+/// A ref to push: its source (full name and id; none to delete), destination and
+/// whether to force.
+type PushWant = (Option<(String, Oid)>, String, bool);
+
 async fn push(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> Res<i32> {
     let (mut force, mut upstream, mut quiet, mut delete) = (false, false, false, false);
     let mut positional = Vec::new();
@@ -1460,7 +1978,7 @@ async fn push(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> R
     });
     let target = target(&first, arg, "push")?;
     let shown = base(&clean(&target.url)).to_string();
-    let mut wanted: Vec<(Option<(String, Oid)>, String, bool)> = Vec::new();
+    let mut wanted: Vec<PushWant> = Vec::new();
     let specs = positional.get(1..).unwrap_or_default();
     if specs.is_empty() {
         let Some(branch) = &branch else {
@@ -1573,6 +2091,7 @@ async fn push(ctx: &mut UtilCtx<'_>, remote: &dyn Remote, inv: &Invocation) -> R
         tips: pushes.iter().filter_map(|p| p.src).collect(),
         known,
         checks: checks.clone(),
+        ofs_delta: advert.has("ofs-delta"),
     };
     let Found::Objects {
         pack: data,

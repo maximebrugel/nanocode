@@ -21,6 +21,7 @@
 | `nanocode-types` | Event channels, over `nanocode-types-core` |
 | `nanocode-agent-types` | Model, usage and error values |
 | `nanocode-cost-fold` | Cost attribution as a pure fold: tokens, dollars and Hand time per step, rolled up by agent, turn, board task and commit |
+| `nanocode-live-fold` | Live views as a pure fold: the sync wire frames, views folded from the log into coalesced diffs, diff rings with resume, sealed projections encoded once per access level |
 | `nanocode-partitions` | Partitioned ownership without a leader: stable partition hashing, rendezvous assignment over live nodes, fenced per-partition lease rows and the claim/release plan |
 | `nanocode-hedge` | Hedged first-byte request policy and the primary-versus-hedge race |
 | `nanocode-agent-core` | Agent lifecycle, handles and session contracts |
@@ -52,6 +53,7 @@
 | `nanocode-durability` | Session drivers, the `SessionStore` catalog, `SharedStore`, `MemoryStore`, branches, the record cache |
 | `nanocode-tool-host` | The `Tools` builder, tool selection, admission, `FunctionTool`, description pins |
 | `nanocode-hands` | Per-call Code Mode targets (workspace, hosted, pool, native, mac), the `HandHost` contract, lazy start and idle release, sha-checked atomic copies |
+| `nanocode-live` | Live views over a partitioned log: one follower and one fold per view instance per node, diffs encoded once per access level and shared by every subscribed socket |
 
 ## backends
 
@@ -76,9 +78,10 @@
 | `nanocode-mcp-tools` | MCP discovery, catalogs, prepared tools, stdio processes |
 | `nanocode-computer` | The `computer` tool over macOS accessibility, Linux AT-SPI, cua-driver and MCP providers; the `cua_repl` tools and browser extension host |
 | `nanocode-chatgpt-extension` | Browser tabs through the official ChatGPT extension's native-messaging host |
-| `nanocode-sandbox` | Commands confined to read-only paths, one writable directory and an allowlisting egress proxy |
+| `nanocode-sandbox` | Commands confined to read-only paths, one writable directory and an allowlisting egress proxy, optionally each in its own cgroup v2 group with CPU, memory, pids and io limits |
 | `nanocode-store-jsonl` | The append-only JSONL store, one file per session: the CLI's default |
 | `nanocode-store-sql` | `Sql` hosts for SQLite (`SqliteSql`), Postgres (`PostgresSql`) and a host's own sqlx pool or transaction (`SqlxSql`, `SqlxTransaction`, `commit_staged`) |
+| `nanocode-s3` | An S3 client for immutable content-addressed blobs: SigV4 signing, put-if-absent, ranged get, head, delete and presigned URLs |
 | `nanocode-observability` | Tracing and OpenTelemetry setup |
 | `nanocode-telemetry` | GenAI span export, held request traces, and events as log lines and counters, for a server host's own subscriber |
 

@@ -288,6 +288,27 @@ pub async fn prepare_output_images(output: &mut ToolOutputBody) {
     }
 }
 
+/// Whether any item holds an image `prepare_history_images` would prepare, so a
+/// caller can skip copying a history that has none.
+pub fn history_has_images<'a>(
+    items: impl IntoIterator<Item = &'a nanocode_types_core::responses::ResponseItem>,
+) -> bool {
+    use nanocode_types_core::responses::{FunctionOutputBody, FunctionOutputContent, ResponseItem};
+    items.into_iter().any(|item| match item {
+        ResponseItem::Message { content, .. } => content
+            .iter()
+            .any(|part| matches!(part, ContentItem::InputImage { .. })),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => match output {
+            FunctionOutputBody::Content(content) => content
+                .iter()
+                .any(|part| matches!(part, FunctionOutputContent::InputImage { .. })),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 pub fn prepare_history_images(items: &mut [nanocode_types_core::responses::ResponseItem]) -> bool {
     use nanocode_types_core::responses::{FunctionOutputBody, FunctionOutputContent, ResponseItem};
     let mut changed = false;

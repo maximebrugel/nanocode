@@ -92,6 +92,7 @@ pub(crate) async fn start(
     // children run on).
     sub.job = None;
     sub.exec_tail = None;
+    sub.own_simple = None;
     sub.exec_now = false;
     sub.top = true;
     let sigs = Rc::new(NestedSigs::default());

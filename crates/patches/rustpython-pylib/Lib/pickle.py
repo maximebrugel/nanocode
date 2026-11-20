@@ -66,8 +66,8 @@ HIGHEST_PROTOCOL = 5
 
 # The protocol we write by default.  May be less than HIGHEST_PROTOCOL.
 # Only bump this if the oldest still supported version of Python already
-# includes it.
-DEFAULT_PROTOCOL = 5
+# includes it.  (4 as in CPython 3.12, which nanocode's Python matches.)
+DEFAULT_PROTOCOL = 4
 
 class PickleError(Exception):
     """A common base class for the other pickling exceptions."""

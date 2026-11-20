@@ -43,6 +43,13 @@ pub fn dispatch(git: &Git<'_>, io: &mut Io<'_>, command: &str, args: &[String]) 
         "clean" => super::stage::clean(git, io, args),
         "merge" => super::checkout::merge(git, io, args),
         "worktree" => super::extra::worktree(git, io, args),
+        "shortlog" => super::log::shortlog(git, io, args),
+        "check-ignore" => super::misc::check_ignore(git, io, args),
+        "hash-object" => super::misc::hash_object(git, io, args),
+        "for-each-ref" => super::misc::for_each_ref(git, io, args),
+        "cherry-pick" => super::merge::pick(git, io, args, false),
+        "revert" => super::merge::pick(git, io, args, true),
+        "apply" => super::misc::apply(git, io, args),
         _ => Err(Error::Lacks(
             format!("'{command}' is not one of its commands"),
             "git beyond its local commands",
@@ -958,7 +965,7 @@ fn branch(git: &Git<'_>, io: &mut Io<'_>, args: &[String]) -> Res<i32> {
 }
 
 /// A for-each-ref format with the atoms agents use.
-fn ref_format(
+pub fn ref_format(
     repo: &Repo<'_>,
     format: &str,
     full: &str,
@@ -984,6 +991,11 @@ fn ref_format(
                 }
             }
             "HEAD" => out.push(if is_head { '*' } else { ' ' }),
+            "objecttype" => {
+                if let Some(oid) = oid {
+                    out.push_str(repo.object(oid)?.0.name());
+                }
+            }
             "upstream" | "upstream:short" => {
                 if let Some(up) = rev::upstream(repo, full) {
                     out.push_str(if atom == "upstream" {

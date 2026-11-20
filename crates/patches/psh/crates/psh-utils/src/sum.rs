@@ -72,6 +72,7 @@ fn gnu_algo(name: &str) -> Algo {
         "sha256sum" => Algo::Sha256,
         "sha384sum" => Algo::Sha384,
         "sha512sum" => Algo::Sha512,
+        "b2sum" => Algo::Blake2b,
         _ => Algo::Md5,
     }
 }
@@ -340,6 +341,7 @@ fn parse_line(line: &[u8], algo: Option<Algo>) -> Option<Entry> {
             Algo::Sha256,
             Algo::Sha384,
             Algo::Sha512,
+            Algo::Blake2b,
         ]
         .into_iter()
         .find(|a| a.tag().as_bytes() == name);

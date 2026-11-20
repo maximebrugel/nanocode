@@ -221,7 +221,7 @@ pub(super) fn run_rounds<'a>(
                 let in_effect = pending
                     .iter()
                     .rev()
-                    .find_map(|message| message.output_config.as_ref())
+                    .find_map(|message| message.output_config())
                     .map(|config| config.effort)
                     .or(pinned);
                 if let Some(effort) = state.effort()
@@ -231,7 +231,7 @@ pub(super) fn run_rounds<'a>(
                 }
             }
             let first =
-                state.upstream_context && !pending.iter().any(|message| message.role == Role::User);
+                state.upstream_context && !pending.iter().any(|message| message.role() == Role::User);
             if first && let Some(message) = prompt.last_mut() {
                 message.content.insert(0, ContentBlock::text(ATTRIBUTION));
                 if let Some(status) = crate::environment::git_status(state.workspace()).await {
@@ -359,10 +359,7 @@ pub(super) fn run_rounds<'a>(
             {
                 round_effort(state, &mut pending, &cursor.template);
             }
-            let discovered = client_discovered_tools(&pending)
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<HashSet<_>>();
+            let discovered = client_discovered_tools(&pending);
             state.discovered.set(discovered.clone());
             let mut preempt = None;
             if let Some(turn) = state.steering.acquire().await.get_mut(&request.key) {
@@ -428,15 +425,15 @@ pub(super) fn run_rounds<'a>(
                         if !stripped_thinking
                             && failure.recovery.is_none()
                             && unsigned_thinking(&failure.error)
-                            && pending.iter().flat_map(|message| &message.content).any(
-                                |block| {
+                            && pending.iter().any(|message| {
+                                message.mentions("thinking") && message.any_block(|block| {
                                     matches!(
                                         block,
                                         ContentBlock::Thinking { .. }
                                             | ContentBlock::RedactedThinking { .. }
                                     )
-                                },
-                            ) =>
+                                })
+                            }) =>
                     {
                         nanocode_trace::warn!(
                             target: "nanocode_claude",
@@ -453,10 +450,11 @@ pub(super) fn run_rounds<'a>(
                             && failure.recovery.is_none()
                             && refused_summary(&failure.error)
                             && failure.error.to_string().contains("compaction")
-                            && pending
-                                .iter()
-                                .flat_map(|message| &message.content)
-                                .any(|block| matches!(block, ContentBlock::Compaction { .. })) =>
+                            && pending.iter().any(|message| {
+                                message.mentions("compaction")
+                                    && message
+                                        .any_block(|block| matches!(block, ContentBlock::Compaction { .. }))
+                            }) =>
                     {
                         nanocode_trace::warn!(
                             target: "nanocode_claude",
@@ -476,8 +474,7 @@ pub(super) fn run_rounds<'a>(
                             && refused_tool_changes(&failure.error)
                             && pending
                                 .iter()
-                                .flat_map(|message| &message.content)
-                                .any(tool_change) =>
+                                .any(|message| message.mentions("tool_") && message.any_block(tool_change)) =>
                     {
                         nanocode_trace::warn!(
                             target: "nanocode_claude",
@@ -620,19 +617,14 @@ pub(super) fn run_rounds<'a>(
                 pending.push(Message::text(Role::User, &upgrade.notice).into());
                 conversation.recovery_notices.push(upgrade.notice);
             }
-            let recorded = response.recorded;
             let mut response = response.message;
             let assistant = Message {
                 role: Role::Assistant,
                 content: std::mem::take(&mut response.content),
                 output_config: None,
             };
-            let assistant = match recorded {
-                Some(recorded) => {
-                    HistoryMessage::recorded(assistant, recorded.json, recorded.record)
-                }
-                None => HistoryMessage::from(assistant),
-            };
+            let assistant = HistoryMessage::from(assistant);
+            let assistant_view = assistant.view();
             state.publish_side_view(Some(pending.iter().chain([&assistant]).cloned().collect()));
             if cursor.model_step_offset == 0 {
                 cursor.model_step_offset = 1;
@@ -704,7 +696,7 @@ pub(super) fn run_rounds<'a>(
                 if let Some(refreshed) = state.spent_aside() {
                     add_usage(usage, &refreshed);
                 }
-                let kept = assistant
+                let kept = assistant_view
                     .content
                     .iter()
                     .filter(|block| {
@@ -759,7 +751,7 @@ pub(super) fn run_rounds<'a>(
             if let Some(refreshed) = state.spent_aside() {
                 add_usage(usage, &refreshed);
             }
-            let has_server_effects = assistant.content.iter().any(|block| {
+            let has_server_effects = assistant_view.content.iter().any(|block| {
                 matches!(
                     block,
                     ContentBlock::ServerToolUse { .. }
@@ -774,11 +766,18 @@ pub(super) fn run_rounds<'a>(
                 )
             });
 
+            let searched = pending
+                .iter()
+                .filter(|message| {
+                    message.mentions("server_tool_use") || message.mentions("tool_search_tool_result")
+                })
+                .map(HistoryMessage::view)
+                .collect::<Vec<_>>();
             let server_discovered = server_discovered_tools(
-                pending
+                searched
                     .iter()
                     .flat_map(|message| &message.content)
-                    .chain(&assistant.content),
+                    .chain(&assistant_view.content),
                 &cursor.template.tools,
                 cursor
                     .wire_profile
@@ -823,7 +822,7 @@ pub(super) fn run_rounds<'a>(
                 let mut seen_ids = HashSet::new();
                 let mut text = String::new();
                 let mut citations = Vec::new();
-                for block in &assistant.content {
+                for block in &assistant_view.content {
                     match block {
                         ContentBlock::Text { text: part, extra } => {
                             text.push_str(part);
@@ -928,7 +927,7 @@ pub(super) fn run_rounds<'a>(
                         const EVIDENCE_LIMIT: usize = 64 * 1024;
                         const TRUNCATED: &str =
                             "\n[provider content truncated; omitted effects remain unknown]";
-                        let mut evidence = serde_json::to_string(&assistant.content)
+                        let mut evidence = serde_json::to_string(&assistant_view.content)
                             .expect("content blocks serialize");
                         if evidence.len() > EVIDENCE_LIMIT {
                             evidence.truncate(
@@ -1173,8 +1172,7 @@ pub(super) fn run_rounds<'a>(
                         pending
                             .last()
                             .expect("tool result was appended")
-                            .json()
-                            .map(|text| estimate_text_tokens(text))
+                            .with_json(estimate_text_tokens)
                             .unwrap_or(0),
                     );
 
@@ -1350,7 +1348,7 @@ pub(super) fn run_rounds<'a>(
                 && !has_tool_calls
                 && !has_server_effects
                 && !cursor.thinking_only_nudged
-                && !assistant.content.iter().any(|block| {
+                && !assistant_view.content.iter().any(|block| {
                     matches!(block, ContentBlock::Text { text, .. } if !text.trim().is_empty())
                 })
             {
@@ -1362,9 +1360,9 @@ pub(super) fn run_rounds<'a>(
                 match pending
                     .iter_mut()
                     .rev()
-                    .find(|message| message.role != Role::System)
+                    .find(|message| message.role() != Role::System)
                 {
-                    Some(message) if message.role == Role::User => message
+                    Some(message) if message.role() == Role::User => message
                         .make_mut()
                         .content
                         .push(ContentBlock::text(NO_VISIBLE_OUTPUT)),
@@ -1682,7 +1680,7 @@ fn round_effort(state: &State, pending: &mut Vec<HistoryMessage>, template: &Mes
     let in_effect = pending
         .iter()
         .rev()
-        .find_map(|message| message.output_config.as_ref())
+        .find_map(|message| message.output_config())
         .or(template.output_config.as_ref())
         .map(|config| config.effort);
     if in_effect != Some(wanted) {
@@ -1693,22 +1691,23 @@ fn round_effort(state: &State, pending: &mut Vec<HistoryMessage>, template: &Mes
 fn round_input(pending: &[HistoryMessage]) -> Option<usize> {
     let at = pending
         .iter()
-        .rposition(|message| message.role != Role::System)?;
+        .rposition(|message| message.role() != Role::System)?;
     let quiet_notices = pending[at + 1..].iter().all(|message| {
         message.is_effort_update()
             || matches!(
-                message.content.as_slice(),
+                message.view().content.as_slice(),
                 [ContentBlock::Text { text, .. }] if nanocode_tool_host::deadline::is_time_left(text)
             )
     });
-    (quiet_notices && pending[at].role == Role::User).then_some(at)
+    (quiet_notices && pending[at].role() == Role::User).then_some(at)
 }
 
 fn result_round(pending: &[HistoryMessage]) -> bool {
     let Some(at) = round_input(pending) else {
         return false;
     };
-    let blocks = pending[at].content.as_slice();
+    let view = pending[at].view();
+    let blocks = view.content.as_slice();
     !blocks.is_empty()
         && blocks.iter().all(|block| {
             let ContentBlock::ToolResult {
@@ -1737,13 +1736,14 @@ fn code_call(tool_use_id: &str, before: &[HistoryMessage]) -> bool {
     before
         .iter()
         .rev()
-        .flat_map(|message| &message.content)
-        .any(|block| {
-            matches!(
-                block,
-                ContentBlock::ToolUse { id, name, .. }
-                    if id == tool_use_id && matches!(name.as_str(), "exec" | "wait")
-            )
+        .any(|message| {
+            message.view().content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { id, name, .. }
+                        if id == tool_use_id && matches!(name.as_str(), "exec" | "wait")
+                )
+            })
         })
 }
 
@@ -1751,7 +1751,8 @@ fn quiet_round(pending: &[HistoryMessage]) -> bool {
     let Some(at) = round_input(pending) else {
         return false;
     };
-    match pending[at].content.as_slice() {
+    let view = pending[at].view();
+    match view.content.as_slice() {
         [ContentBlock::Text { text, .. }] => nanocode_tool_host::deadline::is_finish_notice(text),
         [] => false,
         blocks => blocks
@@ -1797,11 +1798,12 @@ fn earlier_yield(text: &str, before: &[HistoryMessage]) -> Option<String> {
     before
         .iter()
         .rev()
-        .flat_map(|message| message.content.iter().rev())
-        .find_map(|block| match block {
-            ContentBlock::ToolResult { content, .. } => {
-                result_text(content).filter(|earlier| earlier.lines().next() == Some(status))
-            }
-            _ => None,
+        .find_map(|message| {
+            message.view().content.iter().rev().find_map(|block| match block {
+                ContentBlock::ToolResult { content, .. } => {
+                    result_text(content).filter(|earlier| earlier.lines().next() == Some(status))
+                }
+                _ => None,
+            })
         })
 }

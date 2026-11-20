@@ -1,0 +1,626 @@
+//! The partitioned log on SQL: Postgres (LIST partitions by part, one global position sequence,
+//! lz4 bodies, NOTIFY on commit) and SQLite (one table, positions per partition), through any
+//! nanocode_durability_core::Sql host. Every write first locks its partition's fence row, so one
+//! partition's transactions commit one at a time and positions follow commit order within it.
+
+use std::{
+    collections::{BTreeMap, HashSet},
+    future::Future,
+    num::NonZeroU32,
+    sync::Arc,
+};
+
+use nanocode_durability_core::{
+    Settle, Sql, SqlDialect, SqlRow, SqlStatement, StoreError, StoreFuture,
+};
+use nanocode_partitions::{Partition, Row};
+use nanocode_sync::{Atom, Notify};
+
+use super::{Append, Entry, PartStore, Rows, Verdict};
+use crate::host::{Compaction, Extension};
+
+/// The channel Postgres notifies on, with payload "scope:head" per committed scope.
+pub const CHANNEL: &str = "nanocode_log";
+
+const PREPARE_PG: [&str; 8] = [
+    "SELECT pg_advisory_xact_lock(7_061_636_192)",
+    "CREATE SEQUENCE IF NOT EXISTS nanocode_log_pos",
+    "CREATE TABLE IF NOT EXISTS nanocode_log_fence (part INTEGER PRIMARY KEY, epoch BIGINT NOT NULL DEFAULT 0, holder TEXT, expires_ms BIGINT NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS nanocode_log_cursor (part INTEGER NOT NULL, reader TEXT NOT NULL, pos BIGINT NOT NULL, PRIMARY KEY (part, reader))",
+    "CREATE TABLE IF NOT EXISTS nanocode_plog (part INTEGER NOT NULL, scope TEXT NOT NULL, seq BIGINT NOT NULL, pos BIGINT NOT NULL, snap BOOLEAN NOT NULL, body TEXT COMPRESSION lz4 NOT NULL, PRIMARY KEY (part, scope, seq)) PARTITION BY LIST (part)",
+    "CREATE INDEX IF NOT EXISTS nanocode_plog_pos ON nanocode_plog (part, pos)",
+    "CREATE OR REPLACE FUNCTION nanocode_plog_parts(n integer) RETURNS integer LANGUAGE plpgsql AS $parts$ BEGIN FOR i IN 0..n - 1 LOOP EXECUTE format('CREATE TABLE IF NOT EXISTS nanocode_plog_p%s PARTITION OF nanocode_plog FOR VALUES IN (%s)', i, i); INSERT INTO nanocode_log_fence (part) VALUES (i) ON CONFLICT DO NOTHING; END LOOP; RETURN n; END $parts$",
+    "SELECT nanocode_plog_parts(CAST($1::text AS INTEGER))",
+];
+const PREPARE_SQLITE: [&str; 5] = [
+    "CREATE TABLE IF NOT EXISTS nanocode_log_fence (part INTEGER PRIMARY KEY, epoch INTEGER NOT NULL DEFAULT 0, holder TEXT, expires_ms INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS nanocode_log_cursor (part INTEGER NOT NULL, reader TEXT NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (part, reader)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS nanocode_plog (part INTEGER NOT NULL, scope TEXT NOT NULL, seq INTEGER NOT NULL, pos INTEGER NOT NULL, snap INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY (part, scope, seq)) WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS nanocode_plog_pos ON nanocode_plog (part, pos)",
+    "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < CAST(?1 AS INTEGER)) INSERT OR IGNORE INTO nanocode_log_fence (part) SELECT i FROM n",
+];
+
+type Dialects = [&'static str; 2];
+
+const LOCK: Dialects = [
+    "UPDATE nanocode_log_fence SET epoch = epoch WHERE part = CAST(?1 AS INTEGER) AND (CAST(?2 AS INTEGER) < 0 OR (holder IS NOT NULL AND epoch = CAST(?2 AS INTEGER))) RETURNING CAST(epoch AS TEXT)",
+    "UPDATE nanocode_log_fence SET epoch = epoch WHERE part = CAST($1::text AS INTEGER) AND (CAST($2::text AS BIGINT) < 0 OR (holder IS NOT NULL AND epoch = CAST($2::text AS BIGINT))) RETURNING CAST(epoch AS TEXT)",
+];
+const INSERT: Dialects = [
+    "WITH input AS (SELECT CAST(a.key AS INTEGER) AS app, json_extract(a.value, '$[0]') AS scope, CAST(json_extract(r.value, '$[0]') AS INTEGER) AS seq, json_extract(r.value, '$[1]') AS body, CAST(r.key AS INTEGER) AS rord FROM json_each(?3) AS a, json_each(a.value, '$[1]') AS r), keep AS (SELECT i.* FROM input i WHERE EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST(?1 AS INTEGER) AND (CAST(?2 AS INTEGER) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST(?2 AS INTEGER)))) AND i.app NOT IN (SELECT j.app FROM input j JOIN nanocode_plog p ON p.part = CAST(?1 AS INTEGER) AND p.scope = j.scope AND p.seq = j.seq)) INSERT INTO nanocode_plog (part, scope, seq, pos, snap, body) SELECT CAST(?1 AS INTEGER), scope, seq, (SELECT COALESCE(MAX(pos), 0) FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER)) + row_number() OVER (ORDER BY app, rord), substr(body, 1, 1) = 's', body FROM keep WHERE true RETURNING scope, CAST(seq AS TEXT)",
+    "WITH input AS (SELECT a.ord AS app, a.e ->> 0 AS scope, CAST(r.e ->> 0 AS BIGINT) AS seq, r.e ->> 1 AS body, r.ord AS rord FROM jsonb_array_elements(CAST($3::text AS jsonb)) WITH ORDINALITY AS a(e, ord) CROSS JOIN LATERAL jsonb_array_elements(a.e -> 1) WITH ORDINALITY AS r(e, ord)), clash AS (SELECT DISTINCT i.app FROM input i WHERE (SELECT true FROM nanocode_plog p WHERE p.part = CAST($1::text AS INTEGER) AND p.scope = i.scope AND p.seq = i.seq LIMIT 1)), ins AS (INSERT INTO nanocode_plog (part, scope, seq, pos, snap, body) SELECT CAST($1::text AS INTEGER), s.scope, s.seq, nextval('nanocode_log_pos'), substr(s.body, 1, 1) = 's', s.body FROM (SELECT i.scope, i.seq, i.body FROM input i WHERE EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST($1::text AS INTEGER) AND (CAST($2::text AS BIGINT) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST($2::text AS BIGINT)))) AND NOT EXISTS (SELECT 1 FROM clash c WHERE c.app = i.app) ORDER BY i.app, i.rord) s RETURNING scope, seq), note AS (SELECT count(*) AS n FROM (SELECT pg_notify('nanocode_log', h.scope || ':' || h.head) FROM (SELECT scope, max(seq) AS head FROM ins GROUP BY scope) h WHERE CAST($4::text AS INTEGER) = 1) notified) SELECT ins.scope, CAST(ins.seq AS TEXT) FROM ins, note",
+];
+/// Wakes listeners after a commit landed, in its own unsynced transaction: NOTIFY in the commit
+/// itself holds Postgres's global notify lock across the WAL flush and serialises every
+/// partition's commits (P=16, 64 claimers: 2.5k vs 13.7k claims/s with it off).
+const NOTIFY_PG: &str = "SELECT count(pg_notify('nanocode_log', p)) FROM json_array_elements_text(CAST($1::text AS json)) AS p";
+
+const SCAN: Dialects = [
+    "SELECT CAST(seq AS TEXT), body FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND seq >= CAST(?3 AS INTEGER) AND seq < CAST(?4 AS INTEGER) ORDER BY seq",
+    "SELECT CAST(seq AS TEXT), body FROM nanocode_plog WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND seq >= CAST($3::text AS BIGINT) AND seq < CAST($4::text AS BIGINT) ORDER BY nanocode_plog.seq",
+];
+const LOAD: Dialects = [
+    "SELECT CAST(seq AS TEXT), body FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND seq >= COALESCE((SELECT MAX(seq) FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND snap), 0) ORDER BY seq",
+    "SELECT CAST(seq AS TEXT), body FROM nanocode_plog WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND seq >= COALESCE((SELECT max(seq) FROM nanocode_plog WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND snap), 0) ORDER BY nanocode_plog.seq",
+];
+const ARCHIVE: Dialects = [
+    "UPDATE nanocode_plog SET body = ?4, snap = substr(?4, 1, 1) = 's' WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND seq = CAST(?3 AS INTEGER) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST(?1 AS INTEGER) AND (CAST(?5 AS INTEGER) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST(?5 AS INTEGER))))",
+    "UPDATE nanocode_plog SET body = $4::text, snap = substr($4::text, 1, 1) = 's' WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND seq = CAST($3::text AS BIGINT) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST($1::text AS INTEGER) AND (CAST($5::text AS BIGINT) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST($5::text AS BIGINT))))",
+];
+const DROP: Dialects = [
+    "DELETE FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND seq >= CAST(?3 AS INTEGER) AND seq < CAST(?4 AS INTEGER) AND pos <= COALESCE((SELECT MIN(pos) FROM nanocode_log_cursor WHERE part = CAST(?1 AS INTEGER)), 9223372036854775807) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST(?1 AS INTEGER) AND (CAST(?5 AS INTEGER) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST(?5 AS INTEGER))))",
+    "DELETE FROM nanocode_plog WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND seq >= CAST($3::text AS BIGINT) AND seq < CAST($4::text AS BIGINT) AND pos <= COALESCE((SELECT min(pos) FROM nanocode_log_cursor WHERE part = CAST($1::text AS INTEGER)), 9223372036854775807) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST($1::text AS INTEGER) AND (CAST($5::text AS BIGINT) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST($5::text AS BIGINT))))",
+];
+const PRUNE: Dialects = [
+    "DELETE FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND seq < MIN(CAST(?3 AS INTEGER), COALESCE((SELECT MAX(seq) FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND snap), 0)) AND pos <= COALESCE((SELECT MIN(pos) FROM nanocode_log_cursor WHERE part = CAST(?1 AS INTEGER)), 9223372036854775807) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST(?1 AS INTEGER) AND (CAST(?4 AS INTEGER) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST(?4 AS INTEGER)))) RETURNING 1",
+    "DELETE FROM nanocode_plog WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND seq < LEAST(CAST($3::text AS BIGINT), COALESCE((SELECT max(seq) FROM nanocode_plog WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND snap), 0)) AND pos <= COALESCE((SELECT min(pos) FROM nanocode_log_cursor WHERE part = CAST($1::text AS INTEGER)), 9223372036854775807) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST($1::text AS INTEGER) AND (CAST($4::text AS BIGINT) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST($4::text AS BIGINT)))) RETURNING 1",
+];
+const EXTEND: Dialects = [
+    "UPDATE nanocode_plog SET seq = CAST(?4 AS INTEGER), pos = (SELECT COALESCE(MAX(pos), 0) + 1 FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER)), body = substr(CAST(body AS BLOB), 1, length(CAST(body AS BLOB)) - CAST(?5 AS INTEGER)) || ?6 WHERE part = CAST(?1 AS INTEGER) AND scope = ?2 AND seq = CAST(?3 AS INTEGER) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST(?1 AS INTEGER) AND (CAST(?7 AS INTEGER) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST(?7 AS INTEGER)))) RETURNING CAST(seq AS TEXT)",
+    "UPDATE nanocode_plog SET seq = CAST($4::text AS BIGINT), pos = nextval('nanocode_log_pos'), body = substr(body, 1, length(body) - CAST($5::text AS INTEGER)) || $6::text WHERE part = CAST($1::text AS INTEGER) AND scope = $2::text AND seq = CAST($3::text AS BIGINT) AND EXISTS (SELECT 1 FROM nanocode_log_fence f WHERE f.part = CAST($1::text AS INTEGER) AND (CAST($7::text AS BIGINT) < 0 OR (f.holder IS NOT NULL AND f.epoch = CAST($7::text AS BIGINT)))) RETURNING CAST(seq AS TEXT)",
+];
+const FOLLOW: Dialects = [
+    "SELECT CAST(pos AS TEXT), scope, CAST(seq AS TEXT), body FROM nanocode_plog WHERE part = CAST(?1 AS INTEGER) AND pos > CAST(?2 AS INTEGER) ORDER BY pos LIMIT CAST(?3 AS INTEGER)",
+    "SELECT CAST(pos AS TEXT), scope, CAST(seq AS TEXT), body FROM nanocode_plog WHERE part = CAST($1::text AS INTEGER) AND pos > CAST($2::text AS BIGINT) ORDER BY nanocode_plog.pos LIMIT CAST($3::text AS BIGINT)",
+];
+const FENCE: Dialects = [
+    "SELECT CAST(epoch AS TEXT), COALESCE(holder, ''), CAST(expires_ms AS TEXT) FROM nanocode_log_fence WHERE part = CAST(?1 AS INTEGER)",
+    "SELECT CAST(epoch AS TEXT), COALESCE(holder, ''), CAST(expires_ms AS TEXT) FROM nanocode_log_fence WHERE part = CAST($1::text AS INTEGER)",
+];
+const SWAP: Dialects = [
+    "UPDATE nanocode_log_fence SET epoch = CAST(?5 AS INTEGER), holder = NULLIF(?6, ''), expires_ms = CAST(?7 AS INTEGER) WHERE part = CAST(?1 AS INTEGER) AND epoch = CAST(?2 AS INTEGER) AND COALESCE(holder, '') = ?3 AND expires_ms = CAST(?4 AS INTEGER) RETURNING 1",
+    "UPDATE nanocode_log_fence SET epoch = CAST($5::text AS BIGINT), holder = NULLIF($6::text, ''), expires_ms = CAST($7::text AS BIGINT) WHERE part = CAST($1::text AS INTEGER) AND epoch = CAST($2::text AS BIGINT) AND COALESCE(holder, '') = $3::text AND expires_ms = CAST($4::text AS BIGINT) RETURNING 1",
+];
+const CURSOR: Dialects = [
+    "INSERT INTO nanocode_log_cursor (part, reader, pos) VALUES (CAST(?1 AS INTEGER), ?2, CAST(?3 AS INTEGER)) ON CONFLICT (part, reader) DO UPDATE SET pos = MAX(pos, excluded.pos)",
+    "INSERT INTO nanocode_log_cursor (part, reader, pos) VALUES (CAST($1::text AS INTEGER), $2::text, CAST($3::text AS BIGINT)) ON CONFLICT (part, reader) DO UPDATE SET pos = GREATEST(nanocode_log_cursor.pos, EXCLUDED.pos)",
+];
+
+pub struct SqlParts<H: ?Sized> {
+    host: Arc<H>,
+    notify: bool,
+    outbox: Arc<Outbox>,
+}
+
+/// Heads committed but not yet notified, for the notifier task to send in one unsynced
+/// transaction, so a commit's answer never waits on its NOTIFY round trip.
+#[derive(Default)]
+struct Outbox {
+    pending: Atom<Pending>,
+    ready: Notify,
+}
+
+#[derive(Clone, Default)]
+struct Pending {
+    heads: BTreeMap<String, u64>,
+    driven: bool,
+    closed: bool,
+}
+
+/// Marks the outbox undriven when the notifier future ends or is dropped, so commits fall back
+/// to notifying inline instead of queueing heads nobody sends.
+struct Driving(Arc<Outbox>);
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        self.0.pending.update(|pending| pending.driven = false);
+    }
+}
+
+impl<H: ?Sized> Drop for SqlParts<H> {
+    fn drop(&mut self) {
+        self.outbox.pending.update(|pending| pending.closed = true);
+        self.outbox.ready.notify_one();
+    }
+}
+
+fn notify_payloads<'a>(heads: impl Iterator<Item = (&'a str, u64)>) -> Result<String, StoreError> {
+    let payloads: Vec<String> = heads.map(|(scope, head)| format!("{scope}:{head}")).collect();
+    serde_json::to_string(&payloads)
+        .map_err(|error| StoreError::Backend(format!("encode notify: {error}")))
+}
+
+async fn send_notify<H: Sql + ?Sized>(host: &H, payloads: &str) {
+    // The appends are committed; a lost wake only delays followers, so its error is dropped.
+    let _ = host
+        .write(
+            Settle::Ordered,
+            "plog_notify",
+            &[SqlStatement {
+                sql: NOTIFY_PG,
+                params: vec![payloads],
+            }],
+        )
+        .await;
+}
+
+impl<H: Sql + ?Sized> SqlParts<H> {
+    /// Postgres notifies CHANNEL after every commit (see notifier); with_notify(false) turns it off.
+    pub fn new(host: Arc<H>) -> Self {
+        Self {
+            host,
+            notify: true,
+            outbox: Arc::new(Outbox::default()),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_notify(mut self, notify: bool) -> Self {
+        self.notify = notify;
+        self
+    }
+
+    /// Sends committed heads' NOTIFY off the commit path: run it on an executor for as long as
+    /// the store lives. Each pass sends every head queued meanwhile in one unsynced transaction,
+    /// so commits on every partition share notify transactions and never wait on them. Without
+    /// it running, commit notifies inline after the append lands.
+    pub fn notifier(&self) -> impl Future<Output = ()> + use<H>
+    where
+        H: Send + Sync + 'static,
+    {
+        let host = Arc::clone(&self.host);
+        let outbox = Arc::clone(&self.outbox);
+        outbox.pending.update(|pending| pending.driven = true);
+        async move {
+            let _driving = Driving(Arc::clone(&outbox));
+            loop {
+                outbox.ready.notified().await;
+                let (heads, closed) = outbox
+                    .pending
+                    .update(|pending| (std::mem::take(&mut pending.heads), pending.closed));
+                if !heads.is_empty()
+                    && let Ok(payloads) =
+                        notify_payloads(heads.iter().map(|(scope, head)| (scope.as_str(), *head)))
+                {
+                    send_notify(&*host, &payloads).await;
+                }
+                if closed {
+                    return;
+                }
+            }
+        }
+    }
+
+    pub const fn host(&self) -> &Arc<H> {
+        &self.host
+    }
+
+    fn pick(&self, statements: &Dialects) -> &'static str {
+        self.host.dialect().pick(statements)
+    }
+
+    fn postgres(&self) -> bool {
+        self.host.dialect() == SqlDialect::Postgres
+    }
+}
+
+fn invalid(detail: impl std::fmt::Display) -> StoreError {
+    StoreError::Backend(format!("SQL host answered an invalid log row: {detail}"))
+}
+
+fn cell(cells: &[Option<String>], index: usize) -> Result<&str, StoreError> {
+    cells
+        .get(index)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| invalid(format!("missing cell {index}")))
+}
+
+fn number(cells: &[Option<String>], index: usize) -> Result<u64, StoreError> {
+    let text = cell(cells, index)?;
+    text.parse()
+        .map_err(|error| invalid(format!("{text}: {error}")))
+}
+
+fn rows(answer: Vec<SqlRow>) -> Result<Rows, StoreError> {
+    answer
+        .into_iter()
+        .map(|cells| Ok((number(&cells, 0)?, cell(&cells, 1)?.to_owned())))
+        .collect()
+}
+
+fn token(epoch: Option<u64>) -> String {
+    epoch.map_or_else(|| "-1".to_owned(), |epoch| epoch.to_string())
+}
+
+fn result(answer: &[Vec<SqlRow>], index: usize) -> Result<&Vec<SqlRow>, StoreError> {
+    answer
+        .get(index)
+        .ok_or_else(|| invalid(format!("no result {index}")))
+}
+
+fn fence_parts(row: &Row<String>) -> [String; 3] {
+    match row {
+        Row::Free { epoch } => [epoch.to_string(), String::new(), "0".to_owned()],
+        Row::Held {
+            holder,
+            epoch,
+            expires_at,
+        } => [epoch.to_string(), holder.clone(), expires_at.to_string()],
+    }
+}
+
+impl<H: Sql + Send + Sync + ?Sized> SqlParts<H> {
+    /// Runs LOCK then the statements in one transaction; a stale token is Fenced.
+    async fn fenced(
+        &self,
+        operation: &'static str,
+        part: &str,
+        epoch: Option<u64>,
+        statements: Vec<SqlStatement<'_>>,
+    ) -> Result<Vec<Vec<SqlRow>>, StoreError> {
+        let epoch = token(epoch);
+        let mut all = vec![SqlStatement {
+            sql: self.pick(&LOCK),
+            params: vec![part, &epoch],
+        }];
+        all.extend(statements);
+        let answer = self.host.transaction(operation, &all).await?;
+        if result(&answer, 0)?.is_empty() {
+            return Err(StoreError::Fenced);
+        }
+        Ok(answer)
+    }
+}
+
+impl<H: Sql + Send + Sync + ?Sized> PartStore for SqlParts<H> {
+    fn prepare(&self, count: NonZeroU32) -> StoreFuture<'_, Result<(), StoreError>> {
+        Box::pin(async move {
+            let count = count.get().to_string();
+            let list: &[&'static str] = if self.postgres() {
+                &PREPARE_PG
+            } else {
+                &PREPARE_SQLITE
+            };
+            let statements: Vec<_> = list
+                .iter()
+                .enumerate()
+                .map(|(index, sql)| SqlStatement {
+                    sql,
+                    params: if index + 1 == list.len() {
+                        vec![count.as_str()]
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect();
+            self.host
+                .transaction("plog_prepare", &statements)
+                .await
+                .map(drop)
+        })
+    }
+
+    fn commit<'a>(
+        &'a self,
+        part: Partition,
+        epoch: Option<u64>,
+        batch: &'a [Append],
+    ) -> StoreFuture<'a, Result<Vec<Verdict>, StoreError>> {
+        Box::pin(async move {
+            let encoded: Vec<(&str, Vec<(u64, &str)>)> = batch
+                .iter()
+                .map(|append| {
+                    (
+                        append.scope.as_ref(),
+                        append
+                            .rows
+                            .iter()
+                            .map(|(seq, body)| (*seq, body.as_str()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let json = serde_json::to_string(&encoded)
+                .map_err(|error| StoreError::Backend(format!("encode batch: {error}")))?;
+            let (part, epoch_text) = (part.0.to_string(), token(epoch));
+            let mut params = vec![part.as_str(), epoch_text.as_str(), json.as_str()];
+            if self.postgres() {
+                params.push("0");
+            }
+            let insert = SqlStatement {
+                sql: self.pick(&INSERT),
+                params,
+            };
+            let answer = match self.fenced("plog_commit", &part, epoch, vec![insert]).await {
+                Err(StoreError::Fenced) if epoch.is_none() => {
+                    return Err(StoreError::Backend(format!(
+                        "log partition {part} is not prepared"
+                    )));
+                }
+                answer => answer?,
+            };
+            let mut landed = HashSet::new();
+            let mut heads = std::collections::BTreeMap::new();
+            for cells in result(&answer, 1)? {
+                let (scope, seq) = (cell(cells, 0)?, number(cells, 1)?);
+                let head = heads.entry(scope).or_insert(seq);
+                *head = (*head).max(seq);
+                landed.insert((scope.to_owned(), seq));
+            }
+            if self.notify && self.postgres() && !heads.is_empty() {
+                let queued = self.outbox.pending.update(|pending| {
+                    if pending.driven {
+                        for (scope, head) in &heads {
+                            let queued = pending.heads.entry((*scope).to_owned()).or_insert(*head);
+                            *queued = (*queued).max(*head);
+                        }
+                    }
+                    pending.driven
+                });
+                if queued {
+                    self.outbox.ready.notify_one();
+                } else {
+                    send_notify(&*self.host, &notify_payloads(heads.into_iter())?).await;
+                }
+            }
+            Ok(batch
+                .iter()
+                .map(|append| {
+                    let first = append.rows.first().map_or(0, |(seq, _)| *seq);
+                    if landed.contains(&(append.scope.to_string(), first)) {
+                        Verdict::Committed
+                    } else {
+                        Verdict::Conflict
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn scan<'a>(
+        &'a self,
+        part: Partition,
+        scope: &'a str,
+        from: u64,
+        to: u64,
+    ) -> StoreFuture<'a, Result<Rows, StoreError>> {
+        Box::pin(async move {
+            let (part, from, to) = (
+                part.0.to_string(),
+                from.to_string(),
+                to.min(i64::MAX as u64).to_string(),
+            );
+            let statements = [SqlStatement {
+                sql: self.pick(&SCAN),
+                params: vec![&part, scope, &from, &to],
+            }];
+            let answer = self.host.transaction("plog_scan", &statements).await?;
+            rows(answer.into_iter().next().unwrap_or_default())
+        })
+    }
+
+    fn load<'a>(
+        &'a self,
+        part: Partition,
+        scope: &'a str,
+    ) -> StoreFuture<'a, Result<Rows, StoreError>> {
+        Box::pin(async move {
+            let part = part.0.to_string();
+            let statements = [SqlStatement {
+                sql: self.pick(&LOAD),
+                params: vec![&part, scope],
+            }];
+            let answer = self.host.transaction("plog_load", &statements).await?;
+            rows(answer.into_iter().next().unwrap_or_default())
+        })
+    }
+
+    fn compact<'a>(
+        &'a self,
+        part: Partition,
+        epoch: Option<u64>,
+        scope: &'a str,
+        compaction: Compaction<'a>,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let (part, epoch_text) = (part.0.to_string(), token(epoch));
+            let seqs: Vec<String> = compaction
+                .archived
+                .iter()
+                .map(|(seq, _)| seq.to_string())
+                .collect();
+            let ranges: Vec<(String, String)> = std::iter::once(&compaction.dropped)
+                .chain(compaction.superseded)
+                .filter(|range| !range.is_empty())
+                .map(|range| {
+                    (
+                        range.start.to_string(),
+                        range.end.min(i64::MAX as u64).to_string(),
+                    )
+                })
+                .collect();
+            let mut statements = Vec::new();
+            for ((_, body), seq) in compaction.archived.iter().zip(&seqs) {
+                statements.push(SqlStatement {
+                    sql: self.pick(&ARCHIVE),
+                    params: vec![&part, scope, seq, body, &epoch_text],
+                });
+            }
+            for (from, to) in &ranges {
+                statements.push(SqlStatement {
+                    sql: self.pick(&DROP),
+                    params: vec![&part, scope, from, to, &epoch_text],
+                });
+            }
+            self.fenced("plog_compact", &part, epoch, statements)
+                .await
+                .map(drop)
+        })
+    }
+
+    fn extend<'a>(
+        &'a self,
+        part: Partition,
+        epoch: Option<u64>,
+        scope: &'a str,
+        extension: Extension<'a>,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let (part, epoch_text) = (part.0.to_string(), token(epoch));
+            let (row, seq, cut) = (
+                extension.row.to_string(),
+                extension.seq.to_string(),
+                extension.cut.to_string(),
+            );
+            let statements = vec![SqlStatement {
+                sql: self.pick(&EXTEND),
+                params: vec![&part, scope, &row, &seq, &cut, extension.tail, &epoch_text],
+            }];
+            let answer = self.fenced("plog_extend", &part, epoch, statements).await?;
+            if result(&answer, 1)?.is_empty() {
+                return Err(StoreError::Fenced);
+            }
+            Ok(())
+        })
+    }
+
+    fn follow(
+        &self,
+        part: Partition,
+        after: u64,
+        limit: usize,
+    ) -> StoreFuture<'_, Result<Vec<Entry>, StoreError>> {
+        Box::pin(async move {
+            let (part, after, limit) = (part.0.to_string(), after.to_string(), limit.to_string());
+            let statements = [SqlStatement {
+                sql: self.pick(&FOLLOW),
+                params: vec![&part, &after, &limit],
+            }];
+            let answer = self.host.transaction("plog_follow", &statements).await?;
+            answer
+                .into_iter()
+                .next()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|cells| {
+                    Ok(Entry {
+                        pos: number(&cells, 0)?,
+                        scope: Arc::from(cell(&cells, 1)?),
+                        seq: number(&cells, 2)?,
+                        body: cell(&cells, 3)?.to_owned(),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn fence(&self, part: Partition) -> StoreFuture<'_, Result<Row<String>, StoreError>> {
+        Box::pin(async move {
+            let part_text = part.0.to_string();
+            let statements = [SqlStatement {
+                sql: self.pick(&FENCE),
+                params: vec![&part_text],
+            }];
+            let answer = self.host.transaction("plog_fence", &statements).await?;
+            let cells = answer
+                .into_iter()
+                .next()
+                .and_then(|rows| rows.into_iter().next())
+                .ok_or_else(|| {
+                    StoreError::Backend(format!("log partition {} is not prepared", part.0))
+                })?;
+            let epoch = number(&cells, 0)?;
+            let holder = cell(&cells, 1)?;
+            Ok(if holder.is_empty() {
+                Row::Free { epoch }
+            } else {
+                Row::Held {
+                    holder: holder.to_owned(),
+                    epoch,
+                    expires_at: number(&cells, 2)?,
+                }
+            })
+        })
+    }
+
+    fn swap_fence<'a>(
+        &'a self,
+        part: Partition,
+        expected: &'a Row<String>,
+        next: &'a Row<String>,
+    ) -> StoreFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            let part = part.0.to_string();
+            let [old_epoch, old_holder, old_expires] = fence_parts(expected);
+            let [epoch, holder, expires] = fence_parts(next);
+            let statements = [SqlStatement {
+                sql: self.pick(&SWAP),
+                params: vec![
+                    &part,
+                    &old_epoch,
+                    &old_holder,
+                    &old_expires,
+                    &epoch,
+                    &holder,
+                    &expires,
+                ],
+            }];
+            let answer = self
+                .host
+                .transaction("plog_swap_fence", &statements)
+                .await?;
+            Ok(answer.first().is_some_and(|rows| !rows.is_empty()))
+        })
+    }
+
+    fn cursor<'a>(
+        &'a self,
+        part: Partition,
+        reader: &'a str,
+        pos: u64,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            let (part, pos) = (part.0.to_string(), pos.to_string());
+            let statements = [SqlStatement {
+                sql: self.pick(&CURSOR),
+                params: vec![&part, reader, &pos],
+            }];
+            self.host
+                .transaction("plog_cursor", &statements)
+                .await
+                .map(drop)
+        })
+    }
+
+    fn prune<'a>(
+        &'a self,
+        part: Partition,
+        epoch: Option<u64>,
+        scope: &'a str,
+        before: u64,
+    ) -> StoreFuture<'a, Result<u64, StoreError>> {
+        Box::pin(async move {
+            let (part, epoch_text, before) = (
+                part.0.to_string(),
+                token(epoch),
+                before.min(i64::MAX as u64).to_string(),
+            );
+            let statements = vec![SqlStatement {
+                sql: self.pick(&PRUNE),
+                params: vec![&part, scope, &before, &epoch_text],
+            }];
+            let answer = self.fenced("plog_prune", &part, epoch, statements).await?;
+            Ok(result(&answer, 1)?.len() as u64)
+        })
+    }
+}

@@ -2,6 +2,7 @@ mod cells;
 mod host;
 mod machine;
 pub mod sim;
+mod stream;
 mod worker;
 
 use std::{io, rc::Rc, sync::Arc, time::Duration};
@@ -12,6 +13,7 @@ use nanocode_sync::{oneshot, unbounded};
 pub use cells::WorkspaceHost;
 pub use machine::Platform;
 pub use nanocode_shell::{Changes, Ended, Limit, Ran};
+pub use stream::Uploading;
 
 use worker::Job;
 
@@ -47,16 +49,30 @@ pub struct Finished {
 pub struct Workspace {
     jobs: unbounded::Sender<Job>,
     env: Arc<[(Vec<u8>, Vec<u8>)]>,
+    found: Arc<Found>,
+}
+
+pub(crate) struct Found {
+    pub(crate) network: bool,
+    pub(crate) commands: Vec<Vec<u8>>,
 }
 
 impl Workspace {
     pub fn start(config: Config) -> io::Result<Self> {
         let (jobs, received) = unbounded::channel();
-        worker::start(config, received)?;
+        let found = worker::start(config, received)?;
         Ok(Self {
             jobs,
             env: Arc::from(Vec::new()),
+            found: Arc::new(found),
         })
+    }
+
+    #[must_use]
+    pub fn has(&self, command: &str) -> bool {
+        let name = command.as_bytes();
+        nanocode_shell::has(name, self.found.network)
+            || self.found.commands.iter().any(|known| known == name)
     }
 
     #[must_use]
@@ -66,6 +82,7 @@ impl Workspace {
         Self {
             jobs: self.jobs.clone(),
             env: Arc::from(merged),
+            found: Arc::clone(&self.found),
         }
     }
 

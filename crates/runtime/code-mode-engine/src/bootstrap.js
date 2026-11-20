@@ -1,4 +1,4 @@
-((createCodeTools, valueHelpers) => {
+((createCodeTools, valueHelpers, installWebGlobals) => {
   const { stringify, storeSnapshot, normalizeImage, normalizeAudio, generatedImageItems } = valueHelpers;
   const native = (name) => {
     const value = globalThis[name];
@@ -51,7 +51,7 @@
       random: (length) => nativeBytes.random(length).buffer,
     };
   }
-  for (const name of ["console", "Atomics", "SharedArrayBuffer", "WebAssembly"]) delete globalThis[name];
+  for (const name of ["console"]) delete globalThis[name];
   const OriginalDate = Date;
   const clockNow = () => nativeValue(0);
   function JournaledDate(...args) {
@@ -89,6 +89,14 @@
   const now = typeof globalThis.performance?.now === "function"
     ? () => globalThis.performance.now()
     : () => Date.now();
+  installWebGlobals({
+    random: (length) => nativeBytes.random(length).buffer,
+    digest: (algorithm, buffer, offset, length) => nativeBytes.digest(algorithm, buffer, offset, length).buffer,
+    setTimeout,
+    uncaught,
+    clockNow,
+    monotonicNow: () => nativeValue(1),
+  });
   const timers = new Map();
   let stopCell = () => {};
   let settle = () => {};
@@ -616,7 +624,9 @@
         if (preludeSource && !preludeAtSetup) {
           defineGlobals(preludeSource(tools, callHost, callHostSync) ?? {});
         }
-        const script = new AsyncFunction(source);
+        // Strict, as an ES module is (cells run like one: top-level await works), so
+        // top-level `this` is undefined. On the source's first line, so line numbers hold.
+        const script = new AsyncFunction('"use strict";' + source);
         await finish(script());
         if (threw) throw thrown;
         return terminal();

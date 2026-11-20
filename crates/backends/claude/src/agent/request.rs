@@ -120,12 +120,12 @@ pub(super) fn request_response<'a>(
             floors
         };
         request
-            .cache_floors_with(
+            .cache_floors_editing(
                 state.wire_cache.layout(&sent),
                 &mut sent,
                 kept,
                 client.uses_subscription(),
-                HistoryMessage::make_mut,
+                |message: &mut HistoryMessage, edit| edit(&mut message.make_mut()),
             )
             .map_err(provider_error)?;
         request
@@ -205,7 +205,6 @@ pub(super) fn request_response<'a>(
                 return Ok(ResponseOutcome {
                     hedge: HedgeOutcome::Unneeded,
                     message: response,
-                    recorded: None,
                     upgrade: None,
                     replayed: true,
                 });
@@ -246,12 +245,12 @@ pub(super) fn request_response<'a>(
                 floors
             };
             request
-                .cache_floors_with(
+                .cache_floors_editing(
                     state.wire_cache.layout(&sent),
                     &mut sent,
                     kept,
                     client.uses_subscription(),
-                    HistoryMessage::make_mut,
+                    |message: &mut HistoryMessage, edit| edit(&mut message.make_mut()),
                 )
                 .map_err(provider_error)?;
             wire = client
@@ -283,7 +282,6 @@ pub(super) fn request_response<'a>(
                 return Ok(ResponseOutcome {
                     hedge: HedgeOutcome::Unneeded,
                     message: response,
-                    recorded: None,
                     upgrade: Some(upgrade.clone()),
                     replayed: true,
                 });
@@ -646,15 +644,13 @@ pub(super) fn request_response<'a>(
                     if let Some(shown) = shown.take() {
                         response.id = shown;
                     }
-                    let mut recorded = None;
                     state
                         .client
                         .clone()
                         .for_session(&state.session_id)
                         .clear_root_region();
                     if let Some(effect) = active_effect {
-                        let completion;
-                        (completion, recorded) =
+                        let completion =
                             effect.model_completion(&mut response, state.pages_messages())?;
                         match journal.as_deref_mut() {
                             Some(journal) => journal.complete(completion),
@@ -686,7 +682,6 @@ pub(super) fn request_response<'a>(
                     return Ok(ResponseOutcome {
                         hedge,
                         message: response,
-                        recorded,
                         upgrade,
                         replayed: false,
                     });
@@ -792,8 +787,7 @@ pub(super) fn request_response<'a>(
                     || (refused_tool_changes(&error)
                         && sent
                             .iter()
-                            .flat_map(|message| &message.content)
-                            .any(tool_change)))
+                            .any(|message| message.mentions("tool_") && message.any_block(tool_change))))
                     && let Some(effect) = active_effect
                 {
                     effect.refuse(&error).await?;

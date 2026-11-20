@@ -31,27 +31,29 @@ fn with<R>(use_simulation: impl FnOnce(&mut Simulation) -> R) -> R {
     })
 }
 
-struct SimulatedHost {
-    uuid_stamps: std::sync::atomic::AtomicU64,
+struct SimulatedHost;
+
+static HOST: SimulatedHost = SimulatedHost;
+
+thread_local! {
+    // Each worker thread of --jobs runs its own seeds, so the UUID stamps and the pass flag are
+    // per thread. The stamps are leaked once per thread because Host hands out a reference.
+    static UUID_STAMPS: &'static std::sync::atomic::AtomicU64 =
+        Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    static SECOND_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-static HOST: SimulatedHost = SimulatedHost {
-    uuid_stamps: std::sync::atomic::AtomicU64::new(0),
-};
-
-static SECOND_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub fn second_pass<R>(run: impl FnOnce() -> R) -> R {
-    SECOND_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
+    SECOND_PASS.set(true);
     let result = run();
-    SECOND_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+    SECOND_PASS.set(false);
     result
 }
 
 fn origin() -> Instant {
     let now = Instant::now();
     let span = Duration::from_secs(SIMULATED_START_UNIX_SECS);
-    if SECOND_PASS.load(std::sync::atomic::Ordering::Relaxed) {
+    if SECOND_PASS.get() {
         now.checked_sub(span).expect(
             "the second pass's origin lies as far before the real clock as the simulated epoch",
         )
@@ -87,7 +89,7 @@ impl Host for SimulatedHost {
     }
 
     fn uuid_stamps(&self) -> Option<&std::sync::atomic::AtomicU64> {
-        Some(&self.uuid_stamps)
+        Some(UUID_STAMPS.with(|stamps| *stamps))
     }
 
     fn spawn(&self, future: HostFuture) {
@@ -116,8 +118,7 @@ pub fn install() -> std::io::Result<()> {
 }
 
 pub fn enter(seed: u64, clock: &Arc<Clock>) {
-    HOST.uuid_stamps
-        .store(0, std::sync::atomic::Ordering::Relaxed);
+    UUID_STAMPS.with(|stamps| stamps.store(0, std::sync::atomic::Ordering::Relaxed));
     CURRENT.with_borrow_mut(|current| {
         *current = Some(Simulation {
             clock: Arc::clone(clock),

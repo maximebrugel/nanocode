@@ -13,6 +13,7 @@ autobenches = false
 [dependencies]
 nanocode-compression.workspace = true
 nanocode-durability-core.workspace = true
+nanocode-partitions.workspace = true
 nanocode-sync.workspace = true
 nanocode-sys.workspace = true
 serde.workspace = true

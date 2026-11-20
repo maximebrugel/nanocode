@@ -354,7 +354,8 @@ impl App {
                             .load(&session)
                             .await
                             .map_err(|error| error.to_string())?
-                            .transcript
+                            .into_transcript()
+                            .map_err(|error| error.to_string())?
                     }
                     None => Vec::new(),
                 };

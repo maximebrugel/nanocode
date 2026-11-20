@@ -171,9 +171,6 @@ pub(crate) fn prepare_continuation(
     })
 }
 
-static LOADED: nanocode_sync::SwapOption<(ResponseHistory, SequenceLog)> =
-    nanocode_sync::SwapOption::const_empty();
-
 fn loaded_history(
     base: &ResponseHistory,
     log: &mut SequenceLog,
@@ -183,7 +180,7 @@ fn loaded_history(
     let keep = log.len();
     for payload in payloads {
         log.push(payload.reference())?;
-        entries.push((payload.decode()?, payload.shared()?));
+        entries.push(payload.decode::<ResponseItem>()?);
     }
     log.release();
     let history = if keep == 0 {
@@ -191,7 +188,6 @@ fn loaded_history(
     } else {
         base.extended_loaded(keep, entries)
     };
-    LOADED.store(Some(Arc::new((history.clone(), log.clone()))));
     Ok(history)
 }
 
@@ -202,12 +198,22 @@ pub(crate) struct HydratedSnapshot {
     prefix: Option<Vec<EncodedPayload>>,
 }
 
+impl HydratedSnapshot {
+    fn into_resumed(self) -> (SessionSnapshot, ContinuationCache) {
+        let cache = ContinuationCache {
+            history: self.snapshot.shared_history().clone(),
+            history_log: self.history,
+            ..ContinuationCache::default()
+        };
+        (self.snapshot, cache)
+    }
+}
+
 pub(crate) struct AdvancedSnapshot {
     pub(crate) hydrated: HydratedSnapshot,
     pub(crate) keys: HashSet<String>,
     pub(crate) reused: usize,
     pub(crate) decoded: usize,
-    pub(crate) prefix_kept: bool,
 }
 
 async fn load_items(
@@ -259,20 +265,20 @@ pub(crate) async fn advance_snapshot(
     let payloads = if added.is_empty() {
         Vec::new()
     } else {
-        reader.load_payloads(added).await?
+        reader.take_payloads(added).await?
     };
     let history = loaded_history(&previous_history, &mut log, payloads)?;
-    let (prefix, prefix_references, prefix_kept) = match saved.prefix {
-        None => (None, None, false),
+    let (prefix, prefix_references) = match saved.prefix {
+        None => (None, None),
         Some(sequence) => {
             let references = sequence_references(reader, sequence, &mut keys).await?;
             match (previous_prefix, previous_prefix_references) {
                 (Some(items), Some(kept)) if same_keys(&kept, &references) => {
-                    (Some(items), Some(references), true)
+                    (Some(items), Some(references))
                 }
                 _ => {
                     let items = load_items(reader, &references).await?;
-                    (Some(Arc::from(items)), Some(references), false)
+                    (Some(Arc::from(items)), Some(references))
                 }
             }
         }
@@ -286,7 +292,6 @@ pub(crate) async fn advance_snapshot(
         keys,
         reused,
         decoded,
-        prefix_kept,
     })
 }
 
@@ -322,28 +327,13 @@ impl ContinuationCache {
     }
 
     fn sync_history(&mut self, history: &ResponseHistory) -> Result<()> {
-        if self.history_log.is_empty()
-            && let Some(loaded) = LOADED.load_full()
-            && !loaded.0.is_empty()
-            && loaded.0.shared_prefix_len(history) == loaded.0.len()
-        {
-            LOADED.store(None);
-            (self.history, self.history_log) = Arc::unwrap_or_clone(loaded);
-        }
         let unchanged = self
             .history
             .shared_prefix_len(history)
             .min(self.history_log.len());
-        let stored = history.stored_from(unchanged);
         self.history_log.sync(
             unchanged,
-            history
-                .iter_from(unchanged)
-                .zip(stored)
-                .map(|(item, stored)| match stored {
-                    Some(stored) => Ok(EncodedPayload::from_shared(stored)),
-                    None => EncodedPayload::encode(item),
-                }),
+            history.iter_from(unchanged).map(EncodedPayload::encode),
         )?;
         self.history = history.clone();
         Ok(())
@@ -524,18 +514,26 @@ pub(crate) async fn restore_snapshot(
 }
 
 pub(crate) fn preloaded_snapshot(
-    checkpoint: serde_json::Value,
+    checkpoint: nanocode_durability::Checkpoint,
     records: Option<Arc<HashSet<String>>>,
     hydrated: Option<nanocode_durability::Hydrated>,
     key: &str,
-) -> Option<(SessionSnapshot, HashSet<String>)> {
-    let snapshot = match hydrated.and_then(nanocode_durability::Hydrated::take::<HydratedSnapshot>)
-    {
-        Some(hydrated) => hydrated.snapshot,
-        None => SessionSnapshot::deserialize(checkpoint).ok()?,
+) -> Option<(SessionSnapshot, HashSet<String>, ContinuationCache)> {
+    let hydrated = hydrated.or_else(|| checkpoint.hydrated().cloned());
+    let checkpoint = match checkpoint {
+        nanocode_durability::Checkpoint::Value(value) => Some(value),
+        nanocode_durability::Checkpoint::Typed { .. } => None,
     };
+    let (snapshot, cache) =
+        match hydrated.and_then(nanocode_durability::Hydrated::take::<HydratedSnapshot>) {
+            Some(hydrated) => hydrated.into_resumed(),
+            None => (
+                SessionSnapshot::deserialize(checkpoint?).ok()?,
+                ContinuationCache::default(),
+            ),
+        };
     if let Some(records) = records {
-        return Some((snapshot, Arc::unwrap_or_clone(records)));
+        return Some((snapshot, Arc::unwrap_or_clone(records), cache));
     }
     let (head, history, prefix) = snapshot.into_context_parts();
     let known = HashSet::new();
@@ -553,7 +551,11 @@ pub(crate) fn preloaded_snapshot(
     if !prepared.payload.matches_key(key) {
         return None;
     }
-    Some((saved.head.with_context(history, prefix), prepared.keys))
+    Some((
+        saved.head.with_context(history, prefix),
+        prepared.keys,
+        cache,
+    ))
 }
 
 pub(crate) async fn load_snapshot_with_keys(
@@ -565,6 +567,15 @@ pub(crate) async fn load_snapshot_with_keys(
         .map(|(hydrated, keys)| (hydrated.snapshot, keys))
 }
 
+pub(crate) async fn load_resumed(
+    reader: PayloadReader<'_>,
+    saved: Snapshot,
+) -> Result<(SessionSnapshot, HashSet<String>, ContinuationCache)> {
+    let (hydrated, keys) = load_hydrated_with_keys(reader, saved).await?;
+    let (snapshot, cache) = hydrated.into_resumed();
+    Ok((snapshot, keys, cache))
+}
+
 pub(crate) async fn load_hydrated_with_keys(
     reader: PayloadReader<'_>,
     saved: Snapshot,
@@ -574,7 +585,7 @@ pub(crate) async fn load_hydrated_with_keys(
     let payloads = if references.is_empty() {
         Vec::new()
     } else {
-        reader.load_payloads(references).await?
+        reader.take_payloads(references).await?
     };
     let mut log = SequenceLog::default();
     let history = loaded_history(&ResponseHistory::default(), &mut log, payloads)?;

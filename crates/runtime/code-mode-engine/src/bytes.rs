@@ -51,29 +51,11 @@ pub fn take(id: u64) -> Option<Vec<u8>> {
         .take()
 }
 
-const PUT: u32 = 20;
-const TAKE: u32 = 21;
-const TEXT: u32 = 22;
-const DISCARD: u32 = 23;
-const DECODE: u32 = 24;
-const ENCODE: u32 = 25;
-const TO_BASE64: u32 = 26;
-const FROM_BASE64: u32 = 27;
-const DIGEST: u32 = 28;
-const RANDOM: u32 = 29;
-
-pub(crate) const HOST_FNS: [(u32, &str); 10] = [
-    (PUT, "__nanocodeBytesPut"),
-    (TAKE, "__nanocodeBytesTake"),
-    (TEXT, "__nanocodeBytesText"),
-    (DISCARD, "__nanocodeBytesDiscard"),
-    (DECODE, "__nanocodeBytesDecode"),
-    (ENCODE, "__nanocodeBytesEncode"),
-    (TO_BASE64, "__nanocodeBytesToBase64"),
-    (FROM_BASE64, "__nanocodeBytesFromBase64"),
-    (DIGEST, "__nanocodeBytesDigest"),
-    (RANDOM, "__nanocodeBytesRandom"),
-];
+use crate::setup::{
+    BYTES_DECODE as DECODE, BYTES_DIGEST as DIGEST, BYTES_DISCARD as DISCARD, BYTES_ENCODE as ENCODE,
+    BYTES_FROM_BASE64 as FROM_BASE64, BYTES_PUT as PUT, BYTES_RANDOM as RANDOM, BYTES_TAKE as TAKE,
+    BYTES_TEXT as TEXT, BYTES_TO_BASE64 as TO_BASE64,
+};
 
 fn index(call: &HostCall<'_>, at: usize) -> Option<usize> {
     call.arg(at).as_number().map(|number| number as usize)

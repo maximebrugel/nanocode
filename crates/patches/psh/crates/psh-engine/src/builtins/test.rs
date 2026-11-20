@@ -183,14 +183,26 @@ async fn is_set(vp: &mut Vp, name: &str) -> T {
     {
         let (base, sub) = (&name[..open], &name[open + 1..name.len() - 1]);
         let target = vp.resolve(base).into_owned();
+        // `a[]` names no element.
+        if sub.is_empty() {
+            return Ok(false);
+        }
         match vp.vars.get(&target).map(crate::vars::Var::is_assoc) {
+            // bash looks `@` and `*` up as keys of an associative array.
+            Some(true) if matches!(sub, "@" | "*") => {
+                return Ok(matches!(
+                    vp.vars.get(&target).map(|v| &v.value),
+                    Some(crate::vars::Value::Assoc(a)) if a.get(sub.as_bytes()).is_some()
+                ));
+            }
             _ if matches!(sub, "@" | "*") => {}
             Some(true) => {
                 let key = vp.simple_sub(sub.as_bytes());
                 return Ok(vp.is_set(&format!("{target}[{}]", s(&key))));
             }
-            Some(false) => {
-                return match vp.resolve_index(&target, sub.as_bytes())? {
+            // An unset name too: bash evaluates the subscript as arithmetic.
+            Some(false) | None => {
+                return match vp.resolve_read(&target, sub.as_bytes())? {
                     Some(i) => Ok(vp.is_set(&format!("{target}[{i}]"))),
                     None => {
                         vp.error(&format!("{target}: bad array subscript")).await;
@@ -198,7 +210,6 @@ async fn is_set(vp: &mut Vp, name: &str) -> T {
                     }
                 };
             }
-            None => {}
         }
     }
     Ok(vp.is_set(name))
@@ -210,10 +221,10 @@ fn int(v: &[u8]) -> Result<i64, String> {
         .trim_matches(|c| c == ' ' || c == '\t' || c == '\n');
     let digits = t.strip_prefix(['-', '+']).unwrap_or(t);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("{}: integer expected", s(v)));
+        return Err(format!("{}: integer expression expected", s(v)));
     }
     t.parse::<i64>()
-        .map_err(|_| format!("{}: integer expected", s(v)))
+        .map_err(|_| format!("{}: integer expression expected", s(v)))
 }
 
 /// A unary test (`op` is `-f` and so on), for `test` and `[[ ]]`.
@@ -272,7 +283,8 @@ pub(crate) async fn unary(vp: &mut Vp, op: &[u8], arg: &[u8]) -> T {
         b'S' => m.kind == FileKind::Socket,
         b'b' => m.kind == FileKind::BlockDevice,
         b'c' => m.kind == FileKind::CharDevice,
-        b's' => m.size > 0,
+        // A directory always has a size on a real file system (a block, at least).
+        b's' => m.size > 0 || m.kind == FileKind::Dir,
         b'g' => m.mode & 0o2000 != 0,
         b'u' => m.mode & 0o4000 != 0,
         b'k' => m.mode & 0o1000 != 0,
@@ -304,8 +316,15 @@ pub(crate) async fn binary(vp: &Vp, l: &[u8], op: &[u8], r: &[u8]) -> T {
         b"-ge" => int(l)? >= int(r)?,
         b"-nt" | b"-ot" | b"-ef" => {
             let host = vp.host();
-            let a = host.stat(&vp.abs_path(l), true).await.ok();
-            let b = host.stat(&vp.abs_path(r), true).await.ok();
+            // An empty name is no file (stat fails), not the current directory.
+            let a = match l.is_empty() {
+                true => None,
+                false => host.stat(&vp.abs_path(l), true).await.ok(),
+            };
+            let b = match r.is_empty() {
+                true => None,
+                false => host.stat(&vp.abs_path(r), true).await.ok(),
+            };
             match op {
                 b"-nt" => match (a, b) {
                     (Some(a), Some(b)) => a.mtime_ns > b.mtime_ns,

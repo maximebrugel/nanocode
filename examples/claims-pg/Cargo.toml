@@ -1,0 +1,28 @@
+[package]
+name = "nanocode-claims-pg"
+autotests = false
+autobenches = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license = "Apache-2.0"
+repository.workspace = true
+description = "Board claims per second on a real Postgres: the partitioned board's claim and finish loop"
+
+[[bin]]
+name = "claims-pg"
+path = "src/main.rs"
+test = false
+bench = false
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+nanocode-board.workspace = true
+nanocode-durability-core.workspace = true
+nanocode-executor.workspace = true
+nanocode-partitions.workspace = true
+nanocode-store-sql = { path = "../../crates/integrations/store-sql" }
+nanocode-turnlog.workspace = true
+
+[lints]
+workspace = true

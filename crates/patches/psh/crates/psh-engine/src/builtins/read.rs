@@ -316,7 +316,10 @@ pub(super) async fn read(vp: &mut Vp, args: &[Vec<u8>]) -> R {
     let text = |l: &[(u8, bool)]| l.iter().map(|b| b.0).collect::<Vec<u8>>();
     if let Some(name) = array {
         // `-N` keeps the input whole; otherwise every field is an element.
-        let fields = if exact {
+        let fields = if exact && line.is_empty() {
+            // Nothing read: an empty array, as bash leaves it.
+            Vec::new()
+        } else if exact {
             vec![text(&line)]
         } else {
             split_all(&line, ifs)

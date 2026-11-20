@@ -24,9 +24,13 @@ members = [
     "crates/runtime/subagents",
     "crates/core/board-fold",
     "crates/core/cost-fold",
+    "crates/core/live-fold",
     "crates/core/partitions",
+    "crates/core/dispatch",
     "crates/runtime/board",
+    "crates/runtime/dispatcher",
     "crates/runtime/board-sync",
+    "crates/runtime/live",
     "crates/runtime/hands",
     "crates/backends/antigravity",
     "crates/backends/antigravity/client",
@@ -57,6 +61,7 @@ members = [
     "crates/core/python-data",
     "crates/core/python-capi",
     "crates/core/schema",
+    "crates/core/repo-cache",
     "crates/core/shell",
     "crates/core/workspace-fs",
     "crates/core/tool-provider",
@@ -93,13 +98,19 @@ members = [
     "crates/integrations/store-sql",
     "crates/integrations/store-jsonl",
     "crates/integrations/mpp",
+    "crates/integrations/s3",
     "crates/tui",
     "bin/nanocode",
     "bin/cua-driver",
     "bin/nc-lite",
     "bin/nc-board",
+    "bin/nc-build",
+    "crates/runtime/build-opt",
     "bin/nanocode-python",
     "bin/nanocode-sim",
+    "bin/nanocode-fuzz",
+    "examples/claims-pg",
+    "examples/dispatch-pg",
 ]
 default-members = ["crates/nanocode"]
 exclude = ["crates/patches", "bin/nanocode-front"]
@@ -152,6 +163,7 @@ nanocode-home = { version = "0.7.0", path = "crates/core/home" }
 nanocode-http = { version = "0.7.0", path = "crates/core/http" }
 nanocode-google-auth = { version = "0.7.0", path = "crates/core/google-auth" }
 nanocode-bytes = { version = "0.7.0", path = "crates/core/bytes" }
+nanocode-machine = { version = "0.7.0", path = "crates/core/machine" }
 nanocode-mcp = { version = "0.7.0", path = "crates/core/mcp" }
 nanocode-mcp-http = { version = "0.7.0", path = "crates/core/mcp-http" }
 nanocode-platform = { version = "0.7.0", path = "crates/core/platform" }
@@ -165,15 +177,20 @@ nanocode-executor = { version = "0.7.0", path = "crates/core/executor" }
 nanocode-sys = { version = "0.7.0", path = "crates/core/sys" }
 nanocode-tempo = { version = "0.7.0", path = "crates/core/tempo" }
 nanocode-schema = { version = "0.7.0", path = "crates/core/schema" }
+nanocode-repo-cache = { version = "0.7.0", path = "crates/core/repo-cache" }
 nanocode-shell = { version = "0.7.0", path = "crates/core/shell" }
 nanocode-workspace-fs = { version = "0.7.0", path = "crates/core/workspace-fs" }
 nanocode-durability = { version = "0.7.0", path = "crates/runtime/durability" }
 nanocode-subagents = { version = "0.7.0", path = "crates/runtime/subagents" }
 nanocode-board-fold = { version = "0.7.0", path = "crates/core/board-fold" }
 nanocode-cost-fold = { version = "0.7.0", path = "crates/core/cost-fold" }
+nanocode-live-fold = { version = "0.7.0", path = "crates/core/live-fold" }
 nanocode-partitions = { version = "0.7.0", path = "crates/core/partitions" }
+nanocode-dispatch = { version = "0.7.0", path = "crates/core/dispatch" }
 nanocode-board = { version = "0.7.0", path = "crates/runtime/board" }
+nanocode-dispatcher = { version = "0.7.0", path = "crates/runtime/dispatcher" }
 nanocode-board-sync = { version = "0.7.0", path = "crates/runtime/board-sync" }
+nanocode-live = { version = "0.7.0", path = "crates/runtime/live" }
 nanocode-hands = { version = "0.7.0", path = "crates/runtime/hands" }
 nanocode-code-mode = { version = "0.7.0", path = "crates/runtime/code-mode"  }
 nanocode-workspace = { version = "0.7.0", path = "crates/runtime/workspace" }

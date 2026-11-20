@@ -499,6 +499,34 @@ fn apply_in(patch: &str, workspace: &Path, lenient: bool) -> Result<String, Stri
     Ok(plan.summary().to_owned())
 }
 
+pub(crate) fn touched_paths(input: &serde_json::Value) -> Vec<String> {
+    let patch = match input {
+        serde_json::Value::String(patch) => patch.as_str(),
+        serde_json::Value::Object(object) => match object
+            .get("input")
+            .or_else(|| object.get("patch"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(patch) => patch,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let Ok(hunks) = parse(patch) else {
+        return Vec::new();
+    };
+    hunks
+        .into_iter()
+        .flat_map(|hunk| match hunk {
+            Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => vec![path],
+            Hunk::UpdateFile {
+                path, move_path, ..
+            } => std::iter::once(path).chain(move_path).collect(),
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
 fn parse(patch: &str) -> Result<Vec<Hunk>, String> {
     let ApplyPatchArgs {
         hunks,

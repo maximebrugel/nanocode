@@ -288,6 +288,13 @@ where
     ))
 }
 
+pub fn accept_upgraded<S>(stream: S, config: Option<WebSocketConfig>) -> WebSocketStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    WebSocketStream::new(stream, Role::Server, Vec::new(), config)
+}
+
 pub async fn accept_hdr_async<S, C>(stream: S, callback: C) -> Result<WebSocketStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,

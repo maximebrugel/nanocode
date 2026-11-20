@@ -27,8 +27,9 @@ mod _pickle {
     #[pyattr]
     const HIGHEST_PROTOCOL: u8 = 5;
     // The protocol `dumps`/`dump` use when no protocol is given.
+    // 4, as in CPython 3.12.
     #[pyattr]
-    const DEFAULT_PROTOCOL: u8 = 5;
+    const DEFAULT_PROTOCOL: u8 = 4;
 
     #[pyattr(name = "PickleError", once)]
     fn pickle_error(vm: &VirtualMachine) -> PyTypeRef {

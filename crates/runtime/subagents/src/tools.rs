@@ -831,7 +831,7 @@ fn start_child<'a>(
         let session_id = child.session_id().to_string();
         let descriptor = AgentDescriptor {
             id,
-            session_id,
+            session_id: session_id.clone(),
             role: role.clone(),
             task: task.clone(),
             parent: reservation.parent,
@@ -867,12 +867,16 @@ fn start_child<'a>(
         startup.track(&reservation.root_session_id, id);
         registry.send(&reservation.root_session_id, AgentUpdate::Added(descriptor));
         let _ = start_events.send((0, marks));
+        let brief = match registry.briefed(&session_id, &task).await {
+            Ok(brief) => brief,
+            Err(error) => return Err(startup.fail(error).await.into()),
+        };
 
         if let Err(error) = registry
             .launch_initial_turn(
                 &reservation.root_session_id,
                 id,
-                agent_prompt(id, &task, budget),
+                agent_prompt(id, &brief, budget),
                 capacity,
             )
             .await
@@ -1090,11 +1094,14 @@ fn build_unstarted<'a>(
                 schema,
             )
             .await?;
+        let brief = registry
+            .briefed(&child.descriptor.session_id, &child.descriptor.task)
+            .await?;
         registry
             .launch_initial_turn(
                 root_session_id,
                 id,
-                agent_prompt(id, &child.descriptor.task, child.descriptor.budget_usd),
+                agent_prompt(id, &brief, child.descriptor.budget_usd),
                 capacity,
             )
             .await?;

@@ -778,6 +778,8 @@ async fn run_turn(
     }
 }
 
+const SSE_GARBLED: [&str; 2] = ["invalid UTF-8 SSE line", "expected message_start"];
+
 async fn run_root(
     runtime: &Nanocode,
     store: &SessionStore,
@@ -811,6 +813,11 @@ async fn run_root(
             }
             Err(error) => {
                 world.trace(&format!("{label} turn {turn} failed: {error}"));
+                if SSE_GARBLED.iter().any(|garbled| error.contains(garbled)) {
+                    world.wrong(format!(
+                        "sse_garbled: {label} turn {turn} failed on bytes the server never sent as SSE: {error}"
+                    ));
+                }
                 client.failed.borrow_mut().push((label.clone(), turn));
             }
         }
@@ -1127,6 +1134,9 @@ fn drop_spawned() {
 }
 
 pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
+    if options.mutation == WireMutation::ReopenForgetsAgents {
+        nanocode_board::sim::mutate(nanocode_board::sim::Mutation::ReopenForgetsAgents);
+    }
     let shape = Shape::of(seed, options);
     if std::env::var_os("NANOCODE_SIM_POLLS").is_some() {
         eprintln!("RUN seed {seed}");
@@ -1214,9 +1224,13 @@ pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
                 remote.as_ref(),
             )
             .await;
-            result.replace(Some(outcome));
+            let audit = crate::boardagents::audit().await;
+            result.replace(Some(
+                outcome.and_then(|listing| audit.map_or(Ok(listing), Err)),
+            ));
         });
         let crash_at = crashes.pop_front();
+        world.begin_epoch(number);
         world.crash_pending(crash_at.is_some());
         let ended = executor.run(vec![task], crash_at);
         drop(executor);
@@ -1256,6 +1270,7 @@ pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
                 kv.with(crate::store::Kv::power_loss);
             }
             let result = RefCell::new(None);
+            world.begin_epoch(EPOCHS_MAX);
             let mut executor =
                 Executor::new(Arc::clone(&clock), Rng::derive(seed, "scheduler verify"));
             let task: Task<'_> = Box::pin(async {
@@ -1269,7 +1284,8 @@ pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
                     before,
                 )
                 .await;
-                result.replace(Some(outcome));
+                let audit = crate::boardagents::audit().await;
+                result.replace(Some(outcome.and_then(|()| audit.map_or(Ok(()), Err))));
             });
             let ended = executor.run(vec![task], None);
             drop(executor);

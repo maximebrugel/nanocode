@@ -1,4 +1,4 @@
-use std::{num::NonZeroU64, pin::pin, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroU64, pin::pin, sync::Arc};
 
 use nanocode_code_mode::embedded::HandCalls;
 use nanocode_cost_fold::Placement;
@@ -7,7 +7,9 @@ use nanocode_tool_contracts::{ToolContext, ToolOutput, ToolOutputWire};
 use serde_json::{Value, json};
 
 use crate::{
-    HandError, HandHost, HandPhase, HandRef, HostFuture, StepOutcome, Target, Workspace,
+    HandError, HandHost, HandPhase, HandRef, HostFuture, StepOutcome, Target, TargetError,
+    Workspace,
+    auto::{AUTO, Auto, Decision, Origin, decide},
     sim::{self, Mutation},
 };
 
@@ -26,6 +28,18 @@ pub trait Placements: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Policy {
     pub idle_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Placed {
+    pub explicit: u64,
+    pub auto: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Stats {
+    pub placed: BTreeMap<Target, Placed>,
+    pub reasons: BTreeMap<&'static str, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,11 +65,14 @@ type UseKey = (Box<str>, HandRef);
 type StepKey = (Box<str>, Box<str>);
 
 pub struct Router {
-    pub(crate) workspace: Arc<dyn Workspace>,
-    pub(crate) host: Arc<dyn HandHost>,
+    workspace: Arc<dyn Workspace>,
+    host: Arc<dyn HandHost>,
     clock: Arc<dyn Clock>,
     placements: Arc<dyn Placements>,
     policy: Policy,
+    auto: Auto,
+    placed: AtomMap<Target, Placed>,
+    reasons: AtomMap<&'static str, u64>,
     uses: AtomMap<UseKey, Use>,
     steps: AtomMap<StepKey, Step>,
     released: Notify,
@@ -76,9 +93,49 @@ impl Router {
             clock,
             placements,
             policy,
+            auto: Auto::default(),
+            placed: AtomMap::new(),
+            reasons: AtomMap::new(),
             uses: AtomMap::new(),
             steps: AtomMap::new(),
             released: Notify::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_auto(mut self, auto: Auto) -> Self {
+        self.auto = auto;
+        self
+    }
+
+    pub fn decide(&self, hand: &str, tool: &str, input: &Value) -> Result<Decision, TargetError> {
+        let explicit = match hand {
+            "" | AUTO => None,
+            wire => Some(Target::parse(wire)?),
+        };
+        let explicit = explicit.filter(|_| !sim::mutated(Mutation::AutoMovesExplicit));
+        Ok(decide(
+            explicit,
+            tool,
+            input,
+            &self.auto,
+            self.workspace.as_ref(),
+        ))
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> Stats {
+        Stats {
+            placed: self.placed.update(|map| {
+                map.iter()
+                    .map(|(target, placed)| (target.clone(), *placed))
+                    .collect()
+            }),
+            reasons: self.reasons.update(|map| {
+                map.iter()
+                    .map(|(reason, count)| (*reason, *count))
+                    .collect()
+            }),
         }
     }
 
@@ -89,17 +146,52 @@ impl Router {
         input: Value,
         context: ToolContext<'_>,
     ) -> ToolOutput {
-        let target = match Target::parse(hand) {
-            Ok(target) => target,
+        let decision = match self.decide(hand, tool, &input) {
+            Ok(decision) => decision,
             Err(error) => return refused(hand, &error.to_string()),
         };
-        match target {
-            Target::Workspace => self.on_workspace(tool, input, context).await,
-            Target::Hand(hand) => self.on_hand(&hand, tool, input, context).await,
+        let origin = if hand.is_empty() || hand == AUTO {
+            Origin::Auto
+        } else {
+            Origin::Explicit
+        };
+        let at = Placing {
+            origin,
+            reason: decision.reason.name(),
+        };
+        match decision.target {
+            Target::Workspace => self.on_workspace(tool, input, context, at).await,
+            Target::Hand(hand) => self.on_hand(&hand, tool, input, context, at).await,
         }
     }
 
-    async fn on_workspace(&self, tool: &str, input: Value, context: ToolContext<'_>) -> ToolOutput {
+    fn count(&self, target: &Target, at: Placing) {
+        let target = match (target, at.origin) {
+            (Target::Workspace, Origin::Auto) if sim::mutated(Mutation::CountsAutoAsHosted) => {
+                Target::Hand(HandRef::Hosted)
+            }
+            (target, _) => target.clone(),
+        };
+        self.placed.update(|map| {
+            let placed = map.entry(target.clone()).or_default();
+            match at.origin {
+                Origin::Explicit => placed.explicit = placed.explicit.saturating_add(1),
+                Origin::Auto => placed.auto = placed.auto.saturating_add(1),
+            }
+        });
+        self.reasons.update(|map| {
+            let count = map.entry(at.reason).or_default();
+            *count = count.saturating_add(1);
+        });
+    }
+
+    async fn on_workspace(
+        &self,
+        tool: &str,
+        input: Value,
+        context: ToolContext<'_>,
+        at: Placing,
+    ) -> ToolOutput {
         if !self.workspace.runs(tool) && !sim::mutated(Mutation::SkipsToolCheck) {
             return refused(WORKSPACE, &format!("the workspace cannot run `{tool}`"));
         }
@@ -107,6 +199,7 @@ impl Router {
         if !self.claim(session, step) {
             return dispatched_before(WORKSPACE, step);
         }
+        self.count(&Target::Workspace, at);
         let started_ms = self.clock.now_ms();
         let output = self.workspace.run(session, tool, input, context).await;
         let placement = Placement {
@@ -124,6 +217,7 @@ impl Router {
         tool: &str,
         input: Value,
         context: ToolContext<'_>,
+        at: Placing,
     ) -> ToolOutput {
         let (session, step) = (context.session_id(), context.call_id());
         let wire = hand.to_string();
@@ -140,13 +234,14 @@ impl Router {
         if !status.tools.iter().any(|name| name == tool) && !sim::mutated(Mutation::SkipsToolCheck)
         {
             if sim::mutated(Mutation::ForwardsRefused) && self.workspace.runs(tool) {
-                return self.on_workspace(tool, input, context).await;
+                return self.on_workspace(tool, input, context, at).await;
             }
             return refused(&wire, &format!("`{wire}` cannot run `{tool}`"));
         }
         if !self.claim(session, step) {
             return dispatched_before(&wire, step);
         }
+        self.count(&Target::Hand(hand.clone()), at);
         self.hold(session, hand).await;
         let replay = sim::mutated(Mutation::ReplaysUncertain).then(|| input.clone());
         let outcome = self
@@ -264,7 +359,7 @@ impl Router {
             .update(|map| map.retain(|(owner, _), _| owner.as_ref() != session));
     }
 
-    pub(crate) async fn hold(&self, session: &str, hand: &HandRef) {
+    async fn hold(&self, session: &str, hand: &HandRef) {
         let use_key: UseKey = (session.into(), hand.clone());
         loop {
             let mut notified = pin!(self.released.notified());
@@ -285,7 +380,7 @@ impl Router {
         }
     }
 
-    pub(crate) fn unhold(&self, session: &str, hand: &HandRef) {
+    fn unhold(&self, session: &str, hand: &HandRef) {
         let use_key: UseKey = (session.into(), hand.clone());
         let now_ms = self.clock.now_ms();
         self.uses.update(|map| {
@@ -343,6 +438,10 @@ impl HandCalls for Router {
         false
     }
 
+    fn auto(&self, tool: &str) -> bool {
+        self.workspace.runs(tool) && !sim::mutated(Mutation::AutoOff)
+    }
+
     fn call<'a>(
         &'a self,
         hand: &'a str,
@@ -360,6 +459,12 @@ impl HandCalls for Router {
     ) -> HostFuture<'a, Option<ToolOutput>> {
         Box::pin(Self::recover(self, hand, context))
     }
+}
+
+#[derive(Clone, Copy)]
+struct Placing {
+    origin: Origin,
+    reason: &'static str,
 }
 
 fn key(session: &str, step: &str) -> StepKey {

@@ -473,6 +473,19 @@ impl Context {
         PyInt::from(i).into_ref(self)
     }
 
+    /// `new_int` for an `i64`, built in place for hot arithmetic: a value
+    /// in the small-int cache range is one compare and a clone of the cached
+    /// object, with no allocation, and any other value fills a recycled int
+    /// directly, without the generic conversion or a call.
+    #[inline(always)]
+    pub(crate) fn new_int_i64(&self, i: i64) -> PyIntRef {
+        let idx = i.wrapping_sub(i64::from(Self::INT_CACHE_POOL_MIN)) as u64;
+        if idx < self.int_cache_pool.len() as u64 {
+            return self.int_cache_pool[idx as usize].clone();
+        }
+        PyInt::from(i).into_ref(self)
+    }
+
     /// Borrow a cached small integer whose lifetime is tied to this context.
     #[inline(always)]
     pub(crate) fn cached_int(&self, i: i32) -> &Py<PyInt> {

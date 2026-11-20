@@ -1,6 +1,6 @@
 //! `cmp [-b] [-l] [-s] [-i SKIP[:SKIP2]] [-n LIMIT] FILE1 [FILE2 [SKIP1 [SKIP2]]]`:
-//! compares two files byte by byte. GNU's output (D016): `differ: byte N, line L`
-//! (BSD says `char`), `EOF on FILE after byte N`, `-l` offsets padded to the width of
+//! compares two files byte by byte. GNU's output (D016): `differ: char N, line L` in the C
+//! locale, `byte` in any other, `EOF on FILE after byte N`, `-l` offsets padded to the width of
 //! the longest possible one. Status 0 same, 1 different, 2 trouble. Written for psh
 //! after the GNU diffutils manual.
 
@@ -279,8 +279,16 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
             }
             let (c1, c2) = (sa[i], sb[i]);
             if !verbose {
+                let get = |n: &[u8]| ctx.var(n).filter(|v| !v.is_empty());
+                let locale = get(b"LC_ALL")
+                    .or_else(|| get(b"LC_MESSAGES"))
+                    .or_else(|| get(b"LANG"));
+                let unit = match locale {
+                    None | Some(b"C" | b"POSIX") => "char",
+                    Some(_) => "byte",
+                };
                 let mut line = format!(
-                    "{} {} differ: byte {pos}, line {}",
+                    "{} {} differ: {unit} {pos}, line {}",
                     String::from_utf8_lossy(&names[0]),
                     String::from_utf8_lossy(&names[1]),
                     lines + 1

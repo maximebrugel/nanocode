@@ -368,10 +368,24 @@ declare function DateTimezoneOffset(t: f64): f64;
 declare function ArrayBufferCreate(proto: Obj, byteLength: f64, max: Value): Obj;
 /**
  * A field of an ArrayBuffer: 0 byteLength, 1 maxByteLength, 2 resizable, 3 detached,
- * 4 immutable (D1970).
+ * 4 immutable (D1970), 5 shared (a SharedArrayBuffer), 6 a SharedArrayBuffer's waiter
+ * list (undefined for any other buffer).
  * TypeError "ArrayBuffer object expected" for anything else. @leaf
  */
 declare function BufferInfo(b: Value, field: i32): Value;
+/**
+ * A SharedArrayBuffer of byteLength zero bytes (growable up to max when max is a Number)
+ * with prototype proto; waiters (a Record [head]) is its Atomics waiter list. @leaf
+ */
+declare function SharedArrayBufferCreate(proto: Obj, byteLength: f64, max: Value, waiters: Obj): Obj;
+/**
+ * An atomic operation on element i of an integer typed array: op 0 add, 1 and, 2
+ * exchange, 3 or, 4 sub, 5 xor, 6 compareExchange (v expected, w the replacement), 7
+ * load; the operands are integral Numbers or BigInts, taken modulo 2^bits, and the
+ * result is the old element. Op 8: whether the element equals v (Atomics.wait).
+ * RangeError if i is not a valid index. @leaf
+ */
+declare function AtomicOp(o: Obj, i: f64, op: i32, v: Value, w: Value): Value;
 /** DetachArrayBuffer. @leaf */
 declare function BufferDetach(b: Obj): void;
 /** Resizes a resizable buffer in place (new bytes are 0). @leaf */
@@ -600,8 +614,11 @@ declare function StrSubstring(s: Str, start: f64, end: f64): Str;
 declare function StrIndexOf(s: Str, search: Str, from: f64): f64;
 /** The last index ≤ from where search occurs, or -1. @leaf */
 declare function StrLastIndexOf(s: Str, search: Str, from: f64): f64;
-/** Full Unicode upper- or lowercase (SpecialCasing, Final_Sigma; no locales). @leaf */
-declare function StrToCase(s: Str, upper: boolean): Str;
+/**
+ * Full Unicode upper- or lowercase (SpecialCasing, Final_Sigma). `mode` is 0 for
+ * lower, 1 for upper, plus 2, 4 or 6 for the tr/az, lt or el rules. @leaf
+ */
+declare function StrToCase(s: Str, mode: i32): Str;
 /** Trims WhiteSpace and LineTerminators: where 0 both ends, 1 start, 2 end. @leaf */
 declare function StrTrim(s: Str, where: i32): Str;
 /** IsStringWellFormedUnicode. @leaf */
@@ -869,7 +886,8 @@ declare function RecordSet(r: Obj, i: i32, v: Value): void;
  * AsyncFromSyncIteratorUnwrap, 14 AsyncFromSyncIteratorCloseThrow, 15
  * ProxyRevokeFunction, 16 FromAsyncFulfilled, 17 FromAsyncRejected, 18
  * AsyncDisposeFulfilled, 19 AsyncDisposeRejected, 20 DecoratorAddInitializer, 21
- * DecoratorAccessGet, 22 DecoratorAccessSet, 23 DecoratorAccessHas, 24 DecoratorParamCall) with `this` = data and its own
+ * DecoratorAccessGet, 22 DecoratorAccessSet, 23 DecoratorAccessHas, 24 DecoratorParamCall, 25 IntlBoundFormat, 26
+ * IntlBoundCompare, 27 AtomicsWaitTimeout) with `this` = data and its own
  * arguments.
  * @leaf
  */
@@ -989,6 +1007,34 @@ declare function Utf8Encode(s: Str, buffer: Value, offset: Value, length: Value)
  * sequence for the next call if stream; undefined for a fatal error. @leaf
  */
 declare function Utf8Decode(decoder: Obj, buffer: Value, offset: Value, length: Value, stream: boolean): Value;
+// ---- Intl (ECMA-402; builtins/intl.ts, builtins/intl/) -------------------------------
+//
+// Kinds: 0 NumberFormat, 1 DateTimeFormat, 2 Collator, 3 PluralRules, 4 ListFormat, 5
+// RelativeTimeFormat. Option lists are name \u0002 value pairs joined by \u0001.
+
+/** Whether this build has Intl's locale data (djs-core's `embed`). @leaf */
+declare function IntlEnabled(): boolean;
+/** A new Intl object of kind with its resolved options spec. @leaf */
+declare function IntlCreate(proto: Obj, kind: i32, spec: Str): Obj;
+/** v's resolved options if it is an Intl object of kind, else undefined. @leaf */
+declare function IntlSpec(v: Value, kind: i32): Value;
+/** o's bound format or compare function, first set to f unless f is undefined. @leaf */
+declare function IntlBound(o: Obj, f: Value): Value;
+/**
+ * The resolved options of kind for the LF-joined language tags and the raw options, else
+ * RangeError or TypeError. @leaf
+ */
+declare function IntlResolve(kind: i32, locales: Str, raw: Str): Str;
+/**
+ * x (and y) formatted by the resolved options spec of kind: a string, or with parts the
+ * parts as type \u0002 value pairs joined by \u0001; a Collator's comparison as a number. @leaf
+ */
+declare function IntlFormat(kind: i32, spec: Str, x: Value, y: Value, parts: boolean): Value;
+/**
+ * The canonical LF-joined tags, else RangeError. `supported` 0 keeps them all; a
+ * constructor's kind + 1 keeps those whose language ICU has data for in that service. @leaf
+ */
+declare function IntlLocales(tags: Str, supported: i32): Str;
 
 // ---- JSON (0033, builtins/json.rs over crate::json) -------------------------------------
 

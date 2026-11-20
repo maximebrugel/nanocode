@@ -10,9 +10,11 @@ function ToIndex(v: Value): f64 {
   return i;
 }
 
-/** The ArrayBuffer `this` of a prototype method. */
+/** The ArrayBuffer `this` of a prototype method: not a SharedArrayBuffer. */
 function ThisArrayBuffer(v: Value): Obj {
-  BufferInfo(v, 0);
+  if (AsBool(BufferInfo(v, 5))) {
+    throw NewTypeError("ArrayBuffer expected, got a SharedArrayBuffer");
+  }
   return AsObj(v);
 }
 
@@ -66,7 +68,7 @@ function ArrayBufferSpecies(this: Value): Value {
  * @getter ArrayBuffer.prototype.byteLength
  */
 function ArrayBufferPrototypeByteLength(this: Value): Value {
-  return BufferInfo(this, 0);
+  return BufferInfo(ThisArrayBuffer(this), 0);
 }
 
 /**
@@ -74,7 +76,7 @@ function ArrayBufferPrototypeByteLength(this: Value): Value {
  * @getter ArrayBuffer.prototype.maxByteLength
  */
 function ArrayBufferPrototypeMaxByteLength(this: Value): Value {
-  return BufferInfo(this, 1);
+  return BufferInfo(ThisArrayBuffer(this), 1);
 }
 
 /**
@@ -82,7 +84,7 @@ function ArrayBufferPrototypeMaxByteLength(this: Value): Value {
  * @getter ArrayBuffer.prototype.resizable
  */
 function ArrayBufferPrototypeResizable(this: Value): Value {
-  return BufferInfo(this, 2);
+  return BufferInfo(ThisArrayBuffer(this), 2);
 }
 
 /**
@@ -90,7 +92,7 @@ function ArrayBufferPrototypeResizable(this: Value): Value {
  * @getter ArrayBuffer.prototype.detached
  */
 function ArrayBufferPrototypeDetached(this: Value): Value {
-  return BufferInfo(this, 3);
+  return BufferInfo(ThisArrayBuffer(this), 3);
 }
 
 /**
@@ -98,7 +100,7 @@ function ArrayBufferPrototypeDetached(this: Value): Value {
  * @getter ArrayBuffer.prototype.immutable
  */
 function ArrayBufferPrototypeImmutable(this: Value): Value {
-  return BufferInfo(this, 4);
+  return BufferInfo(ThisArrayBuffer(this), 4);
 }
 
 /** IsImmutableBuffer ( buffer ): a buffer whose bytes never change (D1970). */
@@ -150,7 +152,7 @@ function ArrayBufferPrototypeSlice(this: Value, start: Value, end: Value): Obj {
   const newLen: f64 = fin > first ? fin - first : 0;
   const ctor: Value = SpeciesConstructor(o, RealmConstructor("ArrayBuffer"));
   const created: Obj = Construct(ctor, newLen);
-  BufferInfo(created, 0);
+  ThisArrayBuffer(created);
   if (IsDetached(created)) {
     throw NewTypeError("ArrayBuffer is detached");
   }

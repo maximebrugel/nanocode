@@ -171,7 +171,60 @@ pub fn sqrt(x: f64) -> Result<f64> {
 /// Return the cube root of x.
 #[inline]
 pub fn cbrt(x: f64) -> Result<f64> {
-    super::math_1(x, crate::m::cbrt, false)
+    super::math_1(x, glibc_cbrt, false)
+}
+
+/// Cube root computed as glibc's sysdeps/ieee754/dbl-64/s_cbrt.c does, so math.cbrt
+/// returns what CPython does on glibc (cbrt(27.0) is 3.0000000000000004 there), on
+/// every target and whichever libm the binary links.
+fn glibc_cbrt(x: f64) -> f64 {
+    const CBRT2: f64 = 1.2599210498948732; // 2^(1/3)
+    const SQR_CBRT2: f64 = 1.5874010519681996; // 2^(2/3)
+    const FACTOR: [f64; 5] = [1.0 / SQR_CBRT2, 1.0 / CBRT2, 1.0, CBRT2, SQR_CBRT2];
+    if x == 0.0 || !x.is_finite() {
+        return x + x;
+    }
+    // frexp(|x|): xm in [0.5, 1), scaling subnormals up by 2^54 first.
+    let (a, adj) = if x.abs() < f64::MIN_POSITIVE {
+        (x.abs() * f64::from_bits(0x4350_0000_0000_0000), -54)
+    } else {
+        (x.abs(), 0)
+    };
+    let bits = a.to_bits();
+    let xe = ((bits >> 52) & 0x7ff) as i32 - 1022 + adj;
+    let xm = f64::from_bits((bits & !(0x7ff_u64 << 52)) | (1022_u64 << 52));
+    let u = 0.35489576504391984
+        + ((1.508191937815849
+            + ((-2.114994941673713
+                + ((2.4469312256353444
+                    + ((-1.8346927748361308
+                        + (0.7849323449766392 - 0.14526389938548637 * xm) * xm)
+                        * xm))
+                    * xm))
+                * xm))
+            * xm);
+    let t2 = u * u * u;
+    let ym = u * (t2 + 2.0 * xm) / (2.0 * t2 + xm) * FACTOR[(2 + xe % 3) as usize];
+    // ldexp(±ym, xe / 3): |xe / 3| <= 358, so 2^(xe / 3) is a normal double and the product is exact.
+    let scale = f64::from_bits(((xe / 3 + 1023) as u64) << 52);
+    if x > 0.0 { ym * scale } else { -ym * scale }
+}
+
+#[cfg(test)]
+mod glibc_cbrt_tests {
+    use super::glibc_cbrt;
+
+    #[test]
+    fn matches_glibc() {
+        assert_eq!(glibc_cbrt(27.0), 3.0000000000000004);
+        assert_eq!(glibc_cbrt(-27.0), -3.0000000000000004);
+        assert_eq!(glibc_cbrt(8.0), 2.0);
+        assert_eq!(glibc_cbrt(1.0), 1.0);
+        assert_eq!(glibc_cbrt(-0.0).to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(glibc_cbrt(f64::INFINITY), f64::INFINITY);
+        assert!(glibc_cbrt(f64::NAN).is_nan());
+        assert_eq!(glibc_cbrt(5e-324), 1.7031839360032601e-108);
+    }
 }
 
 /// Return x raised to the power y.

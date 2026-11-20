@@ -361,8 +361,7 @@ impl M<'_> {
             let (u, len) = decode(self.text, pos, self.utf8());
             let next = pos + len;
             nlist.clear();
-            for i in 0..clist.dense.len() {
-                let (pc, start) = clist.dense[i];
+            for &(pc, start) in &clist.dense {
                 if best.is_some_and(|(bs, _)| start > bs) {
                     continue;
                 }

@@ -1398,7 +1398,12 @@ impl<'warnings> Compiler<'warnings> {
         let mut sequence_built = false;
         let mut i = 0u32;
 
-        if big {
+        // CPython 3.12's starunpack_helper folds a set display only when every
+        // element is constant; the constant prefix before a starred element is
+        // added item by item, so the late list/set fold must not turn it into a
+        // frozenset + SET_UPDATE (which changes the resulting set's order).
+        let stream_set = seen_star && matches!(collection_type, CollectionType::Set);
+        if big || stream_set {
             self.set_source_range(collection_range);
             match collection_type {
                 CollectionType::List => {

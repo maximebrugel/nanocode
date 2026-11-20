@@ -279,6 +279,12 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         false
     }
 
+    /// Record keys the last load read from the store, taken once.
+    #[doc(hidden)]
+    fn take_stored_records(&self) -> Option<std::collections::HashSet<String>> {
+        None
+    }
+
     #[doc(hidden)]
     fn holds_back_formats(&self) -> bool {
         false

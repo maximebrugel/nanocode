@@ -30,6 +30,11 @@ pub struct Reader<R> {
     /// A parse error ended the input.
     failed: bool,
     keys: Vec<Option<Rc<str>>>,
+    /// The elements of the arrays being read, innermost last, so each array is made at
+    /// its size once complete.
+    items: Vec<Val>,
+    /// The same for the objects being read.
+    pairs: Vec<(Rc<str>, Val)>,
 }
 
 const CHUNK: usize = 64 * 1024;
@@ -46,6 +51,8 @@ impl<R: Read> Reader<R> {
             lines_read: 0,
             failed: false,
             keys: vec![None; 256],
+            items: Vec::new(),
+            pairs: Vec::new(),
         }
     }
 
@@ -57,19 +64,26 @@ impl<R: Read> Reader<R> {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
-        let mut chunk = vec![0u8; CHUNK];
+        // Read straight into the buffer's tail, which keeps its allocation from one
+        // fill to the next.
+        let len = self.buf.len();
+        self.buf.resize(len + CHUNK, 0);
         loop {
-            match self.src.read(&mut chunk) {
+            match self.src.read(&mut self.buf[len..]) {
                 Ok(0) => {
+                    self.buf.truncate(len);
                     self.eof = true;
                     return Ok(false);
                 }
                 Ok(n) => {
-                    self.buf.extend_from_slice(&chunk[..n]);
+                    self.buf.truncate(len + n);
                     return Ok(true);
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.buf.truncate(len);
+                    return Err(e);
+                }
             }
         }
     }
@@ -215,6 +229,9 @@ impl<R: Read> Reader<R> {
     }
 
     fn value_top(&mut self) -> Result<Option<Val>, ParseError> {
+        // What an error left of a value being read.
+        self.items.clear();
+        self.pairs.clear();
         // A byte order mark before a value is skipped, as jq does.
         if self.peek().ok().flatten() == Some(0xEF)
             && self.buf.get(self.pos..self.pos + 3) == Some(&[0xEF, 0xBB, 0xBF][..])
@@ -224,12 +241,20 @@ impl<R: Read> Reader<R> {
         let r = self.skip_ws();
         self.io(r)?;
         let p = self.peek();
-        if self.io(p)?.is_none() {
+        let Some(first) = self.io(p)? else {
             // At the end jq has read every line.
             self.lines_read = self.line - 1;
             return Ok(None);
-        }
+        };
         let v = self.value(0)?;
+        if !matches!(first, b'[' | b'{' | b'"') {
+            // jq delivers a bare literal at the byte that ends it, and only once that byte
+            // is taken: a stray `,` `:` `]` or `}` there fails, and the literal is lost.
+            let p = self.peek();
+            if let Some(b',' | b':' | b']' | b'}') = self.io(p)? {
+                return self.value(0).map(Some);
+            }
+        }
         let r = self.note_line();
         self.io(r)?;
         Ok(Some(v))
@@ -252,14 +277,14 @@ impl<R: Read> Reader<R> {
         match b {
             b'{' => {
                 self.bump().ok();
-                let mut m = Map::new();
                 let r = self.skip_ws();
                 self.io(r)?;
                 let p = self.peek();
                 if self.io(p)? == Some(b'}') {
                     self.bump().ok();
-                    return Ok(Val::obj(m));
+                    return Ok(Val::obj(Map::new()));
                 }
+                let start = self.pairs.len();
                 loop {
                     let r = self.skip_ws();
                     self.io(r)?;
@@ -288,23 +313,33 @@ impl<R: Read> Reader<R> {
                     match self.io(p)? {
                         Some(b':') => {}
                         None => return self.unfinished(),
+                        Some(b',' | b'}') => {
+                            return self.error("Objects must consist of key:value pairs");
+                        }
+                        Some(b']') => return self.error("Unmatched ']'"),
                         Some(_) => {
                             self.unbump();
                             return self.separator_error();
                         }
                     }
                     let v = self.value(depth + 1)?;
-                    m.insert(k, v);
+                    self.pairs.push((k, v));
                     let r = self.skip_ws();
                     self.io(r)?;
                     let p = self.bump();
                     match self.io(p)? {
                         Some(b',') => {}
-                        Some(b'}') => return Ok(Val::obj(m)),
-                        None => return self.unfinished(),
-                        Some(b']') => {
-                            return self.error("Unmatched ']' in the middle of an object");
+                        Some(b'}') => {
+                            let mut m = Map::with_capacity(self.pairs.len() - start);
+                            for (k, v) in self.pairs.drain(start..) {
+                                m.insert(k, v);
+                            }
+                            return Ok(Val::obj(m));
                         }
+                        None => return self.unfinished(),
+                        // jq holds the key on its stack until the value is complete.
+                        Some(b']') => return self.error("Unmatched ']'"),
+                        Some(b':') => return self.error("':' not as part of an object"),
                         Some(_) => {
                             self.unbump();
                             return self.separator_error();
@@ -314,14 +349,14 @@ impl<R: Read> Reader<R> {
             }
             b'[' => {
                 self.bump().ok();
-                let mut a = Vec::new();
                 let r = self.skip_ws();
                 self.io(r)?;
                 let p = self.peek();
                 if self.io(p)? == Some(b']') {
                     self.bump().ok();
-                    return Ok(Val::arr(a));
+                    return Ok(Val::arr(Vec::new()));
                 }
+                let start = self.items.len();
                 loop {
                     let r = self.skip_ws();
                     self.io(r)?;
@@ -334,15 +369,17 @@ impl<R: Read> Reader<R> {
                         }
                         _ => {}
                     }
-                    a.push(self.value(depth + 1)?);
+                    let v = self.value(depth + 1)?;
+                    self.items.push(v);
                     let r = self.skip_ws();
                     self.io(r)?;
                     let p = self.bump();
                     match self.io(p)? {
                         Some(b',') => {}
-                        Some(b']') => return Ok(Val::arr(a)),
+                        Some(b']') => return Ok(Val::arr(self.items.drain(start..).collect())),
                         None => return self.unfinished(),
-                        Some(b'}') => return self.error("Unmatched '}' in the middle of an array"),
+                        Some(b'}') => return self.error("Objects must consist of key:value pairs"),
+                        Some(b':') => return self.error("':' not as part of an object"),
                         Some(_) => {
                             self.unbump();
                             return self.separator_error();
@@ -365,7 +402,7 @@ impl<R: Read> Reader<R> {
             }
             b':' => {
                 self.bump().ok();
-                self.error("':' not as part of an object")
+                self.error("Expected string key before ':'")
             }
             _ => self.literal(),
         }
@@ -476,7 +513,9 @@ impl<R: Read> Reader<R> {
             "-Infinity" | "-infinity" => return Ok(Val::num(f64::NEG_INFINITY)),
             _ => {}
         }
-        if matches!(tok.first(), Some(b't' | b'f' | b'n')) {
+        // jq matches a token against `true`, `false` or `null` by its first bytes (`nu`
+        // for null, as a lone `n` may start `nan`); anything else is read as a number.
+        if matches!(tok.first(), Some(b't' | b'f')) || tok.starts_with(b"nu") {
             return self.error("Invalid literal");
         }
         match Num::literal(&t) {
@@ -529,6 +568,20 @@ impl<R: Read> Reader<R> {
     }
 
     fn string(&mut self) -> Result<Rc<str>, ParseError> {
+        // A string without escapes whose end is in the buffer is made straight from it.
+        let rest = &self.buf[self.pos..];
+        if let Some(n) = rest
+            .get(1..)
+            .and_then(|r| r.iter().position(|&c| c == b'"' || c == b'\\' || c < 0x20))
+            && rest[1 + n] == b'"'
+            && let raw = &rest[1..1 + n]
+            && let Ok(text) = std::str::from_utf8(raw)
+        {
+            let s: Rc<str> = Rc::from(text);
+            self.col += 2 + raw.iter().filter(|&&c| c & 0xC0 != 0x80).count();
+            self.pos += n + 2;
+            return Ok(s);
+        }
         self.bump().ok(); // the quote
         let mut out: Vec<u8> = Vec::new();
         // jq complains about a bad escape or a raw control character once the string is
@@ -880,5 +933,151 @@ pub fn write(out: &mut Vec<u8>, v: &Val, style: &Style, level: usize) {
                 out.extend_from_slice(RESET);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ParseError, Reader};
+
+    /// The values read before the input ends, compact, and the parse error ending it.
+    fn read(text: &str) -> (Vec<String>, Option<String>) {
+        let mut r = Reader::new(text.as_bytes());
+        let mut vals = Vec::new();
+        while let Some(v) = r.next_value() {
+            match v {
+                Ok(v) => vals.push(v.to_json()),
+                Err(ParseError(m)) => return (vals, Some(m)),
+            }
+        }
+        (vals, None)
+    }
+
+    fn check(text: &str, vals: &[&str], err: &str) {
+        let (got, e) = read(text);
+        let want = vals.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!((got, e.as_deref()), (want, Some(err)), "{text:?}");
+    }
+
+    #[test]
+    fn literal_ended_by_stray_delimiter_is_lost() {
+        check(
+            "3,1,2,",
+            &[],
+            "Expected value before ',' at line 1, column 2",
+        );
+        check(
+            "1: x\n",
+            &[],
+            "Expected string key before ':' at line 1, column 2",
+        );
+        check("1]", &[], "Unmatched ']' at line 1, column 2");
+        check("1}", &[], "Unmatched '}' at line 1, column 2");
+        check(
+            "1 2 3,",
+            &["1", "2"],
+            "Expected value before ',' at line 1, column 6",
+        );
+        check(
+            "1 ,",
+            &["1"],
+            "Expected value before ',' at line 1, column 3",
+        );
+        check("1\n]", &["1"], "Unmatched ']' at line 2, column 1");
+        check(
+            "1[",
+            &["1"],
+            "Unfinished JSON term at EOF at line 1, column 2",
+        );
+    }
+
+    #[test]
+    fn nested_values_and_strings_read_whole() {
+        let (vals, err) = read(
+            "[\"a\",\"é\\u00e9\",[[],{}],{\"k\":[1,{\"k\":\"v\\n\"}],\"j\":\"\"}] \"ü\" {\"a\":1,\"a\":2}",
+        );
+        assert_eq!(err, None);
+        assert_eq!(
+            vals,
+            [
+                "[\"a\",\"éé\",[[],{}],{\"k\":[1,{\"k\":\"v\\n\"}],\"j\":\"\"}]",
+                "\"ü\"",
+                "{\"a\":2}",
+            ]
+        );
+        // The column counts characters, past a string read whole as past one with escapes.
+        check("[\"éé\" 1]", &[], "Expected separator between values at line 1, column 8");
+        check("[\"\\u00e9\" 1]", &[], "Expected separator between values at line 1, column 12");
+    }
+
+    #[test]
+    fn values_after_an_error_inside_collections_stand_alone() {
+        let mut r = Reader::new(&b"[1,[2,{\"a\":3,]]] [4] {\"b\":[5]}"[..]);
+        assert!(matches!(r.next_value(), Some(Err(_))));
+        let rest: Vec<_> = std::iter::from_fn(|| r.next_value())
+            .filter_map(|v| v.ok().map(|v| v.to_json()))
+            .collect();
+        assert!(rest.iter().all(|v| !v.contains('2') && !v.contains('3')), "{rest:?}");
+    }
+
+    #[test]
+    fn colon_without_key() {
+        check(
+            "[1]:",
+            &["[1]"],
+            "Expected string key before ':' at line 1, column 4",
+        );
+        check(
+            "\"a\":1",
+            &["\"a\""],
+            "Expected string key before ':' at line 1, column 4",
+        );
+        check(
+            "[:]",
+            &[],
+            "Expected string key before ':' at line 1, column 2",
+        );
+        check(
+            "{:1}",
+            &[],
+            "Expected string key before ':' at line 1, column 2",
+        );
+        check(
+            "[1:2]",
+            &[],
+            "':' not as part of an object at line 1, column 3",
+        );
+        check(
+            r#"{"a":1:}"#,
+            &[],
+            "':' not as part of an object at line 1, column 7",
+        );
+    }
+
+    #[test]
+    fn mismatched_closers() {
+        check(
+            r#"{"a"}"#,
+            &[],
+            "Objects must consist of key:value pairs at line 1, column 5",
+        );
+        check(
+            r#"{"a",1}"#,
+            &[],
+            "Objects must consist of key:value pairs at line 1, column 5",
+        );
+        check(
+            "[1}",
+            &[],
+            "Objects must consist of key:value pairs at line 1, column 3",
+        );
+        check(r#"{"a":1]"#, &[], "Unmatched ']' at line 1, column 7");
+    }
+
+    #[test]
+    fn literal_kinds() {
+        check("n ", &[], "Invalid numeric literal at line 1, column 2");
+        check("1 nul ", &["1"], "Invalid literal at line 1, column 6");
+        check("tru,", &[], "Invalid literal at line 1, column 4");
     }
 }

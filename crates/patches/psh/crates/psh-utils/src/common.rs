@@ -39,7 +39,11 @@ pub async fn option_error(
     argv: &[Vec<u8>],
     e: &OptError,
 ) -> i32 {
-    if e.is_unknown() {
+    // Utilities whose every GNU short option psh has: an unknown one is GNU's usage
+    // error, not one psh lacks.
+    const COMPLETE: &[&str] = &["basename", "dirname"];
+    let complete = COMPLETE.contains(&spec.name) && !e.option().starts_with("--");
+    if e.is_unknown() && !complete {
         if let Some(status) = ctx.run_program(argv.to_vec()).await {
             return status;
         }

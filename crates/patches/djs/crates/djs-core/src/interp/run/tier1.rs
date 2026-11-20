@@ -10,7 +10,9 @@ use crate::value::Value;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
-fn body(b: &[u8], head: u32, end: u32) -> Result<(u32, i64, Option<(u32, u32)>), u8> {
+type Scan = (u32, i64, Option<(u32, u32)>);
+
+fn body(b: &[u8], head: u32, end: u32) -> Result<Scan, u8> {
     let (mut at, mut fuel, mut site, mut prev, mut call, mut field) = (head, 0, None, head, false, false);
     while at < end {
         let w = word(b, at);
@@ -408,6 +410,11 @@ enum K {
     Compare,
     Div,
     Equal,
+    FoldAnd,
+    FoldMod,
+    FoldMul,
+    FoldOr,
+    FoldXor,
     GetElem,
     IsNullish,
     IsUndefined,
@@ -624,6 +631,57 @@ fn accumulate(r: &mut [Value; 256], o: &Op, a: usize, c: usize, fuel: &mut i64, 
     };
     r[a] = s;
     r[c] = Value::int(y);
+    *fuel = left;
+    out
+}
+
+#[inline(never)]
+fn fold(
+    r: &mut [Value; 256],
+    o: &Op,
+    q: &Op,
+    fuel: &mut i64,
+    pass: i64,
+    op: impl Fn(i32, i32) -> Option<Value>,
+) -> Result<Option<u16>, ()> {
+    let (a, c, t, sx, x) = (o.a as usize, o.c as usize, o.d as usize, q.a as usize, q.lx as usize);
+    let (Some(mut i), Some(y)) = (r[x].as_int(), r[c].as_int()) else {
+        return Err(());
+    };
+    let inv = if a == x {
+        None
+    } else {
+        Some(r[a].as_int().ok_or(())?)
+    };
+    let step = i32::from(q.lc as i8);
+    let cost = i64::from(o.mfuel) + i64::from(q.lfuel);
+    let (mut s, mut tv, mut left) = (r[sx], None, *fuel);
+    let out = loop {
+        let Some(v) = op(inv.unwrap_or(i), y) else {
+            break Err(());
+        };
+        let Some(w) = add(s, v) else {
+            break Err(());
+        };
+        (s, tv) = (w, Some(v));
+        let Some(n) = i.checked_add(step) else {
+            left -= i64::from(o.mfuel) + i64::from(q.fuel);
+            break Ok(Some(q.aux));
+        };
+        i = n;
+        left -= cost;
+        if n.wrapping_sub(q.n) as u32 > q.span {
+            break Ok(None);
+        }
+        if left <= pass {
+            break Ok(Some(0));
+        }
+    };
+    r[sx] = s;
+    r[x] = Value::int(i);
+    if let Some(v) = tv {
+        r[t] = v;
+    }
     *fuel = left;
     out
 }
@@ -1496,6 +1554,17 @@ fn local_put(w: u64) -> Option<(u32, bool)> {
 }
 
 impl Exec<'_> {
+    pub(crate) fn tier1_nudged(&self) -> bool {
+        self.tier1_nudge.is_some()
+    }
+
+    pub(crate) fn nudge_tier1(&mut self) {
+        if self.tier1_nudge.is_none() && self.opts.hot_loop {
+            self.tier1_nudge = Some(self.opts.hot_backedges);
+            self.opts.hot_backedges = 1;
+        }
+    }
+
     #[inline(never)]
     pub(super) fn run_tier1(&mut self) {
         let nudged = self
@@ -1505,7 +1574,8 @@ impl Exec<'_> {
         let start = self.fuel;
         match self.tier1() {
             Some(pass) => {
-                if (start - self.fuel) / i64::from(self.opts.hot_backedges) >= pass {
+                let long = (start - self.fuel) / i64::from(self.opts.hot_backedges) >= pass;
+                if long || self.fuel <= pass {
                     self.tier1_nudge = Some(self.opts.hot_backedges);
                     self.opts.hot_backedges = 1;
                 }
@@ -1731,6 +1801,32 @@ impl Exec<'_> {
                 (o.ra, o.rd, o.res, o.rfuel) = (ra, rd, true, rfuel);
             }
         }
+        if plan.prog.len() >= 3 {
+            let (o, q) = (&prog[0], &prog[1]);
+            let fk = match o.k.get() {
+                K::BAnd => Some(K::FoldAnd),
+                K::BOr => Some(K::FoldOr),
+                K::BXor => Some(K::FoldXor),
+                K::Mod => Some(K::FoldMod),
+                K::Mul => Some(K::FoldMul),
+                _ => None,
+            };
+            if let Some(fk) = fk
+                && matches!(q.k.get(), K::Add)
+                && q.l
+                && !targets[1]
+                && !o.m
+                && !o.l
+                && usize::from(o.nx) == 1
+                && q.a == q.d
+                && q.c == o.d
+                && ![o.a, o.c, q.a, q.lx].contains(&o.d)
+                && ![o.a, o.c, q.lx].contains(&q.a)
+                && o.c != q.lx
+            {
+                o.k.set(fk);
+            }
+        }
         let mut fuel = self.fuel;
         let mut mark = fuel;
         let mut k = 0u8;
@@ -1839,6 +1935,35 @@ impl Exec<'_> {
                         }
                     } else {
                         o.k.set(K::Add);
+                    }
+                }
+                K::FoldAnd | K::FoldMod | K::FoldMul | K::FoldOr | K::FoldXor => {
+                    let q = &prog[1];
+                    let kind = o.k.get();
+                    let res = match kind {
+                        K::FoldAnd => fold(&mut r, o, q, &mut fuel, pass, |x, y| Some(Value::int(x & y))),
+                        K::FoldOr => fold(&mut r, o, q, &mut fuel, pass, |x, y| Some(Value::int(x | y))),
+                        K::FoldXor => fold(&mut r, o, q, &mut fuel, pass, |x, y| Some(Value::int(x ^ y))),
+                        K::FoldMod => fold(&mut r, o, q, &mut fuel, pass, |x, y| {
+                            (x >= 0 && y != 0).then(|| Value::int(x % y))
+                        }),
+                        _ => fold(&mut r, o, q, &mut fuel, pass, |x, y| {
+                            Some(match x.checked_mul(y).filter(|&v| v != 0) {
+                                Some(v) => Value::int(v),
+                                None => number(f64::from(x) * f64::from(y)),
+                            })
+                        }),
+                    };
+                    match res {
+                        Ok(Some(e)) => break 'run e,
+                        Ok(None) => k = 3,
+                        Err(()) => o.k.set(match kind {
+                            K::FoldAnd => K::BAnd,
+                            K::FoldOr => K::BOr,
+                            K::FoldXor => K::BXor,
+                            K::FoldMod => K::Mod,
+                            _ => K::Mul,
+                        }),
                     }
                 }
                 K::Add => spin!({

@@ -129,8 +129,7 @@ pub async fn execute(
         headers: request.headers().clone(),
         body: request
             .body()
-            .and_then(crate::Body::as_bytes)
-            .map(<[u8]>::to_vec)
+            .and_then(crate::Body::bytes)
             .unwrap_or_default(),
     };
     let (status, headers, body, _) = layer

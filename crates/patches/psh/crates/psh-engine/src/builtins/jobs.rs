@@ -182,6 +182,8 @@ pub(super) async fn wait(vp: &mut Vp, args: &[Vec<u8>]) -> R {
         for j in &all {
             reap(vp, j);
         }
+        // bash's plain `wait` also forgets the statuses it kept for `wait PID`.
+        vp.jobs.borrow_mut().forget();
         return Ok(0);
     }
     for j in targets.into_iter().flatten() {
@@ -380,7 +382,14 @@ pub(super) async fn kill(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             match job_spec(vp, &w) {
                 Ok(j) => {
                     crate::jobs::settle(&vp.core.sched, &j).await;
-                    j.signal(sig, &vp.core.sched)
+                    if j.status().is_some() {
+                        // Finished before the shell noticed (see below).
+                        if sig != 0 && j.stopped().is_none() && super::trap::terminates(sig) {
+                            j.killed_late(sig);
+                        }
+                    } else {
+                        j.signal(sig, &vp.core.sched);
+                    }
                 }
                 Err(msg) => {
                     vp.error(&format!("kill: {msg}")).await;
@@ -423,13 +432,32 @@ pub(super) async fn kill(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             continue;
         }
         // One of our jobs: the job (its externals' groups, its vprocs).
-        let job = u32::try_from(pid)
-            .ok()
-            .and_then(|p| vp.jobs.borrow().by_pid(p));
-        if let Some(j) = job
-            && j.status().is_none()
-        {
-            j.signal(sig, &vp.core.sched);
+        let (job, gone) = match u32::try_from(pid) {
+            Ok(p) => {
+                let jobs = vp.jobs.borrow();
+                // A disowned job that finished is gone too.
+                match jobs.by_pid(p) {
+                    Some(j) if j.disowned.get() && j.status().is_some() => (None, true),
+                    j => (j, jobs.gone(p)),
+                }
+            }
+            Err(_) => (None, false),
+        };
+        if let Some(j) = job {
+            if j.status().is_none() {
+                j.signal(sig, &vp.core.sched);
+            } else if sig != 0 && j.stopped().is_none() && super::trap::terminates(sig) {
+                // Finished before the shell noticed: a bash child is still starting
+                // when `kill $!` follows `cmd &`, and the signal ends it.
+                j.killed_late(sig);
+            }
+            continue;
+        }
+        // A job `wait` or `jobs` reported, or one the shell let go of: its process
+        // is gone, and bash's kill(2) fails with ESRCH.
+        if gone {
+            vp.error(&format!("kill: ({pid}) - No such process")).await;
+            status = 1;
             continue;
         }
         // The shell itself, from a shell psh runs for `bash`/`sh` (`sh -c "kill $$"`):
@@ -702,8 +730,16 @@ pub(super) async fn disown(vp: &mut Vp, args: &[Vec<u8>]) -> R {
             }
         }
     }
+    // `disown -a` deletes every job, and bash forgets the saved statuses with them.
+    let forget = all && !running && args.len() <= i;
     for j in chosen {
         j.disown();
+        if forget {
+            j.forgotten.set(true);
+        }
+    }
+    if forget {
+        vp.jobs.borrow_mut().forget();
     }
     Ok(status)
 }

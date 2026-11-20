@@ -559,7 +559,7 @@ impl Client {
                         method: method.clone(),
                         url: url.to_owned(),
                         headers: merged,
-                        body: body.to_vec(),
+                        body: body.to_vec().into(),
                     })
                     .await
                     .map_err(|error| sender_error(&error))?;

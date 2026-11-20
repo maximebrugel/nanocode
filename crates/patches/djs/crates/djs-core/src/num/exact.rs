@@ -9,8 +9,6 @@ use super::big::Big;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Round {
-    /// Round half to even (IEEE default, used when parsing and for shortest digits).
-    HalfEven,
     /// Round half away from zero (Number.prototype.toFixed / toExponential / toPrecision).
     HalfUp,
 }
@@ -38,31 +36,23 @@ fn pow_bits_upper(r: u32, n: u32) -> u32 {
 /// `round(x * 2^e2 * radix^k)` as an integer.
 pub(crate) fn scale_round(mut x: Big, e2: i32, radix: u32, k: i32, mode: Round) -> Big {
     let (r, s) = split_radix(radix);
-    // Compute floor(2 * value) and whether it was inexact; the low bit is then the half bit.
+    // Compute floor(2 * value); its low bit is then the half bit, which rounds half up.
+    let Round::HalfUp = mode;
     let t = e2 + s * k + 1;
-    let mut sticky = false;
     if k >= 0 {
         x.mul_pow(r, k as u32);
-        if t >= 0 {
-            x.shl(t as u32);
-        } else {
-            sticky = x.shr_sticky((-t) as u32);
-        }
+    }
+    if t >= 0 {
+        x.shl(t as u32);
     } else {
-        if t >= 0 {
-            x.shl(t as u32);
-        } else {
-            sticky = x.shr_sticky((-t) as u32);
-        }
-        sticky |= x.div_pow(r, (-k) as u32);
+        x.shr_sticky((-t) as u32);
+    }
+    if k < 0 {
+        x.div_pow(r, (-k) as u32);
     }
     let half = x.bit(0);
     x.shr_sticky(1);
-    let up = match mode {
-        Round::HalfUp => half,
-        Round::HalfEven => half && (sticky || x.bit(0)),
-    };
-    if up {
+    if half {
         x.add_small(1);
     }
     x

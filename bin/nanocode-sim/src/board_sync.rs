@@ -2805,6 +2805,7 @@ pub fn simulate(seed: u64, mutation: SyncMutation) -> SyncOutcome {
         latency_ms: shape.latency_ms,
         faults: AtomicU64::new(0),
         conflicts: AtomicU64::new(0),
+        fenced: AtomicU64::new(0),
     });
     let fakes = ["github", "linear", "slack"]
         .into_iter()

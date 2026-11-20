@@ -495,6 +495,45 @@ fn base32_decode(b: &[u8]) -> Vec<u8> {
 
 /// `_match_impl(re; flags; test)`: jq's matches over the `regex` crate with Oniguruma's
 /// Ruby defaults (`^`/`$` at line ends), offsets and lengths in code points.
+/// Rewrites each `$` outside a class and an escape as `(?m:$)`, Oniguruma's line end.
+fn line_ends(re: &str) -> String {
+    let mut out = String::with_capacity(re.len());
+    let mut chars = re.chars();
+    let mut class = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            }
+            '[' if !class => {
+                class = true;
+                out.push(c);
+                // A `]` first in a class (or after `^`) is a member, not its end.
+                let mut rest = chars.clone();
+                let mut lead = String::new();
+                if rest.clone().next() == Some('^') {
+                    lead.push(rest.next().unwrap_or('^'));
+                }
+                if rest.clone().next() == Some(']') {
+                    lead.push(rest.next().unwrap_or(']'));
+                    out.push_str(&lead);
+                    chars = rest;
+                }
+            }
+            ']' if class => {
+                class = false;
+                out.push(c);
+            }
+            '$' if !class => out.push_str("(?m:$)"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn match_impl(input: &Val, re: &Val, flags: &Val, test: bool) -> ValR {
     let s = match input {
         Val::Str(s) => s.clone(),
@@ -521,8 +560,11 @@ fn match_impl(input: &Val, re: &Val, flags: &Val, test: bool) -> ValR {
     };
     let mut global = false;
     let mut skip_empty = false;
-    let mut b = psh_pattern::RegexBuilder::new(&re_s);
-    b.multi_line(true);
+    // jq's Oniguruma (Perl syntax): `^` is the text's start only, `$` also matches
+    // before any newline unless the `s` flag asks for the text's end only.
+    let single = flags_s.contains(['s', 'p']);
+    let pattern = if single { re_s.to_string() } else { line_ends(&re_s) };
+    let mut b = psh_pattern::RegexBuilder::new(&pattern);
     for c in flags_s.chars() {
         match c {
             'g' => global = true,
@@ -533,11 +575,8 @@ fn match_impl(input: &Val, re: &Val, flags: &Val, test: bool) -> ValR {
                 b.ignore_whitespace(true);
             }
             'n' => skip_empty = true,
-            's' => {
-                b.multi_line(false);
-            }
+            's' => {}
             'p' => {
-                b.multi_line(false);
                 b.ignore_whitespace(true);
             }
             'l' => {}
@@ -581,6 +620,12 @@ fn match_impl(input: &Val, re: &Val, flags: &Val, test: bool) -> ValR {
                         c.insert("offset".into(), Val::from(cp(gs)));
                         c.insert("length".into(), Val::from(s[gs..ge].chars().count()));
                         c.insert("string".into(), Val::str(&s[gs..ge]));
+                    }
+                    // jq 1.7 orders an unmatched unnamed group's keys differently.
+                    None if name.is_none() => {
+                        c.insert("offset".into(), Val::num(-1.0));
+                        c.insert("string".into(), Val::Null);
+                        c.insert("length".into(), Val::num(0.0));
                     }
                     None => {
                         c.insert("offset".into(), Val::num(-1.0));

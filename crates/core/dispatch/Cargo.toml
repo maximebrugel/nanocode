@@ -1,0 +1,23 @@
+[package]
+autotests = false
+autobenches = false
+name = "nanocode-dispatch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sans-IO agent dispatcher over the board: spawn, retire and wait plans under member, project and dollar budgets, with spawn intents recorded on the board before any agent starts"
+
+[dependencies]
+nanocode-board-fold.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+test = false
+doctest = false
+bench = false

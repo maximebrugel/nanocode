@@ -385,7 +385,7 @@ impl Board {
                 return Ok(found);
             }
             let head = fold.next() - 1;
-            let wake_at = fold
+            let wake_at = self
                 .due_ms()
                 .filter(|due| *due > now)
                 .map_or(until_ms, |due| due.min(until_ms));

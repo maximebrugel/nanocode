@@ -226,6 +226,7 @@ fn curl_failure(
         Failure::Redirects => (47, format!("Maximum ({redirects}) redirects followed")),
         Failure::Secure(detail) => (60, detail.clone()),
         Failure::TooLarge => (63, "Maximum file size exceeded".to_owned()),
+        Failure::Denied(detail) if detail.is_empty() => (7, UNAVAILABLE.to_owned()),
         Failure::Denied(detail) => (7, format!("{detail}: {UNAVAILABLE}")),
         Failure::Other(detail) => (56, detail.clone()),
     }
@@ -511,6 +512,74 @@ fn write_out(
     out
 }
 
+/// The path of a `file://` URL (`file:///x` or `file://localhost/x`), percent escapes
+/// left as written.
+fn file_url(raw: &str) -> Option<&str> {
+    let (scheme, rest) = raw.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("file") {
+        return None;
+    }
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    Some(rest.split(['?', '#']).next().unwrap_or_default())
+}
+
+/// Copies a local file where a download would go, as curl does for `file://` URLs,
+/// which work without the network. `-w` sees no HTTP response (`000`).
+async fn curl_file(
+    ctx: &mut UtilCtx<'_>,
+    options: &Curl,
+    target: &Target,
+    path: &str,
+    quiet: bool,
+) -> i32 {
+    let (status, message) = match read_file(ctx, path.as_bytes()).await {
+        Err(_) => (37, format!("Couldn't open file {path}")),
+        Ok(body) if options.head => {
+            let head = format!("Content-Length: {}\r\nAccept-ranges: bytes\r\n\r\n", body.len());
+            match ctx.write(head.as_bytes()).await {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return 141,
+                Err(error) => (23, format!("Failure writing output to destination: {}", error_text(&error))),
+                Ok(()) => (0, String::new()),
+            }
+        }
+        Ok(body) => {
+            let written = match target {
+                Target::Stdout => ctx.write(&body).await,
+                Target::File(name) => write_file(ctx, name, &body).await,
+                Target::Remote => match path.rsplit('/').next() {
+                    Some(name) if !name.is_empty() => write_file(ctx, name.as_bytes(), &body).await,
+                    _ => Err(std::io::Error::other("Remote file name has no length")),
+                },
+            };
+            match written {
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return 141,
+                Err(error) => (23, format!("Failure writing output to destination: {}", error_text(&error))),
+                Ok(()) => (0, String::new()),
+            }
+        }
+    };
+    if let Some(format) = &options.write_out {
+        let request = Request {
+            method: "GET".to_owned(),
+            url: format!("file://{path}"),
+            headers: Vec::new(),
+            body: Bytes::default(),
+            follow: None,
+            timeout: None,
+            limit: 0,
+        };
+        let text = write_out(format, None, &request, status, &message, 0.0);
+        if ctx.write(text.as_bytes()).await.is_err() {
+            return 141;
+        }
+    }
+    if status != 0 && !quiet {
+        let _ = ctx.flush().await;
+        ctx.error(&format!("({status}) {message}")).await;
+    }
+    status
+}
+
 async fn curl(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
     let network = current();
     let options = match curl_options(ctx, argv).await {
@@ -533,14 +602,29 @@ async fn curl(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
             .await;
         return 2;
     }
-    let Some(Network { fetch, limit, .. }) = network else {
-        ctx.error(&format!("(7) {UNAVAILABLE}")).await;
-        return 7;
-    };
+    let limit = network.as_ref().map_or(0, |found| found.limit);
     let quiet = options.silent && !options.show_error;
     let mut last = 0;
     for (number, raw) in options.urls.iter().enumerate() {
+        let target = options.targets.get(number).unwrap_or(&Target::Stdout);
+        if let Some(path) = file_url(raw) {
+            let status = curl_file(ctx, &options, target, path, quiet).await;
+            if status == 141 {
+                return 141;
+            }
+            last = status;
+            continue;
+        }
         let mut url = with_scheme(raw);
+        let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            if !quiet {
+                let msg = format!("(1) Protocol \"{scheme}\" not supported");
+                ctx.error(&msg).await;
+            }
+            last = 1;
+            continue;
+        }
         let Some(target_parts) = parts(&url) else {
             if !quiet {
                 ctx.error("(3) URL rejected: No host part in the URL").await;
@@ -660,7 +744,10 @@ async fn curl(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
             limit,
         };
         let started = ctx.now();
-        let answer = fetch.fetch(request.clone()).await;
+        let answer = match &network {
+            Some(found) => found.fetch.fetch(request.clone()).await,
+            None => Err(Failure::Denied(String::new())),
+        };
         let seconds = ctx.now().saturating_sub(started).as_secs_f64();
         let answer = match answer {
             Ok(response) if response.body.len() as u64 > limit => Err(Failure::TooLarge),
@@ -700,7 +787,7 @@ async fn curl(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
             if !options.head {
                 output.extend_from_slice(&response.body);
             }
-            let written = match options.targets.get(number).unwrap_or(&Target::Stdout) {
+            let written = match target {
                 Target::Stdout => ctx.write(&output).await,
                 Target::File(path) => write_file(ctx, path, &output).await,
                 Target::Remote => {

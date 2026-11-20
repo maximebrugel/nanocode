@@ -4,13 +4,21 @@ use nanocode_durability_core::StoreError;
 use serde::{Deserialize, Serialize};
 
 pub mod access;
+pub mod brief;
+mod compact;
+pub mod deliver;
+pub mod delivery;
+pub mod intent;
 pub mod mirror;
 pub mod schedule;
 pub mod sim;
+pub mod stage;
+pub mod steer;
 pub mod tasks;
 pub mod watch;
 
 use sim::{Mutation, mutated};
+use stage::{Act, Stage};
 use tasks::{Moved, Occurrence, Refusal, TaskOp, Terms};
 
 const FIRST: u64 = 1;
@@ -34,8 +42,10 @@ id!(ClaimId);
 id!(EventId);
 
 pub mod blocks;
+pub mod group;
 pub mod messages;
 
+pub use compact::Spread;
 pub use messages::{MessageId, Say};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,11 +59,43 @@ pub struct NewTask {
     pub terms: Terms,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Fence {
+    pub partition: u32,
+    pub epoch: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum Outcome {
     Done(String),
     Failed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Cap {
+    Partition(u32),
+    Label {
+        max: u32,
+        key: String,
+        value: String,
+    },
+}
+
+impl Cap {
+    pub const fn max(&self) -> u32 {
+        match self {
+            Self::Partition(max) | Self::Label { max, .. } => *max,
+        }
+    }
+
+    pub fn covers(&self, task: &Task) -> bool {
+        match self {
+            Self::Partition(_) => true,
+            Self::Label { key, value, .. } => task.spec.labels.get(key) == Some(value),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +107,10 @@ pub enum Op {
     Claim {
         task: TaskId,
         lease_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fence: Option<Fence>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap: Option<Cap>,
     },
     Renew {
         task: TaskId,
@@ -108,6 +154,10 @@ pub enum Op {
     Revoke {
         grant: EventId,
     },
+    Epoch {
+        partition: u32,
+        epoch: u64,
+    },
     Charter {},
     Tasks(TaskOp),
     Sync {
@@ -117,6 +167,7 @@ pub enum Op {
         say: Say,
     },
     Watch(watch::Step),
+    Steer(steer::SteerOp),
 }
 
 impl Op {
@@ -134,8 +185,10 @@ impl Op {
             | Self::Move { task, .. } => Some(task),
             Self::Tasks(op) => Some(op.task()),
             Self::Sync { sync } => sync.task(),
+            Self::Steer(op) => Some(op.task()),
             Self::Grant { .. }
             | Self::Revoke { .. }
+            | Self::Epoch { .. }
             | Self::Charter {}
             | Self::Say { .. }
             | Self::Watch(_) => None,
@@ -161,9 +214,13 @@ pub enum Phase {
     },
     Done {
         result: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
     },
     Failed {
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<String>,
     },
     Cancelled {
         reason: String,
@@ -195,6 +252,9 @@ pub struct Task {
     pub due_at_ms: Option<u64>,
     #[serde(default)]
     pub occurrence: Option<Occurrence>,
+    /// The cap the current claim was taken under: renewing a lapsed claim takes a slot again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<Cap>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,8 +270,13 @@ pub enum Rejection {
     Access(access::Denied),
     Tasks(Refusal),
     Sync(mirror::Refusal),
+    Intent(intent::Refusal),
     Said(messages::Refusal),
     Watch(watch::Refusal),
+    Steer(steer::Refusal),
+    Illegal { from: String, to: String },
+    Stale { fence: Fence },
+    Full { cap: Cap },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +317,11 @@ pub enum Change {
         rank: Option<u64>,
     },
     Synced(mirror::Synced),
+    Steered(steer::Steered),
+    Reported {
+        child: TaskId,
+        report: intent::Report,
+    },
 }
 
 impl Change {
@@ -322,10 +392,18 @@ pub struct Fold {
     access: access::Access,
     mirror: mirror::Mirror,
     live: BTreeSet<TaskId>,
+    #[serde(skip)]
+    posted: BTreeMap<TaskId, usize>,
     #[serde(with = "crate::pairs")]
     labelled: BTreeMap<String, BTreeMap<String, BTreeSet<TaskId>>>,
     said: messages::Said,
     marks: watch::Marks,
+    #[serde(default)]
+    steers: steer::Steers,
+    #[serde(default)]
+    intents: intent::Intents,
+    #[serde(skip)]
+    refused: Option<nanocode_machine::Illegal<Stage>>,
 }
 
 impl Default for Fold {
@@ -347,9 +425,13 @@ impl Fold {
             access: access::Access::new(),
             mirror: mirror::Mirror::new(),
             live: BTreeSet::new(),
+            posted: BTreeMap::new(),
             labelled: BTreeMap::new(),
             said: messages::Said::new(),
             marks: watch::Marks::new(),
+            steers: steer::Steers::new(),
+            intents: intent::Intents::new(),
+            refused: None,
         }
     }
 
@@ -367,6 +449,10 @@ impl Fold {
 
     pub fn task(&self, id: &TaskId) -> Option<&Task> {
         self.tasks.get(id)
+    }
+
+    pub fn epoch(&self, partition: u32) -> u64 {
+        self.access.epoch(partition)
     }
 
     pub fn outcome(&self, event: &EventId) -> Option<&Result<u64, Rejection>> {
@@ -390,31 +476,28 @@ impl Fold {
     pub fn claimable(&self, id: &TaskId, at_ms: u64) -> Result<Option<ClaimId>, Rejection> {
         let task = self.tasks.get(id).ok_or(Rejection::UnknownTask)?;
         let now = self.now_ms.max(at_ms);
-        match &task.phase {
-            Phase::Open => {}
-            Phase::Claimed {
-                claim, until_ms, ..
-            } if (*until_ms > now || mutated(Mutation::LeasesNeverExpire))
-                && !mutated(Mutation::ClaimIgnoresLease) =>
+        match task.may(Act::Claim, now) {
+            Ok(Stage::Lapsed)
+                if mutated(Mutation::LeasesNeverExpire)
+                    && !mutated(Mutation::ClaimIgnoresLease) =>
             {
-                return Err(Rejection::Held {
-                    claim: claim.clone(),
-                    until_ms: *until_ms,
-                });
+                return Err(task.refusal(Act::Claim, Stage::Held));
             }
-            Phase::Claimed { claim, .. } => return Ok(Some(claim.clone())),
-            Phase::Blocked { .. } if !mutated(Mutation::ClaimIgnoresBlock) => {
-                return Err(Rejection::Tasks(Refusal::Blocked));
+            Ok(_) => {}
+            Err(refused) => {
+                let loose = match task.stage(now) {
+                    Stage::Held => mutated(Mutation::ClaimIgnoresLease),
+                    Stage::Blocked => mutated(Mutation::ClaimIgnoresBlock),
+                    Stage::Scheduled => mutated(Mutation::DueIgnored),
+                    _ => false,
+                };
+                if !loose {
+                    return Err(refused);
+                }
             }
-            Phase::Blocked { .. } => {}
-            _ => return Err(Rejection::Terminal),
         }
-        if let Some(due_at_ms) = task.due_at_ms
-            && due_at_ms > now
-            && matches!(task.phase, Phase::Open)
-            && !mutated(Mutation::DueIgnored)
-        {
-            return Err(Rejection::Tasks(Refusal::NotDue(due_at_ms)));
+        if let Phase::Claimed { claim, .. } = &task.phase {
+            return Ok(Some(claim.clone()));
         }
         if mutated(Mutation::ClaimIgnoresNeeds) {
             return Ok(None);
@@ -512,20 +595,25 @@ impl Fold {
     }
 
     fn holder(&self, id: &TaskId, held: &ClaimId) -> Result<&Task, Rejection> {
+        self.holds(id, held, Act::Renew)
+    }
+
+    fn holds(&self, id: &TaskId, held: &ClaimId, act: Act) -> Result<&Task, Rejection> {
         let task = self.tasks.get(id).ok_or(Rejection::UnknownTask)?;
+        task.may(act, self.now_ms)?;
         match &task.phase {
             Phase::Claimed { claim, .. } if claim == held => Ok(task),
-            Phase::Claimed { .. } | Phase::Open | Phase::Blocked { .. } => {
-                Err(Rejection::NotHolder)
-            }
-            _ => Err(Rejection::Terminal),
+            _ => Err(Rejection::NotHolder),
         }
     }
 
     pub fn check(&self, at_ms: u64, op: &Op) -> Result<(), Rejection> {
         match op {
             Op::Post { task } => {
-                if self.tasks.contains_key(&task.id) && !mutated(Mutation::PostOverwrites) {
+                if self.tasks.contains_key(&task.id)
+                    && !mutated(Mutation::PostOverwrites)
+                    && !self.reposted(task)
+                {
                     return Err(Rejection::Exists);
                 }
                 if let Some(parent) = &task.parent
@@ -543,7 +631,13 @@ impl Fold {
                     None => Ok(()),
                 }
             }
-            Op::Claim { task, .. } => self.claimable(task, at_ms).map(drop),
+            Op::Claim {
+                task, fence, cap, ..
+            } => {
+                self.fenced(fence.as_ref())?;
+                self.claimable(task, at_ms)?;
+                self.room(task, cap.as_ref(), at_ms)
+            }
             Op::Finish { task, .. } if mutated(Mutation::FinishIgnoresClaim) => {
                 match self.tasks.get(task).map(|task| &task.phase) {
                     None => Err(Rejection::UnknownTask),
@@ -557,32 +651,102 @@ impl Fold {
                 claim,
                 outcome,
             } => {
-                self.holder(task, claim)?;
+                self.holds(task, claim, Act::Finish)?;
+                self.unheeded(task)?;
                 self.scheduled(task, self.now_ms.max(at_ms), outcome)
                     .map(drop)
             }
-            Op::Renew { task, claim, .. } | Op::Release { task, claim, .. } => {
-                self.holder(task, claim).map(drop)
+            Op::Renew { task, claim, .. } => {
+                let held = self.holds(task, claim, Act::Renew)?;
+                if held.stage(self.now_ms.max(at_ms)) == Stage::Lapsed
+                    && !mutated(Mutation::RenewIgnoresCap)
+                {
+                    self.room(task, held.cap.as_ref(), at_ms)
+                } else {
+                    Ok(())
+                }
             }
+            Op::Release { task, claim, .. } => self.holds(task, claim, Act::Release).map(drop),
             Op::Cancel { task, .. } => match self.tasks.get(task) {
                 None => Err(Rejection::UnknownTask),
-                Some(task) if task.finished() => Err(Rejection::Terminal),
-                Some(_) => Ok(()),
+                Some(task) => task.may(Act::Cancel, self.now_ms.max(at_ms)).map(drop),
             },
             Op::Reply { task, .. } | Op::Relabel { task, .. } | Op::Rank { task, .. } => {
                 self.tasks.get(task).map(drop).ok_or(Rejection::UnknownTask)
             }
             Op::Move { task, parent } => self.movable(task, parent.as_ref()),
+            Op::Epoch { partition, epoch } => self.advances(*partition, *epoch),
             Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} => Ok(()),
             Op::Tasks(op) => self.check_tasks(at_ms, op),
             Op::Sync { sync } => self.check_sync(sync),
             Op::Say { .. } => Ok(()),
             Op::Watch(step) => self.check_step(at_ms, step),
+            Op::Steer(op) => self.check_steer(op),
         }
     }
 
     pub fn children(&self, task: &TaskId) -> impl Iterator<Item = &TaskId> {
         self.children.get(task).into_iter().flatten()
+    }
+
+    fn fenced(&self, fence: Option<&Fence>) -> Result<(), Rejection> {
+        let Some(fence) = fence else {
+            return Ok(());
+        };
+        let held = Fence {
+            partition: fence.partition,
+            epoch: self.access.epoch(fence.partition),
+        };
+        if held == *fence || mutated(Mutation::EpochFenceIgnored) {
+            Ok(())
+        } else {
+            Err(Rejection::Stale { fence: held })
+        }
+    }
+
+    pub fn held(&self, cap: &Cap, at_ms: u64) -> usize {
+        let now = self.now_ms.max(at_ms);
+        self.live
+            .iter()
+            .filter_map(|id| self.tasks.get(id))
+            .filter(|task| task.stage(now) == Stage::Held && cap.covers(task))
+            .count()
+    }
+
+    fn room(&self, task: &TaskId, cap: Option<&Cap>, at_ms: u64) -> Result<(), Rejection> {
+        let Some(cap) = cap else {
+            return Ok(());
+        };
+        let now = self.now_ms.max(at_ms);
+        let max = cap.max() as usize;
+        let others = self
+            .live
+            .iter()
+            .filter(|id| *id != task)
+            .filter_map(|id| self.tasks.get(id))
+            .filter(|held| held.stage(now) == Stage::Held)
+            .filter(|held| cap.covers(held) || mutated(Mutation::ClaimCapIgnoresLabel))
+            .take(max)
+            .count();
+        if others < max || mutated(Mutation::ClaimCapIgnored) {
+            Ok(())
+        } else {
+            Err(Rejection::Full { cap: cap.clone() })
+        }
+    }
+
+    fn advances(&self, partition: u32, epoch: u64) -> Result<(), Rejection> {
+        let epoch_held = self.access.epoch(partition);
+        if epoch > epoch_held {
+            Ok(())
+        } else {
+            Err(Rejection::Stale {
+                fence: Fence {
+                    partition,
+                    epoch: epoch_held,
+                },
+            })
+        }
     }
 
     fn movable(&self, task: &TaskId, parent: Option<&TaskId>) -> Result<(), Rejection> {
@@ -615,45 +779,94 @@ impl Fold {
         Ok(())
     }
 
-    pub fn snapshot(&self) -> String {
+    fn posted_order(&self) -> BTreeMap<TaskId, usize> {
+        let mut posted = BTreeMap::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.change == Change::Posted {
+                posted.entry(entry.task.clone()).or_insert(index);
+            }
+        }
+        posted
+    }
+
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.snapshot_spread(Spread::for_fold(self))
+    }
+
+    pub fn snapshot_spread(&self, spread: Spread) -> Vec<u8> {
+        compact::snapshot(self, spread).expect("a fold encodes")
+    }
+
+    pub fn snapshot_json(&self) -> String {
         serde_json::to_string(self).expect("a fold serializes")
     }
 
-    pub fn restore(snapshot: &str) -> Result<Self, BoardError> {
-        let mut fold: Self =
-            serde_json::from_str(snapshot).map_err(|error| BoardError::Corrupt {
-                seq: 0,
-                detail: format!("fold snapshot: {error}"),
-            })?;
+    pub fn restore(snapshot: &[u8]) -> Result<Self, BoardError> {
+        Self::restore_spread(snapshot, Spread::for_snapshot(snapshot))
+    }
+
+    pub fn restore_spread(snapshot: &[u8], spread: Spread) -> Result<Self, BoardError> {
+        let corrupt = |detail: String| BoardError::Corrupt {
+            seq: 0,
+            detail: format!("fold snapshot: {detail}"),
+        };
+        let mut fold: Self = if snapshot.starts_with(compact::MAGIC) {
+            compact::restore(snapshot, spread).map_err(|error| corrupt(error.to_string()))?
+        } else {
+            serde_json::from_slice(snapshot).map_err(|error| corrupt(error.to_string()))?
+        };
+        fold.posted = fold.posted_order();
         if mutated(Mutation::SnapshotSkipsRows) {
             fold.next += 1;
+        }
+        if mutated(Mutation::SnapshotLosesDedupe) {
+            fold.seen.retain(|_, verdict| verdict.is_ok());
         }
         Ok(fold)
     }
 
     pub fn apply(&mut self, seq: u64, body: &str) -> Result<(), BoardError> {
+        let event: Event = serde_json::from_str(body).map_err(|error| BoardError::Corrupt {
+            seq,
+            detail: error.to_string(),
+        })?;
+        self.apply_event(seq, &event)
+    }
+
+    pub fn apply_event(&mut self, seq: u64, event: &Event) -> Result<(), BoardError> {
         if seq != self.next {
             return Err(BoardError::Corrupt {
                 seq,
                 detail: format!("expected row {}", self.next),
             });
         }
-        let event: Event = serde_json::from_str(body).map_err(|error| BoardError::Corrupt {
-            seq,
-            detail: error.to_string(),
-        })?;
         self.next = seq + 1;
-        if self.seen.contains_key(&event.id) || !access::owns(&event.by, &event.id) {
+        let replayed = self.seen.contains_key(&event.id) && !mutated(Mutation::ReplaysApply);
+        if replayed || !access::owns(&event.by, &event.id) {
             return Ok(());
         }
         self.now_ms = self.now_ms.max(event.at_ms);
-        let verdict = self.judge(&event).map(|()| seq);
+        if let Some(original) = self.repost(event) {
+            self.seen.insert(event.id.clone(), Ok(original));
+            return Ok(());
+        }
+        let verdict = self.judge(event).map(|()| seq);
         self.seen.insert(event.id.clone(), verdict.clone());
         if verdict.is_ok() {
             self.access.record(&event.by, &event.id, &event.op);
-            self.transition(seq, &event);
-            self.hear(seq, &event);
+            self.transition(seq, event);
+            if let Some(illegal) = self.refused.take() {
+                self.seen
+                    .insert(event.id.clone(), Err(stage::rejection(illegal)));
+                return Ok(());
+            }
+            self.intend(seq, event);
+            self.hear(seq, event);
             self.index_marks();
+        } else if mutated(Mutation::RefusalsCountAttempts) {
+            self.miscount(&event.op);
+        } else if mutated(Mutation::DeliveryRefusalsWrite) {
+            self.mirror.leak(&event.op);
         }
         Ok(())
     }
@@ -663,6 +876,12 @@ impl Fold {
         if !mutated(Mutation::ReadyIndexStale) {
             self.reindex(task);
         }
+        let terminal = change.terminal().then(|| change.clone());
+        if change == Change::Posted {
+            self.posted
+                .entry(task.clone())
+                .or_insert(self.entries.len());
+        }
         self.entries.push(Entry {
             seq,
             event: event.id.clone(),
@@ -670,6 +889,9 @@ impl Fold {
             task: task.clone(),
             change,
         });
+        if let Some(change) = terminal {
+            self.reported(seq, event, task, &change);
+        }
     }
 
     fn transition(&mut self, seq: u64, event: &Event) {
@@ -680,6 +902,10 @@ impl Fold {
         }
         if let Op::Watch(step) = &event.op {
             self.apply_step(seq, event, step);
+            return;
+        }
+        if let Op::Steer(op) = &event.op {
+            self.apply_steer(seq, event, op);
             return;
         }
         let Some(id) = event.op.task().cloned() else {
@@ -701,7 +927,7 @@ impl Fold {
                 }
                 return;
             }
-            Op::Claim { lease_ms, .. } => {
+            Op::Claim { lease_ms, cap, .. } => {
                 let until_ms = now.saturating_add(*lease_ms);
                 let claim = ClaimId(event.id.0.clone());
                 let Some(task) = self.tasks.get_mut(&id) else {
@@ -711,14 +937,19 @@ impl Fold {
                     Phase::Claimed { claim, .. } => Some(claim.clone()),
                     _ => None,
                 };
-                if !mutated(Mutation::AttemptsNotCounted) {
-                    task.attempts += 1;
-                }
-                task.phase = Phase::Claimed {
+                let claimed = Phase::Claimed {
                     claim: claim.clone(),
                     worker: event.by.clone(),
                     until_ms,
                 };
+                if let Err(illegal) = task.enter(claimed, now) {
+                    self.refused = Some(illegal);
+                    return;
+                }
+                if !mutated(Mutation::AttemptsNotCounted) {
+                    task.attempts += 1;
+                }
+                task.cap.clone_from(cap);
                 Change::Claimed {
                     claim,
                     worker: event.by.clone(),
@@ -730,15 +961,20 @@ impl Fold {
                 claim, lease_ms, ..
             } => {
                 let until_ms = now.saturating_add(*lease_ms);
-                if let Some(Task {
-                    phase:
-                        Phase::Claimed {
-                            until_ms: until, ..
-                        },
-                    ..
-                }) = self.tasks.get_mut(&id)
-                {
-                    *until = until_ms;
+                let Some(task) = self.tasks.get_mut(&id) else {
+                    return;
+                };
+                let Phase::Claimed { worker, .. } = &task.phase else {
+                    return;
+                };
+                let renewed = Phase::Claimed {
+                    claim: claim.clone(),
+                    worker: worker.clone(),
+                    until_ms,
+                };
+                if let Err(illegal) = task.enter(renewed, now) {
+                    self.refused = Some(illegal);
+                    return;
                 }
                 Change::Renewed {
                     claim: claim.clone(),
@@ -746,8 +982,8 @@ impl Fold {
                 }
             }
             Op::Release { claim, note, .. } => {
-                if let Some(task) = self.tasks.get_mut(&id) {
-                    task.phase = Phase::Open;
+                if !self.enter(&id, Phase::Open, None, now) {
+                    return;
                 }
                 Change::Released {
                     claim: claim.clone(),
@@ -758,9 +994,8 @@ impl Fold {
                 if let Ok(Some(due_at_ms)) = self.scheduled(&id, now, outcome)
                     && let Outcome::Failed(error) = outcome
                 {
-                    if let Some(task) = self.tasks.get_mut(&id) {
-                        task.phase = Phase::Open;
-                        task.due_at_ms = Some(due_at_ms);
+                    if !self.enter(&id, Phase::Open, Some(Some(due_at_ms)), now) {
+                        return;
                     }
                     self.record(
                         seq,
@@ -773,15 +1008,26 @@ impl Fold {
                     );
                     return;
                 }
-                if let Some(task) = self.tasks.get_mut(&id) {
-                    task.phase = match outcome {
-                        Outcome::Done(result) => Phase::Done {
-                            result: result.clone(),
-                        },
-                        Outcome::Failed(error) => Phase::Failed {
-                            error: error.clone(),
-                        },
-                    };
+                let worker = match self.tasks.get(&id).map(|task| &task.phase) {
+                    Some(Phase::Claimed { worker, .. })
+                        if !mutated(Mutation::FinishForgetsWorker) =>
+                    {
+                        Some(worker.clone())
+                    }
+                    _ => None,
+                };
+                let finished = match outcome {
+                    Outcome::Done(result) => Phase::Done {
+                        result: result.clone(),
+                        worker,
+                    },
+                    Outcome::Failed(error) => Phase::Failed {
+                        error: error.clone(),
+                        worker,
+                    },
+                };
+                if !self.enter(&id, finished, None, now) {
+                    return;
                 }
                 self.record(seq, event, &id, Change::Finished(outcome.clone()));
                 if matches!(outcome, Outcome::Failed(_)) && self.cascades(&id) {
@@ -851,26 +1097,31 @@ impl Fold {
                     to: parent.clone(),
                 }
             }
-            Op::Grant { .. } | Op::Revoke { .. } | Op::Charter {} | Op::Watch(_) => return,
+            Op::Grant { .. }
+            | Op::Revoke { .. }
+            | Op::Epoch { .. }
+            | Op::Charter {}
+            | Op::Watch(_) => return,
             Op::Tasks(op) => {
                 self.steer(seq, event, op);
                 return;
             }
-            Op::Sync { .. } | Op::Say { .. } => return,
+            Op::Sync { .. } | Op::Say { .. } | Op::Steer(_) => return,
         };
         self.record(seq, event, &id, change);
     }
 
     pub(crate) fn cancel(&mut self, seq: u64, event: &Event, id: &TaskId, reason: String) {
-        let Some(task) = self.tasks.get_mut(id) else {
-            return;
-        };
-        if task.finished() {
+        if self.tasks.get(id).is_none_or(Task::finished) {
             return;
         }
-        task.phase = Phase::Cancelled {
+        let cancelled = Phase::Cancelled {
             reason: reason.clone(),
         };
+        if !self.enter(id, cancelled, None, self.now_ms) {
+            return;
+        }
+        self.drop_steers(seq, event, id);
         self.record(seq, event, id, Change::Cancelled { reason });
         self.cascade(seq, event, id);
     }
@@ -936,6 +1187,15 @@ impl Pending {
         let attempt = std::mem::replace(&mut self.attempt, Attempt::Fresh);
         let rows = match (rows, &attempt) {
             (Ok(rows), _) => rows,
+            (
+                Err(_),
+                Attempt::Appended {
+                    result: Err(StoreError::Fenced),
+                    ..
+                },
+            ) if !mutated(Mutation::FencedUnsettled) => {
+                return Err(BoardError::Store(StoreError::Fenced));
+            }
             (Err(error), Attempt::Appended { .. }) => {
                 return Err(BoardError::Unsettled {
                     event: self.event.id.clone(),
@@ -969,6 +1229,11 @@ impl Pending {
                         ),
                     });
                 }
+                Err(StoreError::Fenced)
+                    if fold.next <= seq && !mutated(Mutation::FencedUnsettled) =>
+                {
+                    return Err(BoardError::Store(StoreError::Fenced));
+                }
                 Err(error) if fold.next <= seq => {
                     return Err(BoardError::Unsettled {
                         event: self.event.id.clone(),
@@ -978,7 +1243,9 @@ impl Pending {
                 Err(_) => {}
             }
         }
-        fold.judge(&self.event).map_err(BoardError::Rejected)?;
+        if fold.repost(&self.event).is_none() {
+            fold.judge(&self.event).map_err(BoardError::Rejected)?;
+        }
         Ok(Step::Append {
             seq: fold.next,
             body: self.body.clone(),
@@ -989,7 +1256,9 @@ impl Pending {
         if fold.outcome(&self.event.id).is_some() {
             return None;
         }
-        fold.judge(&self.event).ok()?;
+        if fold.repost(&self.event).is_none() {
+            fold.judge(&self.event).ok()?;
+        }
         Some(Step::Append {
             seq: fold.next,
             body: self.body.clone(),
@@ -1065,5 +1334,97 @@ mod pairs {
         D: Deserializer<'de>,
     {
         Vec::<(K, V)>::deserialize(deserializer).map(|pairs| pairs.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod renew_cap_tests {
+    use std::collections::BTreeMap;
+
+    use crate::access::{Can, Grant, Who};
+    use crate::tasks::Terms;
+    use crate::{Cap, ClaimId, Event, EventId, Fold, NewTask, Op, Rejection, TaskId};
+
+    struct Board {
+        fold: Fold,
+        minted: u64,
+    }
+
+    impl Board {
+        fn write(&mut self, by: &str, at_ms: u64, op: Op) -> (EventId, Result<u64, Rejection>) {
+            self.minted += 1;
+            let id = EventId(format!("{by}.{}", self.minted));
+            let body = serde_json::to_string(&Event {
+                id: id.clone(),
+                by: by.to_owned(),
+                at_ms,
+                op,
+            })
+            .expect("an event encodes");
+            self.fold
+                .apply(self.fold.next(), &body)
+                .expect("the row applies");
+            let outcome = self.fold.outcome(&id).cloned().expect("an outcome");
+            (id, outcome)
+        }
+    }
+
+    fn pooled(id: &str) -> Op {
+        Op::Post {
+            task: NewTask {
+                id: TaskId(id.to_owned()),
+                parent: None,
+                spec: id.to_owned(),
+                labels: BTreeMap::from([("pool".to_owned(), "lent".to_owned())]),
+                needs: Vec::new(),
+                terms: Terms::default(),
+            },
+        }
+    }
+
+    /// A claim that lapsed while another worker filled the cap stays out on renew.
+    #[test]
+    fn renewing_a_lapsed_claim_respects_its_cap() {
+        for cap in [
+            Cap::Partition(1),
+            Cap::Label {
+                max: 1,
+                key: "pool".to_owned(),
+                value: "lent".to_owned(),
+            },
+        ] {
+            let mut board = Board {
+                fold: Fold::default(),
+                minted: 0,
+            };
+            assert!(board.write("user:lead", 0, Op::Charter {}).1.is_ok());
+            let grant = Grant {
+                who: vec![Who::Everyone],
+                can: BTreeMap::from([("*".to_owned(), Can::ALL.to_vec())]),
+            };
+            assert!(board.write("user:lead", 0, Op::Grant { grant }).1.is_ok());
+            assert!(board.write("user:lead", 0, pooled("a")).1.is_ok());
+            assert!(board.write("user:lead", 0, pooled("b")).1.is_ok());
+            let claim = |task: &str| Op::Claim {
+                task: TaskId(task.to_owned()),
+                lease_ms: 100,
+                fence: None,
+                cap: Some(cap.clone()),
+            };
+            let (first, verdict) = board.write("agent:w0", 10, claim("a"));
+            assert!(verdict.is_ok(), "{verdict:?}");
+            let (_, verdict) = board.write("agent:w1", 50, claim("b"));
+            assert_eq!(verdict, Err(Rejection::Full { cap: cap.clone() }));
+            let (_, verdict) = board.write("agent:w1", 200, claim("b"));
+            assert!(verdict.is_ok(), "the first claim lapsed: {verdict:?}");
+            let renew = Op::Renew {
+                task: TaskId("a".to_owned()),
+                claim: ClaimId(first.0),
+                lease_ms: 100,
+            };
+            let (_, verdict) = board.write("agent:w0", 210, renew);
+            assert_eq!(verdict, Err(Rejection::Full { cap: cap.clone() }));
+            assert_eq!(board.fold.held(&cap, 210), 1);
+        }
     }
 }

@@ -20,6 +20,8 @@ use crate::{
 };
 
 const ACCEPTED_FIELD: &str = "\"accepted_output\"";
+const RECEIPT_MARK: &str = "\"accepted\":true";
+const RECEIPT_WORD: &str = "accepted";
 const ACKED_WRITES_DROPPED_MAX: u64 = 3;
 const CAS_IGNORES_EXPECTED_PPM: u64 = 500_000;
 const KV_LIES_PPM: u64 = 250_000;
@@ -285,16 +287,19 @@ impl Kv {
         if let Some(scope) = key
             .strip_prefix(RECORD_PREFIX)
             .and_then(|rest| rest.split('/').nth(1))
-            .filter(|scope| scope.ends_with(SUBAGENTS_SUFFIX))
         {
-            if entry.value.contains(ACCEPTED_FIELD) {
+            let accepts = if scope.ends_with(SUBAGENTS_SUFFIX) {
+                entry.value.contains(ACCEPTED_FIELD)
+            } else {
+                entry.value.contains(RECEIPT_WORD)
+                    && entry.value.replace('\\', "").contains(RECEIPT_MARK)
+            };
+            if accepts {
                 self.accepting.insert(scope.to_owned());
             }
             return;
         }
-        if let Some(scope) = key
-            .strip_prefix(STATE_PREFIX)
-            .filter(|scope| scope.ends_with(SUBAGENTS_SUFFIX))
+        if let Some(scope) = key.strip_prefix(STATE_PREFIX)
             && self.accepting.remove(scope)
         {
             let prev = self.durable.get(key).cloned();

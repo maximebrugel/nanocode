@@ -1,9 +1,11 @@
 //! `cut -b|-c|-f LIST` with `-d -s -n -z --complement --output-delimiter` and BSD's
 //! `-w`. Written for psh after GNU's documented behavior.
 //!
-//! `-c` counts UTF-8 characters, in every locale (D1161): agents mean characters, and
-//! GNU's `-c` (bytes, like `-b`) splits multibyte characters. BSD's `cut` in a UTF-8
-//! locale agrees with psh. Bytes that are not valid UTF-8 count as one character each.
+//! `-c` counts UTF-8 characters unless the locale is explicitly C or POSIX (D1161):
+//! agents mean characters, and GNU's `-c` (bytes, like `-b`) splits multibyte
+//! characters. BSD's `cut` in a UTF-8 locale agrees with psh. Bytes that are not valid
+//! UTF-8 count as one character each. With `LC_ALL=C` (or `LC_CTYPE`/`LANG`) both GNU
+//! and BSD count bytes, and so does psh.
 
 use psh_engine::util::UtilCtx;
 
@@ -141,6 +143,15 @@ pub async fn run(ctx: &mut UtilCtx<'_>, argv: &[Vec<u8>]) -> i32 {
         mode = Some(m);
         list = value.unwrap_or_default().to_vec();
     }
+    let get = |n: &[u8]| ctx.var(n).filter(|v| !v.is_empty());
+    let locale = get(b"LC_ALL")
+        .or_else(|| get(b"LC_CTYPE"))
+        .or_else(|| get(b"LANG"));
+    let c_locale = matches!(locale, Some(b"C" | b"POSIX"));
+    let mode = match mode {
+        Some(Mode::Chars) if c_locale => Some(Mode::Bytes),
+        m => m,
+    };
     let Some(mode) = mode else {
         return common::usage(
             ctx,

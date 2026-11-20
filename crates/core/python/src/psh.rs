@@ -107,6 +107,11 @@ fn execute(run: Run, files: SyncFiles) -> io::Result<Ran> {
 
     static IDLE: LazyLock<Slot<mpsc::Sender<Job>>> = LazyLock::new(Slot::default);
 
+    let shell = Shell(files);
+    if crate::native::wanted(&run, &shell) {
+        return crate::native::run(run, &shell);
+    }
+    let Shell(files) = shell;
     let Some(native) = files.native() else {
         return kept(run, files);
     };
@@ -219,8 +224,13 @@ pub fn serve() -> i32 {
     let ran = python.run(run, Rc::new(Shell(machine)));
     std::mem::forget(python);
     let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(&ran.stdout).and_then(|()| stdout.flush());
-    let _ = stderr.write_all(&ran.stderr);
+    for (fd, bytes) in ran.segments() {
+        if fd == 2 {
+            let _ = stderr.write_all(bytes);
+        } else {
+            let _ = stdout.write_all(bytes).and_then(|()| stdout.flush());
+        }
+    }
     ending(ran.ended, &name, &mut |text| drop(stderr.write_all(text)))
 }
 
@@ -292,7 +302,12 @@ fn body(ctx: &mut SyncCtx, argv: Vec<Vec<u8>>) -> i32 {
             return 1;
         }
     };
-    let _ = ctx.write(&ran.stdout);
-    ctx.error_raw(&ran.stderr);
+    for (fd, bytes) in ran.segments() {
+        if fd == 2 {
+            ctx.error_raw(bytes);
+        } else {
+            let _ = ctx.write(bytes);
+        }
+    }
     ending(ran.ended, &name, &mut |text| ctx.error_raw(text))
 }

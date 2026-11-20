@@ -9,6 +9,7 @@ from concurrent.futures import _base
 import itertools
 import queue
 import threading
+_ThreadParked = getattr(__import__('_thread'), '_ThreadParked', ())
 import types
 import weakref
 import os
@@ -119,7 +120,17 @@ def _worker(executor_reference, ctx, work_queue):
                 if executor is not None:
                     executor._idle_semaphore.release()
                 del executor
-                work_item = work_queue.get(block=True)
+                try:
+                    work_item = work_queue.get(block=True)
+                except _ThreadParked:
+                    # Cooperative threads (see _thread): nothing else can run to
+                    # feed this worker, so it ends; the executor starts another
+                    # when new work arrives.
+                    executor = executor_reference()
+                    if executor is not None:
+                        executor._idle_semaphore.acquire(timeout=0)
+                        executor._threads.discard(threading.current_thread())
+                    return
 
             if work_item is not None:
                 work_item.run(ctx)

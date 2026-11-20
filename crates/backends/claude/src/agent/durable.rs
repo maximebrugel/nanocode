@@ -1382,7 +1382,7 @@ impl<T: Paged> Pages<T> {
         stored: Option<&HashSet<String>>,
     ) -> Result<Sequence> {
         self.log
-            .sync(
+            .sync_known(
                 unchanged,
                 items[unchanged..].iter().map(|item| {
                     let record = item
@@ -1393,6 +1393,7 @@ impl<T: Paged> Pages<T> {
                         _ => record,
                     })
                 }),
+                stored,
             )
             .map_err(provider_error)?;
         self.items.truncate(unchanged);

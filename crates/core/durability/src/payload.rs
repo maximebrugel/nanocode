@@ -856,7 +856,12 @@ impl EncodedPayload {
             } else if let Some(hashes) = record.strip_prefix(SHA256_MANIFEST_PREFIX) {
                 Assembly::Leaves(hashes.to_owned(), false)
             } else {
-                Assembly::Assembled(value.numbered_chunks(store, state_id, record).await?)
+                Assembly::Assembled(
+                    value
+                        .numbered_chunks(store, state_id, record)
+                        .await?
+                        .into(),
+                )
             });
         }
         Self::resolve_trees(values, store, state_id, &mut pending).await?;
@@ -865,8 +870,8 @@ impl EncodedPayload {
         for ((value, record), assembly) in values.iter().zip(&records).zip(pending) {
             let (content, verified) = match &assembly {
                 Assembly::Inline => (&record[1..], false),
-                Assembly::Assembled(content) => (content.as_str(), false),
-                Assembly::Verified(content) => (content.as_str(), true),
+                Assembly::Assembled(content) => (&**content, false),
+                Assembly::Verified(content) => (&**content, true),
                 Assembly::Tree(_) | Assembly::Leaves(..) => {
                     return Err(Error::InvalidState("invalid payload chunk manifest".into()));
                 }
@@ -879,9 +884,7 @@ impl EncodedPayload {
             }
             let json = match assembly {
                 Assembly::Inline => Text::Record(Arc::clone(record)),
-                Assembly::Assembled(content) | Assembly::Verified(content) => {
-                    Text::Json(content.into())
-                }
+                Assembly::Assembled(content) | Assembly::Verified(content) => Text::Json(content),
                 Assembly::Tree(_) | Assembly::Leaves(..) => {
                     return Err(Error::InvalidState("invalid payload chunk manifest".into()));
                 }
@@ -1007,8 +1010,15 @@ impl EncodedPayload {
         if chunks.len() != keys.len() {
             return Err(Error::InvalidState("record batch length mismatch".into()));
         }
-        let mut contents: Vec<String> = vec![String::new(); pending.len()];
+        let mut content = String::new();
+        let mut current = None;
         for ((key, chunk), (index, position)) in keys.iter().zip(chunks).zip(owners) {
+            if current != Some(index) {
+                if let Some(done) = current {
+                    finish(&mut pending[done], std::mem::take(&mut content));
+                }
+                current = Some(index);
+            }
             let chunk = chunk.ok_or_else(|| {
                 Error::InvalidState(format!(
                     "missing payload chunk {key} of {}",
@@ -1023,18 +1033,23 @@ impl EncodedPayload {
                     values[index].key()
                 )));
             }
-            contents[index].push_str(&chunk);
+            content.push_str(&chunk);
         }
-        for (assembly, content) in pending.iter_mut().zip(contents) {
-            if let Assembly::Leaves(_, verified) = assembly {
-                *assembly = if *verified {
-                    Assembly::Verified(content)
-                } else {
-                    Assembly::Assembled(content)
-                };
-            }
+        if let Some(done) = current {
+            finish(&mut pending[done], content);
         }
         Ok(())
+    }
+}
+
+fn finish(assembly: &mut Assembly, content: String) {
+    if let Assembly::Leaves(_, verified) = assembly {
+        let content = Arc::from(content);
+        *assembly = if *verified {
+            Assembly::Verified(content)
+        } else {
+            Assembly::Assembled(content)
+        };
     }
 }
 
@@ -1042,8 +1057,8 @@ enum Assembly {
     Inline,
     Tree(Vec<Arc<str>>),
     Leaves(String, bool),
-    Assembled(String),
-    Verified(String),
+    Assembled(Arc<str>),
+    Verified(Arc<str>),
 }
 
 fn manifest<'a>(record: &'a str, chunk: &dyn Fn(&str) -> Option<&'a str>) -> Option<String> {

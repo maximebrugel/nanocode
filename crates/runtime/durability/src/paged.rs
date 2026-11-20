@@ -155,6 +155,14 @@ impl SequenceLog {
     }
 
     pub fn push(&mut self, item: EncodedPayload) -> Result<()> {
+        self.push_known(item, None)
+    }
+
+    pub fn push_known(
+        &mut self,
+        item: EncodedPayload,
+        known: Option<&HashSet<String>>,
+    ) -> Result<()> {
         let mut entry = item;
         let mut level = 0;
         loop {
@@ -168,8 +176,12 @@ impl SequenceLog {
                 return Ok(());
             }
             let group = &entries[entries.len() - GROUP..];
-            entry =
-                EncodedPayload::encode(&GroupRef { entries: group })?.with_payloads(group.to_vec());
+            let encoded = EncodedPayload::encode(&GroupRef { entries: group })?;
+            entry = if known.is_some_and(|known| known.contains(encoded.key())) {
+                encoded.reference()
+            } else {
+                encoded.with_payloads(group.to_vec())
+            };
             level += 1;
         }
     }
@@ -179,9 +191,18 @@ impl SequenceLog {
         unchanged: usize,
         items: impl IntoIterator<Item = Result<EncodedPayload>>,
     ) -> Result<()> {
+        self.sync_known(unchanged, items, None)
+    }
+
+    pub fn sync_known(
+        &mut self,
+        unchanged: usize,
+        items: impl IntoIterator<Item = Result<EncodedPayload>>,
+        known: Option<&HashSet<String>>,
+    ) -> Result<()> {
         self.truncate(unchanged);
         for item in items {
-            self.push(item?)?;
+            self.push_known(item?, known)?;
         }
         Ok(())
     }

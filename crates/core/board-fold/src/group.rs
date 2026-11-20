@@ -468,3 +468,59 @@ impl Planned {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EventId, Op};
+
+    fn event(id: &str, op: Op) -> Event {
+        Event {
+            id: EventId(id.to_owned()),
+            by: "user:lead".to_owned(),
+            at_ms: 0,
+            op,
+        }
+    }
+
+    /// An aborted plan leaves nothing visible and its seqs free; a committed one folds in order,
+    /// and a write it already holds takes no row the next time.
+    #[test]
+    fn a_planned_group_is_visible_only_once_committed() {
+        let mut fold = Fold::default();
+        let start = fold.next();
+        let planned = fold.plan_group(vec![event("a", Op::Charter {}), event("b", Op::Charter {})]);
+        assert_eq!(planned.first(), start);
+        let seqs: Vec<u64> = planned.rows().iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![start, start + 1]);
+        let verdicts = planned.aborted(&mut fold, &StoreError::Fenced);
+        assert!(verdicts.iter().all(|v| matches!(v, Err(BoardError::Store(StoreError::Fenced)))));
+        assert_eq!(fold.next(), start);
+        assert!(fold.outcome(&EventId("a".into())).is_none());
+
+        let planned = fold.plan_group(vec![event("a", Op::Charter {}), event("b", Op::Charter {})]);
+        assert_eq!(planned.first(), start);
+        let verdicts = planned.committed(&mut fold).expect("the rows fold");
+        assert_eq!(fold.next(), start + 2);
+        assert!(matches!(&verdicts[0], Ok(applied) if applied.seq == start));
+        // The second member's verdict is the fold's, whatever it judged.
+        let judged = fold.outcome(&EventId("b".into())).cloned().expect("b folded");
+        assert_eq!(verdicts[1].as_ref().map(|a| a.seq).map_err(|_| ()), judged.map_err(|_| ()));
+
+        let again = fold.plan_group(vec![event("a", Op::Charter {})]);
+        assert!(again.rows().is_empty());
+        assert!(matches!(&again.committed(&mut fold).expect("nothing to fold")[0], Ok(_)));
+    }
+
+    /// Committing a plan on a fold that moved since is refused, the fold untouched.
+    #[test]
+    fn a_stale_plan_does_not_commit() {
+        let mut fold = Fold::default();
+        let stale = fold.plan_group(vec![event("a", Op::Charter {})]);
+        let first = fold.plan_group(vec![event("b", Op::Charter {})]);
+        first.committed(&mut fold).expect("the row folds");
+        let next = fold.next();
+        assert!(stale.committed(&mut fold).is_err());
+        assert_eq!(fold.next(), next);
+    }
+}

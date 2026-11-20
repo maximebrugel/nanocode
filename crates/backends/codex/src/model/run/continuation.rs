@@ -178,7 +178,10 @@ impl ModelRun {
         session.conversation = if history.is_empty() && saved.phase == ExecutionPhase::Compact {
             ConversationState::empty(saved.canonical_context)
         } else {
-            ConversationState::resume(saved.canonical_context, history, None)?
+            ConversationState::resume(
+                saved.canonical_context,
+                crate::client::responses::ResponseHistory::new(history),
+            )?
         };
         session
             .conversation

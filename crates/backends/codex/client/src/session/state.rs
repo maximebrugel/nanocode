@@ -130,32 +130,32 @@ impl ManagedSessionState {
     }
 
     pub fn resume(items: Vec<ResponseItem>) -> Result<Self, ManagedSessionStateError> {
-        Self::resume_loaded(items, None)
+        Self::resume_history(ResponseHistory::new(items))
     }
 
     #[doc(hidden)]
-    pub fn resume_loaded(
-        mut items: Vec<ResponseItem>,
-        loaded: Option<ResponseHistory>,
-    ) -> Result<Self, ManagedSessionStateError> {
-        if items.is_empty() {
+    pub fn resume_history(history: ResponseHistory) -> Result<Self, ManagedSessionStateError> {
+        if history.is_empty() {
             return Err(ManagedSessionStateError::EmptyHistory);
         }
-        let loaded = loaded.filter(|_| {
-            items.iter().all(|item| {
-                item.id().is_some_and(|id| !id.is_empty()) || item.id_prefix().is_none()
-            })
-        });
-        assign_missing_response_item_ids(&mut items);
-        if !has_well_formed_tool_calls(&items) {
+        if !has_well_formed_tool_calls(history.iter()) {
             return Err(ManagedSessionStateError::MalformedToolCalls);
         }
-        let history_len = items.len();
         let mut state = Self::new(Vec::new());
-        state.context = ContextManager::resume(items, loaded);
-        if state.context.len() != history_len {
-            return Err(ManagedSessionStateError::UnsupportedHistoryItem);
-        }
+        state.context = match ContextManager::resume_shared(history) {
+            Ok(context) => context,
+            Err(history) => {
+                let mut items = history.iter().cloned().collect::<Vec<_>>();
+                drop(history);
+                assign_missing_response_item_ids(&mut items);
+                let history_len = items.len();
+                let context = ContextManager::resume(items);
+                if context.len() != history_len {
+                    return Err(ManagedSessionStateError::UnsupportedHistoryItem);
+                }
+                context
+            }
+        };
         if state.context.replace_invalid_tool_images() > 0 {
             state.history_revision = state.history_revision.saturating_add(1);
         }

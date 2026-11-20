@@ -26,9 +26,9 @@ enum ReasoningPin {
 }
 
 impl ReasoningState {
-    pub(crate) fn validate(
+    pub(crate) fn validate<'a>(
         &self,
-        history: &[crate::client::responses::ResponseItem],
+        history: impl IntoIterator<Item = &'a crate::client::responses::ResponseItem>,
     ) -> crate::Result<()> {
         use crate::client::{Model, responses::ResponseItem};
         let invalid = |detail: &str| crate::NanocodeError::InvalidCheckpoint(detail.to_owned());
@@ -47,7 +47,7 @@ impl ReasoningState {
         }
         if let Some(authored) = &self.latest_override
             && (!model.supports_thinking(authored.effort)
-                || !matches!(history.get(authored.history_index),
+                || !matches!(history.into_iter().nth(authored.history_index),
                     Some(ResponseItem::ConfigurationUpdate { reasoning })
                         if reasoning.effort == model.wire_thinking(authored.effort)))
         {

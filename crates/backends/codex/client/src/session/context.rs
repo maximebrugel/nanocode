@@ -56,17 +56,37 @@ impl ContextManager {
         context
     }
 
-    pub(super) fn resume(items: Vec<ResponseItem>, loaded: Option<ResponseHistory>) -> Self {
+    pub(super) fn resume(items: Vec<ResponseItem>) -> Self {
         let mut context = Self::new(Vec::new());
-        let len = items.len();
         context.record(items, None);
-        if let Some(loaded) = loaded
-            && context.items.len() == len
-            && loaded.len() == len
-        {
-            context.items = loaded;
-        }
         context
+    }
+
+    pub(super) fn resume_shared(items: ResponseHistory) -> Result<Self, ResponseHistory> {
+        let kept = {
+            let mut custom_calls = HashSet::new();
+            items.iter().all(|item| {
+                if let ResponseItem::CustomToolCall { call_id, .. } = item {
+                    custom_calls.insert(call_id);
+                }
+                is_api_item(item)
+                    && (item.id().is_some_and(|id| !id.is_empty()) || item.id_prefix().is_none())
+                    && !matches!(
+                        item,
+                        ResponseItem::CustomToolCallOutput { call_id, name: Some(_), .. }
+                            if !custom_calls.contains(call_id)
+                    )
+            })
+        };
+        if !kept {
+            return Err(items);
+        }
+        let mut context = Self::new(Vec::new());
+        for item in items.iter() {
+            context.calls.track(item);
+        }
+        context.items = items;
+        Ok(context)
     }
 
     #[must_use]
@@ -140,6 +160,9 @@ impl ContextManager {
     }
 
     pub(super) fn replace_invalid_tool_images(&mut self) -> usize {
+        if !self.items.iter().any(has_invalid_tool_image) {
+            return 0;
+        }
         let mut replaced = 0;
         let mut items = self.flattened_items();
         for item in &mut items {
@@ -152,17 +175,7 @@ impl ContextManager {
                 continue;
             };
             for part in content {
-                let invalid = match part {
-                    FunctionOutputContent::InputImage { image_url, .. } => {
-                        !valid_tool_image_data_url(image_url)
-                            && !image_url.starts_with("nanocode-blob:")
-                    }
-                    FunctionOutputContent::InputImageFile { file_id, .. } => {
-                        !crate::client::responses::valid_image_file_id(file_id)
-                    }
-                    _ => false,
-                };
-                if invalid {
+                if invalid_tool_image(part) {
                     let text = if matches!(part, FunctionOutputContent::InputImageFile { .. }) {
                         "[image omitted: invalid file ID in restored tool output]"
                     } else {
@@ -607,7 +620,7 @@ fn synthetic_output_id(prefix: &str, source_id: Option<&ResponseItemId>) -> Opti
 }
 
 #[must_use]
-pub fn has_well_formed_tool_calls(items: &[ResponseItem]) -> bool {
+pub fn has_well_formed_tool_calls<'a>(items: impl IntoIterator<Item = &'a ResponseItem>) -> bool {
     let mut function_calls = HashSet::new();
     let mut function_outputs = HashSet::new();
     let mut custom_calls = HashSet::new();
@@ -786,6 +799,32 @@ fn matches_marked_text(start: &str, end: &str, text: &str) -> bool {
         && text
             .get(text.len().saturating_sub(end.len())..)
             .is_some_and(|candidate| candidate.eq_ignore_ascii_case(end))
+}
+
+fn invalid_tool_image(part: &FunctionOutputContent) -> bool {
+    match part {
+        FunctionOutputContent::InputImage { image_url, .. } => {
+            !valid_tool_image_data_url(image_url) && !image_url.starts_with("nanocode-blob:")
+        }
+        FunctionOutputContent::InputImageFile { file_id, .. } => {
+            !crate::client::responses::valid_image_file_id(file_id)
+        }
+        _ => false,
+    }
+}
+
+fn has_invalid_tool_image(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            output: FunctionOutputBody::Content(content),
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            output: FunctionOutputBody::Content(content),
+            ..
+        } => content.iter().any(invalid_tool_image),
+        _ => false,
+    }
 }
 
 const fn is_api_item(item: &ResponseItem) -> bool {

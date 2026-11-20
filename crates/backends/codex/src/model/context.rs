@@ -13,7 +13,7 @@ const REMOVAL_NOTICE: &str = "The previously provided AGENTS.md instructions no 
 const HOST_INSTRUCTIONS_END: &str = "</runtime_model_identity>";
 
 impl ContextBaseline {
-    pub(crate) fn reconstruct(history: &[ResponseItem]) -> Self {
+    pub(crate) fn reconstruct<'a>(history: impl IntoIterator<Item = &'a ResponseItem>) -> Self {
         let reconstructed = ContextSnapshot::reconstruct(history);
         if reconstructed.is_empty() {
             Self::Missing
@@ -170,7 +170,7 @@ impl ContextSnapshot {
         }
     }
 
-    pub(crate) fn reconstruct(history: &[ResponseItem]) -> Self {
+    pub(crate) fn reconstruct<'a>(history: impl IntoIterator<Item = &'a ResponseItem>) -> Self {
         let mut agents_md = None;
         let mut environment = None;
         for text in contextual_text(history) {
@@ -240,8 +240,10 @@ impl ContextSnapshot {
     }
 }
 
-fn contextual_text(history: &[ResponseItem]) -> impl Iterator<Item = &str> {
-    history.iter().flat_map(|item| match item {
+fn contextual_text<'a>(
+    history: impl IntoIterator<Item = &'a ResponseItem>,
+) -> impl Iterator<Item = &'a str> {
+    history.into_iter().flat_map(|item| match item {
         ResponseItem::Message {
             role: MessageRole::User,
             content,

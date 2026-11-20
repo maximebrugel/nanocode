@@ -93,8 +93,7 @@ impl ConversationState {
 
     pub(super) fn resume(
         mut canonical_context: ResponseItem,
-        history: Vec<ResponseItem>,
-        loaded: Option<ResponseHistory>,
+        history: ResponseHistory,
     ) -> Result<Self> {
         if !canonical_context.is_user_message() {
             return Err(NanocodeError::InvalidCheckpoint(
@@ -102,7 +101,7 @@ impl ConversationState {
             ));
         }
         assign_missing_response_item_id(&mut canonical_context);
-        let managed = ManagedSessionState::resume_loaded(history, loaded)
+        let managed = ManagedSessionState::resume_history(history)
             .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
         let mut state = Self {
             canonical_context: Arc::new(canonical_context),
@@ -115,16 +114,19 @@ impl ConversationState {
     }
 
     pub(super) fn prepare_replay_images(&mut self) -> bool {
-        let mut history = self.managed.flattened_history();
-        let history_changed = nanocode_code_mode::image::prepare_history_images(&mut history);
-        let context_changed = nanocode_code_mode::image::prepare_history_images(
-            std::slice::from_mut(Arc::make_mut(&mut self.canonical_context)),
-        );
-        let changed = history_changed || context_changed;
-        if changed {
-            self.managed.replace_prepared_history(history);
-        }
-        changed
+        let history_changed = self.managed.history().any(has_inline_image) && {
+            let mut history = self.managed.flattened_history();
+            let changed = nanocode_code_mode::image::prepare_history_images(&mut history);
+            if changed {
+                self.managed.replace_prepared_history(history);
+            }
+            changed
+        };
+        let context_changed = has_inline_image(&self.canonical_context)
+            && nanocode_code_mode::image::prepare_history_images(std::slice::from_mut(
+                Arc::make_mut(&mut self.canonical_context),
+            ));
+        history_changed || context_changed
     }
 
     pub(super) fn flattened_history(&self) -> Vec<ResponseItem> {
@@ -226,5 +228,22 @@ impl ConversationState {
 
     pub(super) fn commit_tail(&mut self) {
         self.managed.commit_tail();
+    }
+}
+
+fn has_inline_image(item: &ResponseItem) -> bool {
+    use crate::client::responses::{ContentItem, FunctionOutputBody, FunctionOutputContent};
+    match item {
+        ResponseItem::Message { content, .. } => content
+            .iter()
+            .any(|part| matches!(part, ContentItem::InputImage { .. })),
+        ResponseItem::FunctionCallOutput { output, .. }
+        | ResponseItem::CustomToolCallOutput { output, .. } => match output {
+            FunctionOutputBody::Content(content) => content
+                .iter()
+                .any(|part| matches!(part, FunctionOutputContent::InputImage { .. })),
+            FunctionOutputBody::Text(_) => false,
+        },
+        _ => false,
     }
 }

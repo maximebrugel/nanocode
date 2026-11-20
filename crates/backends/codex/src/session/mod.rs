@@ -358,6 +358,10 @@ impl fmt::Debug for SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    pub(crate) const fn shared_history(&self) -> &ResponseHistory {
+        &self.history
+    }
+
     pub(crate) fn history_len(&self) -> usize {
         self.history.len()
     }
@@ -472,8 +476,7 @@ impl SessionSnapshot {
                 "request prefix does not match the supported model contract".to_owned(),
             ));
         }
-        let history = self.history.iter().cloned().collect::<Vec<_>>();
-        self.reasoning.validate(&history)?;
+        self.reasoning.validate(self.history.iter())?;
         let lineage_id = Arc::<str>::from(self.lineage_id);
         let prompt_cache_key = Arc::<str>::from(self.prompt_cache_key);
         let checkpoint = self
@@ -485,8 +488,7 @@ impl SessionSnapshot {
                     request_prefix,
                     Arc::clone(&prompt_cache_key),
                     self.canonical_context.clone(),
-                    history.clone(),
-                    Some(self.history.clone()),
+                    self.history.clone(),
                     self.client_authored.clone(),
                     None,
                     self.context_snapshot.clone(),
@@ -504,7 +506,7 @@ impl SessionSnapshot {
             prompt_cache_key,
             workspace: self.workspace,
             canonical_context: self.canonical_context,
-            history,
+            history: self.history,
             client_authored: self.client_authored,
             context_baseline: self.context_snapshot,
             reasoning: self.reasoning,
@@ -519,7 +521,7 @@ pub(crate) struct SessionResume {
     pub(crate) prompt_cache_key: Arc<str>,
     pub(crate) workspace: String,
     pub(crate) canonical_context: ResponseItem,
-    pub(crate) history: Vec<ResponseItem>,
+    pub(crate) history: ResponseHistory,
     pub(crate) client_authored: std::collections::BTreeSet<String>,
     pub(crate) context_baseline: Option<ContextBaseline>,
     pub(crate) reasoning: crate::reasoning::ReasoningState,

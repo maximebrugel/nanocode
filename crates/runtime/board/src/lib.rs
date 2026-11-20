@@ -483,7 +483,7 @@ impl Board {
         for (index, verdict) in members.into_iter().zip(settled) {
             verdicts[index] = Some(verdict);
         }
-        self.keep_checkpoint().await;
+        self.keep_checkpoint();
         verdicts
             .into_iter()
             .map(|verdict| verdict.unwrap_or_else(|| Err(BoardError::Dropped("unsettled".into()))))

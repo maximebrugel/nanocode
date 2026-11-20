@@ -513,7 +513,7 @@ impl From<&str> for Prompt {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PromptInput {
     Text(String),
@@ -559,7 +559,7 @@ impl From<&str> for PromptInput {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UserInput {
     Text {

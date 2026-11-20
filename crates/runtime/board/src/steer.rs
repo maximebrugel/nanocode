@@ -7,12 +7,12 @@ impl Board {
         &mut self,
         at_ms: u64,
         task: TaskId,
-        body: String,
+        body: impl Into<PromptInput>,
     ) -> Result<Applied, BoardError> {
         let send = SteerOp::Send {
             task,
             claim: None,
-            body,
+            body: body.into(),
         };
         self.submit(at_ms, Op::Steer(send)).await
     }
@@ -22,12 +22,12 @@ impl Board {
         at_ms: u64,
         task: TaskId,
         claim: ClaimId,
-        body: String,
+        body: impl Into<PromptInput>,
     ) -> Result<Applied, BoardError> {
         let send = SteerOp::Send {
             task,
             claim: Some(claim),
-            body,
+            body: body.into(),
         };
         self.submit(at_ms, Op::Steer(send)).await
     }

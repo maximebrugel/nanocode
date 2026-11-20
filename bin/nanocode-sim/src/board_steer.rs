@@ -8,7 +8,7 @@ use nanocode_board::{
     Change, ClaimId, Event, EventId, Fold, NewTask, Op, Outcome, Phase, Rejection, TaskId,
     access::{Can, Grant, Who},
     sim::{self as board_sim, Mutation as BoardRule},
-    steer::{SteerOp, Steered},
+    steer::{PromptInput, SteerOp, Steered, UserInput},
 };
 
 use crate::rng::{FNV_OFFSET, Rng, fnv};
@@ -27,10 +27,11 @@ pub enum SteerMutation {
     ToTerminal,
     FinishIgnoresSteers,
     KeptOnCancel,
+    LocalPath,
 }
 
 impl SteerMutation {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::None,
         Self::LostOnMove,
         Self::RedeliveredAfterHeed,
@@ -39,6 +40,7 @@ impl SteerMutation {
         Self::ToTerminal,
         Self::FinishIgnoresSteers,
         Self::KeptOnCancel,
+        Self::LocalPath,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -57,6 +59,7 @@ impl SteerMutation {
             Self::ToTerminal => "steer_to_terminal",
             Self::FinishIgnoresSteers => "finish_ignores_steers",
             Self::KeptOnCancel => "steer_kept_on_cancel",
+            Self::LocalPath => "steer_local_path",
         }
     }
 
@@ -79,6 +82,7 @@ impl SteerMutation {
             Self::ToTerminal => BoardRule::SteerToTerminal,
             Self::FinishIgnoresSteers => BoardRule::FinishIgnoresSteers,
             Self::KeptOnCancel => BoardRule::SteerKeptOnCancel,
+            Self::LocalPath => BoardRule::SteerLocalPath,
         }
     }
 }
@@ -194,6 +198,7 @@ struct Worker {
 #[derive(Default)]
 struct Oracle {
     sent: BTreeMap<u64, (TaskId, u64)>,
+    bodies: BTreeMap<u64, PromptInput>,
     taken: BTreeMap<u64, BTreeSet<ClaimId>>,
     acked: BTreeMap<u64, ClaimId>,
     dropped: BTreeSet<u64>,
@@ -231,6 +236,32 @@ fn post(host: &mut Host, now: u64, number: u64) -> Result<TaskId, String> {
     Ok(id)
 }
 
+/// A steer body like a member's message: plain text, or blocks with an image by URL or
+/// file id. One in eight carries a path on the sender's machine, which the board refuses
+/// because the claim may be read on another one.
+fn body(rng: &mut Rng, now: u64) -> (PromptInput, bool) {
+    let text = UserInput::Text {
+        text: format!("steer at {now}"),
+    };
+    let other = match rng.below(8) {
+        0..=3 => return (PromptInput::Text(format!("steer at {now}")), false),
+        4 | 5 => UserInput::Image {
+            image_url: format!("https://example.test/{now}.png"),
+            detail: None,
+        },
+        6 => UserInput::ImageFile {
+            file_id: format!("file-{now}"),
+            detail: None,
+        },
+        _ => UserInput::LocalImage {
+            path: format!("/tmp/{now}.png").into(),
+            detail: None,
+        },
+    };
+    let local = matches!(other, UserInput::LocalImage { .. });
+    (PromptInput::Content(vec![text, other]), local)
+}
+
 fn send(
     host: &mut Host,
     oracle: &mut Oracle,
@@ -246,7 +277,9 @@ fn send(
             (!claims.is_empty()).then(|| claims[rng.pick(claims.len())].clone())
         }),
     };
-    let wanted = !host.finished(task)
+    let (body, local) = body(rng, now);
+    let wanted = !local
+        && !host.finished(task)
         && claim
             .as_ref()
             .is_none_or(|claim| Some(claim) == holder.as_ref());
@@ -254,7 +287,7 @@ fn send(
     let op = Op::Steer(SteerOp::Send {
         task: task.clone(),
         claim,
-        body: format!("steer at {now}"),
+        body: body.clone(),
     });
     let (_, verdict) = host.append(OWNER, now, op)?;
     expect(
@@ -271,6 +304,7 @@ fn send(
         Ok(seq) => {
             oracle.stats.sent += 1;
             oracle.sent.insert(seq, (task.clone(), now));
+            oracle.bodies.insert(seq, body);
         }
         Err(_) => oracle.stats.refused += 1,
     }
@@ -343,7 +377,16 @@ fn take(host: &Host, oracle: &mut Oracle, worker: &mut Worker) -> Result<(), Str
         worker.taken.clear();
         return Ok(());
     };
-    let seqs: Vec<u64> = steers.map(|steer| steer.seq).collect();
+    let steers: Vec<_> = steers.collect();
+    for steer in &steers {
+        if oracle.bodies.get(&steer.seq) != Some(&steer.body) {
+            return Err(format!(
+                "steer {} on {task} reached {} with a body it was not sent with",
+                steer.seq, claim.0
+            ));
+        }
+    }
+    let seqs: Vec<u64> = steers.iter().map(|steer| steer.seq).collect();
     for seq in &seqs {
         if let Some(by) = oracle.acked.get(seq) {
             return Err(format!(

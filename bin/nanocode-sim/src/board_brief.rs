@@ -247,7 +247,7 @@ fn steer(world: &mut World, rng: &mut Rng, now: u64, number: u64) -> Result<(), 
     let op = Op::Steer(SteerOp::Send {
         task: world.child.clone(),
         claim: None,
-        body: body.clone(),
+        body: body.clone().into(),
     });
     let (_, seq) = world.host.append(OWNER, now, op)?;
     world.steers.insert(seq, body);

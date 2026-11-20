@@ -154,7 +154,9 @@ impl Fold {
         for steer in &pending[..kept] {
             text.push_str(&format!(
                 "\n# Steer {} from {}\n{}\n",
-                steer.seq, steer.by, steer.body
+                steer.seq,
+                steer.by,
+                crate::steer::render(&steer.body)
             ));
             steers.push(steer.seq);
         }

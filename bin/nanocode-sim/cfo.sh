@@ -178,6 +178,7 @@ default_table='
 1 canary_board_steer_to_terminal canary:40 --scenario board_steer --mutation steer_to_terminal
 1 canary_board_finish_ignores_steers canary:40 --scenario board_steer --mutation finish_ignores_steers
 1 canary_board_steer_kept_on_cancel canary:40 --scenario board_steer --mutation steer_kept_on_cancel
+1 canary_board_steer_local_path canary:40 --scenario board_steer --mutation steer_local_path
 8 board_brief pass --scenario board_brief
 2 board_brief_twice pass --scenario board_brief --twice
 1 canary_board_brief_over_budget canary:40 --scenario board_brief --mutation brief_over_budget

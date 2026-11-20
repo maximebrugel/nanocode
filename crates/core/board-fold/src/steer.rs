@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
+pub use nanocode_types_core::{PromptInput, UserInput};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,7 +16,7 @@ pub enum SteerOp {
         task: TaskId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claim: Option<ClaimId>,
-        body: String,
+        body: PromptInput,
     },
     Heed {
         task: TaskId,
@@ -38,7 +39,7 @@ pub struct Steer {
     pub by: String,
     pub at_ms: u64,
     pub to: Option<ClaimId>,
-    pub body: String,
+    pub body: PromptInput,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,8 @@ pub enum Refusal {
     Unheeded { upto: u64 },
     NotPending { upto: u64 },
     Text(usize),
+    Local,
+    Bytes(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +56,7 @@ pub enum Steered {
     Sent {
         by: String,
         to: Option<ClaimId>,
-        body: String,
+        body: PromptInput,
     },
     Heeded {
         claim: ClaimId,
@@ -121,9 +124,9 @@ impl Fold {
                 if !mutated(Mutation::SteerByClaimFollows) {
                     self.holder(task, claim)?;
                 }
-                steer_text(body)
+                steer_body(body)
             }
-            SteerOp::Send { body, .. } => steer_text(body),
+            SteerOp::Send { body, .. } => steer_body(body),
             SteerOp::Heed { task, claim, upto } => {
                 if !mutated(Mutation::HeedFromStaleClaim) {
                     self.holder(task, claim)?;
@@ -202,10 +205,74 @@ impl Fold {
     }
 }
 
-fn steer_text(body: &str) -> Result<(), Rejection> {
-    let chars = body.chars().count();
-    if chars == 0 || chars > TEXT_CHARS {
-        return Err(Rejection::Steer(Refusal::Text(chars)));
+/// The most a steer may carry inline (text, URLs, file ids and file data together).
+pub const STEER_BYTES: usize = 64 * 1024;
+
+/// A steer is a member message, so it may hold the same blocks as one, except paths on
+/// the sender's machine: the claim can move to another holder anywhere before it is read.
+fn steer_body(body: &PromptInput) -> Result<(), Rejection> {
+    let refuse = |refusal| Err(Rejection::Steer(refusal));
+    if let PromptInput::Content(items) = body {
+        if items.iter().any(is_local) && !mutated(Mutation::SteerLocalPath) {
+            return refuse(Refusal::Local);
+        }
+        let bytes: usize = items.iter().map(inline_bytes).sum();
+        if bytes > STEER_BYTES {
+            return refuse(Refusal::Bytes(bytes));
+        }
+    }
+    let chars = body.text_chars();
+    if body.is_empty() || chars > TEXT_CHARS {
+        return refuse(Refusal::Text(chars));
     }
     Ok(())
+}
+
+const fn is_local(item: &UserInput) -> bool {
+    matches!(
+        item,
+        UserInput::LocalImage { .. } | UserInput::LocalAudio { .. }
+    )
+}
+
+fn inline_bytes(item: &UserInput) -> usize {
+    match item {
+        UserInput::Text { text } => text.len(),
+        UserInput::Image { image_url, .. } => image_url.len(),
+        UserInput::ImageFile { file_id, .. } => file_id.len(),
+        UserInput::Audio { audio_url } => audio_url.len(),
+        UserInput::File {
+            file_data,
+            filename,
+        } => file_data.len() + filename.as_ref().map_or(0, String::len),
+        UserInput::LocalImage { path, .. } | UserInput::LocalAudio { path } => {
+            path.as_os_str().len()
+        }
+    }
+}
+
+/// The steer as text for a brief: its text blocks in order, other blocks as a short tag.
+#[must_use]
+pub fn render(body: &PromptInput) -> String {
+    let items = match body {
+        PromptInput::Text(text) => return text.clone(),
+        PromptInput::Content(items) => items,
+    };
+    let parts: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            UserInput::Text { text } => text.clone(),
+            UserInput::Image { image_url, .. } if !image_url.starts_with("data:") => {
+                format!("[image {image_url}]")
+            }
+            UserInput::Image { .. } | UserInput::LocalImage { .. } => "[image]".to_owned(),
+            UserInput::ImageFile { file_id, .. } => format!("[image {file_id}]"),
+            UserInput::Audio { .. } | UserInput::LocalAudio { .. } => "[audio]".to_owned(),
+            UserInput::File { filename, .. } => {
+                format!("[file {}]", filename.as_deref().unwrap_or("attached"))
+            }
+        })
+        .collect();
+    parts.join("
+")
 }

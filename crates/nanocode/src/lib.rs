@@ -19,6 +19,12 @@ pub use nanocode_process_contracts as process;
 
 pub use nanocode_agent::HarnessRequest;
 pub use nanocode_backend_claude::ClaudeHarness;
+pub mod antigravity {
+    pub use nanocode_backend_antigravity::{
+        AntigravityHarness, Auth, CacheConfig, Client, DEFAULT_MODEL, Endpoint, FAMILY, Profile,
+        RetryPolicy,
+    };
+}
 pub use nanocode_backend_codex::CodexHarness;
 pub type Harness = nanocode_agent::Harness<Defaults>;
 pub type HarnessBuilder = nanocode_agent::HarnessBuilder<Defaults>;

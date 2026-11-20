@@ -56,6 +56,9 @@
 
 | Crate | Owns |
 | --- | --- |
+| `nanocode-backend-antigravity-client` | The Gemini wire format, SSE streaming, retries, explicit context caching |
+| `nanocode-backend-antigravity-tools` | Antigravity's engine tools, their declarations and output formats |
+| `nanocode-backend-antigravity` | The Antigravity driver, its pinned prompts, reminders and compaction |
 | `nanocode-backend-claude-client` | The Messages wire format, authentication, the subscription wire, streaming, message threads |
 | `nanocode-backend-claude-tools` | Claude's tool definitions and handlers |
 | `nanocode-backend-claude` | The Claude driver, its pinned upstream prompts and tools, durability format |

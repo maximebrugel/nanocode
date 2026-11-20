@@ -196,6 +196,11 @@ impl<B, D: RuntimeDefaults> RuntimeBuilder<B, D> {
         self.install_harness(Arc::new(harness.into()))
     }
 
+    #[must_use]
+    pub fn harness(self, harness: impl RuntimeBackend) -> Self {
+        self.install_harness(Arc::new(harness))
+    }
+
     fn install_harness(mut self, harness: Arc<dyn RuntimeBackend>) -> Self {
         let id = harness.id();
         self.data

@@ -442,10 +442,11 @@ fn runner_failure(event: &nanocode::RunnerEvent) -> Option<String> {
     }
 }
 
-const fn family(harness: HarnessArg) -> nanocode::HarnessFamily {
+fn family(harness: HarnessArg) -> nanocode::HarnessFamily {
     match harness {
         HarnessArg::Codex => nanocode::HarnessFamily::Codex,
         HarnessArg::Claude => nanocode::HarnessFamily::Claude,
+        HarnessArg::Antigravity => nanocode::HarnessFamily::new(nanocode::antigravity::FAMILY),
     }
 }
 

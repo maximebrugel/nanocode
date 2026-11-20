@@ -50,13 +50,17 @@ pub enum CuaCommand {
 pub enum HarnessArg {
     Codex,
     Claude,
+    Antigravity,
 }
 
 impl HarnessArg {
-    const ALL: [Self; 2] = [Self::Codex, Self::Claude];
-    const CHOICES: [Choice; 2] = [
+    const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Antigravity];
+    const CHOICES: [Choice; 3] = [
         Choice::new("codex").help("OpenAI Codex models (ChatGPT login)"),
         Choice::new("claude").help("Anthropic Claude models (Claude Code login)"),
+        Choice::new("antigravity").help(
+            "Google Antigravity's engine on Gemini models (GEMINI_API_KEY or AGY_LLM_GATEWAY_URL)",
+        ),
     ];
 }
 

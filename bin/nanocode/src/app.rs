@@ -3056,6 +3056,8 @@ pub fn subagent_status(status: &AgentStatus) -> (NodeStatus, String) {
 pub fn family_label(family: &HarnessFamily) -> &'static str {
     if *family == HarnessFamily::Claude {
         "Claude"
+    } else if family.as_str() == nanocode::antigravity::FAMILY {
+        "Antigravity"
     } else {
         "Codex"
     }

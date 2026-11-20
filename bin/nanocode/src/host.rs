@@ -867,6 +867,7 @@ impl Host {
         let mut builder = Nanocode::builder()
             .openai(codex)
             .claude(claude)
+            .harness(nanocode::antigravity::AntigravityHarness::new())
             .workspace(config.workspace.clone())
             .tool_environment(config.clients.tool_environment.clone());
         if !config.clients.mcp_servers.is_empty() {

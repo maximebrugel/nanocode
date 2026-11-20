@@ -56,11 +56,13 @@ for (let w = 1; w <= 3; w++) for (let k = 0; k < 3024; k++) {
   const want = m.infer(o).p;
   if (want !== apply(glue_short, T.date[dkk([w, 0, 0, 0, 0])], T.time[k])) wex[w * 3024 + k] = want;
 }
-// localized GMT format: [prefix, minus sign]
+// localized GMT format: [prefix, minus sign], the prefix as prefix{0}suffix when the offset has text
+// after it (fa \u200e{0} گرینویچ); he's trailing LRMs are not a suffix (date.rs locale_offset)
 const lo = new Intl.DateTimeFormat(LOC, {timeZone: "-03:00", timeZoneName: "shortOffset"}).formatToParts(0).find(p => p.type === "timeZoneName").value;
 const hi = new Intl.DateTimeFormat(LOC, {timeZone: "+03:00", timeZoneName: "shortOffset"}).formatToParts(0).find(p => p.type === "timeZoneName").value;
 const neg = lo.replace(/\u200e$/, "");
-const gmt = [hi.slice(0, hi.indexOf("+")), neg.slice(neg.length - 2, neg.length - 1)];
+const suffix = hi.slice(hi.indexOf("+") + 1).replace(/^\p{Nd}+/u, "").replace(/\u200e+$/, "");
+const gmt = [hi.slice(0, hi.indexOf("+")) + (suffix ? "{0}" + suffix : ""), neg[neg.search(/\p{Nd}/u) - 1]];
 // styles
 const st = ["full", "long", "medium", "short"];
 const styles = {date: st.map(s => m.infer({dateStyle: s}).p), time: [], both: []};

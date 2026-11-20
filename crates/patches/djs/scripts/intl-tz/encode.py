@@ -69,6 +69,10 @@ def ltoday(li, R, slot):
 def lgmt(li, off, long, g=None):
     """date.rs locale_offset: the name a locale's GMT format gives the offset."""
     g, minus = (LGMT[li][0] if g is None else g), LGMT[li][1]
+    if "{0}" in g:
+        # fa puts text after the offset: \u200e{0} گرینویچ
+        pre, suf = g.split("{0}", 1)
+        return pre + lgmt(li, off, long, "") + suf
     if g.endswith("\u200e"):
         # he isolates the offset with LRMs: GMT\u200e+5\u200e, but GMT-5\u200e (GMT-05:00\u200e\u200e long)
         plain = lgmt(li, off, long, g[:-1])

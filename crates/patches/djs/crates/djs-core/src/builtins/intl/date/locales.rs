@@ -1248,7 +1248,7 @@ pub(super) static DATE_LOCALES: &[DateLocale] = &[
         style_glue: [" ساعت ", " ساعت ", "، ", ", "],
         glue: [" ساعت ", " ساعت ", "، ", ", "],
         zones: &FA_ZONES,
-        gmt: ["‎", "ی"],
+        gmt: ["‎{0} گرینویچ", "−"],
     },
     DateLocale {
         tags: &["am", "am-ET"],

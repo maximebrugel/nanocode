@@ -949,6 +949,11 @@ fn zone_name(kind: usize, z: &ZoneAt) -> String {
 }
 
 fn locale_offset(l: &DateLocale, off: i64, long: bool) -> String {
+    // fa puts text after the offset: \u{200e}{0} گرینویچ.
+    if let Some((pre, suf)) = l.gmt[0].split_once("{0}") {
+        let body = locale_offset(&DateLocale { gmt: ["", l.gmt[1]], ..*l }, off, long);
+        return format!("{pre}{body}{suf}");
+    }
     // he isolates the offset with LRMs: GMT\u{200e}+5\u{200e}, but GMT-5\u{200e} (GMT-05:00\u{200e}\u{200e} long).
     if let Some(prefix) = l.gmt[0].strip_suffix('\u{200e}') {
         let plain = locale_offset(&DateLocale { gmt: [prefix, l.gmt[1]], ..*l }, off, long);

@@ -486,10 +486,6 @@ impl GcState {
         let generation = generation.min(2);
         let debug = gc.get_debug();
 
-        // Clear the method cache to release strong references that
-        // might prevent cycle collection (_PyType_ClearCache).
-        crate::builtins::type_::type_cache_clear();
-
         // Backstop for QSBR reclamation (threads may have missed requests).
 
         // Stop the world before reading any tracked object's interpreter
@@ -744,6 +740,14 @@ impl GcState {
                 candidates,
                 duration,
             };
+        }
+
+        // The method cache holds borrowed pointers into types. Nothing has
+        // been freed up to here; clear it (_PyType_ClearCache) only now that
+        // this collection is about to finalize and break cycles, so a
+        // collection that finds nothing to free leaves it warm.
+        if !unreachable.is_empty() {
+            crate::builtins::type_::type_cache_clear();
         }
 
         // Create strong references while read locks are still held.

@@ -16,6 +16,10 @@ nanocode-sync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+nanocode-io.workspace = true
+nanocode-websocket.workspace = true
+
 [lints]
 workspace = true
 

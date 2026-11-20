@@ -362,16 +362,8 @@ impl SessionSnapshot {
         &self.history
     }
 
-    pub(crate) fn history_len(&self) -> usize {
-        self.history.len()
-    }
-
     pub(crate) fn history_from(&self, start: usize) -> impl Iterator<Item = &ResponseItem> {
         self.history.iter_from(start)
-    }
-
-    pub(crate) fn request_prefix(&self) -> Option<&[ResponseItem]> {
-        self.request_prefix.as_deref()
     }
 
     pub(crate) fn without_context(&self) -> Self {

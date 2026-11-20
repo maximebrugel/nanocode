@@ -1065,11 +1065,32 @@ impl ClaudeBuilder {
     }
 
     pub fn execution_policy(
-        mut self,
+        self,
         policy: Arc<dyn ClaudeExecutionPolicy>,
         checkpoint: Option<Value>,
     ) -> Result<Self> {
         let restored = checkpoint.map(Snapshot::decode).transpose()?;
+        self.restored_execution_policy(policy, restored)
+    }
+
+    pub(crate) fn paged_execution_policy(
+        self,
+        policy: Arc<dyn ClaudeExecutionPolicy>,
+        checkpoint: Option<Value>,
+        pages: Option<ContinuationPages>,
+    ) -> Result<Self> {
+        let restored = match (checkpoint, pages) {
+            (Some(head), Some(pages)) => Some(Snapshot::decode_paged(head, pages)?),
+            (checkpoint, _) => checkpoint.map(Snapshot::decode).transpose()?,
+        };
+        self.restored_execution_policy(policy, restored)
+    }
+
+    fn restored_execution_policy(
+        mut self,
+        policy: Arc<dyn ClaudeExecutionPolicy>,
+        restored: Option<Snapshot>,
+    ) -> Result<Self> {
         if let (Some(configured), Some(stored)) = (&self.restored, &restored)
             && configured != stored
         {
@@ -2950,6 +2971,12 @@ struct Refused<'a> {
     fallback: &'a str,
     refusing: &'a str,
     scope: RefusalFallbackScope,
+}
+
+pub(crate) struct ContinuationPages {
+    pub(crate) messages: Vec<nanocode_durability::EncodedPayload>,
+    pub(crate) code_calls: Option<Vec<nanocode_durability::EncodedPayload>>,
+    pub(crate) compacted: Option<Vec<nanocode_durability::EncodedPayload>>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]

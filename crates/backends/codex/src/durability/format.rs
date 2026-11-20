@@ -52,8 +52,7 @@ impl CheckpointFormat for CodexCheckpointFormat {
                 serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
             let (hydrated, keys) = context::load_hydrated_with_keys(reader, saved).await?;
             read.extend(keys);
-            let value = serde_json::to_value(&hydrated.snapshot).map_err(Error::InvalidPayload)?;
-            Ok((value, Some(Hydrated::new(hydrated))))
+            Ok((summary(&hydrated.snapshot)?, Some(Hydrated::new(hydrated))))
         })
     }
 
@@ -113,6 +112,50 @@ impl CheckpointFormat for CodexCheckpointFormat {
     fn transcript(&self, checkpoint: &Value, _turns: &[AdmittedTurn<'_>]) -> Vec<TranscriptItem> {
         let mut items = Vec::new();
         for item in checkpoint["history"].as_array().into_iter().flatten() {
+            transcript_item(item, &mut items);
+        }
+        items
+    }
+
+    fn typed_session_checkpoint(
+        &self,
+        record: &SessionRecord,
+        _checkpoint: &Value,
+        hydrated: &Hydrated,
+    ) -> Option<Result<SessionCheckpoint>> {
+        let hydrated = hydrated.get::<context::HydratedSnapshot>()?;
+        Some(
+            SessionCheckpoint::codex(
+                record.session_id.clone(),
+                record.lineage.clone(),
+                record.model.default_thinking(),
+                hydrated.snapshot.clone(),
+            )
+            .map_err(|error| Error::InvalidState(error.to_string())),
+        )
+    }
+
+    fn typed_transcript(
+        &self,
+        _checkpoint: &Value,
+        hydrated: &Hydrated,
+        _turns: &[AdmittedTurn<'_>],
+    ) -> Option<Vec<TranscriptItem>> {
+        let hydrated = hydrated.get::<context::HydratedSnapshot>()?;
+        let mut items = Vec::new();
+        for item in hydrated.snapshot.history_from(0) {
+            let item = serde_json::to_value(item).ok()?;
+            transcript_item(&item, &mut items);
+        }
+        Some(items)
+    }
+}
+
+fn summary(snapshot: &SessionSnapshot) -> Result<Value> {
+    serde_json::to_value(snapshot.without_context()).map_err(Error::InvalidPayload)
+}
+
+fn transcript_item(item: &Value, items: &mut Vec<TranscriptItem>) {
             match item["type"].as_str() {
                 Some("message") => {
                     let role = item["role"].as_str();
@@ -169,9 +212,6 @@ impl CheckpointFormat for CodexCheckpointFormat {
                 }
                 _ => {}
             }
-        }
-        items
-    }
 }
 
 async fn hydrate(
@@ -199,55 +239,20 @@ async fn advance(
     read: &mut HashSet<String>,
     previous: Previous,
 ) -> Result<Advanced> {
-    let Previous {
-        checkpoint: mut value,
-        hydrated,
-    } = previous;
-    let earlier = hydrated.and_then(Hydrated::take::<context::HydratedSnapshot>);
-    let values = match value.get_mut("history").map(Value::take) {
-        Some(Value::Array(values)) => Some(values),
-        _ => None,
-    };
-    let (Some(earlier), Some(mut values)) = (earlier, values) else {
-        let saved: context::Snapshot =
-            serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let saved: context::Snapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
+    let Some(earlier) = previous
+        .hydrated
+        .and_then(Hydrated::take::<context::HydratedSnapshot>)
+    else {
         let (hydrated, keys) = context::load_hydrated_with_keys(reader, saved).await?;
         read.extend(keys);
-        let value = serde_json::to_value(&hydrated.snapshot).map_err(Error::InvalidPayload)?;
+        let value = summary(&hydrated.snapshot)?;
         return Ok(Advanced::whole(value, Some(Hydrated::new(hydrated))));
     };
-    let converted = if values.len() == earlier.snapshot.history_len() {
-        values.len()
-    } else {
-        0
-    };
-    let earlier_prefix = value.get_mut("request_prefix").map(Value::take);
-    let saved: context::Snapshot = serde_json::from_value(stored).map_err(Error::InvalidPayload)?;
     let advanced = context::advance_snapshot(reader, saved, earlier).await?;
     read.extend(advanced.keys);
-    let snapshot = &advanced.hydrated.snapshot;
-    let reused = advanced.reused.min(converted);
-    values.truncate(reused);
-    for item in snapshot.history_from(reused) {
-        values.push(serde_json::to_value(item).map_err(Error::InvalidPayload)?);
-    }
-    let mut value =
-        serde_json::to_value(snapshot.without_context()).map_err(Error::InvalidPayload)?;
-    let Some(object) = value.as_object_mut() else {
-        return Err(Error::InvalidPayload(
-            <serde_json::Error as serde::de::Error>::custom("a Codex checkpoint is an object"),
-        ));
-    };
-    *object.entry("history").or_insert(Value::Null) = Value::Array(values);
-    if let Some(prefix) = snapshot.request_prefix() {
-        let prefix = match earlier_prefix {
-            Some(kept) if advanced.prefix_kept && !kept.is_null() => kept,
-            _ => serde_json::to_value(prefix).map_err(Error::InvalidPayload)?,
-        };
-        *object.entry("request_prefix").or_insert(Value::Null) = prefix;
-    }
     Ok(Advanced {
-        checkpoint: value,
+        checkpoint: summary(&advanced.hydrated.snapshot)?,
         hydrated: Some(Hydrated::new(advanced.hydrated)),
         whole: false,
         reused: advanced.reused,

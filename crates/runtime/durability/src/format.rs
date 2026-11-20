@@ -23,6 +23,11 @@ impl Hydrated {
     pub fn take<T: Any + Clone + Send + Sync>(self) -> Option<T> {
         Arc::downcast::<T>(self.0).ok().map(Arc::unwrap_or_clone)
     }
+
+    #[must_use]
+    pub fn get<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
 }
 
 impl fmt::Debug for Hydrated {
@@ -143,6 +148,24 @@ pub trait CheckpointFormat: Send + Sync {
     }
 
     fn transcript(&self, checkpoint: &Value, turns: &[AdmittedTurn<'_>]) -> Vec<TranscriptItem>;
+
+    fn typed_session_checkpoint(
+        &self,
+        _record: &SessionRecord,
+        _checkpoint: &Value,
+        _hydrated: &Hydrated,
+    ) -> Option<Result<SessionCheckpoint>> {
+        None
+    }
+
+    fn typed_transcript(
+        &self,
+        _checkpoint: &Value,
+        _hydrated: &Hydrated,
+        _turns: &[AdmittedTurn<'_>],
+    ) -> Option<Vec<TranscriptItem>> {
+        None
+    }
 }
 
 #[derive(Clone, Default)]

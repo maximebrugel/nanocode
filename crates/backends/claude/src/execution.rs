@@ -82,6 +82,26 @@ pub struct ClaudeSteer {
     pub input_json: String,
 }
 
+pub struct ClaudeContinuation {
+    pub(crate) head: Value,
+    pub(crate) pages: Option<crate::agent::ContinuationPages>,
+}
+
+impl ClaudeContinuation {
+    #[must_use]
+    pub const fn whole(cursor: Value) -> Self {
+        Self {
+            head: cursor,
+            pages: None,
+        }
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.head["template"]["model"].as_str()
+    }
+}
+
 pub trait ClaudeExecutionPolicy: Send + Sync {
     fn state_id(&self) -> &str;
     fn admit(
@@ -161,6 +181,9 @@ pub trait ClaudeExecutionPolicy: Send + Sync {
         })
     }
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>>;
+    fn continuation_paged(&self, id: String) -> PolicyFuture<'_, Option<ClaudeContinuation>> {
+        Box::pin(async move { Ok(self.continuation(id).await?.map(ClaudeContinuation::whole)) })
+    }
     fn continuation_model(&self, id: String) -> PolicyFuture<'_, Option<String>> {
         Box::pin(async move {
             Ok(self

@@ -80,6 +80,18 @@ impl Default for Snapshot {
     }
 }
 impl Snapshot {
+    pub(super) fn decode_paged(head: Value, pages: ContinuationPages) -> Result<Self> {
+        let mut snapshot = serde_json::from_value::<Self>(head).map_err(provider_error)?;
+        snapshot.conversation.messages = decode_pages(pages.messages)?;
+        if let Some(code_calls) = pages.code_calls {
+            snapshot.conversation.code_calls = decode_pages(code_calls)?;
+        }
+        if let Some(compacted) = pages.compacted {
+            snapshot.conversation.compacted = decode_pages(compacted)?;
+        }
+        snapshot.validated()
+    }
+
     pub(super) fn decode(value: Value) -> Result<Self> {
         serde_json::from_value::<Self>(value)
             .map_err(provider_error)?
@@ -481,9 +493,20 @@ impl State {
     ) -> Result<Cursor> {
         let update = self.persistence_update.enter().await;
         if let (Some(policy), Some(operation)) = (&self.policy, operation)
-            && let Some(value) = policy.continuation(operation.to_owned()).await?
+            && let Some(continuation) = policy.continuation_paged(operation.to_owned()).await?
         {
-            let mut cursor: Cursor = serde_json::from_value(value).map_err(recovery_error)?;
+            let mut cursor: Cursor =
+                serde_json::from_value(continuation.head).map_err(recovery_error)?;
+            if let Some(pages) = continuation.pages {
+                let conversation = &mut cursor.snapshot.conversation;
+                conversation.messages = decode_pages(pages.messages)?;
+                if let Some(code_calls) = pages.code_calls {
+                    conversation.code_calls = decode_pages(code_calls)?;
+                }
+                if let Some(compacted) = pages.compacted {
+                    conversation.compacted = decode_pages(compacted)?;
+                }
+            }
             if let Some(base) = cursor.pending_base.take() {
                 let prefix = usize::try_from(base)
                     .ok()
@@ -1065,6 +1088,16 @@ impl State {
             .await
             .map(drop)
     }
+}
+
+fn decode_pages<T: serde::de::DeserializeOwned>(payloads: Vec<EncodedPayload>) -> Result<Vec<T>> {
+    let mut decoded = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let value = payload.decode::<Value>().map_err(provider_error)?;
+        drop(payload);
+        decoded.push(serde_json::from_value(value).map_err(provider_error)?);
+    }
+    Ok(decoded)
 }
 
 const PAGED_VERSION: u32 = 4;

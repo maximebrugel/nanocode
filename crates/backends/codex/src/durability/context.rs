@@ -214,7 +214,6 @@ pub(crate) struct AdvancedSnapshot {
     pub(crate) keys: HashSet<String>,
     pub(crate) reused: usize,
     pub(crate) decoded: usize,
-    pub(crate) prefix_kept: bool,
 }
 
 async fn load_items(
@@ -269,17 +268,17 @@ pub(crate) async fn advance_snapshot(
         reader.load_payloads(added).await?
     };
     let history = loaded_history(&previous_history, &mut log, payloads)?;
-    let (prefix, prefix_references, prefix_kept) = match saved.prefix {
-        None => (None, None, false),
+    let (prefix, prefix_references) = match saved.prefix {
+        None => (None, None),
         Some(sequence) => {
             let references = sequence_references(reader, sequence, &mut keys).await?;
             match (previous_prefix, previous_prefix_references) {
                 (Some(items), Some(kept)) if same_keys(&kept, &references) => {
-                    (Some(items), Some(references), true)
+                    (Some(items), Some(references))
                 }
                 _ => {
                     let items = load_items(reader, &references).await?;
-                    (Some(Arc::from(items)), Some(references), false)
+                    (Some(Arc::from(items)), Some(references))
                 }
             }
         }
@@ -293,7 +292,6 @@ pub(crate) async fn advance_snapshot(
         keys,
         reused,
         decoded,
-        prefix_kept,
     })
 }
 

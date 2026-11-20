@@ -1066,8 +1066,14 @@ impl AgentRuntime {
             NanocodeError::InvalidRequest("runtime durability is not configured".into())
         })?;
         let _opening = self.inner.ownership.claim_opening(session_id).await;
-        let stored = configured.load(session_id).await.map_err(catalog_error)?;
-        self.open_stored(configured, &stored, None).await
+        let mut stored = configured.load(session_id).await.map_err(catalog_error)?;
+        let thinking = stored.checkpoint_thinking().map_err(catalog_error)?;
+        let durable_state = configured
+            .prepare_resume_taking(&mut stored)
+            .await
+            .map_err(catalog_error)?;
+        self.open_stored_prepared(&stored, durable_state, thinking, None)
+            .await
     }
 
     async fn open_stored(

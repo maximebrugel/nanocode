@@ -22,7 +22,7 @@ use serde_json::{Value, value::RawValue};
 use crate::{
     Claude, ClaudeBuilder, PreparedWire,
     execution::{
-        Admission as ClaudeAdmission, BeginRequest, ClaudeExecutionPolicy, ClaudeSteer,
+        Admission as ClaudeAdmission, BeginRequest, ClaudeContinuation, ClaudeExecutionPolicy, ClaudeSteer,
         EncodedState, JournalWrite, PolicyFuture, Settlement, Step,
     },
 };
@@ -91,9 +91,18 @@ impl DurableAgentExt for ClaudeBuilder {
             .await
             .map_err(agent_error)?;
         let (preloaded, preloaded_records) = state
-            .take_checkpoint_preload_with_records(
-                checkpoint.as_ref().map_or("", EncodedPayload::key),
-            )
+            .take_checkpoint_preload_hydrated(checkpoint.as_ref().map_or("", EncodedPayload::key))
+            .map(|(value, records, hydrated)| {
+                (
+                    (
+                        value,
+                        hydrated.and_then(nanocode_durability::Hydrated::take::<
+                            format::HydratedConversation,
+                        >),
+                    ),
+                    records,
+                )
+            })
             .unzip();
         let record = state.record().await.map_err(agent_error)?;
         let branches = Branches {
@@ -121,17 +130,21 @@ impl DurableAgentExt for ClaudeBuilder {
         };
         let mut read = preloaded_records
             .flatten()
-            .map(|records| Arc::unwrap_or_clone(records))
+            .map(Arc::unwrap_or_clone)
             .unwrap_or_default();
-        let checkpoint = match (checkpoint, preloaded) {
-            (Some(_), Some(preloaded)) => Some(
-                hydrate(PayloadReader::from(&owner), preloaded, &mut read)
-                    .instrument(nanocode_trace::info_span!(
-                        target: "nanocode",
-                        "claude.open.hydrate",
-                        preloaded = true
-                    ))
-                    .await?,
+        let (checkpoint, pages) = match (checkpoint, preloaded) {
+            (Some(_), Some((head, Some(pages)))) => (Some(head), Some(pages)),
+            (Some(_), Some((preloaded, None))) => (
+                Some(
+                    hydrate(PayloadReader::from(&owner), preloaded, &mut read)
+                        .instrument(nanocode_trace::info_span!(
+                            target: "nanocode",
+                            "claude.open.hydrate",
+                            preloaded = true
+                        ))
+                        .await?,
+                ),
+                None,
             ),
             (Some(value), None) => {
                 let span = nanocode_trace::info_span!(
@@ -140,11 +153,12 @@ impl DurableAgentExt for ClaudeBuilder {
                     preloaded = false
                 );
                 let decoded = span.in_scope(|| value.decode()).map_err(agent_error)?;
-                Some(
-                    hydrate(PayloadReader::from(&owner), decoded, &mut read)
+                let (head, pages) =
+                    format::hydrate_paged(PayloadReader::from(&owner), decoded, &mut read)
                         .instrument(span)
-                        .await?,
-                )
+                        .await
+                        .map_err(agent_error)?;
+                (Some(head), pages)
             }
             (None, _) => {
                 let imported = builder.configured_checkpoint()?;
@@ -161,12 +175,13 @@ impl DurableAgentExt for ClaudeBuilder {
                         .await
                         .map_err(agent_error)?;
                 }
-                imported
+                (imported, None)
             }
         };
         let _decode =
             nanocode_trace::info_span!(target: "nanocode", "claude.open.decode").entered();
-        builder.child_journal(journal).execution_policy(
+        let pages = pages.map(format::HydratedConversation::into_pages);
+        builder.child_journal(journal).paged_execution_policy(
             Arc::new(ClaudeExecution {
                 state_id,
                 owner,
@@ -177,6 +192,7 @@ impl DurableAgentExt for ClaudeBuilder {
                 stored: nanocode_sync::Slot::new(Some(read).filter(|read| !read.is_empty())),
             }),
             checkpoint,
+            pages,
         )
     }
 }
@@ -220,7 +236,7 @@ struct ClaudeExecution {
     owner: DurableOwner,
     session: DurableSession,
     branches: Branches,
-    hydrated: nanocode_sync::Slot<(String, Value, bool)>,
+    hydrated: nanocode_sync::Slot<(String, ClaudeContinuation, bool)>,
     hydrating: nanocode_sync::Sequencer,
     stored: nanocode_sync::Slot<HashSet<String>>,
 }
@@ -365,7 +381,7 @@ impl LazyClaudeExecution {
                         .is_empty();
                 let hydrated = nanocode_sync::Slot::default();
                 if let Some((key, cursor)) = self.ahead.take() {
-                    hydrated.put((key, cursor, true));
+                    hydrated.put((key, ClaudeContinuation::whole(cursor), true));
                 }
                 Ok::<_, nanocode_agent_core::NanocodeError>(Acquired {
                     execution: ClaudeExecution {
@@ -496,6 +512,10 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
 
     fn continuation_model(&self, id: String) -> PolicyFuture<'_, Option<String>> {
         Box::pin(async move { self.get().await?.continuation_model(id).await })
+    }
+
+    fn continuation_paged(&self, id: String) -> PolicyFuture<'_, Option<ClaudeContinuation>> {
+        Box::pin(async move { self.get().await?.continuation_paged(id).await })
     }
 
     fn prefetch_continuation(&self, id: String) -> PolicyFuture<'_, bool> {
@@ -732,6 +752,26 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
     }
 }
 
+impl ClaudeExecution {
+    async fn read_continuation(
+        &self,
+        value: EncodedPayload,
+        read: &mut HashSet<String>,
+    ) -> nanocode_agent_core::Result<ClaudeContinuation> {
+        let (head, pages) = format::hydrate_cursor_paged(
+            PayloadReader::from(&self.owner),
+            value.decode().map_err(agent_error)?,
+            read,
+        )
+        .await
+        .map_err(agent_error)?;
+        Ok(ClaudeContinuation {
+            head,
+            pages: pages.map(format::HydratedConversation::into_pages),
+        })
+    }
+}
+
 impl ClaudeExecutionPolicy for ClaudeExecution {
     fn state_id(&self) -> &str {
         &self.state_id
@@ -920,6 +960,20 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
     }
     fn continuation(&self, id: String) -> PolicyFuture<'_, Option<Value>> {
         Box::pin(async move {
+            let Some(continuation) = self.continuation_paged(id).await? else {
+                return Ok(None);
+            };
+            match &continuation.pages {
+                Some(pages) => format::assemble_cursor(continuation.head, pages)
+                    .map(Some)
+                    .map_err(agent_error),
+                None => Ok(Some(continuation.head)),
+            }
+        })
+    }
+
+    fn continuation_paged(&self, id: String) -> PolicyFuture<'_, Option<ClaudeContinuation>> {
+        Box::pin(async move {
             let span = nanocode_trace::info_span!(
                 target: "nanocode",
                 "agent.continuation",
@@ -940,24 +994,15 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 && key == value.key()
             {
                 span.record("hydrated", if ahead { "ahead" } else { "kept" });
-                if ahead {
-                    self.hydrated.put((key, hydrated.clone(), false));
-                }
                 return Ok(Some(hydrated));
             }
             span.record("hydrated", "read");
             let mut read = HashSet::new();
-            let hydrated = format::hydrate_cursor(
-                PayloadReader::from(&self.owner),
-                value.decode().map_err(agent_error)?,
-                &mut read,
-            )
-            .instrument(span)
-            .await
-            .map_err(agent_error)?;
+            let hydrated = self
+                .read_continuation(value, &mut read)
+                .instrument(span)
+                .await?;
             self.stored.put(read);
-            self.hydrated
-                .put((value.key().to_owned(), hydrated.clone(), false));
             Ok(Some(hydrated))
         })
     }
@@ -989,19 +1034,16 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 _ => {
                     span.record("hydrated", "read");
                     let mut read = HashSet::new();
-                    let hydrated = format::hydrate_cursor(
-                        PayloadReader::from(&self.owner),
-                        value.decode().map_err(agent_error)?,
-                        &mut read,
-                    )
-                    .instrument(span)
-                    .await
-                    .map_err(agent_error)?;
+                    let key = value.key().to_owned();
+                    let hydrated = self
+                        .read_continuation(value, &mut read)
+                        .instrument(span)
+                        .await?;
                     self.stored.put(read);
-                    (value.key().to_owned(), hydrated)
+                    (key, hydrated)
                 }
             };
-            let model = hydrated["template"]["model"].as_str().map(str::to_owned);
+            let model = hydrated.model().map(str::to_owned);
             self.hydrated.put((key, hydrated, false));
             Ok(model)
         })
@@ -1025,15 +1067,10 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 return Ok(true);
             }
             let mut read = HashSet::new();
-            let hydrated = format::hydrate_cursor(
-                PayloadReader::from(&self.owner),
-                value.decode().map_err(agent_error)?,
-                &mut read,
-            )
-            .await
-            .map_err(agent_error)?;
+            let key = value.key().to_owned();
+            let hydrated = self.read_continuation(value, &mut read).await?;
             self.stored.put(read);
-            self.hydrated.put((value.key().to_owned(), hydrated, true));
+            self.hydrated.put((key, hydrated, true));
             Ok(true)
         })
     }
@@ -1067,19 +1104,15 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
                 && ahead.key() == value.key()
             {
                 let (key, cursor) = ahead.into_parts();
-                self.hydrated.put((key, cursor, true));
+                self.hydrated
+                    .put((key, ClaudeContinuation::whole(cursor), true));
                 return Ok(Prefetched::Kept);
             }
             let mut read = HashSet::new();
-            let hydrated = format::hydrate_cursor(
-                PayloadReader::from(&self.owner),
-                value.decode().map_err(agent_error)?,
-                &mut read,
-            )
-            .await
-            .map_err(agent_error)?;
+            let key = value.key().to_owned();
+            let hydrated = self.read_continuation(value, &mut read).await?;
             self.stored.put(read);
-            self.hydrated.put((value.key().to_owned(), hydrated, true));
+            self.hydrated.put((key, hydrated, true));
             Ok(Prefetched::Read)
         })
     }

@@ -45,7 +45,9 @@ pub(super) fn recovery<'a>(
         }
         let provider = is_listed(&state).then(|| record.provider.clone()).flatten();
         let checkpoint = match checkpoint {
-            Some((checkpoint, ..)) => session_checkpoint(&this.formats, &record, &checkpoint)?,
+            Some((checkpoint, _, _, hydrated)) => {
+                session_checkpoint(&this.formats, &record, &checkpoint, hydrated.as_ref())?
+            }
             None => journal,
         };
         Ok((checkpoint, provider))

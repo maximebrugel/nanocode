@@ -547,7 +547,7 @@ mod store {
         };
         if is_portable(checkpoint) {
             return Ok(Some(
-                session_checkpoint(formats, record, checkpoint)?.thinking(),
+                session_checkpoint(formats, record, checkpoint, None)?.thinking(),
             ));
         }
         formats
@@ -569,7 +569,13 @@ mod store {
             let Some(checkpoint) = &self.checkpoint else {
                 return Ok(None);
             };
-            session_checkpoint(&self.formats, &self.summary.record, checkpoint).map(Some)
+            session_checkpoint(
+                &self.formats,
+                &self.summary.record,
+                checkpoint,
+                self.loaded.hydrated.as_ref(),
+            )
+            .map(Some)
         }
     }
 
@@ -577,7 +583,16 @@ mod store {
         formats: &Formats,
         record: &SessionRecord,
         checkpoint: &Value,
+        hydrated: Option<&crate::Hydrated>,
     ) -> Result<nanocode_agent_core::SessionCheckpoint> {
+        if let Some(hydrated) = hydrated
+            && !is_portable(checkpoint)
+            && let Some(typed) = formats
+                .family(record.family())?
+                .typed_session_checkpoint(record, checkpoint, hydrated)
+        {
+            return typed;
+        }
         if is_portable(checkpoint) {
             let portable = portable_checkpoint(checkpoint)?;
             portable
@@ -1637,15 +1652,20 @@ mod store {
         fn transcript(
             &self,
             checkpoint: &Value,
+            hydrated: Option<&crate::Hydrated>,
             family: HarnessFamily,
             turns: &[AdmittedTurn<'_>],
         ) -> Result<Vec<TranscriptItem>> {
-            let checkpoint = if is_portable(checkpoint) {
-                &checkpoint["payload"]
-            } else {
-                checkpoint
-            };
-            Ok(self.formats.family(family)?.transcript(checkpoint, turns))
+            let format = self.formats.family(family)?;
+            if is_portable(checkpoint) {
+                return Ok(format.transcript(&checkpoint["payload"], turns));
+            }
+            if let Some(transcript) =
+                hydrated.and_then(|hydrated| format.typed_transcript(checkpoint, hydrated, turns))
+            {
+                return Ok(transcript);
+            }
+            Ok(format.transcript(checkpoint, turns))
         }
 
         async fn progress(

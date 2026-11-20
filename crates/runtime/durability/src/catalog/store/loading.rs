@@ -31,11 +31,13 @@ pub(super) fn load<'a>(
         let progress = this.progress(id, &state, record.family()).await?;
         let transcript = match (&progress, &checkpoint) {
             (Some((_, view, steers)), _) => {
-                let mut transcript = this.transcript(view, record.family(), &admitted)?;
+                let mut transcript = this.transcript(view, None, record.family(), &admitted)?;
                 transcript.extend(steers.iter().cloned().map(TranscriptItem::User));
                 transcript
             }
-            (None, Some(checkpoint)) => this.transcript(checkpoint, record.family(), &admitted)?,
+            (None, Some(checkpoint)) => {
+                this.transcript(checkpoint, hydrated.as_ref(), record.family(), &admitted)?
+            }
             (None, None) => Vec::new(),
         };
         let preview = turns

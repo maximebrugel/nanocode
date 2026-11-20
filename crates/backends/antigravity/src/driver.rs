@@ -60,12 +60,20 @@ struct Inner {
     config: Config,
     state: Mutex<State>,
     cancel: Mutex<Option<Arc<Signal>>>,
+    steers: Mutex<SteerQueue>,
     stopped: AtomicBool,
     noticed: AtomicBool,
 }
 
 pub struct Driver {
     inner: Arc<Inner>,
+}
+
+#[derive(Default)]
+struct SteerQueue {
+    events: Option<(AgentEventPublisher, String)>,
+    pending: std::collections::VecDeque<(String, PromptInput)>,
+    index: u64,
 }
 
 fn emit(events: &AgentEventPublisher, kind: AgentEventKind, value: Value) {
@@ -470,6 +478,54 @@ impl Inner {
         delivered
     }
 
+    fn take_steers(&self, events: &AgentEventPublisher) -> Vec<Part> {
+        let Ok(mut queue) = self.steers.lock() else {
+            return Vec::new();
+        };
+        let mut parts = Vec::new();
+        while let Some((id, input)) = queue.pending.pop_front() {
+            queue.index += 1;
+            let text = prompt_text(&input);
+            emit(
+                events,
+                AgentEventKind::RunSteered,
+                json!({"steer_index": queue.index, "instruction_bytes": text.len(), "message_id": id}),
+            );
+            parts.push(Part::text(prompts::user_request(
+                &text,
+                &local_timestamp(Self::now()),
+                None,
+            )));
+        }
+        parts
+    }
+
+    fn steer_turn(&self, id: String, prompt: nanocode_agent_core::input::Prompt) -> Result<()> {
+        let mut queue = self
+            .steers
+            .lock()
+            .map_err(|_| NanocodeError::InvalidRequest("steer queue poisoned".into()))?;
+        let Some((events, turn_id)) = queue.events.clone() else {
+            return Err(NanocodeError::InvalidRequest(
+                "no turn is running to steer".into(),
+            ));
+        };
+        emit(
+            &events,
+            AgentEventKind::InputAccepted,
+            json!({
+                "session_id": self.config.session,
+                "turn_id": turn_id,
+                "item_id": format!("{turn_id}:steer:{id}"),
+                "kind": "steer",
+                "request_id": id,
+                "input": prompt.instruction,
+            }),
+        );
+        queue.pending.push_back((id, prompt.instruction));
+        Ok(())
+    }
+
     async fn run(
         self: Arc<Self>,
         input: PromptInput,
@@ -549,6 +605,13 @@ impl Inner {
                 .collect::<Vec<_>>();
             state.push(Content::model(parts));
             if calls.is_empty() {
+                let steers = self.take_steers(&events);
+                if !steers.is_empty() {
+                    state.step += 1;
+                    state.push(Content::user(steers));
+                    self.save(&state);
+                    continue;
+                }
                 state.streak += 1;
                 self.save(&state);
                 let engine = &self.config.engine;
@@ -619,6 +682,11 @@ impl Inner {
                     append(last, &system_message(REMINDER));
                 }
             }
+            let steers = self.take_steers(&events);
+            if !steers.is_empty() {
+                state.step += 1;
+            }
+            responses.extend(steers);
             state.push(Content::user(responses));
             self.save(&state);
         }
@@ -673,6 +741,7 @@ impl Driver {
                 config,
                 state: Mutex::new(State::default()),
                 cancel: Mutex::new(None),
+                steers: Mutex::new(SteerQueue::default()),
                 stopped: AtomicBool::new(false),
                 noticed: AtomicBool::new(false),
             }),
@@ -725,6 +794,23 @@ impl Driver {
             *slot = Some(Arc::clone(&cancel));
         }
         let events = prompt.events.clone();
+        let turn_id = events.turn_id().unwrap_or(events.request_id()).to_owned();
+        emit(
+            &events,
+            AgentEventKind::InputAccepted,
+            json!({
+                "session_id": inner.config.session,
+                "turn_id": turn_id,
+                "item_id": format!("{turn_id}:prompt"),
+                "kind": "prompt",
+                "request_id": prompt.request_id,
+                "input": prompt.prompt.instruction,
+            }),
+        );
+        if let Ok(mut queue) = inner.steers.lock() {
+            queue.events = Some((events.clone(), turn_id.clone()));
+            queue.pending.clear();
+        }
         let id = request_id.clone();
         let (sender, receiver) = nanocode_sync::oneshot::channel();
         nanocode_platform::spawn(async move {
@@ -744,6 +830,14 @@ impl Driver {
                     Err(NanocodeError::TurnCancelled)
                 }
             };
+            let leftover = match inner.steers.lock() {
+                Ok(mut queue) => {
+                    queue.events = None;
+                    std::mem::take(&mut queue.pending)
+                }
+                Err(_) => Default::default(),
+            };
+            drop(leftover);
             drop(sender.send(result));
         });
         let result =
@@ -772,6 +866,8 @@ impl LifecycleBackend for Driver {
     fn capabilities(&self) -> Capabilities {
         let mut capabilities = Capabilities::NONE;
         capabilities.checkpoint = true;
+        capabilities.steering = true;
+        capabilities.identified_steering = true;
         capabilities.compaction = true;
         capabilities
     }
@@ -789,9 +885,31 @@ impl LifecycleBackend for Driver {
     fn steer(
         &self,
         _key: BackendTurnKey,
-        _prompt: nanocode_agent_core::input::Prompt,
+        prompt: nanocode_agent_core::input::Prompt,
     ) -> BackendFuture<Result<()>> {
-        unsupported("steering")
+        let result = self
+            .inner
+            .steer_turn(nanocode_platform::uuid_v7().to_string(), prompt);
+        Box::pin(async move { result })
+    }
+
+    fn steer_with_id(
+        &self,
+        _key: BackendTurnKey,
+        id: String,
+        prompt: nanocode_agent_core::input::Prompt,
+    ) -> BackendFuture<Result<()>> {
+        let result = self.inner.steer_turn(id, prompt);
+        Box::pin(async move { result })
+    }
+
+    fn withdraw_steer(&self, _key: BackendTurnKey, id: String) -> BackendFuture<Result<bool>> {
+        let removed = self.inner.steers.lock().is_ok_and(|mut queue| {
+            let before = queue.pending.len();
+            queue.pending.retain(|(pending, _)| *pending != id);
+            queue.pending.len() != before
+        });
+        Box::pin(async move { Ok(removed) })
     }
 
     fn cancel(&self, _key: BackendTurnKey) -> BackendFuture<Result<()>> {

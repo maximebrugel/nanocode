@@ -10,6 +10,7 @@ publish.workspace = true
 description = "Google Cloud access tokens from Application Default Credentials: user, service account, impersonated and workload identity credentials, the metadata server and the gcloud CLI"
 
 [dependencies]
+nanocode-digest.workspace = true
 nanocode-http.workspace = true
 nanocode-platform.workspace = true
 nanocode-sync.workspace = true

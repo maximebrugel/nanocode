@@ -1,5 +1,5 @@
 use crate::nanotools::NanoTools;
-use crate::profile::{Profile, SKIP_SIGNATURE};
+use crate::profile::{Profile, SKIP_SIGNATURE, Thinking as ProfileThinking};
 use crate::prompts;
 use crate::request::{Ids, Prefix, Request};
 use nanocode_agent_core::{
@@ -25,6 +25,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+pub const USAGE_LOG: &str = "usage.jsonl";
+
 pub struct Config {
     pub client: Client,
     pub profile: Profile,
@@ -37,6 +39,7 @@ pub struct Config {
     pub session: String,
     pub cache: Option<Arc<ExplicitCache>>,
     pub logs: PathBuf,
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -58,6 +61,7 @@ struct Inner {
     state: Mutex<State>,
     cancel: Mutex<Option<Arc<Signal>>>,
     stopped: AtomicBool,
+    noticed: AtomicBool,
 }
 
 pub struct Driver {
@@ -193,10 +197,27 @@ impl Inner {
         emit(
             events,
             AgentEventKind::ModelCallStarted,
-            json!({"model_call_index": call, "model": config.profile.model}),
+            json!({
+                "call_index": call,
+                "model_call_index": call,
+                "model": config.profile.model,
+                "reasoning_mode": "standard",
+                "effort": match config.profile.thinking {
+                    ProfileThinking::Level(level) => level.to_ascii_lowercase(),
+                    ProfileThinking::Budget(budget) => budget.to_string(),
+                },
+            }),
         );
+        let started = nanocode_platform::now();
+        let nanos = |since: nanocode_platform::Instant| {
+            u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        };
+        let mut first_event = None;
+        let mut first_output = None;
         let mut on_part = |part: &Part| {
+            first_event.get_or_insert_with(|| nanos(started));
             if let Some(text) = part.text.as_deref().filter(|_| !part.is_thought()) {
+                first_output.get_or_insert_with(|| nanos(started));
                 emit(
                     events,
                     AgentEventKind::AssistantDelta,
@@ -214,27 +235,72 @@ impl Inner {
                 emit(
                     events,
                     AgentEventKind::ModelCallFailed,
-                    json!({"model_call_index": call, "error": error.to_string()}),
+                    json!({
+                        "call_index": call,
+                        "model_call_index": call,
+                        "model": config.profile.model,
+                        "duration_ns": nanos(started),
+                        "error": error.to_string(),
+                    }),
                 );
                 return Err(NanocodeError::InvalidRequest(error.to_string()));
             }
         };
         let usage = reply.usage;
+        let output_tokens = usage.candidates_token_count + usage.thoughts_token_count;
         emit(
             events,
             AgentEventKind::ModelCallCompleted,
             json!({
+                "call_index": call,
                 "model_call_index": call,
                 "model": config.profile.model,
+                "attempt": 1,
+                "connection_generation": 0,
+                "status": reply
+                    .finish_reason
+                    .as_deref()
+                    .unwrap_or("STOP")
+                    .to_ascii_lowercase(),
+                "duration_ns": nanos(started),
+                "time_to_first_event_ns": first_event.unwrap_or_else(|| nanos(started)),
+                "time_to_first_output_ns": first_output,
+                "tool_calls": reply.parts.iter().filter(|part| part.function_call.is_some()).count(),
                 "usage": {
                     "input_tokens": usage.prompt_token_count,
-                    "output_tokens": usage.candidates_token_count + usage.thoughts_token_count,
-                    "input_tokens_details": {"cached_tokens": usage.cached_content_token_count},
+                    "input_tokens_details": {
+                        "cached_tokens": usage.cached_content_token_count,
+                        "cache_write_tokens": 0,
+                    },
+                    "output_tokens": output_tokens,
                     "output_tokens_details": {"reasoning_tokens": usage.thoughts_token_count},
+                    "total_tokens": usage.total_token_count.max(usage.prompt_token_count + output_tokens),
                 },
             }),
         );
+        self.log_usage(call, &config.profile.model, usage);
         Ok(reply)
+    }
+
+    fn log_usage(&self, call: u64, model: &str, usage: nanocode_backend_antigravity_client::Usage) {
+        use std::io::Write as _;
+        let line = json!({
+            "call_index": call,
+            "model": model,
+            "prompt_tokens": usage.prompt_token_count,
+            "cache_read_tokens": usage.cached_content_token_count,
+            "output_tokens": usage.candidates_token_count,
+            "thoughts_tokens": usage.thoughts_token_count,
+            "total_tokens": usage.total_token_count,
+        });
+        let _ = std::fs::create_dir_all(&self.config.logs);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.config.logs.join(USAGE_LOG))
+        {
+            let _ = writeln!(file, "{line}");
+        }
     }
 
     fn write_transcript(&self, state: &State) {
@@ -411,6 +477,15 @@ impl Inner {
         request_id: String,
     ) -> Result<TurnResult> {
         let mut state = self.load();
+        if let Some(notice) = &self.config.notice
+            && !self.noticed.swap(true, Ordering::SeqCst)
+        {
+            emit(
+                &events,
+                AgentEventKind::RunError,
+                json!({"error": notice, "source": "antigravity", "observational": true}),
+            );
+        }
         let text = prompt_text(&input);
         if !state.contents.is_empty() {
             state.step += 1;
@@ -439,12 +514,13 @@ impl Inner {
                 self.compact(&mut state, &events).await?;
                 self.save(&state);
             }
+            let call_index = state.calls;
             let reply = self
                 .request(
                     &state,
                     None,
                     self.config.profile.max_output_tokens,
-                    state.calls,
+                    call_index,
                     &events,
                 )
                 .await?;
@@ -459,7 +535,6 @@ impl Inner {
             state.step += 1;
             let parts = normalize(reply.parts, self.config.profile.skip_signature);
             let message = visible(&parts);
-            let call_index = state.calls;
             if !message.is_empty() {
                 final_message = message.clone();
                 emit(
@@ -597,6 +672,7 @@ impl Driver {
                 state: Mutex::new(State::default()),
                 cancel: Mutex::new(None),
                 stopped: AtomicBool::new(false),
+                noticed: AtomicBool::new(false),
             }),
         }
     }

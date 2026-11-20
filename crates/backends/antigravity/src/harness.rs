@@ -18,6 +18,15 @@ pub struct AntigravityHarness {
     cache: CacheConfig,
     model: Option<String>,
     app_data: Option<std::path::PathBuf>,
+    #[cfg(not(target_family = "wasm"))]
+    connection: Arc<nanocode_sync::OnceCell<Connection>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone)]
+struct Connection {
+    sender: Arc<dyn nanocode_backend_antigravity_client::Sender>,
+    endpoint: Endpoint,
 }
 
 impl AntigravityHarness {
@@ -158,17 +167,29 @@ impl AntigravityHarness {
                 nanocode_platform::system_time()
             ))
         });
-        let sender = Client::native_sender().map_err(|error| invalid(error.to_string()))?;
-        let endpoint = match self.endpoint.clone() {
-            Some(endpoint) => endpoint,
-            None => Endpoint::discover(
-                &self.google,
-                &|name: &str| std::env::var(name).ok(),
-                Arc::clone(&sender),
-            )
-            .await
-            .map_err(invalid)?,
-        };
+        let mut fresh = false;
+        let connection = self
+            .connection
+            .get_or_try_init(|| async {
+                fresh = true;
+                let sender = Client::native_sender().map_err(|error| invalid(error.to_string()))?;
+                let endpoint = match self.endpoint.clone() {
+                    Some(endpoint) => endpoint,
+                    None => Endpoint::discover(
+                        &self.google,
+                        &|name: &str| std::env::var(name).ok(),
+                        Arc::clone(&sender),
+                        model.as_str(),
+                    )
+                    .await
+                    .map_err(invalid)?,
+                };
+                Ok::<_, NanocodeError>(Connection { sender, endpoint })
+            })
+            .await?
+            .clone();
+        let notice = connection.endpoint.notice.clone().filter(|_| fresh);
+        let Connection { sender, endpoint } = connection;
         if endpoint.route.is_vertex() && model.as_str().to_ascii_lowercase().starts_with("claude") {
             return Err(invalid(format!(
                 "{model} on Vertex AI is served by Anthropic's Model Garden publisher (streamRawPredict with the Messages API), not the Gemini generateContent API the antigravity harness speaks; run it with --harness claude and CLAUDE_CODE_USE_VERTEX=1 (ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION), which uses the same Application Default Credentials",
@@ -270,6 +291,7 @@ impl AntigravityHarness {
             session,
             cache,
             logs: brain.join(".system_generated").join("logs"),
+            notice,
         });
         Ok((runtime.bind(driver), events))
     }

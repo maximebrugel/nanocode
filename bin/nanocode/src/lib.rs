@@ -24,6 +24,7 @@ mod patch;
 mod prepare;
 mod python;
 mod sessions;
+mod setup;
 mod side;
 mod split;
 mod stream;
@@ -341,6 +342,7 @@ fn start<const EXEC: bool>(clients: ModelClients) -> ExitCode {
             Some(Command::Hand(args)) => hand(args).await,
             #[cfg(unix)]
             Some(Command::Cua(args)) => cua::cua(args).await,
+            Some(Command::Setup(args)) => setup::setup(args).await,
             Some(Command::Sessions(mut args)) => {
                 args.home = args.home.or(cli.session.home);
                 on_worker(list_sessions(args)).await

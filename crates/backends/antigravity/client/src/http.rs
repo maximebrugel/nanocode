@@ -1,3 +1,4 @@
+use crate::project::{Projects, Saved, Store};
 use crate::sse::SseDecoder;
 use crate::wire::{GenerateResponse, Part, Reply, merge_parts};
 use nanocode_google_auth::GoogleAuth;
@@ -5,6 +6,8 @@ use nanocode_http::Method;
 use nanocode_http::header::{HeaderMap, HeaderName, HeaderValue};
 use nanocode_http::layer::{Request, Sender};
 use nanocode_sync::StreamExt;
+use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +19,11 @@ pub const USER_AGENT_VERTEX_EXPRESS: &str = "antigravity/cli/1.5.13 (aidev_clien
 pub const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub const VERTEX_GLOBAL_BASE_URL: &str = "https://aiplatform.googleapis.com";
 pub const VERTEX_GLOBAL_LOCATION: &str = "global";
+pub const SETUP_COMMAND: &str = "nanocode setup google";
+pub const ADC_LOGIN_COMMAND: &str = "gcloud auth application-default login";
+pub const SERVICE_DISABLED_BACKOFF: [Duration; 2] =
+    [Duration::from_secs(5), Duration::from_secs(15)];
+const LISTED_FAILURES: usize = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Auth {
@@ -95,6 +103,7 @@ pub struct GoogleConfig {
     pub method: Option<AuthMethod>,
     pub project: Option<String>,
     pub location: Option<String>,
+    pub state: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +112,7 @@ pub struct Endpoint {
     pub auth: Auth,
     pub user_agent: String,
     pub route: Route,
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +120,16 @@ pub struct RetryPolicy {
     pub max_retries: u32,
     pub initial: Duration,
     pub multiplier: u32,
+    pub service_disabled: &'static [Duration],
+}
+
+impl RetryPolicy {
+    pub const NONE: Self = Self {
+        max_retries: 0,
+        initial: Duration::ZERO,
+        multiplier: 1,
+        service_disabled: &[],
+    };
 }
 
 impl Default for RetryPolicy {
@@ -118,31 +138,128 @@ impl Default for RetryPolicy {
             max_retries: 4,
             initial: Duration::from_secs(1),
             multiplier: 2,
+            service_disabled: &SERVICE_DISABLED_BACKOFF,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    ServiceDisabled,
+    BillingDisabled,
+    PermissionDenied,
+    ModelNotFound,
+    FreeTier,
+    RateLimited,
+    Reauth,
+    Other,
+}
+
+fn mentions_reauth(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["invalid_grant", "invalid_rapt", "reauth"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+pub fn classify(status: u16, body: &str) -> Failure {
+    let value = serde_json::from_str::<Value>(body).ok();
+    let error = value.as_ref().and_then(|value| value.get("error"));
+    let reason = error
+        .and_then(|error| error.get("details"))
+        .and_then(Value::as_array)
+        .and_then(|details| {
+            details
+                .iter()
+                .find_map(|detail| detail.get("reason").and_then(Value::as_str))
+        });
+    let lower = body.to_ascii_lowercase();
+    match (status, reason) {
+        (_, Some("SERVICE_DISABLED")) => Failure::ServiceDisabled,
+        (_, Some("BILLING_DISABLED")) => Failure::BillingDisabled,
+        _ if lower.contains("free_tier") || lower.contains("free tier") => Failure::FreeTier,
+        (403, _)
+            if lower.contains("has not been used in project")
+                || lower.contains("it is disabled") =>
+        {
+            Failure::ServiceDisabled
+        }
+        (403, _) if lower.contains("billing") => Failure::BillingDisabled,
+        (403, _) => Failure::PermissionDenied,
+        (404, _) => Failure::ModelNotFound,
+        (429, _) => Failure::RateLimited,
+        (400 | 401, _) if mentions_reauth(body) => Failure::Reauth,
+        _ => Failure::Other,
+    }
+}
+
+pub fn error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| body.trim().to_owned())
+}
+
+pub fn reauth_hint() -> String {
+    format!("your Google sign-in expired or needs reauthentication: run `{ADC_LOGIN_COMMAND}`")
 }
 
 #[derive(Debug)]
 pub enum ClientError {
     Transport(String),
-    Status { status: u16, body: String },
+    Status {
+        status: u16,
+        body: String,
+        hint: Option<String>,
+    },
     Decode(String),
     Blocked(String),
     Auth(String),
+}
+
+impl ClientError {
+    pub fn failure(&self) -> Failure {
+        match self {
+            Self::Status { status, body, .. } => classify(*status, body),
+            Self::Auth(detail) if mentions_reauth(detail) => Failure::Reauth,
+            Self::Transport(_) | Self::Decode(_) | Self::Blocked(_) | Self::Auth(_) => {
+                Failure::Other
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transport(detail) => write!(formatter, "Gemini transport error: {detail}"),
-            Self::Status { status, body } => {
-                write!(formatter, "Gemini API returned {status}: {body}")
+            Self::Status { status, body, hint } => {
+                write!(
+                    formatter,
+                    "Gemini API returned {status}: {}",
+                    error_message(body)
+                )?;
+                match hint {
+                    Some(hint) => write!(formatter, "\nhint: {hint}"),
+                    None => Ok(()),
+                }
             }
             Self::Decode(detail) => {
                 write!(formatter, "Gemini response could not be decoded: {detail}")
             }
             Self::Blocked(detail) => write!(formatter, "Gemini blocked the request: {detail}"),
-            Self::Auth(detail) => write!(formatter, "Google authentication failed: {detail}"),
+            Self::Auth(detail) => {
+                write!(formatter, "Google authentication failed: {detail}")?;
+                match mentions_reauth(detail) {
+                    true => write!(formatter, "\nhint: {}", reauth_hint()),
+                    false => Ok(()),
+                }
+            }
         }
     }
 }
@@ -180,6 +297,7 @@ impl Endpoint {
             auth: get("AGY_LLM_GATEWAY_API_KEY").map_or(Auth::None, Auth::Bearer),
             user_agent: USER_AGENT_GATEWAY.to_owned(),
             route: Route::Gateway,
+            notice: None,
         })
     }
 
@@ -193,6 +311,7 @@ impl Endpoint {
             auth: Auth::ApiKey(key),
             user_agent: USER_AGENT_API_KEY.to_owned(),
             route: Route::GeminiApi,
+            notice: None,
         })
     }
 
@@ -205,42 +324,126 @@ impl Endpoint {
             auth: Auth::ApiKey(key),
             user_agent: USER_AGENT_VERTEX_EXPRESS.to_owned(),
             route: Route::VertexExpress,
+            notice: None,
         })
+    }
+
+    pub fn for_vertex(
+        auth: &GoogleAuth,
+        base: Option<&str>,
+        project: &str,
+        location: &str,
+    ) -> Self {
+        let base = base.map_or_else(|| vertex_base_url(location), str::to_owned);
+        Self {
+            base_url: base.trim_end_matches('/').to_owned(),
+            auth: Auth::Google(auth.clone().with_user_project(project.to_owned())),
+            user_agent: USER_AGENT_VERTEX.to_owned(),
+            route: Route::Vertex {
+                project: project.to_owned(),
+                location: location.to_owned(),
+            },
+            notice: None,
+        }
     }
 
     async fn vertex(
         config: &GoogleConfig,
         get: &(dyn Fn(&str) -> Option<String> + Sync),
         sender: Arc<dyn Sender>,
+        model: &str,
     ) -> Result<Self, String> {
-        let auth = GoogleAuth::discover(get, sender)
+        let auth = GoogleAuth::discover(get, Arc::clone(&sender))
             .await
             .map_err(|error| error.to_string())?;
-        let project = auth
-            .resolve_project(config.project.as_deref(), get)
-            .ok_or_else(|| {
+        let projects = Projects::new(auth.clone(), sender, get);
+        let configured_location =
+            present(config.location.clone()).or_else(|| get("GOOGLE_CLOUD_LOCATION"));
+        let found = auth.project_source(config.project.as_deref(), get);
+        if let Some((project, source)) = &found
+            && source.is_explicit()
+        {
+            let location = configured_location.unwrap_or_else(|| VERTEX_GLOBAL_LOCATION.to_owned());
+            return Ok(projects.endpoint(project, &location));
+        }
+        let store = Store::locate(config.state.clone(), get);
+        let identity = auth.identity();
+        if let Some(saved) = store.load(&identity).await {
+            let location = configured_location.unwrap_or(saved.location);
+            return Ok(projects.endpoint(&saved.project, &location));
+        }
+        let location = configured_location.unwrap_or_else(|| VERTEX_GLOBAL_LOCATION.to_owned());
+        let saved = |project: &str| Saved {
+            project: project.to_owned(),
+            location: location.clone(),
+            model: model.to_owned(),
+        };
+        let mut ruled_out = None;
+        if let Some((project, source)) = found {
+            let probe = projects.probe(&project, &location, model).await;
+            if !probe.rules_out() {
+                if probe.is_ready() {
+                    let _ = store.save(&identity, saved(&project)).await;
+                }
+                return Ok(projects.endpoint(&project, &location));
+            }
+            ruled_out = Some((project, source, probe));
+        }
+        let skip = ruled_out.as_ref().map(|(project, _, _)| project.as_str());
+        let why = match &ruled_out {
+            Some((project, source, probe)) => format!(
+                "{project} (from {}) answered: {}",
+                source.name(),
+                probe.describe()
+            ),
+            None => format!(
+                "the {} credentials from {} name no project",
+                auth.kind().name(),
+                auth.origin()
+            ),
+        };
+        let discovery = projects
+            .discover(&location, model, skip)
+            .await
+            .map_err(|error| {
                 format!(
-                    "Vertex AI needs a Google Cloud project: pass --google-project or set GOOGLE_CLOUD_PROJECT (the {} credentials from {} name none)",
-                    auth.kind().name(),
-                    auth.origin()
+                    "Vertex AI needs a Google Cloud project and {why}; listing your projects to find one failed: {error}\nhint: run `{SETUP_COMMAND}`, pass --google-project, or set GOOGLE_CLOUD_PROJECT"
                 )
             })?;
-        let location = present(config.location.clone())
-            .or_else(|| get("GOOGLE_CLOUD_LOCATION"))
-            .unwrap_or_else(|| VERTEX_GLOBAL_LOCATION.to_owned());
-        let base = get("GOOGLE_VERTEX_BASE_URL").unwrap_or_else(|| vertex_base_url(&location));
-        Ok(Self {
-            base_url: base.trim_end_matches('/').to_owned(),
-            auth: Auth::Google(auth.with_user_project(project.clone())),
-            user_agent: USER_AGENT_VERTEX.to_owned(),
-            route: Route::Vertex { project, location },
-        })
+        let Some(chosen) = discovery.chosen else {
+            let failures = discovery
+                .probed
+                .iter()
+                .take(LISTED_FAILURES)
+                .map(|(project, probe)| format!("{}: {}", project.id, probe.describe()))
+                .collect::<Vec<_>>();
+            let more = discovery.probed.len().saturating_sub(LISTED_FAILURES);
+            let listed = match (failures.is_empty(), more) {
+                (true, _) => "you can list no active projects".to_owned(),
+                (false, 0) => failures.join("; "),
+                (false, more) => format!("{}; and {more} more", failures.join("; ")),
+            };
+            return Err(format!(
+                "Vertex AI needs a Google Cloud project where {model} answers in {location}, and none worked: {why}; {listed}\nhint: run `{SETUP_COMMAND}` to enable Vertex AI (aiplatform.googleapis.com) in one of them, pass --google-project, or use a Gemini API key (GEMINI_API_KEY)"
+            ));
+        };
+        let kept = match store.save(&identity, saved(&chosen.id)).await {
+            Ok(path) => format!("saved in {path}"),
+            Err(error) => format!("not saved: {error}"),
+        };
+        let mut endpoint = projects.endpoint(&chosen.id, &location);
+        endpoint.notice = Some(format!(
+            "using Google Cloud project {} for Vertex AI ({why}; {kept}); override with --google-project or GOOGLE_CLOUD_PROJECT, or rerun `{SETUP_COMMAND}`",
+            chosen.id
+        ));
+        Ok(endpoint)
     }
 
     pub async fn discover(
         config: &GoogleConfig,
         lookup: &(dyn Fn(&str) -> Option<String> + Sync),
         sender: Arc<dyn Sender>,
+        model: &str,
     ) -> Result<Self, String> {
         let get = |name: &str| present(lookup(name));
         let missing = |method: AuthMethod, needs: &str| {
@@ -257,7 +460,7 @@ impl Endpoint {
                     "GOOGLE_API_KEY (a Vertex AI express mode key)",
                 )
             }),
-            Some(AuthMethod::Vertex) => Self::vertex(config, &get, sender)
+            Some(AuthMethod::Vertex) => Self::vertex(config, &get, sender, model)
                 .await
                 .map_err(|error| format!("--google-auth vertex: {error}")),
             None => {
@@ -272,7 +475,7 @@ impl Endpoint {
                     {
                         return Ok(endpoint);
                     }
-                    return Self::vertex(config, &get, sender).await.map_err(|error| {
+                    return Self::vertex(config, &get, sender, model).await.map_err(|error| {
                         format!(
                             "GOOGLE_GENAI_USE_VERTEXAI is set but Vertex AI is unavailable: {error}"
                         )
@@ -281,12 +484,59 @@ impl Endpoint {
                 if let Some(endpoint) = Self::api_key(&get) {
                     return Ok(endpoint);
                 }
-                Self::vertex(config, &get, sender).await.map_err(|error| {
+                Self::vertex(config, &get, sender, model).await.map_err(|error| {
                     format!(
                         "the antigravity harness found no Google credentials; tried AGY_LLM_GATEWAY_URL (unset), GOOGLE_GENAI_USE_VERTEXAI (unset), GEMINI_API_KEY and GOOGLE_API_KEY (unset), then Application Default Credentials for Vertex AI: {error}"
                     )
                 })
             }
+        }
+    }
+
+    pub fn hint(&self, failure: Failure, model: Option<&str>) -> Option<String> {
+        let model = model.unwrap_or("this model");
+        let project = match &self.route {
+            Route::Vertex { project, .. } => Some(project.as_str()),
+            Route::GeminiApi | Route::Gateway | Route::VertexExpress => None,
+        };
+        let location = match &self.route {
+            Route::Vertex { location, .. } => Some(location.as_str()),
+            Route::GeminiApi | Route::Gateway | Route::VertexExpress => None,
+        };
+        let elsewhere = format!(
+            "run `{SETUP_COMMAND}` to find or set up a project that works, or pass --google-project"
+        );
+        match (failure, project) {
+            (Failure::ServiceDisabled, Some(project)) => Some(format!(
+                "Vertex AI (aiplatform.googleapis.com) is not enabled in project {project}: run `{SETUP_COMMAND}`, or enable it with `gcloud services enable aiplatform.googleapis.com --project {project}` (just after enabling, Google can take a few minutes to accept calls)"
+            )),
+            (Failure::ServiceDisabled, None) => Some(
+                "the Gemini API (generativelanguage.googleapis.com) is not enabled for this key's project: enable it in Google AI Studio or the Cloud console".to_owned(),
+            ),
+            (Failure::BillingDisabled, Some(project)) => Some(format!(
+                "project {project} has no active billing account: link one in the Cloud console, or {elsewhere}"
+            )),
+            (Failure::BillingDisabled, None) => Some(
+                "this key's project has no active billing account: enable billing in Google AI Studio".to_owned(),
+            ),
+            (Failure::PermissionDenied, Some(project)) => Some(format!(
+                "your Google credentials cannot call Vertex AI in project {project} (they need roles/aiplatform.user): {elsewhere}"
+            )),
+            (Failure::ModelNotFound, Some(_)) if location != Some(VERTEX_GLOBAL_LOCATION) => Some(format!(
+                "{model} is not served in {}: try --google-location global",
+                location.unwrap_or_default()
+            )),
+            (Failure::ModelNotFound, _) => Some(format!(
+                "{model} is not available here: check the name with --model"
+            )),
+            (Failure::FreeTier, None) => Some(format!(
+                "{model} needs a paid-tier Gemini API key: enable billing for the key's project in Google AI Studio, or use Vertex AI with `{SETUP_COMMAND}`"
+            )),
+            (Failure::RateLimited, _) => Some(
+                "Gemini kept rate limiting after nanocode's retries: wait a minute and try again, or raise the project's quota".to_owned(),
+            ),
+            (Failure::Reauth, _) => Some(reauth_hint()),
+            (Failure::FreeTier | Failure::PermissionDenied | Failure::Other, _) => None,
         }
     }
 
@@ -468,11 +718,20 @@ impl Client {
             }
             _ => false,
         };
-        let retry = refreshed || matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
         let body = collect(response.body).await.unwrap_or_default();
+        let body = String::from_utf8_lossy(&body).into_owned();
+        let failure = classify(status.as_u16(), &body);
+        let retry = refreshed
+            || (failure != Failure::FreeTier
+                && matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504));
+        let model = path
+            .split("/models/")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next());
         let error = ClientError::Status {
             status: status.as_u16(),
-            body: String::from_utf8_lossy(&body).into_owned(),
+            body,
+            hint: self.endpoint.hint(failure, model),
         };
         Err(match retry {
             true => Attempt::Retry(error),
@@ -488,10 +747,16 @@ impl Client {
     ) -> Result<nanocode_http::layer::Response, ClientError> {
         let mut delay = self.retry.initial;
         let mut attempt = 0;
+        let mut disabled = self.retry.service_disabled.iter();
         loop {
             match self.send_once(method.clone(), path, body).await {
                 Ok(response) => return Ok(response),
-                Err(Attempt::Fatal(error)) => return Err(error),
+                Err(Attempt::Fatal(error)) => match disabled.next() {
+                    Some(wait) if error.failure() == Failure::ServiceDisabled => {
+                        nanocode_platform::sleep(*wait).await;
+                    }
+                    _ => return Err(error),
+                },
                 Err(Attempt::Retry(error)) if attempt >= self.retry.max_retries => {
                     return Err(error);
                 }
@@ -545,9 +810,16 @@ impl Client {
             .model_path(model, "streamGenerateContent?alt=sse");
         let mut delay = self.retry.initial;
         let mut attempt = 0;
+        let mut disabled = self.retry.service_disabled.iter();
         loop {
             match self.stream_once(&path, body, on_part).await {
                 Ok(reply) => return Ok(reply),
+                Err((false, error)) if error.failure() == Failure::ServiceDisabled => {
+                    match disabled.next() {
+                        Some(wait) => nanocode_platform::sleep(*wait).await,
+                        None => return Err(error),
+                    }
+                }
                 Err((false, error)) | Err((true, error)) if attempt >= self.retry.max_retries => {
                     return Err(error);
                 }

@@ -233,6 +233,7 @@ name = "nanocode-backend-antigravity-client"
 version = "0.7.0"
 dependencies = [
  "nanocode-google-auth",
+ "nanocode-home",
  "nanocode-http",
  "nanocode-platform",
  "nanocode-sync",
@@ -607,6 +608,7 @@ name = "nanocode-google-auth"
 version = "0.7.0"
 dependencies = [
  "graviola",
+ "nanocode-digest",
  "nanocode-http",
  "nanocode-platform",
  "nanocode-sync",

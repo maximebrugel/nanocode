@@ -26,6 +26,24 @@ pub enum Source {
     Gcloud,
 }
 
+impl Source {
+    pub fn identity(&self) -> String {
+        match self {
+            Self::Static(_) => "access-token".to_owned(),
+            Self::Refresh(refresh) => format!(
+                "{}:{}",
+                refresh.client_id,
+                nanocode_digest::blake3(refresh.refresh_token.as_bytes()).to_hex()
+            ),
+            Self::ServiceAccount(account) => account.email.clone(),
+            Self::Impersonated(impersonated) => impersonated.url.clone(),
+            Self::External(external) => external.audience.clone(),
+            Self::Metadata(base) => base.clone(),
+            Self::Gcloud => "gcloud".to_owned(),
+        }
+    }
+}
+
 pub struct Refresh {
     token_url: String,
     refresh_token: String,

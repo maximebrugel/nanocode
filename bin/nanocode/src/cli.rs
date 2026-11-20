@@ -21,6 +21,36 @@ pub enum Command {
     },
     #[cfg(unix)]
     Cua(CuaArgs),
+    Setup(SetupArgs),
+}
+
+#[derive(Clone, Debug)]
+pub struct SetupArgs {
+    pub command: SetupCommand,
+}
+
+#[derive(Clone, Debug)]
+pub enum SetupCommand {
+    Google {
+        google: GoogleArgs,
+        model: Option<String>,
+        check: bool,
+    },
+}
+
+impl SetupArgs {
+    fn from_matches(matches: &Matches) -> Self {
+        let (name, matches) = matches.subcommand().expect("setup requires a subcommand");
+        let command = match name {
+            "google" => SetupCommand::Google {
+                google: GoogleArgs::from_matches(matches),
+                model: matches.text("setup_model"),
+                check: matches.flag("check"),
+            },
+            other => unreachable!("{other} is not a setup subcommand"),
+        };
+        Self { command }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -481,7 +511,7 @@ const GOOGLE: Group = Group::named(
         Argument::value("google_project", "PROJECT", Parser::Text)
             .long("google-project")
             .help(
-                "Google Cloud project for --google-auth vertex; defaults to GOOGLE_CLOUD_PROJECT, then the credentials' quota or service account project, then the metadata server's",
+                "Google Cloud project for Vertex AI; defaults to GOOGLE_CLOUD_PROJECT, then the credentials' quota or service account project, the metadata server's, the gcloud configuration's, then the project nanocode setup google saved or found by probing",
             ),
         Argument::value("google_location", "LOCATION", Parser::Text)
             .long("google-location")
@@ -629,6 +659,28 @@ const CUA: arguments::Command = arguments::Command::new("cua")
             .groups(&[Group::named("BrowserHost", &[Argument::trailing("args", "ARGS")])]),
     ]);
 
+const SETUP: arguments::Command = arguments::Command::new("setup")
+    .about("Set up a model provider's credentials")
+    .subcommand_required()
+    .subcommands(&[arguments::Command::new("google")
+        .about(
+            "Set up Gemini through Vertex AI: sign in with gcloud Application Default Credentials if needed, find a Google Cloud project where the model answers (offering to enable aiplatform.googleapis.com), and save it for later runs",
+        )
+        .groups(&[
+            GOOGLE,
+            Group::named(
+                "SetupGoogle",
+                &[
+                    Argument::value("setup_model", "MODEL", Parser::Text)
+                        .long("model")
+                        .help("Model to probe with (defaults to gemini-4-neon)"),
+                    Argument::flag("check").long("check").help(
+                        "Print the resolved auth method, project, location and model, and probe them with one countTokens call, without changing anything",
+                    ),
+                ],
+            ),
+        ])]);
+
 pub static COMMAND: arguments::Command = arguments::Command::new("nanocode")
     .version(env!("CARGO_PKG_VERSION"))
     .about("Interactive coding agent for Codex and Claude")
@@ -658,6 +710,7 @@ pub static COMMAND: arguments::Command = arguments::Command::new("nanocode")
             )]),
         #[cfg(unix)]
         CUA,
+        SETUP,
     ]);
 
 impl Cli {
@@ -688,6 +741,7 @@ impl Command {
             },
             #[cfg(unix)]
             "cua" => Self::Cua(CuaArgs::from_matches(matches)),
+            "setup" => Self::Setup(SetupArgs::from_matches(matches)),
             other => unreachable!("{other} is not a nanocode subcommand"),
         }
     }
@@ -791,6 +845,7 @@ impl GoogleArgs {
             method: self.auth.and_then(GoogleAuthArg::method),
             project: self.project.clone(),
             location: self.location.clone(),
+            state: None,
         }
     }
 }

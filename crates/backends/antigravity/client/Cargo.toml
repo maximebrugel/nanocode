@@ -11,6 +11,7 @@ description = "Gemini generateContent wire format, SSE streaming, retries and co
 
 [dependencies]
 nanocode-google-auth.workspace = true
+nanocode-home.workspace = true
 nanocode-http.workspace = true
 nanocode-platform.workspace = true
 nanocode-sync.workspace = true

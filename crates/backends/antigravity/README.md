@@ -4,6 +4,47 @@ A nanocode harness that reproduces the engine of Google Antigravity CLI (`agy` 1
 its engine tools, its per-turn reminders, its compaction and its Gemini request shape. Subagents, Code Mode and MCP
 stay nanocode's own, as in the other harnesses.
 
+## Quick start
+
+With Vertex AI and your Google account:
+
+```
+gcloud auth application-default login && nanocode setup google
+nanocode -m gemini-4-neon
+```
+
+`nanocode setup google` signs you in with `gcloud auth application-default login` when Application Default Credentials are
+missing or expired, finds a Google Cloud project where `gemini-4-neon` answers in `global`, and saves it in
+`~/.nanocode/antigravity.json` (per credential) so later runs start without probing. When no project works it lists each one with
+why (Vertex AI disabled, no permission, no billing) and offers to enable `aiplatform.googleapis.com` in one you pick, after a y/N
+confirmation, then waits until three calls in a row succeed. It never enables anything or changes billing without that confirmation.
+`nanocode setup google --check` prints the resolved auth method, project, location and model and probes them with one
+`countTokens` call.
+
+Or with a Gemini API key (`gemini-4-neon` needs a paid-tier key):
+
+```
+GEMINI_API_KEY=... nanocode -m gemini-4-neon
+```
+
+Vertex AI resolves the project in this order: `--google-project`, `GOOGLE_CLOUD_PROJECT`, the project `setup` or an
+earlier run saved for these credentials, the credentials' `quota_project_id`, `GOOGLE_CLOUD_QUOTA_PROJECT`, a service account's
+`project_id`, the metadata server's project, then the gcloud configuration's project (`CLOUDSDK_CORE_PROJECT`, else `[core] project`
+of the active configuration). The first three are used as given. A project found any other way is probed once with `countTokens`
+and saved when it answers; when it answers 403 (Vertex AI disabled, no permission, no billing), or when none is found, nanocode
+lists your active projects (Cloud Resource Manager), probes each in parallel, uses the first that answers, saves it, and prints
+one line on stderr naming it and how to override it.
+
+Errors name the fix: Vertex AI disabled in a project points at `nanocode setup google` and the `gcloud services enable` command (a
+just-enabled project answers 403 `SERVICE_DISABLED` on and off for a few minutes, so those are retried after 5 s and 15 s); an expired
+sign-in points at `gcloud auth application-default login`; a model missing in a regional location suggests `--google-location global`;
+a free-tier API key says the model needs a paid-tier key; 429s are retried with backoff before saying so.
+
+Each model call's usage (`prompt_tokens`, `cache_read_tokens` from `cachedContentTokenCount`, output and thought tokens) goes to the
+turn summary like other harnesses' and to `usage.jsonl` beside the transcript in the session's
+`brain/<session>/.system_generated/logs/`, so Gemini's implicit caching can be checked: the system instruction, tools and earlier
+turns are byte-identical across turns, and per-turn metadata rides in the new user turn.
+
 ## Selecting it
 
 ```
@@ -43,7 +84,9 @@ and refreshed five minutes before they expire; concurrent requests share one ref
 
 | Variable | Use |
 | --- | --- |
-| `GOOGLE_CLOUD_PROJECT` | The project, after `--google-project`; then the credentials' `quota_project_id`, `GOOGLE_CLOUD_QUOTA_PROJECT`, a service account's `project_id`, the metadata server's project |
+| `GOOGLE_CLOUD_PROJECT` | The project, after `--google-project`; then the order in Quick start |
+| `CLOUDSDK_CORE_PROJECT`, `CLOUDSDK_ACTIVE_CONFIG_NAME` | The gcloud configuration project, as gcloud reads it |
+| `CLOUDSDK_API_ENDPOINT_OVERRIDES_CLOUDRESOURCEMANAGER`, `CLOUDSDK_API_ENDPOINT_OVERRIDES_SERVICEUSAGE` | Other base URLs for listing projects and enabling Vertex AI |
 | `GOOGLE_CLOUD_LOCATION` | The location, after `--google-location`; `global` otherwise |
 | `GOOGLE_CLOUD_QUOTA_PROJECT` | The `x-goog-user-project` billing project when the credentials name none |
 | `GOOGLE_VERTEX_BASE_URL` | Another base URL for `vertex` and `vertex-express` |

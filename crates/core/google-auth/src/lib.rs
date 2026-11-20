@@ -1,4 +1,5 @@
 mod discover;
+mod gcloud;
 mod sign;
 mod source;
 mod time;
@@ -12,6 +13,32 @@ use std::time::{Duration, SystemTime};
 
 pub const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+pub use gcloud::{ACTIVE_CONFIG_ENV, CORE_PROJECT_ENV};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectSource {
+    Configured,
+    Environment,
+    QuotaProject,
+    Credentials,
+    GcloudConfig,
+}
+
+impl ProjectSource {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Configured => "--google-project",
+            Self::Environment => "GOOGLE_CLOUD_PROJECT",
+            Self::QuotaProject => "the credentials' quota project",
+            Self::Credentials => "the credentials' project",
+            Self::GcloudConfig => "the gcloud configuration",
+        }
+    }
+
+    pub const fn is_explicit(self) -> bool {
+        matches!(self, Self::Configured | Self::Environment)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error(String);
@@ -113,6 +140,7 @@ struct Inner {
     origin: String,
     project: Option<String>,
     quota_project: Option<String>,
+    gcloud_project: Option<String>,
     sender: Arc<dyn Sender>,
     cached: Atom<Option<Token>>,
     flight: SingleFlight<Result<Token, Error>>,
@@ -172,7 +200,15 @@ impl GoogleAuth {
         sender: Arc<dyn Sender>,
     ) -> Result<Self, Error> {
         let found = discover::find(lookup, sender.as_ref()).await?;
-        Ok(Self::from_found(found, sender))
+        let gcloud_project = gcloud::active_project(lookup).await;
+        Ok(Self::from_found(found, sender).with_gcloud_project(gcloud_project))
+    }
+
+    fn with_gcloud_project(mut self, project: Option<String>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.gcloud_project = project;
+        }
+        self
     }
 
     fn from_found(found: Found, sender: Arc<dyn Sender>) -> Self {
@@ -183,6 +219,7 @@ impl GoogleAuth {
                 origin: found.origin,
                 project: found.project,
                 quota_project: found.quota_project,
+                gcloud_project: None,
                 sender,
                 cached: Atom::new(found.token),
                 flight: SingleFlight::default(),
@@ -217,20 +254,53 @@ impl GoogleAuth {
         })
     }
 
+    pub fn identity(&self) -> String {
+        format!(
+            "{}:{}",
+            self.inner.kind.name(),
+            self.inner.source.identity()
+        )
+    }
+
+    pub fn gcloud_project(&self) -> Option<&str> {
+        self.inner.gcloud_project.as_deref()
+    }
+
+    pub fn project_source(
+        &self,
+        configured: Option<&str>,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<(String, ProjectSource)> {
+        let present = |value: Option<String>, source: ProjectSource| {
+            value
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .map(|value| (value, source))
+        };
+        present(configured.map(str::to_owned), ProjectSource::Configured)
+            .or_else(|| present(lookup("GOOGLE_CLOUD_PROJECT"), ProjectSource::Environment))
+            .or_else(|| {
+                present(
+                    self.inner.quota_project.clone(),
+                    ProjectSource::QuotaProject,
+                )
+            })
+            .or_else(|| present(self.inner.project.clone(), ProjectSource::Credentials))
+            .or_else(|| {
+                present(
+                    self.inner.gcloud_project.clone(),
+                    ProjectSource::GcloudConfig,
+                )
+            })
+    }
+
     pub fn resolve_project(
         &self,
         configured: Option<&str>,
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Option<String> {
-        let present = |value: Option<String>| {
-            value
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-        };
-        present(configured.map(str::to_owned))
-            .or_else(|| present(lookup("GOOGLE_CLOUD_PROJECT")))
-            .or_else(|| present(self.inner.quota_project.clone()))
-            .or_else(|| present(self.inner.project.clone()))
+        self.project_source(configured, lookup)
+            .map(|(project, _)| project)
     }
 
     pub async fn token(&self) -> Result<String, Error> {

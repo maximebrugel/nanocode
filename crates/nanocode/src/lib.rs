@@ -21,8 +21,10 @@ pub use nanocode_agent::HarnessRequest;
 pub use nanocode_backend_claude::ClaudeHarness;
 pub mod antigravity {
     pub use nanocode_backend_antigravity::{
-        AntigravityHarness, Auth, AuthMethod, CacheConfig, Client, DEFAULT_MODEL, Endpoint, FAMILY,
-        GoogleAuth, GoogleConfig, Profile, RetryPolicy, Route, vertex_base_url,
+        AntigravityHarness, Auth, AuthMethod, CacheConfig, Client, ClientError, DEFAULT_MODEL,
+        Endpoint, FAMILY, Failure, GoogleAuth, GoogleConfig, Probe, Profile, Project,
+        ProjectSource, Projects, RetryPolicy, Route, SETUP_COMMAND, Saved, Store,
+        VERTEX_GLOBAL_LOCATION, VERTEX_SERVICE, vertex_base_url,
     };
 }
 pub use nanocode_backend_codex::CodexHarness;

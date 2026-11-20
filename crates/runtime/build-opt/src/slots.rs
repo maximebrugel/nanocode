@@ -17,7 +17,7 @@ pub const WAITER_GONE_MS: u64 = 2 * 60_000;
 pub const RESERVATION_IDLE_MS: u64 = 15 * 60_000;
 
 /// Standing reservations under these label prefixes are never given back for being idle.
-pub const IDLE_EXEMPT_PREFIXES: [&str; 3] = ["p2live-", "nf-deploy-", "lander-p2live"];
+pub const IDLE_EXEMPT_PREFIXES: [&str; 4] = ["p2live-", "nf-deploy-", "lander-p2live", "boardrel-red-"];
 
 /// Whether a standing reservation with label prefix P is kept however long it sits idle.
 pub fn idle_exempt(prefix: &str) -> bool {

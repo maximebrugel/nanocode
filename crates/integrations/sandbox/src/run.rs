@@ -1,6 +1,7 @@
 use crate::{
     bubblewrap::Bubblewrap,
     budget::{Admitted, Budget, Busy, Stopped},
+    cgroup::{self, Usage},
     confine,
     egress::{Allowlist, Egress, Limits, Secret, Tls, tailnet_host},
 };
@@ -60,6 +61,13 @@ pub struct Runner {
     reach: Reach,
     caps: Caps,
     budget: Budget,
+    cgroups: Option<Cgroups>,
+}
+
+pub struct Cgroups {
+    pub tree: cgroup::Tree,
+    pub limits: cgroup::Limits,
+    pub settle: Duration,
 }
 
 impl Drop for Runner {
@@ -154,7 +162,19 @@ impl Runner {
             reach,
             caps,
             budget,
+            cgroups: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_cgroups(mut self, cgroups: Cgroups) -> Self {
+        self.cgroups = Some(cgroups);
+        self
+    }
+
+    #[must_use]
+    pub const fn cgroups(&self) -> Option<&Cgroups> {
+        self.cgroups.as_ref()
     }
 
     #[must_use]
@@ -166,6 +186,35 @@ impl Runner {
         &self,
         call: Call<'_>,
         compose: impl FnOnce(&Seen<'_>, &mut Command),
+    ) -> io::Result<Ran> {
+        self.run_measured(call, compose).await.map(|(ran, _)| ran)
+    }
+
+    pub async fn run_measured(
+        &self,
+        call: Call<'_>,
+        compose: impl FnOnce(&Seen<'_>, &mut Command),
+    ) -> io::Result<(Ran, Option<Usage>)> {
+        let Some(cgroups) = &self.cgroups else {
+            let ran = self.run_in(call, compose, None).await?;
+            return Ok((ran, None));
+        };
+        let name = nanocode_platform::uuid_v4().simple().to_string();
+        let group = cgroups.tree.create(&name, &cgroups.limits)?;
+        let ran = self.run_in(call, compose, Some(group.procs())).await;
+        let usage = group.kill().and_then(|()| group.usage());
+        let removed = group.remove(cgroups.settle).await;
+        let ran = ran?;
+        let usage = usage?;
+        removed?;
+        Ok((ran, Some(usage)))
+    }
+
+    async fn run_in(
+        &self,
+        call: Call<'_>,
+        compose: impl FnOnce(&Seen<'_>, &mut Command),
+        procs: Option<&Path>,
     ) -> io::Result<Ran> {
         let id = nanocode_platform::uuid_v4().simple().to_string();
         let mut cleanup = Cleanup {
@@ -221,9 +270,11 @@ impl Runner {
                 let proxy = root.join(PROXY_SOCKET);
                 sandbox.bind(&socket, &proxy);
                 let program = root.join(call.program.name);
-                let mut child = match host {
-                    Some(_) => sandbox.command_with_channel(launcher, program),
-                    None => sandbox.command(program),
+                let mut child = match (host, procs) {
+                    (None, None) => sandbox.command(program),
+                    (host, procs) => {
+                        sandbox.command_joined(launcher, procs, host.is_some(), program)
+                    }
                 };
                 let seen = Seen::Mounted {
                     root,
@@ -241,10 +292,8 @@ impl Runner {
                     write: cleanup.work.clone(),
                     port,
                 };
-                let mut child = match host {
-                    Some(_) => policy.command_with_channel(launcher, call.program.path)?,
-                    None => policy.command(launcher, call.program.path)?,
-                };
+                let mut child =
+                    policy.command_joined(launcher, procs, host.is_some(), call.program.path)?;
                 let seen = Seen::InPlace {
                     work: &cleanup.work,
                     port,

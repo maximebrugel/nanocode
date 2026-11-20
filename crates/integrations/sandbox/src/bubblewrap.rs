@@ -1,4 +1,4 @@
-use crate::{SYSTEM, confine::CHANNEL};
+use crate::{SYSTEM, cgroup, confine::CHANNEL};
 use nanocode_executor::process::Command;
 use std::{
     ffi::{OsStr, OsString},
@@ -55,8 +55,24 @@ impl Bubblewrap {
     }
 
     pub fn command_with_channel(&self, launcher: &Path, program: impl AsRef<OsStr>) -> Command {
+        self.command_joined(launcher, None, true, program)
+    }
+
+    pub fn command_joined(
+        &self,
+        launcher: &Path,
+        procs: Option<&Path>,
+        channel: bool,
+        program: impl AsRef<OsStr>,
+    ) -> Command {
         let mut command = Command::new(launcher);
-        command.arg(CHANNEL).arg(&self.bwrap);
+        if let Some(procs) = procs {
+            command.arg(cgroup::ARGUMENT).arg(procs);
+        }
+        if channel {
+            command.arg(CHANNEL);
+        }
+        command.arg(&self.bwrap);
         self.sandboxed(command, program)
     }
 

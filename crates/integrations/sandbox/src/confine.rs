@@ -1,5 +1,5 @@
 use crate::{
-    SYSTEM,
+    SYSTEM, cgroup,
     landlock::{
         Abi, Created, FS_IOCTL_DEV, FS_READ_DIR, FS_READ_FILE, FS_WRITE_FILE, Kind, NET_BIND_TCP,
         NET_CONNECT_TCP, Ruleset, SCOPE_ABSTRACT_UNIX_SOCKET, SCOPE_SIGNAL,
@@ -120,8 +120,23 @@ impl Policy {
     }
 
     pub fn command_with_channel(&self, launcher: &Path, program: &Path) -> io::Result<Command> {
+        self.command_joined(launcher, None, true, program)
+    }
+
+    pub fn command_joined(
+        &self,
+        launcher: &Path,
+        procs: Option<&Path>,
+        channel: bool,
+        program: &Path,
+    ) -> io::Result<Command> {
         let mut command = Command::new(launcher);
-        command.arg(CHANNEL);
+        if let Some(procs) = procs {
+            command.arg(cgroup::ARGUMENT).arg(procs);
+        }
+        if channel {
+            command.arg(CHANNEL);
+        }
         self.launched(command, program)
     }
 
@@ -142,12 +157,20 @@ impl Policy {
 
 pub fn launch_if_requested() {
     let mut arguments = std::env::args_os().skip(1).peekable();
+    let joined = arguments
+        .next_if(|first| first == cgroup::ARGUMENT)
+        .is_some();
+    let procs = if joined { arguments.next() } else { None };
     let channel = arguments.next_if(|first| first == CHANNEL).is_some();
     let confined = arguments.next_if(|first| first == ARGUMENT).is_some();
-    if !channel && !confined {
+    if !joined && !channel && !confined {
         return;
     }
     let error = (|| -> io::Result<io::Error> {
+        if joined {
+            let procs = procs.ok_or_else(|| other("no cgroup"))?;
+            cgroup::join(Path::new(&procs))?;
+        }
         if channel {
             take_channel()?;
         }

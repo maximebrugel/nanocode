@@ -74,7 +74,7 @@
 | `nanocode-mcp-tools` | MCP discovery, catalogs, prepared tools, stdio processes |
 | `nanocode-computer` | The `computer` tool over macOS accessibility, Linux AT-SPI, cua-driver and MCP providers; the `cua_repl` tools and browser extension host |
 | `nanocode-chatgpt-extension` | Browser tabs through the official ChatGPT extension's native-messaging host |
-| `nanocode-sandbox` | Commands confined to read-only paths, one writable directory and an allowlisting egress proxy |
+| `nanocode-sandbox` | Commands confined to read-only paths, one writable directory and an allowlisting egress proxy, optionally each in its own cgroup v2 group with CPU, memory, pids and io limits |
 | `nanocode-store-jsonl` | The append-only JSONL store, one file per session: the CLI's default |
 | `nanocode-store-sql` | `Sql` hosts for SQLite (`SqliteSql`), Postgres (`PostgresSql`) and a host's own sqlx pool or transaction (`SqlxSql`, `SqlxTransaction`, `commit_staged`) |
 | `nanocode-observability` | Tracing and OpenTelemetry setup |

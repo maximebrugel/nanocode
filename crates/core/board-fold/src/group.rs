@@ -7,6 +7,8 @@
 //! precondition fails against the fold before the batch (a claim on a task posted earlier in the
 //! same batch) wait for the next round instead of being rejected early.
 
+use std::collections::BTreeSet;
+
 use nanocode_durability_core::StoreError;
 
 use crate::{
@@ -305,5 +307,164 @@ impl Group {
         {
             member.verdict = Some(Err(error.clone()));
         }
+    }
+}
+
+/// A group planned for a caller's own transaction: the members the fold has not seen yet,
+/// numbered densely from the fold's next seq, without judging them. The caller writes `rows`
+/// beside its own records in one transaction, then hands the planned group back: on commit the
+/// fold takes every row and judges each in order, so each member's verdict is the fold's, as
+/// in a group append; on abort the fold is untouched, so no row the store lacks is ever
+/// visible.
+pub struct Planned {
+    first: u64,
+    rows: Vec<(u64, String)>,
+    members: Vec<Member>,
+}
+
+impl Fold {
+    /// Plans `events` as one group at the fold's next seq for a caller's transaction. A member
+    /// the fold already holds (a keyed write that landed before) settles at once with its
+    /// verdict and takes no row; one that does not encode is refused as corrupt.
+    pub fn plan_group(&self, events: Vec<Event>) -> Planned {
+        let first = self.next;
+        let gap = u64::from(mutated(Mutation::PlannedSkipsSeq));
+        let mut rows = Vec::new();
+        let mut members = Vec::with_capacity(events.len());
+        let mut fresh = BTreeSet::new();
+        for event in events {
+            let known = self.outcome(&event.id).map(|verdict| {
+                verdict
+                    .clone()
+                    .map(|seq| Applied {
+                        seq,
+                        event: event.id.clone(),
+                    })
+                    .map_err(BoardError::Rejected)
+            });
+            // A second write of one event id in a group lands once: the fold keeps the first.
+            let verdict = match known {
+                Some(verdict) => Some(verdict),
+                None if !fresh.insert(event.id.clone()) => None,
+                None => match serde_json::to_string(&event) {
+                    Ok(body) => {
+                        rows.push((first + gap + rows.len() as u64 * (1 + gap), body));
+                        None
+                    }
+                    Err(error) => Some(Err(BoardError::Corrupt {
+                        seq: first,
+                        detail: error.to_string(),
+                    })),
+                },
+            };
+            members.push(Member {
+                event,
+                body: String::new(),
+                verdict,
+            });
+        }
+        Planned {
+            first,
+            rows,
+            members,
+        }
+    }
+}
+
+impl Planned {
+    /// The seq of the first row: the fold's next when the group was planned.
+    pub const fn first(&self) -> u64 {
+        self.first
+    }
+
+    /// The rows to write in the caller's transaction, in seq order.
+    pub fn rows(&self) -> &[(u64, String)] {
+        &self.rows
+    }
+
+    pub const fn len(&self) -> usize {
+        self.members.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// The caller's transaction committed every row: the fold takes them in order and each open
+    /// member gets the fold's verdict. Fails as corrupt, leaving the fold untouched, when the fold
+    /// moved past the planned seq since (a second plan on one fold) or a row does not fold.
+    pub fn committed(self, fold: &mut Fold) -> Result<Vec<Result<Applied, BoardError>>, BoardError> {
+        if fold.next != self.first {
+            return Err(BoardError::Corrupt {
+                seq: self.first,
+                detail: format!(
+                    "a group planned at {} committed on a fold at {}",
+                    self.first, fold.next
+                ),
+            });
+        }
+        for (seq, body) in &self.rows {
+            fold.apply(*seq, body)?;
+        }
+        Ok(self
+            .members
+            .into_iter()
+            .map(|member| {
+                member.verdict.unwrap_or_else(|| {
+                    match fold.outcome(&member.event.id) {
+                        Some(verdict) => verdict
+                            .clone()
+                            .map(|seq| Applied {
+                                seq,
+                                event: member.event.id.clone(),
+                            })
+                            .map_err(BoardError::Rejected),
+                        None => Err(BoardError::Corrupt {
+                            seq: self.first,
+                            detail: format!(
+                                "the caller committed {} but it did not fold",
+                                member.event.id
+                            ),
+                        }),
+                    }
+                })
+            })
+            .collect())
+    }
+
+    /// The caller's transaction rolled back, so none of the rows is in the store: the fold stays
+    /// where it was and every open member fails with the store's error. A taken seq
+    /// (`StoreError::Fenced`) means the fold is behind the log: the planner must rescan before
+    /// it plans again.
+    pub fn aborted(self, fold: &mut Fold, error: &StoreError) -> Vec<Result<Applied, BoardError>> {
+        if mutated(Mutation::PlannedVisibleOnAbort) {
+            for (seq, body) in &self.rows {
+                let _ = fold.apply(*seq, body);
+            }
+        }
+        self.members
+            .into_iter()
+            .map(|member| {
+                member
+                    .verdict
+                    .unwrap_or_else(|| Err(BoardError::Store(error.clone())))
+            })
+            .collect()
+    }
+
+    /// The caller cannot tell whether its transaction committed (its acknowledgement was lost):
+    /// every open member is unsettled until a rescan shows whether its row landed.
+    pub fn unknown(self, error: &StoreError) -> Vec<Result<Applied, BoardError>> {
+        self.members
+            .into_iter()
+            .map(|member| {
+                member.verdict.unwrap_or_else(|| {
+                    Err(BoardError::Unsettled {
+                        event: member.event.id.clone(),
+                        error: error.clone(),
+                    })
+                })
+            })
+            .collect()
     }
 }

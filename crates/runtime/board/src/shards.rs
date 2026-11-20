@@ -18,12 +18,13 @@ use std::{
     sync::Arc,
 };
 
+use nanocode_durability_core::StoreError;
 use nanocode_partitions::{Partition, partition_of};
 use nanocode_sync::{mpsc, oneshot};
 use nanocode_turnlog::LogHost;
 
 use crate::{
-    Applied, Board, BoardError, Fold, NewTask, Op, Task, TaskId, Write, access,
+    Applied, Board, BoardError, Fold, NewTask, Op, Resolution, Task, TaskId, Write, access,
     deliver::{Delivery, Key, Outbox},
     sim::{Mutation, mutated},
     tasks::TaskOp,
@@ -506,39 +507,119 @@ impl ReadyIndex {
 }
 
 type Reply = oneshot::Sender<Result<Applied, BoardError>>;
+type Verdicts = Vec<Result<Applied, BoardError>>;
+
+enum Job {
+    Write(Write, Reply),
+    Plan(Vec<Write>, oneshot::Sender<Result<Ticket, BoardError>>),
+}
 
 /// A handle that queues writes for one partition's committer.
 #[derive(Clone)]
 pub struct Committer {
-    queue: mpsc::UnboundedSender<(Write, Reply)>,
+    queue: mpsc::UnboundedSender<Job>,
+}
+
+/// A group the committer planned for the caller's own transaction ([`Committer::plan`]): write
+/// [`Ticket::rows`] in that transaction beside the records they belong to, then
+/// [`Ticket::settle`] with how it ended. The partition's committer waits for the settle before it
+/// numbers anything else, so seqs stay dense; dropping a ticket unsettled settles it as unknown.
+pub struct Ticket {
+    first: u64,
+    rows: Vec<(u64, String)>,
+    resolve: Option<oneshot::Sender<Resolution>>,
+    verdicts: Option<oneshot::Receiver<Verdicts>>,
+}
+
+impl Ticket {
+    /// The seq of the first row: the partition's next seq when the group was planned.
+    pub const fn first(&self) -> u64 {
+        self.first
+    }
+
+    /// The rows to write, densely from [`Ticket::first`], in seq order.
+    pub fn rows(&self) -> &[(u64, String)] {
+        &self.rows
+    }
+
+    /// Settles the group: each write's verdict, in the order it was planned.
+    pub async fn settle(mut self, resolution: Resolution) -> Verdicts {
+        let count = self.rows.len();
+        if let Some(resolve) = self.resolve.take() {
+            let _ = resolve.send(resolution);
+        }
+        let Some(verdicts) = self.verdicts.take() else {
+            return Vec::new();
+        };
+        verdicts.await.unwrap_or_else(|_| {
+            (0..count)
+                .map(|_| {
+                    Err(BoardError::Dropped(
+                        "the partition's committer stopped".into(),
+                    ))
+                })
+                .collect()
+        })
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        if let Some(resolve) = self.resolve.take() {
+            let _ = resolve.send(Resolution::Unknown(StoreError::Backend(
+                "a planned group's ticket was dropped unsettled".into(),
+            )));
+        }
+    }
 }
 
 impl Committer {
     /// A committer for `board` and the loop that drives it: run the loop on one task, hand
     /// clones of the committer to every writer. Each pass takes every queued write, up to
-    /// `batch`, and commits them as one group. The loop returns the board once every committer
-    /// is dropped.
+    /// `batch`, and commits them as one group; a planned group ([`Committer::plan`]) is numbered
+    /// on its own and holds the loop until its ticket settles. The loop returns the board once
+    /// every committer is dropped.
     pub fn start(
         board: Board,
         batch: usize,
     ) -> (Self, impl std::future::Future<Output = (Board, Stats)>) {
-        let (queue, mut writes) = mpsc::unbounded_channel::<(Write, Reply)>();
+        let (queue, mut jobs) = mpsc::unbounded_channel::<Job>();
         let drive = async move {
             let mut board = board;
             let mut stats = Stats::default();
             let mut taken = Vec::new();
-            while writes.recv_many(&mut taken, batch.max(1)).await > 0 {
-                let (group, replies): (Vec<Write>, Vec<Reply>) = taken.drain(..).unzip();
-                stats.groups += 1;
-                stats.writes += group.len() as u64;
-                stats.largest = stats.largest.max(group.len() as u64);
-                let (verdicts, rounds) = board.submit_group(group).await;
-                stats.appends += rounds;
-                for (reply, verdict) in replies.into_iter().zip(verdicts) {
-                    if verdict.is_ok() {
-                        stats.applied += 1;
+            while jobs.recv_many(&mut taken, batch.max(1)).await > 0 {
+                let mut drained = taken.drain(..).peekable();
+                while let Some(job) = drained.next() {
+                    match job {
+                        Job::Plan(writes, reply) => {
+                            stats.planned += 1;
+                            stats.writes += writes.len() as u64;
+                            stats.largest = stats.largest.max(writes.len() as u64);
+                            plan(&mut board, &mut stats, writes, reply).await;
+                        }
+                        Job::Write(write, reply) => {
+                            let mut group = vec![write];
+                            let mut replies = vec![reply];
+                            while let Some(Job::Write(..)) = drained.peek() {
+                                if let Some(Job::Write(write, reply)) = drained.next() {
+                                    group.push(write);
+                                    replies.push(reply);
+                                }
+                            }
+                            stats.groups += 1;
+                            stats.writes += group.len() as u64;
+                            stats.largest = stats.largest.max(group.len() as u64);
+                            let (verdicts, rounds) = board.submit_group(group).await;
+                            stats.appends += rounds;
+                            for (reply, verdict) in replies.into_iter().zip(verdicts) {
+                                if verdict.is_ok() {
+                                    stats.applied += 1;
+                                }
+                                let _ = reply.send(verdict);
+                            }
+                        }
                     }
-                    let _ = reply.send(verdict);
                 }
                 let mut yielded = false;
                 std::future::poll_fn(|cx| {
@@ -560,7 +641,7 @@ impl Committer {
     pub async fn submit(&self, write: Write) -> Result<Applied, BoardError> {
         let (reply, verdict) = oneshot::channel();
         self.queue
-            .send((write, reply))
+            .send(Job::Write(write, reply))
             .map_err(|_| BoardError::Dropped("the partition's committer stopped".into()))?;
         verdict.await.unwrap_or_else(|_| {
             Err(BoardError::Dropped(
@@ -568,6 +649,51 @@ impl Committer {
             ))
         })
     }
+
+    /// Plans `writes` as one group at the partition's next seq without appending them, for the
+    /// caller to write in its own transaction (a log append that must hold the board rows it
+    /// derives). Settle the returned ticket with how that transaction ended.
+    pub async fn plan(&self, writes: Vec<Write>) -> Result<Ticket, BoardError> {
+        let (reply, ticket) = oneshot::channel();
+        self.queue
+            .send(Job::Plan(writes, reply))
+            .map_err(|_| BoardError::Dropped("the partition's committer stopped".into()))?;
+        ticket.await.unwrap_or_else(|_| {
+            Err(BoardError::Dropped(
+                "the partition's committer stopped".into(),
+            ))
+        })
+    }
+}
+
+async fn plan(
+    board: &mut Board,
+    stats: &mut Stats,
+    writes: Vec<Write>,
+    reply: oneshot::Sender<Result<Ticket, BoardError>>,
+) {
+    let group = board.plan_group(writes).await;
+    let (resolve, resolution) = oneshot::channel();
+    let (verdict, verdicts) = oneshot::channel();
+    let ticket = Ticket {
+        first: group.first(),
+        rows: group.rows().to_vec(),
+        resolve: Some(resolve),
+        verdicts: Some(verdicts),
+    };
+    // A caller that left before taking the ticket dropped it, which settles it as unknown.
+    let _ = reply.send(Ok(ticket));
+    let resolution = resolution.await.unwrap_or_else(|_| {
+        Resolution::Unknown(StoreError::Backend(
+            "a planned group's ticket was dropped unsettled".into(),
+        ))
+    });
+    if matches!(resolution, Resolution::Aborted(_)) {
+        stats.aborted += 1;
+    }
+    let settled = board.settle_group(group, resolution).await;
+    stats.applied += settled.iter().filter(|verdict| verdict.is_ok()).count() as u64;
+    let _ = verdict.send(settled);
 }
 
 /// What one committer did.
@@ -578,6 +704,9 @@ pub struct Stats {
     pub applied: u64,
     pub appends: u64,
     pub largest: u64,
+    /// Groups planned for a caller's transaction, and how many of them it rolled back.
+    pub planned: u64,
+    pub aborted: u64,
 }
 
 /// Catches every partition's board up with its log in one read where they share a host (one round trip and one

@@ -215,6 +215,17 @@ impl Committer {
                     }
                     let _ = reply.send(verdict);
                 }
+                let mut yielded = false;
+                std::future::poll_fn(|cx| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
             }
             (board, stats)
         };

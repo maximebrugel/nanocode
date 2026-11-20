@@ -11,7 +11,11 @@
 //! - a renew of a lapsed claim takes a slot again: under a cap it lands only with room, and is
 //!   refused full only without it;
 //! - with one committer per partition, claims on different tasks never retry because of each
-//!   other: no append loses a seq race, and a claim is only refused for its own task's state.
+//!   other: no append loses a seq race, and a claim is only refused for its own task's state;
+//! - outer transactions (Shape::outer): a committer plans each write's rows, and an outer
+//!   transaction that sometimes aborts writes them beside their log records (pyramid2's
+//!   append_projected). No board row is in the store without its log record at the same seq,
+//!   and the seqs stay dense however many transactions roll back.
 
 use std::{
     cell::RefCell,
@@ -28,7 +32,7 @@ use std::{
 
 use nanocode_board::{
     Applied, Board, BoardError, Cap, ClaimId, EventId, Fence, Fold, NewTask, Op, Outcome, Phase,
-    Rejection, TaskId, Write,
+    Rejection, Resolution, TaskId, Write,
     access::{Can, Grant, Who},
     deliver::Outbox,
     shards::{self, Committer, Merged, ReadyIndex, Route, Stats as CommitStats},
@@ -59,6 +63,10 @@ pub enum ShardsMutation {
     GroupSkipsSeq,
     GroupVerdictFromPlan,
     GroupSplits,
+    PlannedSkipsSeq,
+    PlannedVisibleOnAbort,
+    PlannedFencedNoRescan,
+    OuterTxSplits,
     RouteIgnoresTask,
     MergeSkipsPartition,
     MergedIndexSkipsRows,
@@ -75,11 +83,15 @@ pub enum ShardsMutation {
 }
 
 impl ShardsMutation {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 21] = [
         Self::None,
         Self::GroupSkipsSeq,
         Self::GroupVerdictFromPlan,
         Self::GroupSplits,
+        Self::PlannedSkipsSeq,
+        Self::PlannedVisibleOnAbort,
+        Self::PlannedFencedNoRescan,
+        Self::OuterTxSplits,
         Self::RouteIgnoresTask,
         Self::MergeSkipsPartition,
         Self::MergedIndexSkipsRows,
@@ -107,6 +119,10 @@ impl ShardsMutation {
             Self::GroupSkipsSeq => "group_skips_seq",
             Self::GroupVerdictFromPlan => "group_verdict_from_plan",
             Self::GroupSplits => "group_splits",
+            Self::PlannedSkipsSeq => "planned_skips_seq",
+            Self::PlannedVisibleOnAbort => "planned_visible_on_abort",
+            Self::PlannedFencedNoRescan => "planned_fenced_no_rescan",
+            Self::OuterTxSplits => "outer_tx_splits",
             Self::RouteIgnoresTask => "route_ignores_task",
             Self::MergeSkipsPartition => "merge_skips_partition",
             Self::MergedIndexSkipsRows => "merged_index_skips_rows",
@@ -121,6 +137,17 @@ impl ShardsMutation {
             Self::FinishForgetsWorker => "finish_forgets_worker",
             Self::RenewIgnoresCap => "renew_ignores_cap",
         }
+    }
+
+    /// The mutations only an outer-transaction run can show: their canary seeds run outer.
+    const fn outer(self) -> bool {
+        matches!(
+            self,
+            Self::PlannedSkipsSeq
+                | Self::PlannedVisibleOnAbort
+                | Self::PlannedFencedNoRescan
+                | Self::OuterTxSplits
+        )
     }
 
     pub fn names() -> String {
@@ -138,6 +165,10 @@ impl ShardsMutation {
             Self::GroupSkipsSeq => BoardRule::GroupSkipsSeq,
             Self::GroupVerdictFromPlan => BoardRule::GroupVerdictFromPlan,
             Self::GroupSplits => BoardRule::GroupSplits,
+            Self::PlannedSkipsSeq => BoardRule::PlannedSkipsSeq,
+            Self::PlannedVisibleOnAbort => BoardRule::PlannedVisibleOnAbort,
+            Self::PlannedFencedNoRescan => BoardRule::PlannedFencedNoRescan,
+            Self::OuterTxSplits => BoardRule::None,
             Self::RouteIgnoresTask => BoardRule::RouteIgnoresTask,
             Self::MergeSkipsPartition => BoardRule::MergeSkipsPartition,
             Self::MergedIndexSkipsRows => BoardRule::MergedIndexSkipsRows,
@@ -180,6 +211,8 @@ pub struct ShardsStats {
     pub crashes: u64,
     pub lapsed_renews: u64,
     pub renews_full: u64,
+    pub planned: u64,
+    pub aborted: u64,
 }
 
 impl ShardsStats {
@@ -209,6 +242,8 @@ impl ShardsStats {
         self.crashes += other.crashes;
         self.lapsed_renews += other.lapsed_renews;
         self.renews_full += other.renews_full;
+        self.planned += other.planned;
+        self.aborted += other.aborted;
     }
 }
 
@@ -268,6 +303,11 @@ struct Shape {
     /// however the writers race (seed 1795200002000022054). The budget keeps the time
     /// lapses hold the cap to a quarter of the deadline.
     lapse_budget: u64,
+    /// Writes go through planned groups written in an outer transaction with their log
+    /// records, as pyramid2's append_projected writes them, rather than through group appends.
+    outer: bool,
+    /// Share of outer transactions that roll back after the rows were planned.
+    abort_ppm: u64,
 }
 
 impl Shape {
@@ -310,6 +350,8 @@ impl Shape {
             stale_ppm: rng.range(100_000, 600_000),
             lapse_ppm: 0,
             lapse_budget: 0,
+            outer: false,
+            abort_ppm: 0,
         };
         // Drawn apart from the shape's own stream so every earlier seed keeps its shape.
         let lapse_ppm = if shape.cap.is_some() {
@@ -321,10 +363,19 @@ impl Shape {
         let lapse_budget = shape.cap.as_ref().map_or(0, |cap| {
             shape.deadline_ms / 4 * u64::from(cap.max()) / (lease_ms + shape.step_ms)
         });
+        // Also apart from the shape's stream, so seeds that ran before the outer arm keep theirs.
+        let mut outer = Rng::derive(seed, "board shards outer");
+        let (outer, abort_ppm) = if outer.chance(300_000) {
+            (true, outer.range(0, 300_000))
+        } else {
+            (false, 0)
+        };
         Self {
             lease_ms,
             lapse_ppm,
             lapse_budget,
+            outer,
+            abort_ppm,
             ..shape
         }
     }
@@ -373,8 +424,12 @@ struct ShardLog {
     before_ppm: u64,
     after_ppm: u64,
     read_ppm: u64,
+    abort_ppm: u64,
+    /// The OuterTxSplits canary: an outer transaction may write its board rows without their records.
+    splits: bool,
     calls: Mutex<BTreeMap<String, Vec<Call>>>,
     appends: AtomicU64,
+    aborts: AtomicU64,
     rows: AtomicU64,
     faults: AtomicU64,
     conflicts: AtomicU64,
@@ -433,6 +488,55 @@ impl ShardLog {
         }
         self.wait(rows.iter().map(Vec::len).sum()).await;
         Ok(rows)
+    }
+}
+
+/// The log scope beside a board partition's scope that holds the records its rows derive from.
+fn records_of(scope: &str) -> String {
+    format!("{scope}/records")
+}
+
+/// The record an outer transaction writes for a board row: what the row derives from.
+fn record_for(body: &str) -> String {
+    format!("{:016x}", fnv(FNV_OFFSET, body.as_bytes()))
+}
+
+impl ShardLog {
+    /// One outer transaction, as pyramid2's append_projected runs it: the planned board rows and
+    /// the records they derive from go down together or not at all. It may roll back (an
+    /// injected abort, or a planned seq another committer took) or lose its acknowledgement
+    /// after it committed.
+    async fn carry(&self, scope: &str, rows: &[(u64, String)]) -> Resolution {
+        self.wait(rows.len()).await;
+        if rows.is_empty() {
+            return Resolution::Committed;
+        }
+        self.appends.fetch_add(1, Ordering::SeqCst);
+        if self.roll(|rng| rng.chance(self.abort_ppm)) {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            return Resolution::Aborted(self.injected("outer transaction"));
+        }
+        if let Err(error) = self.inner.append(scope, rows).await {
+            self.conflicts.fetch_add(1, Ordering::SeqCst);
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            return Resolution::Aborted(error);
+        }
+        let records: Vec<(u64, String)> = rows
+            .iter()
+            .map(|(seq, body)| (*seq, record_for(body)))
+            .collect();
+        if !(self.splits && self.roll(|rng| rng.chance(200_000))) {
+            // The board rows above took their seqs, so the records' seqs beside them are free.
+            if let Err(error) = self.inner.append(&records_of(scope), &records).await {
+                return Resolution::Unknown(error);
+            }
+        }
+        self.rows.fetch_add(rows.len() as u64, Ordering::SeqCst);
+        self.wait(0).await;
+        if self.roll(|rng| rng.chance(self.after_ppm)) {
+            return Resolution::Unknown(self.injected("outer acknowledgement"));
+        }
+        Resolution::Committed
     }
 }
 
@@ -719,14 +823,22 @@ impl World {
         let committer = self
             .committer(partition)
             .ok_or_else(|| BoardError::Dropped("no committer".into()))?;
-        committer
-            .submit(Write {
-                by: Some(by.to_owned()),
-                key: Some(key),
-                at_ms: self.now_ms(),
-                op,
-            })
+        let write = Write {
+            by: Some(by.to_owned()),
+            key: Some(key),
+            at_ms: self.now_ms(),
+            op,
+        };
+        if !self.shape.outer {
+            return committer.submit(write).await;
+        }
+        let ticket = committer.plan(vec![write]).await?;
+        let resolution = self.host.carry(&self.scope(partition), ticket.rows()).await;
+        ticket
+            .settle(resolution)
             .await
+            .pop()
+            .unwrap_or_else(|| Err(BoardError::Dropped("the planned group was empty".into())))
     }
 
     async fn submit(
@@ -1552,6 +1664,36 @@ fn check(world: &World, logs: &[Vec<(u64, String)>]) -> Result<ShardsStats, Stri
                 .count()
         ));
     }
+    if world.shape.outer {
+        for (index, log) in logs.iter().enumerate() {
+            let scope = world.scope(Partition(index as u32));
+            let records: BTreeMap<u64, String> = nanocode_sync::block_on(
+                world.host.inner.scan(&records_of(&scope), 0, END),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+            for (seq, body) in log {
+                if records.get(seq) != Some(&record_for(body)) {
+                    return Err(format!(
+                        "partition {index} shows board row {seq} without its log record"
+                    ));
+                }
+            }
+            if let Some(seq) = records.keys().find(|seq| !log.iter().any(|(at, _)| at == *seq)) {
+                return Err(format!(
+                    "partition {index} holds a log record at {seq} with no board row"
+                ));
+            }
+            for (at, (seq, _)) in log.iter().enumerate() {
+                if *seq != at as u64 + 1 {
+                    return Err(format!(
+                        "partition {index}'s board seq is not dense: row {at} has seq {seq}"
+                    ));
+                }
+            }
+        }
+    }
     let conflicts = world.host.conflicts.load(Ordering::SeqCst);
     if world.shape.committers == 1 && conflicts > 0 {
         return Err(format!(
@@ -1562,6 +1704,10 @@ fn check(world: &World, logs: &[Vec<(u64, String)>]) -> Result<ShardsStats, Stri
         stats.groups += commit.groups;
         stats.largest = stats.largest.max(commit.largest);
     }
+    for (_, commit) in &oracle.commits {
+        stats.planned += commit.planned;
+    }
+    stats.aborted = world.host.aborts.load(Ordering::SeqCst);
     stats.conflicts = conflicts;
     Ok(stats)
 }
@@ -1586,8 +1732,11 @@ fn simulate_shape(seed: u64, shape: Shape, mutation: ShardsMutation) -> ShardsOu
         before_ppm: shape.before_ppm,
         after_ppm: shape.after_ppm,
         read_ppm: shape.read_ppm,
+        abort_ppm: shape.abort_ppm,
+        splits: mutation == ShardsMutation::OuterTxSplits,
         calls: Mutex::new(BTreeMap::new()),
         appends: AtomicU64::new(0),
+        aborts: AtomicU64::new(0),
         rows: AtomicU64::new(0),
         faults: AtomicU64::new(0),
         conflicts: AtomicU64::new(0),
@@ -1664,7 +1813,17 @@ fn simulate_shape(seed: u64, shape: Shape, mutation: ShardsMutation) -> ShardsOu
 }
 
 pub fn simulate(seed: u64, mutation: ShardsMutation) -> ShardsOutcome {
-    simulate_shape(seed, Shape::of(seed), mutation)
+    let mut shape = Shape::of(seed);
+    if mutation.outer() {
+        // An outer canary needs the arm it breaks: outer transactions that abort, and for a
+        // fenced plan a second committer to take its seq.
+        shape.outer = true;
+        shape.abort_ppm = shape.abort_ppm.max(100_000);
+        if mutation == ShardsMutation::PlannedFencedNoRescan {
+            shape.committers = 2;
+        }
+    }
+    simulate_shape(seed, shape, mutation)
 }
 
 pub fn run_seed(seed: u64, mutation: ShardsMutation) -> ShardsOutcome {
@@ -1757,6 +1916,8 @@ pub fn bench(partitions: &[u32], writers: &[u64], batch: usize, cost: Cost) {
                 stale_ppm: 0,
                 lapse_ppm: 0,
                 lapse_budget: 0,
+                outer: false,
+                abort_ppm: 0,
             };
             let mut walls = Vec::new();
             for _ in 0..BENCH_ROUNDS {

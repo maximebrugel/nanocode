@@ -29,6 +29,12 @@ struct Connection {
     endpoint: Endpoint,
 }
 
+impl From<GoogleConfig> for AntigravityHarness {
+    fn from(google: GoogleConfig) -> Self {
+        Self::new().google(google)
+    }
+}
+
 impl AntigravityHarness {
     #[must_use]
     pub fn new() -> Self {

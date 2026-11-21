@@ -87,8 +87,8 @@ pub fn census() -> Profile {
 }
 
 fn walk(seg: &Segment, profile: &mut Profile) {
-    let free = seg.free_slices.peek();
-    let dirty = seg.dirty_slices.peek();
+    let free = seg.free_slices.get();
+    let dirty = seg.dirty_slices.get();
     let slices = &mut profile.slices;
     slices.headers += HEADER_SLICES;
     slices.free_dirty += (free & dirty & SLICES_FREE_ALL).count_ones() as usize;
@@ -109,16 +109,20 @@ fn walk(seg: &Segment, profile: &mut Profile) {
             continue;
         }
         let page = &seg.pages[slice];
-        let span = page.span.peek();
-        let class = page.class.peek();
-        let block_bytes = page.block_bytes.peek();
-        let used = page.used.peek();
-        let whole = page.head.peek() == slice
+        let span = page.span.get();
+        let class = page.class.get();
+        let block_bytes = page.block_bytes.get();
+        let used = page.used.get();
+        let whole = page.head.get() == slice
             && span > 0
             && span <= SLICES - slice
             && class < CLASSES
             && block_bytes == CLASS_BYTES[class];
-        let blocks = if whole { span * SLICE_BYTES / block_bytes } else { 0 };
+        let blocks = if whole {
+            span * SLICE_BYTES / block_bytes
+        } else {
+            0
+        };
         if !whole || used > blocks {
             profile.slices.torn += 1;
             slice += 1;

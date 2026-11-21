@@ -30,25 +30,52 @@ static SEGMENT_CACHE: Slots<SEGMENT_CACHE_SLOTS> = Slots::new();
 static LARGE_CACHE: Slots<LARGE_CACHE_SLOTS> = Slots::new();
 static LARGE_CACHED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static REGISTERED: [AtomicU64; REGISTRY_WORDS] = [const { AtomicU64::new(0) }; REGISTRY_WORDS];
-static REGISTERED_SUMMARY: [AtomicU64; SUMMARY_WORDS] = [const { AtomicU64::new(0) }; SUMMARY_WORDS];
+static REGISTERED_SUMMARY: [AtomicU64; SUMMARY_WORDS] =
+    [const { AtomicU64::new(0) }; SUMMARY_WORDS];
 static UNREGISTERED: AtomicUsize = AtomicUsize::new(0);
 static READERS: AtomicUsize = AtomicUsize::new(0);
 
-pub struct Shared<T>(Cell<T>);
+pub struct Shared<T: Atomic>(T::Cell);
 
-impl<T: Copy> Shared<T> {
+pub trait Atomic: Copy {
+    type Cell;
+    fn load(cell: &Self::Cell) -> Self;
+    fn store(cell: &Self::Cell, value: Self);
+}
+
+impl Atomic for usize {
+    type Cell = AtomicUsize;
     #[inline]
-    pub const fn get(&self) -> T {
-        self.0.get()
+    fn load(cell: &AtomicUsize) -> Self {
+        cell.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn store(cell: &AtomicUsize, value: Self) {
+        cell.store(value, Ordering::Relaxed);
+    }
+}
+
+impl Atomic for u64 {
+    type Cell = AtomicU64;
+    #[inline]
+    fn load(cell: &AtomicU64) -> Self {
+        cell.load(Ordering::Relaxed)
+    }
+    #[inline]
+    fn store(cell: &AtomicU64, value: Self) {
+        cell.store(value, Ordering::Relaxed);
+    }
+}
+
+impl<T: Atomic> Shared<T> {
+    #[inline]
+    pub fn get(&self) -> T {
+        T::load(&self.0)
     }
 
     #[inline]
     pub fn set(&self, value: T) {
-        self.0.set(value);
-    }
-
-    pub fn peek(&self) -> T {
-        unsafe { self.0.as_ptr().read_volatile() }
+        T::store(&self.0, value);
     }
 }
 
@@ -180,12 +207,13 @@ impl Page {
     }
 
     #[inline]
-    pub unsafe fn free_local(&self, block: *mut Block) {
+    pub unsafe fn free_local(&self, block: *mut Block) -> usize {
         let used = self.used.get();
         check(used > 0, "a block freed by its page's owner was handed out");
         unsafe { (*block).next = self.free.get() };
         self.free.set(block);
         self.used.set(used - 1);
+        used - 1
     }
 
     #[inline]
@@ -205,7 +233,7 @@ impl Page {
         }
     }
 
-    pub const fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.span.get() * SLICE_BYTES / self.block_bytes.get()
     }
 
@@ -240,7 +268,7 @@ impl Page {
         self.used.set(used - count);
     }
 
-    pub const fn span_mask(&self) -> u64 {
+    pub fn span_mask(&self) -> u64 {
         span_mask(self.head.get(), self.span.get())
     }
 }
@@ -442,7 +470,10 @@ pub fn segments_cached() -> usize {
 }
 
 pub fn large_cached() -> (usize, usize) {
-    (LARGE_CACHE.filled(), LARGE_CACHED_BYTES.load(Ordering::Relaxed))
+    (
+        LARGE_CACHE.filled(),
+        LARGE_CACHED_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 pub fn unregistered() -> usize {

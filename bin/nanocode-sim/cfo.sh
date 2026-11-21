@@ -114,6 +114,7 @@ default_table='
 1 canary_alloc_overstate_size canary --scenario alloc --mutation overstate_size
 1 canary_alloc_forget_free canary --scenario alloc --mutation forget_free
 1 canary_alloc_scribble canary --scenario alloc --mutation scribble
+1 canary_alloc_wrong_class canary --scenario alloc --mutation wrong_class
 1 canary_egress_widen_allowlist canary --scenario egress --mutation widen_allowlist
 1 canary_egress_corrupt_tunnel_byte canary --scenario egress --mutation corrupt_tunnel_byte
 1 canary_mpp_drop_abandon canary --scenario mpp --mutation drop_abandon

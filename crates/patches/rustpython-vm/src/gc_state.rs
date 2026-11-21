@@ -48,6 +48,67 @@ pub fn set_host_holds(holds: HostHolds) {
     let _ = HOST_HOLDS.set(holds);
 }
 
+/// Debug-only record of which thread's `GcState` tracks each object.
+///
+/// In non-threading builds every OS thread has its own lists, so an object
+/// tracked by one thread and untracked, promoted or walked by another is
+/// corrupting a list that thread does not lock. This catches that at the
+/// first touch, with a backtrace, instead of as heap corruption later.
+#[cfg(debug_assertions)]
+mod home {
+    use super::GcState;
+    use crate::PyObject;
+    use core::ptr::NonNull;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    const SHARDS: usize = 64;
+    type Home = (usize, std::thread::ThreadId);
+    static TABLE: [Mutex<Option<HashMap<usize, Home>>>; SHARDS] =
+        [const { Mutex::new(None) }; SHARDS];
+
+    fn shard(addr: usize) -> &'static Mutex<Option<HashMap<usize, Home>>> {
+        &TABLE[(addr >> 4).wrapping_mul(0x9E37_79B9) % SHARDS]
+    }
+
+    fn fail(what: &str, obj: NonNull<PyObject>, state: &GcState, home: Option<Home>) -> ! {
+        let me = std::thread::current();
+        eprintln!(
+            "GC OWNER CHECK FAILED: {what} obj={obj:p} from thread {:?} ({:?}) state={:p}; object home={:?}
+{}",
+            me.id(),
+            me.name(),
+            state as *const GcState,
+            home.map(|(s, t)| (s as *const GcState, t)),
+            std::backtrace::Backtrace::force_capture()
+        );
+        std::process::abort()
+    }
+
+    pub(super) fn track(state: &GcState, obj: NonNull<PyObject>) {
+        let addr = obj.as_ptr() as usize;
+        let here = (state as *const GcState as usize, std::thread::current().id());
+        shard(addr)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(addr, here);
+    }
+
+    pub(super) fn check(what: &str, state: &GcState, obj: NonNull<PyObject>, remove: bool) {
+        let addr = obj.as_ptr() as usize;
+        let mut g = shard(addr).lock().unwrap_or_else(|e| e.into_inner());
+        let map = g.get_or_insert_with(HashMap::new);
+        let home = if remove { map.remove(&addr) } else { map.get(&addr).copied() };
+        drop(g);
+        let me = std::thread::current().id();
+        match home {
+            Some((s, t)) if s == state as *const GcState as usize && t == me => {}
+            other => fail(what, obj, state, other),
+        }
+    }
+}
+
 /// Result from a single collection run
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CollectResult {
@@ -298,6 +359,8 @@ impl GcState {
         obj_ref.set_gc_tracked();
         obj_ref.set_gc_generation(0);
         obj_ref.set_gc_owner(owner);
+        #[cfg(debug_assertions)]
+        home::track(self, obj);
 
         self.generation_lists[0].write().push_front(obj);
         self.counts[0].fetch_add(1, Ordering::Relaxed);
@@ -322,6 +385,8 @@ impl GcState {
         obj_ref.init_gc_tracked_bit();
         obj_ref.set_gc_generation(0);
         obj_ref.set_gc_owner(owner);
+        #[cfg(debug_assertions)]
+        home::track(self, obj);
 
         self.generation_lists[0].write().push_front(obj);
         self.counts[0].fetch_add(1, Ordering::Relaxed);
@@ -342,6 +407,8 @@ impl GcState {
             obj_ref.init_gc_tracked_bit();
             obj_ref.set_gc_generation(0);
             obj_ref.set_gc_owner(owner);
+            #[cfg(debug_assertions)]
+            home::track(self, obj);
         }
 
         {
@@ -375,6 +442,8 @@ impl GcState {
                 return; // GC_UNTRACKED or unknown — already untracked
             };
 
+            #[cfg(debug_assertions)]
+            home::check("untrack_object", self, obj, false);
             let mut list = list_lock.write();
             // Re-check generation under lock (may have changed due to promotion)
             if obj_ref.gc_generation() != obj_gen {
@@ -382,6 +451,8 @@ impl GcState {
                 continue; // Retry with the updated generation
             }
             if unsafe { list.remove(obj) }.is_some() {
+                #[cfg(debug_assertions)]
+                home::check("untrack_object(removed)", self, obj, true);
                 release_count(count);
                 obj_ref.clear_gc_tracked();
                 obj_ref.set_gc_generation(GC_UNTRACKED);
@@ -539,6 +610,8 @@ impl GcState {
         let mut candidate_ptrs: Vec<GcPtr> = Vec::new();
         for gen_list in &gen_locks {
             for obj in gen_list.iter() {
+                #[cfg(debug_assertions)]
+                home::check("collect_inner walk", self, NonNull::from(obj), false);
                 if retired.binary_search(&obj.gc_owner()).is_ok() {
                     obj.set_gc_owner(GC_NO_OWNER);
                 }
@@ -1041,6 +1114,8 @@ impl GcState {
                     }
 
                     let ptr = NonNull::from(obj);
+                    #[cfg(debug_assertions)]
+                    home::check("promote_survivors", self, ptr, false);
                     if unsafe { src.remove(ptr) }.is_some() {
                         dst.push_front(ptr);
                         obj.set_gc_generation(next_gen as u8);

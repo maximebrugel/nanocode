@@ -1,6 +1,6 @@
 use std::{alloc::Layout, collections::BTreeMap, ops::Range, process::ExitCode};
 
-use nanocode_sys::alloc::{Allocation, Local, is_small};
+use nanocode_sys::alloc::{Allocation, Heap, Local, Profile, is_small, small_class};
 
 use crate::rng::{FNV_OFFSET, PPM, Rng, fnv};
 
@@ -35,10 +35,11 @@ pub enum AllocMutation {
     DropAlign,
     OversizeRequest,
     DropZero,
+    WrongClass,
 }
 
 impl AllocMutation {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::None,
         Self::OverstateSize,
         Self::ForgetFree,
@@ -46,6 +47,7 @@ impl AllocMutation {
         Self::DropAlign,
         Self::OversizeRequest,
         Self::DropZero,
+        Self::WrongClass,
     ];
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -63,6 +65,7 @@ impl AllocMutation {
             Self::DropAlign => "drop_align",
             Self::OversizeRequest => "oversize_request",
             Self::DropZero => "drop_zero",
+            Self::WrongClass => "wrong_class",
         }
     }
 
@@ -106,6 +109,7 @@ struct Block {
     claimed_bytes: usize,
     tag: u64,
     thread: usize,
+    class: Option<usize>,
 }
 
 const fn expected(tag: u64, at: usize) -> u8 {
@@ -264,7 +268,13 @@ impl World {
         Ok(())
     }
 
-    fn claim(&mut self, allocation: Allocation, thread: usize, align: usize) -> Result<(), String> {
+    fn claim(
+        &mut self,
+        allocation: Allocation,
+        thread: usize,
+        align: usize,
+        class: Option<usize>,
+    ) -> Result<(), String> {
         let layout = allocation.layout();
         if let Err(message) = self.placed(allocation.address(), layout.size(), align) {
             self.rejected.push(allocation);
@@ -281,6 +291,7 @@ impl World {
             claimed_bytes,
             tag,
             thread,
+            class,
         };
         block.fill();
         self.by_address
@@ -333,7 +344,8 @@ impl World {
                 ));
             }
         }
-        self.claim(allocation, thread, layout.align())
+        let class = small_class(allocation.layout());
+        self.claim(allocation, thread, layout.align(), class)
     }
 
     fn free(&mut self, thread: usize, index: usize) -> Result<(), String> {
@@ -364,6 +376,7 @@ impl World {
         self.note("reallocate", size_new as u64);
         self.stats.reallocations += 1;
         let tag = old.tag;
+        let address = old.allocation.address();
         let allocation = match self.locals[thread].reallocate(old.allocation, size_new) {
             Ok(allocation) => allocation,
             Err(allocation) => {
@@ -373,32 +386,74 @@ impl World {
                 ));
             }
         };
+        let class = if allocation.address() == address {
+            old.class
+        } else {
+            small_class(allocation.layout())
+        };
         let moved = Block {
             allocation,
             claimed_bytes: size_new,
             tag,
             thread,
+            class,
         };
         if let Err(message) = moved.check_written(size, size.min(size_new)) {
             self.rejected.push(moved.allocation);
             return Err(message);
         }
         let align = moved.allocation.layout().align();
-        self.claim(moved.allocation, thread, align)
+        self.claim(moved.allocation, thread, align, class)
     }
 
     fn checkpoint(&mut self, thread: usize) -> Result<(), String> {
         self.stats.adopted += self.locals[thread].adopt_abandoned() as u64;
         self.stats.checkpoints += 1;
-        let used: usize = self
-            .locals
-            .iter()
-            .map(|local| local.census().blocks_used)
-            .sum();
+        let censuses: Vec<_> = self.locals.iter().map(Local::census).collect();
+        let used: usize = censuses.iter().map(|census| census.blocks_used).sum();
         let tracked = self.live.iter().filter(|block| block.small()).count();
         if used != tracked {
             return Err(format!(
                 "census: the heaps hold {used} small blocks, the simulation tracks {tracked} live"
+            ));
+        }
+        let profile = Heap::profile();
+        let classes = profile.classes.len();
+        let mut by_class = vec![0_usize; classes];
+        for class in self.live.iter().filter_map(|block| block.class) {
+            by_class[class] += 1;
+        }
+        if tracked > 0 && self.mutation_due(AllocMutation::WrongClass) {
+            let class = by_class.iter().position(|&count| count > 0).unwrap_or(0);
+            by_class[class] -= 1;
+            by_class[(class + 1) % classes] += 1;
+        }
+        for (class, &tracked) in by_class.iter().enumerate() {
+            let held: usize = censuses.iter().map(|census| census.classes[class]).sum();
+            if held != tracked {
+                return Err(format!(
+                    "census: the heaps hold {held} blocks of class {class}, the simulation tracks {tracked}"
+                ));
+            }
+            Self::profiled(&profile, class, held)?;
+        }
+        Ok(())
+    }
+
+    fn profiled(profile: &Profile, class: usize, held: usize) -> Result<(), String> {
+        let entry = &profile.classes[class];
+        if entry.used < held || entry.used > entry.blocks {
+            return Err(format!(
+                "profile: class {class} counts {} used of {} blocks, these heaps alone hold {held}",
+                entry.used, entry.blocks
+            ));
+        }
+        if entry.bytes != entry.pages * entry.bytes.checked_div(entry.pages).unwrap_or(0)
+            || entry.blocks * entry.block_bytes > entry.bytes
+        {
+            return Err(format!(
+                "profile: class {class} holds {} blocks of {} bytes in {} pages of {} bytes",
+                entry.blocks, entry.block_bytes, entry.pages, entry.bytes
             ));
         }
         Ok(())

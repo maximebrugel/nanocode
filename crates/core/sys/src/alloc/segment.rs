@@ -1,6 +1,6 @@
 use core::cell::Cell;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
 
 use super::class::SMALL_BYTES_MAX;
 use super::os::{self, check};
@@ -20,11 +20,37 @@ const LARGE_CACHE_SLOTS: usize = 16;
 const LARGE_CACHE_BYTES_MAX: usize = 8 << 20;
 const LARGE_CACHE_FIT: usize = 2;
 const LARGE_UNITS_LIMIT: usize = SEGMENT_BYTES;
+const ADDRESS_BITS: usize = 48;
+const REGISTRY_SEGMENTS: usize = 1 << (ADDRESS_BITS - SEGMENT_BYTES.trailing_zeros() as usize);
+const REGISTRY_WORDS: usize = REGISTRY_SEGMENTS / u64::BITS as usize;
+const SUMMARY_WORDS: usize = REGISTRY_WORDS / u64::BITS as usize;
 
 pub static ABANDONED: Slots<ABANDONED_SLOTS> = Slots::new();
 static SEGMENT_CACHE: Slots<SEGMENT_CACHE_SLOTS> = Slots::new();
 static LARGE_CACHE: Slots<LARGE_CACHE_SLOTS> = Slots::new();
 static LARGE_CACHED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static REGISTERED: [AtomicU64; REGISTRY_WORDS] = [const { AtomicU64::new(0) }; REGISTRY_WORDS];
+static REGISTERED_SUMMARY: [AtomicU64; SUMMARY_WORDS] = [const { AtomicU64::new(0) }; SUMMARY_WORDS];
+static UNREGISTERED: AtomicUsize = AtomicUsize::new(0);
+static READERS: AtomicUsize = AtomicUsize::new(0);
+
+pub struct Shared<T>(Cell<T>);
+
+impl<T: Copy> Shared<T> {
+    #[inline]
+    pub const fn get(&self) -> T {
+        self.0.get()
+    }
+
+    #[inline]
+    pub fn set(&self, value: T) {
+        self.0.set(value);
+    }
+
+    pub fn peek(&self) -> T {
+        unsafe { self.0.as_ptr().read_volatile() }
+    }
+}
 
 pub struct Block {
     pub next: *mut Self,
@@ -35,11 +61,11 @@ pub struct Page {
     pub thread_free: AtomicPtr<Block>,
     pub bump: Cell<usize>,
     pub end: Cell<usize>,
-    pub block_bytes: Cell<usize>,
-    pub used: Cell<usize>,
-    pub head: Cell<usize>,
-    pub span: Cell<usize>,
-    pub class: Cell<usize>,
+    pub block_bytes: Shared<usize>,
+    pub used: Shared<usize>,
+    pub head: Shared<usize>,
+    pub span: Shared<usize>,
+    pub class: Shared<usize>,
     pub next: Cell<*mut Self>,
     pub prev: Cell<*mut Self>,
     pub zero: Cell<bool>,
@@ -56,8 +82,8 @@ pub struct Segment {
     pub kind: Cell<usize>,
     pub mapping_bytes: Cell<usize>,
     pub owner: AtomicU64,
-    pub free_slices: Cell<u64>,
-    pub dirty_slices: Cell<u64>,
+    pub free_slices: Shared<u64>,
+    pub dirty_slices: Shared<u64>,
     pub next: Cell<*mut Self>,
     pub prev: Cell<*mut Self>,
     pub pages: [Page; SLICES],
@@ -95,6 +121,10 @@ impl<const N: usize> Slots<N> {
             }
         }
         false
+    }
+
+    pub fn filled(&self) -> usize {
+        usize::try_from(self.filled.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     pub fn take(&self, fits: impl Fn(usize) -> bool) -> usize {
@@ -269,6 +299,7 @@ pub unsafe fn acquire(owner: u64) -> *mut Segment {
         (*segment).next.set(null_mut());
         (*segment).prev.set(null_mut());
         if cached == 0 {
+            register(base);
             return segment;
         }
         for page in &(*segment).pages {
@@ -310,6 +341,7 @@ pub unsafe fn release(segment: *mut Segment) {
         );
         purge_dirty(segment);
         if !SEGMENT_CACHE.put(segment.addr()) {
+            unregister(segment.addr());
             os::unmap(segment.addr(), SEGMENT_BYTES);
         }
     }
@@ -366,12 +398,14 @@ pub unsafe fn large_allocate_with(bytes: usize, align: usize) -> (*mut u8, Conte
         (*segment).mapping_bytes.set(mapping_bytes);
     }
     super::stats::taken(mapping_bytes);
+    super::stats::large_taken(mapping_bytes);
     ((base + offset) as *mut u8, contents)
 }
 
 pub unsafe fn large_free(segment: *mut Segment) {
     let bytes = unsafe { (*segment).mapping_bytes.get() };
     super::stats::given(bytes);
+    super::stats::large_given(bytes);
     let units = bytes / os::page_bytes();
     if units < LARGE_UNITS_LIMIT {
         let before = LARGE_CACHED_BYTES.fetch_add(bytes, Ordering::Relaxed);
@@ -399,7 +433,73 @@ pub unsafe fn large_resize(segment: *mut Segment, pointer: *mut u8, bytes_new: u
     if unsafe { os::grow_in_place(segment.addr(), mapping_bytes, need) } {
         unsafe { (*segment).mapping_bytes.set(need) };
         super::stats::taken(need - mapping_bytes);
+        super::stats::large_grown(need - mapping_bytes);
         return true;
     }
     false
+}
+
+pub fn segments_cached() -> usize {
+    SEGMENT_CACHE.filled()
+}
+
+pub fn large_cached() -> (usize, usize) {
+    (LARGE_CACHE.filled(), LARGE_CACHED_BYTES.load(Ordering::Relaxed))
+}
+
+pub fn unregistered() -> usize {
+    UNREGISTERED.load(Ordering::Relaxed)
+}
+
+const fn registry_index(base: usize) -> Option<usize> {
+    let index = base / SEGMENT_BYTES;
+    if index < REGISTRY_SEGMENTS {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn register(base: usize) {
+    let Some(index) = registry_index(base) else {
+        UNREGISTERED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let word = index / u64::BITS as usize;
+    REGISTERED_SUMMARY[word / u64::BITS as usize]
+        .fetch_or(1 << (word % u64::BITS as usize), Ordering::Release);
+    REGISTERED[word].fetch_or(1 << (index % u64::BITS as usize), Ordering::Release);
+}
+
+fn unregister(base: usize) {
+    let Some(index) = registry_index(base) else {
+        UNREGISTERED.fetch_sub(1, Ordering::Relaxed);
+        return;
+    };
+    let word = index / u64::BITS as usize;
+    REGISTERED[word].fetch_and(!(1 << (index % u64::BITS as usize)), Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    while READERS.load(Ordering::Relaxed) != 0 {
+        std::thread::yield_now();
+    }
+    fence(Ordering::Acquire);
+}
+
+pub fn each_registered(mut visit: impl FnMut(&Segment)) {
+    READERS.fetch_add(1, Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    for (summary_index, summary) in REGISTERED_SUMMARY.iter().enumerate() {
+        let mut words = summary.load(Ordering::Acquire);
+        while words != 0 {
+            let word = summary_index * u64::BITS as usize + words.trailing_zeros() as usize;
+            words &= words - 1;
+            let mut bits = REGISTERED[word].load(Ordering::Acquire);
+            while bits != 0 {
+                let index = word * u64::BITS as usize + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                visit(unsafe { &*((index * SEGMENT_BYTES) as *const Segment) });
+            }
+        }
+    }
+    READERS.fetch_sub(1, Ordering::Release);
 }

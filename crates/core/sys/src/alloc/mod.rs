@@ -6,6 +6,8 @@ mod local;
 #[cfg(unix)]
 mod os;
 #[cfg(unix)]
+mod profile;
+#[cfg(unix)]
 mod segment;
 #[cfg(unix)]
 mod stats;
@@ -24,6 +26,8 @@ static HEAP_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub struct Heap;
 
+#[cfg(unix)]
+pub use profile::{Class, Mappings, Profile, Segments, Slices};
 #[cfg(unix)]
 pub use stats::Stats;
 
@@ -46,6 +50,10 @@ impl Heap {
         {
             Stats::default()
         }
+    }
+    #[cfg(unix)]
+    pub fn profile() -> Profile {
+        profile::census()
     }
 }
 
@@ -200,4 +208,9 @@ impl Drop for Local {
 #[cfg(unix)]
 pub const fn is_small(layout: Layout) -> bool {
     class::small_bytes(layout.size(), layout.align()).is_some()
+}
+
+#[cfg(unix)]
+pub fn small_class(layout: Layout) -> Option<usize> {
+    class::small_bytes(layout.size(), layout.align()).map(class::class_for)
 }

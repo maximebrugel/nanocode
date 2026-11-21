@@ -2,6 +2,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 static MAPPED: AtomicUsize = AtomicUsize::new(0);
 static IN_PAGES: AtomicUsize = AtomicUsize::new(0);
+static LARGE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static LARGE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// What the heap holds, counted on its slow paths only (page and mapping changes), so reading it costs
 /// two loads and the allocation fast path pays nothing.
@@ -36,6 +38,27 @@ pub fn taken(bytes: usize) {
 
 pub fn given(bytes: usize) {
     IN_PAGES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
+pub fn large_taken(bytes: usize) {
+    LARGE_LIVE.fetch_add(1, Ordering::Relaxed);
+    LARGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub fn large_given(bytes: usize) {
+    LARGE_LIVE.fetch_sub(1, Ordering::Relaxed);
+    LARGE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
+pub fn large_grown(bytes: usize) {
+    LARGE_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+pub fn large() -> (usize, usize) {
+    (
+        LARGE_LIVE.load(Ordering::Relaxed),
+        LARGE_BYTES.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]

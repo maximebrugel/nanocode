@@ -58,6 +58,7 @@ pub struct Census {
     pub segments: usize,
     pub pages: usize,
     pub blocks_used: usize,
+    pub classes: [usize; CLASSES],
 }
 
 unsafe extern "C" fn thread_exited(state: *mut c_void) {
@@ -520,6 +521,7 @@ impl State {
             segments: 0,
             pages: 0,
             blocks_used: 0,
+            classes: [0; CLASSES],
         };
         let mut segment = self.segments.get();
         while !segment.is_null() {
@@ -555,7 +557,9 @@ impl State {
                 }
                 taken |= span_mask(slice, span);
                 census.pages += 1;
-                census.blocks_used += Self::page_census(page);
+                let used = Self::page_census(page);
+                census.blocks_used += used;
+                census.classes[page.class.get()] += used;
                 slice += span;
             }
             assert_eq!(

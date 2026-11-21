@@ -154,6 +154,26 @@ fn is_owned_by(obj: &PyObject, owner: GcOwner) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct GcPtr(NonNull<PyObject>);
 
+/// Hands every candidate's header back if a collection unwinds between taking
+/// the candidates (step 1) and splitting them (step 5).
+struct ClearOnUnwind<'a> {
+    ptrs: &'a [GcPtr],
+    armed: bool,
+}
+
+impl Drop for ClearOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            for ptr in self.ptrs {
+                // SAFETY: still armed means step 5 has not run, so every
+                // candidate is pinned by the generation read locks, which are
+                // declared before this guard and so dropped after it.
+                unsafe { ptr.0.as_ref() }.end_gc_refs();
+            }
+        }
+    }
+}
+
 /// Hashing for the tables a collection keys by an object's address.
 ///
 /// The default hasher is SipHash, which buys resistance against a caller
@@ -537,6 +557,8 @@ impl GcState {
         // became a candidate, which is what lets an all-reachable collection
         // promote whole lists at once below.
         let mut scanned = 0usize;
+        // Objects found with `COLLECTING` already set; see below.
+        let mut already_collecting: Vec<GcPtr> = Vec::new();
         for gen_list in &gen_locks {
             for obj in gen_list.iter() {
                 scanned += 1;
@@ -544,12 +566,44 @@ impl GcState {
                     obj.set_gc_owner(GC_NO_OWNER);
                 }
                 let strong_count = obj.strong_count();
-                if strong_count > 0 && is_owned_by(obj, owner) && !obj.is_gc_collecting() {
-                    obj.start_gc_refs(strong_count);
-                    candidate_ptrs.push(GcPtr(NonNull::from(obj)));
+                if strong_count > 0 && is_owned_by(obj, owner) {
+                    if !obj.is_gc_collecting() {
+                        obj.start_gc_refs(strong_count);
+                        candidate_ptrs.push(GcPtr(NonNull::from(obj)));
+                    } else {
+                        already_collecting.push(GcPtr(NonNull::from(obj)));
+                    }
                 }
             }
         }
+
+        // The bit is set either by this scan (an object in two lists) or left
+        // over from a collection that unwound before handing the headers back.
+        // This thread holds `collecting`, so no other pass owns a leftover:
+        // clear it and take the object in, or it would never be a candidate
+        // again and its gc_refs would be misread as an index below.
+        if !already_collecting.is_empty() {
+            let mine: GcSet<GcPtr> = candidate_ptrs.iter().copied().collect();
+            for ptr in already_collecting {
+                if !mine.contains(&ptr) {
+                    let obj = unsafe { ptr.0.as_ref() };
+                    obj.end_gc_refs();
+                    let strong_count = obj.strong_count();
+                    if strong_count > 0 {
+                        obj.start_gc_refs(strong_count);
+                        candidate_ptrs.push(ptr);
+                    }
+                }
+            }
+        }
+
+        // Every candidate now carries `COLLECTING`. Step 5 takes it off; if
+        // anything between here and there unwinds, the guard does instead, so
+        // no header leaves this pass still claiming a count or an index.
+        let mut clear_on_unwind = ClearOnUnwind {
+            ptrs: &candidate_ptrs,
+            armed: true,
+        };
 
         // A full collection is the only one that sees every generation, so it
         // is where adoption finishes and the tags stop being tracked.
@@ -679,7 +733,12 @@ impl GcState {
                     let child = unsafe { child_ptr.as_ref() };
                     if child.is_gc_collecting() {
                         let child_idx = child.gc_refs() as usize;
-                        if !reached[child_idx] {
+                        // Only an index this pass wrote names this child: any
+                        // other value is a header this pass does not own.
+                        if child_idx < candidates
+                            && candidate_ptrs[child_idx].0 == child_ptr
+                            && !reached[child_idx]
+                        {
                             reached[child_idx] = true;
                             worklist.push(child_idx);
                         }
@@ -702,6 +761,7 @@ impl GcState {
             }
             obj.end_gc_refs();
         }
+        clear_on_unwind.armed = false;
 
         // With the world stopped, every frame on any thread's call stack is a
         // live root that is externally referenced and must have been

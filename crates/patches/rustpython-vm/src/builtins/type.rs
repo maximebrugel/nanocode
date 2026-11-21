@@ -37,7 +37,7 @@ use core::{
     cell::Cell,
     ops::Deref,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 use indexmap::{IndexMap, map::Entry};
 use rustpython_common::wtf8::iteration::Itertools;
@@ -183,19 +183,25 @@ impl TypeCacheEntry {
     }
 }
 
-// std::sync::LazyLock is used here (not crate::common::lock::LazyLock)
-// because TYPE_CACHE is a global shared across test threads. The common
-// LazyLock delegates to LazyCell in non-threading mode, which is !Sync.
-static TYPE_CACHE: std::sync::LazyLock<Box<[TypeCacheEntry]>> = std::sync::LazyLock::new(|| {
-    (0..TYPE_CACHE_SIZE)
+// Per thread: without threading, QSBR frees a published value at once, so
+// only the thread whose interpreters own the cached types may read an entry.
+// A process-wide cache let one thread try-incref another thread's object
+// (non-atomic refcounts) while that thread freed or overwrote it.
+thread_local! {
+    static TYPE_CACHE: Box<[TypeCacheEntry]> = (0..TYPE_CACHE_SIZE)
         .map(|_| TypeCacheEntry::new())
         .collect::<Vec<_>>()
-        .into_boxed_slice()
-});
+        .into_boxed_slice();
 
-/// When true, find_name_in_mro skips populating the cache.
-/// Set during GC's type_cache_clear to prevent re-population from drops.
-static TYPE_CACHE_CLEARING: AtomicBool = AtomicBool::new(false);
+    /// When true, find_name_in_mro skips populating the cache.
+    /// Set during GC's type_cache_clear to prevent re-population from drops.
+    static TYPE_CACHE_CLEARING: Cell<bool> = const { Cell::new(false) };
+}
+
+#[inline]
+fn with_type_cache<R>(f: impl FnOnce(&[TypeCacheEntry]) -> R) -> Option<R> {
+    TYPE_CACHE.try_with(|cache| f(cache)).ok()
+}
 
 /// MCACHE_HASH: XOR of version and name pointer hash, masked to cache size.
 #[inline]
@@ -207,16 +213,18 @@ fn type_cache_hash(version: u32, name: &'static PyStrInterned) -> usize {
 /// Invalidate cache entries for a specific version tag.
 /// Called from modified() when a type is changed.
 fn type_cache_clear_version(version: u32) {
-    for entry in TYPE_CACHE.iter() {
-        if entry.version.load(Ordering::Relaxed) == version {
-            entry.begin_write();
+    with_type_cache(|cache| {
+        for entry in cache {
             if entry.version.load(Ordering::Relaxed) == version {
-                entry.version.store(0, Ordering::Release);
-                entry.clear_value();
+                entry.begin_write();
+                if entry.version.load(Ordering::Relaxed) == version {
+                    entry.version.store(0, Ordering::Release);
+                    entry.clear_value();
+                }
+                entry.end_write();
             }
-            entry.end_write();
         }
-    }
+    });
 }
 
 /// Clear all method cache entries (_PyType_ClearCache).
@@ -227,14 +235,16 @@ fn type_cache_clear_version(version: u32) {
 /// entire operation, preventing concurrent lookups from repopulating
 /// entries while we're clearing them.
 pub(crate) fn type_cache_clear() {
-    TYPE_CACHE_CLEARING.store(true, Ordering::Release);
-    for entry in TYPE_CACHE.iter() {
-        entry.begin_write();
-        entry.version.store(0, Ordering::Release);
-        entry.clear_value();
-        entry.end_write();
-    }
-    TYPE_CACHE_CLEARING.store(false, Ordering::Release);
+    TYPE_CACHE_CLEARING.set(true);
+    with_type_cache(|cache| {
+        for entry in cache {
+            entry.begin_write();
+            entry.version.store(0, Ordering::Release);
+            entry.clear_value();
+            entry.end_write();
+        }
+    });
+    TYPE_CACHE_CLEARING.set(false);
 }
 
 unsafe impl crate::object::Traverse for PyType {
@@ -1303,33 +1313,38 @@ impl PyType {
         let version = self.tp_version_tag.load(Ordering::Acquire);
         if version != 0 {
             let idx = type_cache_hash(version, name);
-            let entry = &TYPE_CACHE[idx];
             let name_ptr = name as *const _ as *mut _;
-            loop {
-                let seq1 = entry.begin_read();
-                let entry_version = entry.version.load(Ordering::Acquire);
-                let type_version = self.tp_version_tag.load(Ordering::Acquire);
-                if entry_version != type_version
-                    || !core::ptr::eq(entry.name.load(Ordering::Relaxed), name_ptr)
-                {
-                    break;
-                }
-                let ptr = entry.value.load(Ordering::Acquire);
-                if ptr.is_null() {
-                    if entry.end_read(seq1) {
-                        return (None, entry_version);
+            let hit = with_type_cache(|cache| {
+                let entry = &cache[idx];
+                loop {
+                    let seq1 = entry.begin_read();
+                    let entry_version = entry.version.load(Ordering::Acquire);
+                    let type_version = self.tp_version_tag.load(Ordering::Acquire);
+                    if entry_version != type_version
+                        || !core::ptr::eq(entry.name.load(Ordering::Relaxed), name_ptr)
+                    {
+                        return None;
                     }
-                    continue;
-                }
-                if let Some(cloned) = unsafe { PyObject::try_to_owned_from_ptr(ptr) } {
-                    let same_ptr = core::ptr::eq(entry.value.load(Ordering::Relaxed), ptr);
-                    if same_ptr && entry.end_read(seq1) {
-                        return (Some(cloned), entry_version);
+                    let ptr = entry.value.load(Ordering::Acquire);
+                    if ptr.is_null() {
+                        if entry.end_read(seq1) {
+                            return Some((None, entry_version));
+                        }
+                        continue;
                     }
-                    drop(cloned);
-                    continue;
+                    if let Some(cloned) = unsafe { PyObject::try_to_owned_from_ptr(ptr) } {
+                        let same_ptr = core::ptr::eq(entry.value.load(Ordering::Relaxed), ptr);
+                        if same_ptr && entry.end_read(seq1) {
+                            return Some((Some(cloned), entry_version));
+                        }
+                        drop(cloned);
+                        continue;
+                    }
+                    return None;
                 }
-                break;
+            });
+            if let Some(Some(hit)) = hit {
+                return hit;
             }
         }
 
@@ -1341,24 +1356,26 @@ impl PyType {
             };
             let result = self.find_name_in_mro_uncached(name);
             if assigned != 0
-                && !TYPE_CACHE_CLEARING.load(Ordering::Acquire)
+                && !TYPE_CACHE_CLEARING.try_with(Cell::get).unwrap_or(true)
                 && self.tp_version_tag.load(Ordering::Acquire) == assigned
             {
                 let idx = type_cache_hash(assigned, name);
-                let entry = &TYPE_CACHE[idx];
                 let name_ptr = name as *const _ as *mut _;
-                entry.begin_write();
-                entry.version.store(0, Ordering::Release);
-                let new_ptr = result.as_ref().map_or(core::ptr::null_mut(), |found| {
-                    // Defer memory reclamation of cached values via QSBR so
-                    // racing readers never try-incref freed memory.
-                    found.mark_cache_published();
-                    &**found as *const PyObject as *mut _
+                with_type_cache(|cache| {
+                    let entry = &cache[idx];
+                    entry.begin_write();
+                    entry.version.store(0, Ordering::Release);
+                    let new_ptr = result.as_ref().map_or(core::ptr::null_mut(), |found| {
+                        // Defer memory reclamation of cached values via QSBR so
+                        // racing readers never try-incref freed memory.
+                        found.mark_cache_published();
+                        &**found as *const PyObject as *mut _
+                    });
+                    entry.value.store(new_ptr, Ordering::Relaxed);
+                    entry.name.store(name_ptr, Ordering::Relaxed);
+                    entry.version.store(assigned, Ordering::Release);
+                    entry.end_write();
                 });
-                entry.value.store(new_ptr, Ordering::Relaxed);
-                entry.name.store(name_ptr, Ordering::Relaxed);
-                entry.version.store(assigned, Ordering::Release);
-                entry.end_write();
             }
             (result, assigned)
         })
@@ -1525,25 +1542,26 @@ impl PyType {
         let version = self.tp_version_tag.load(Ordering::Acquire);
         if version != 0 {
             let idx = type_cache_hash(version, name);
-            let entry = &TYPE_CACHE[idx];
             let name_ptr = name as *const _ as *mut _;
-            loop {
-                let seq1 = entry.begin_read();
-                let v1 = entry.version.load(Ordering::Acquire);
-                let type_version = self.tp_version_tag.load(Ordering::Acquire);
-                if v1 != type_version
-                    || !core::ptr::eq(entry.name.load(Ordering::Relaxed), name_ptr)
-                {
-                    break;
-                }
-                let ptr = entry.value.load(Ordering::Acquire);
-                if entry.end_read(seq1) {
-                    if !ptr.is_null() {
-                        return true;
+            let hit = with_type_cache(|cache| {
+                let entry = &cache[idx];
+                loop {
+                    let seq1 = entry.begin_read();
+                    let v1 = entry.version.load(Ordering::Acquire);
+                    let type_version = self.tp_version_tag.load(Ordering::Acquire);
+                    if v1 != type_version
+                        || !core::ptr::eq(entry.name.load(Ordering::Relaxed), name_ptr)
+                    {
+                        return false;
                     }
-                    break;
+                    let ptr = entry.value.load(Ordering::Acquire);
+                    if entry.end_read(seq1) {
+                        return !ptr.is_null();
+                    }
                 }
-                continue;
+            });
+            if hit == Some(true) {
+                return true;
             }
         }
 

@@ -18,6 +18,13 @@ const COLLECT_LIVE_DIVISOR: usize = 4;
 /// many pages it holds: COLLECT_LIVE_DIVISOR alone let a thread holding N pages leave remote frees uncollected
 /// (allocated, unusable) for N / 4 new pages, which on a long-lived thread holding gigabytes is never.
 const COLLECT_PAGES_MAX: usize = 256;
+/// One collection step walks at most this many pages, or stops once it has moved this many remote-freed blocks
+/// (their cost dominates: each is a cache miss on memory another core wrote), and the next slow allocation resumes
+/// where it stopped, so no single slow allocation pauses for a whole heap's walk.
+const COLLECT_STEP_PAGES: usize = 1024;
+const COLLECT_STEP_BLOCKS: usize = 2048;
+/// Or once it has retired this many empty pages: a retired page can purge the heap's dirty slices (madvise).
+const COLLECT_STEP_RETIRES: usize = 4;
 const DIRTY_SLICES_MAX: usize = 4;
 const SHRINK_IN_PLACE_DIVISOR: usize = 2;
 
@@ -33,12 +40,6 @@ pub enum Exit {
     Unwatched,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Heads {
-    Kept,
-    Retired,
-}
-
 pub struct State {
     id: Cell<u64>,
     heads: [Cell<*mut Page>; CLASSES],
@@ -48,6 +49,9 @@ pub struct State {
     pages_live: Cell<usize>,
     pages_since_collect: Cell<usize>,
     slices_dirty: Cell<usize>,
+    /// The collection in progress: the class it is in (CLASSES when none) and the next page it walks there.
+    sweep_class: Cell<usize>,
+    sweep_page: Cell<*mut Page>,
 }
 
 pub struct Census {
@@ -72,6 +76,8 @@ impl State {
             pages_live: Cell::new(0),
             pages_since_collect: Cell::new(0),
             slices_dirty: Cell::new(0),
+            sweep_class: Cell::new(CLASSES),
+            sweep_page: Cell::new(null_mut()),
         }
     }
 
@@ -177,12 +183,13 @@ impl State {
         if self.id.get() == 0 {
             self.start(exit);
         }
-        if self.pages_since_collect.get()
-            >= COLLECT_PAGES_MIN
-                .max(self.pages_live.get() / COLLECT_LIVE_DIVISOR)
-                .min(COLLECT_PAGES_MAX)
+        if self.sweep_class.get() < CLASSES
+            || self.pages_since_collect.get()
+                >= COLLECT_PAGES_MIN
+                    .max(self.pages_live.get() / COLLECT_LIVE_DIVISOR)
+                    .min(COLLECT_PAGES_MAX)
         {
-            self.collect_all(Heads::Kept);
+            self.collect_step();
         }
         for _ in 0..PAGE_SCAN_MAX {
             let page = self.heads[class].get();
@@ -358,7 +365,53 @@ impl State {
         self.slices_dirty.set(0);
     }
 
-    fn collect_all(&self, heads: Heads) {
+    /// One bounded step of a collection over every queued page: starts one when none is in progress, walks at most
+    /// COLLECT_STEP_PAGES pages (or until COLLECT_STEP_BLOCKS blocks moved or COLLECT_STEP_RETIRES pages retired) and
+    /// keeps its place for the next call.
+    fn collect_step(&self) {
+        let mut class = self.sweep_class.get();
+        let mut page = self.sweep_page.get();
+        if class >= CLASSES {
+            self.pages_since_collect.set(0);
+            class = 0;
+            page = self.heads[0].get();
+        }
+        self.sweep_page.set(null_mut());
+        let mut pages = 0;
+        let mut blocks = 0;
+        let mut retired = 0;
+        loop {
+            while page.is_null() {
+                class += 1;
+                if class == CLASSES {
+                    self.sweep_class.set(CLASSES);
+                    return;
+                }
+                page = self.heads[class].get();
+            }
+            if pages >= COLLECT_STEP_PAGES
+                || blocks >= COLLECT_STEP_BLOCKS
+                || retired >= COLLECT_STEP_RETIRES
+            {
+                break;
+            }
+            unsafe {
+                let next = (*page).next.get();
+                blocks += (*page).collect();
+                pages += 1;
+                if (*page).used.get() == 0 && self.heads[class].get() != page {
+                    self.retire(page);
+                    retired += 1;
+                }
+                page = next;
+            }
+        }
+        self.sweep_class.set(class);
+        self.sweep_page.set(page);
+    }
+
+    /// Collects every page and retires every empty one, heads included: the heap is being given up.
+    fn collect_all(&self) {
         self.pages_since_collect.set(0);
         for class in 0..CLASSES {
             let mut page = self.heads[class].get();
@@ -366,9 +419,7 @@ impl State {
                 unsafe {
                     let next = (*page).next.get();
                     (*page).collect();
-                    if (*page).used.get() == 0
-                        && (heads == Heads::Retired || self.heads[class].get() != page)
-                    {
+                    if (*page).used.get() == 0 {
                         self.retire(page);
                     }
                     page = next;
@@ -381,7 +432,7 @@ impl State {
         if self.id.get() == 0 {
             return;
         }
-        self.collect_all(Heads::Retired);
+        self.collect_all();
         self.purge_all();
         let mut segment = self.segments.get();
         while !segment.is_null() {
@@ -405,6 +456,8 @@ impl State {
         self.pages_live.set(0);
         self.pages_since_collect.set(0);
         self.slices_dirty.set(0);
+        self.sweep_class.set(CLASSES);
+        self.sweep_page.set(null_mut());
         self.id.set(0);
     }
 
@@ -603,6 +656,9 @@ impl State {
         unsafe {
             let class = (*page).class.get();
             let next = (*page).next.get();
+            if self.sweep_page.get() == page {
+                self.sweep_page.set(next);
+            }
             let prev = (*page).prev.get();
             if prev.is_null() {
                 self.heads[class].set(next);
@@ -673,8 +729,9 @@ mod collect_tests {
 
     use super::{Exit, State};
 
-    /// Blocks another thread freed wait on their pages until the owner collects them: the owner's own new pages
-    /// must collect them within COLLECT_PAGES_MAX, however many pages it holds, or they stay allocated forever.
+    /// Blocks another thread freed wait on their pages until the owner collects them: a collection starts within
+    /// COLLECT_PAGES_MAX new pages, however many pages the owner holds, and its bounded steps (one per slow
+    /// allocation) reach every page, or the blocks stay allocated forever.
     #[test]
     fn an_owner_collects_pages_another_thread_freed_within_collect_pages_max_new_pages() {
         let _alone = super::super::HEAP_TESTS
@@ -703,7 +760,12 @@ mod collect_tests {
         .join()
         .unwrap();
         let kept = Layout::from_size_align(4096, 8).unwrap();
-        let pages_kept = super::COLLECT_PAGES_MAX + 8;
+        let blocks_held = (256usize << 20) / 640;
+        let steps = blocks_held / super::COLLECT_STEP_BLOCKS
+            + held / super::COLLECT_STEP_PAGES
+            + held / super::COLLECT_STEP_RETIRES
+            + 2;
+        let pages_kept = super::COLLECT_PAGES_MAX + 8 + steps;
         let blocks_per_page = (64 << 10) / 4096;
         let fresh: Vec<*mut u8> = (0..pages_kept * blocks_per_page)
             .map(|_| unsafe { owner.allocate(kept, Exit::Unwatched) })
@@ -711,9 +773,60 @@ mod collect_tests {
         let pages = owner.census().pages;
         assert!(
             pages <= pages_kept + super::COLLECT_PAGES_MAX / 2,
-            "the 4096 pages another thread emptied are collected within COLLECT_PAGES_MAX new pages: {pages} pages live"
+            "the 4096 pages another thread emptied are collected within COLLECT_PAGES_MAX new pages and the steps that walk them: {pages} pages live"
         );
         for block in fresh {
+            unsafe { owner.deallocate(block) };
+        }
+        owner.abandon();
+    }
+
+    /// A collection step walks at most COLLECT_STEP_PAGES pages and keeps its place across slow allocations, and a
+    /// page the owner retires or requeues between steps (its blocks all freed) moves the place on rather than leaving
+    /// it on a page that is no longer queued.
+    #[test]
+    fn a_collection_step_walks_a_bounded_number_of_pages_and_survives_the_owner_retiring_its_next_page()
+     {
+        let _alone = super::super::HEAP_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = State::new();
+        let layout = Layout::from_size_align(1024, 8).unwrap();
+        let per_page = (64 << 10) / 1024;
+        let pages_held = 3 * super::COLLECT_STEP_PAGES;
+        let blocks: Vec<*mut u8> = (0..pages_held * per_page)
+            .map(|_| unsafe { owner.allocate(layout, Exit::Unwatched) })
+            .collect();
+        owner.sweep_class.set(super::CLASSES);
+        owner.collect_step();
+        assert!(
+            owner.sweep_class.get() < super::CLASSES,
+            "a heap of three steps' pages is not walked in one step"
+        );
+        let place = owner.sweep_page.get();
+        assert!(!place.is_null(), "a step that stops keeps the next page");
+        let freed: Vec<*mut u8> = blocks
+            .iter()
+            .copied()
+            .filter(|&block| unsafe { super::page_of(super::segment_of(block), block) == place })
+            .collect();
+        assert_eq!(freed.len(), per_page, "the kept page is full");
+        for &block in &freed {
+            unsafe { owner.deallocate(block) };
+        }
+        assert_ne!(
+            owner.sweep_page.get(),
+            place,
+            "retiring the kept page moves the place on"
+        );
+        let mut steps = 1;
+        while owner.sweep_class.get() < super::CLASSES {
+            owner.collect_step();
+            steps += 1;
+            assert!(steps <= 8, "a collection of three steps' pages ends");
+        }
+        owner.census();
+        for block in blocks.into_iter().filter(|block| !freed.contains(block)) {
             unsafe { owner.deallocate(block) };
         }
         owner.abandon();

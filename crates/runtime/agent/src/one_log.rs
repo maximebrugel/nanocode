@@ -13,9 +13,11 @@ use nanocode_tool_host::{
     },
     effects::{Carried, EffectCall, EffectGate, RemoteBarrier},
     embedded::HostFuture,
+    hold::{HoldCall, HoldLedger, LedgerError, Running},
 };
 use nanocode_turnlog::{
-    EffectClass, Effects, Fold, LogHost, Outcome, Phase, Point, Record, Rider, Stats, Status, Turn,
+    Answer, EffectClass, Effects, Fold, HeldCall, Hold, LogHost, Outcome, Phase, Point, Record,
+    Resumption, Rider, Stats, Status, Turn,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json, value::RawValue};
@@ -61,6 +63,7 @@ pub struct OneLog {
     owed: Atom<bool>,
     owners: Atom<nanocode_sync::Map<String, OwnerToken>>,
     recovering: Atom<BTreeSet<String>>,
+    resolved: Atom<BTreeSet<String>>,
     restarts: u64,
     unsaved: Atom<BTreeMap<(String, u64), u64>>,
 }
@@ -290,6 +293,7 @@ impl OneLog {
             owed: Atom::new(false),
             owners: Atom::default(),
             recovering: Atom::new(recovering),
+            resolved: Atom::default(),
             restarts: policy.restarts,
             unsaved: Atom::default(),
         }))
@@ -366,6 +370,45 @@ impl OneLog {
     #[must_use]
     pub fn store(self: &Arc<Self>) -> OneLogStore {
         OneLogStore(Arc::clone(self))
+    }
+
+    #[must_use]
+    pub fn ledger(self: &Arc<Self>) -> Arc<dyn HoldLedger> {
+        Arc::clone(self) as Arc<dyn HoldLedger>
+    }
+
+    pub async fn uncertain_holds(&self) -> Vec<String> {
+        let resolved = self.resolved.get();
+        self.log
+            .read(|fold| {
+                fold.holds()
+                    .filter(|(key, hold)| {
+                        matches!(hold, Hold::Running { .. }) && !resolved.contains(*key)
+                    })
+                    .map(|(key, _)| key.to_owned())
+                    .collect()
+            })
+            .await
+    }
+
+    async fn journal_hold(
+        &self,
+        key: &str,
+        next: impl FnOnce(Option<&Hold>) -> Result<Option<Hold>, LedgerError>,
+    ) -> Result<(), LedgerError> {
+        let journal = |error: StoreError| LedgerError::Journal(error.to_string());
+        let mut lease = self.log.lease().await;
+        let Some(hold) = next(lease.fold().hold(key))? else {
+            return Ok(());
+        };
+        lease
+            .push(Record::Hold {
+                hold,
+                key: key.to_owned(),
+            })
+            .map_err(journal)?;
+        lease.commit(Point::Call).await.map_err(journal)?;
+        Ok(())
     }
 
     #[must_use]
@@ -1239,6 +1282,87 @@ impl EffectGate for OneLog {
             }) {
                 nanocode_trace::warn!(%error, call_id, "turn log could not record a tool result");
             }
+        })
+    }
+}
+
+impl HoldLedger for OneLog {
+    fn hold<'a>(
+        &'a self,
+        key: &'a str,
+        call: HoldCall<'a>,
+        card: &'a RawValue,
+    ) -> HostFuture<'a, Result<(), LedgerError>> {
+        Box::pin(async move {
+            let held = HeldCall {
+                call_id: call.call_id,
+                card,
+                input: call.input,
+                tool: call.tool,
+                turn: call.turn_id,
+            };
+            self.journal_hold(key, |existing| {
+                Hold::hold(existing, key, &held).map_err(LedgerError::Hold)
+            })
+            .await
+        })
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        key: &'a str,
+        answer: Answer,
+    ) -> HostFuture<'a, Result<Resumption, LedgerError>> {
+        Box::pin(async move {
+            let mut resumption = None;
+            self.journal_hold(key, |existing| {
+                let (hold, resumed) =
+                    Hold::resolve(existing, key, answer).map_err(LedgerError::Hold)?;
+                resumption = Some(resumed);
+                Ok(Some(hold))
+            })
+            .await?;
+            let resumption =
+                resumption.expect("a resolve that journaled its hold returns its resumption");
+            if matches!(resumption, Resumption::Run { .. }) {
+                self.resolved.update(|resolved| {
+                    resolved.insert(key.to_owned());
+                });
+            }
+            Ok(resumption)
+        })
+    }
+
+    fn running<'a>(&'a self, call_id: &'a str) -> HostFuture<'a, Option<Running>> {
+        Box::pin(async move {
+            let resolved = self.resolved.get();
+            self.log
+                .read(|fold| {
+                    let (key, hold) = fold.running_hold(call_id)?;
+                    let Hold::Running { input, .. } = hold else {
+                        unreachable!("running_hold returns only running holds");
+                    };
+                    resolved.contains(key).then(|| Running {
+                        input: input.clone(),
+                        key: key.to_owned(),
+                    })
+                })
+                .await
+        })
+    }
+
+    fn release<'a>(&'a self, key: &'a str) -> HostFuture<'a, Result<(), LedgerError>> {
+        Box::pin(async move {
+            self.journal_hold(key, |existing| {
+                Hold::release(existing, key)
+                    .map(Some)
+                    .map_err(LedgerError::Hold)
+            })
+            .await?;
+            self.resolved.update(|resolved| {
+                resolved.remove(key);
+            });
+            Ok(())
         })
     }
 }

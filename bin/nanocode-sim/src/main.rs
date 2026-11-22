@@ -28,6 +28,7 @@ mod gitremote;
 mod handauto;
 mod handrouter;
 mod hands;
+mod holds;
 mod host;
 mod httpd;
 mod httpserver;
@@ -89,6 +90,7 @@ use crate::{
     handauto::{HandAutoMutation, HandAutoStats},
     handrouter::{HandRouterMutation, HandRouterStats},
     hands::{HandsMutation, HandsStats},
+    holds::{HoldsMutation, HoldsStats},
     httpd::WireMutation,
     httpserver::{HttpServerMutation, HttpServerStats},
     inboxstress::InboxStressStats,
@@ -167,6 +169,7 @@ enum Scenario {
     NestedMeta,
     GcUnwind,
     InterpDrop,
+    Holds,
 }
 
 struct Args {
@@ -218,6 +221,7 @@ struct Args {
     nested_meta: NestedMetaMutation,
     gc_unwind: GcUnwindMutation,
     interp_drop: InterpDropMutation,
+    holds: HoldsMutation,
     #[cfg(unix)]
     alloc: alloc::AllocMutation,
     #[cfg(unix)]
@@ -232,7 +236,7 @@ type Caught = BTreeMap<Invariant, (u64, u64, (u64, u64))>;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|scale|gc_unwind|interp_drop] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
+        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|scale|gc_unwind|interp_drop|holds] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
        websocket: [--mutation {}]
        http_server: [--mutation {}]
        alloc: [--mutation overstate_size|forget_free|scribble]
@@ -265,7 +269,8 @@ fn usage() -> ExitCode {
        hand_auto: [--mutation {}]
        nested_meta: [--mutation {}]
        gc_unwind: [--mutation {}]
-       interp_drop: [--mutation {}]",
+       interp_drop: [--mutation {}]
+       holds: [--mutation {}]",
         Mutation::names(),
         TurnMutation::names(),
         onelog::PROTECTIONS.join("|"),
@@ -300,7 +305,8 @@ fn usage() -> ExitCode {
         HandAutoMutation::names(),
         NestedMetaMutation::names(),
         GcUnwindMutation::names(),
-        InterpDropMutation::names()
+        InterpDropMutation::names(),
+        HoldsMutation::names()
     );
     ExitCode::from(2)
 }
@@ -381,6 +387,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut nested_meta = NestedMetaMutation::None;
     let mut gc_unwind = GcUnwindMutation::None;
     let mut interp_drop = InterpDropMutation::None;
+    let mut holds = HoldsMutation::None;
     #[cfg(unix)]
     let mut capture = capture::CaptureMutation::None;
     #[cfg(target_os = "linux")]
@@ -477,6 +484,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "nested_meta" => Scenario::NestedMeta,
                     "gc_unwind" => Scenario::GcUnwind,
                     "interp_drop" => Scenario::InterpDrop,
+                    "holds" => Scenario::Holds,
                     #[cfg(unix)]
                     "capture" => Scenario::Capture,
                     #[cfg(target_os = "linux")]
@@ -553,6 +561,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         (Scenario::NestedMeta, Some(name)) => nested_meta = NestedMetaMutation::parse(name)?,
         (Scenario::GcUnwind, Some(name)) => gc_unwind = GcUnwindMutation::parse(name)?,
         (Scenario::InterpDrop, Some(name)) => interp_drop = InterpDropMutation::parse(name)?,
+        (Scenario::Holds, Some(name)) => holds = HoldsMutation::parse(name)?,
         #[cfg(unix)]
         (Scenario::Capture, Some(name)) => capture = capture::CaptureMutation::parse(name)?,
         #[cfg(not(unix))]
@@ -626,6 +635,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         nested_meta,
         gc_unwind,
         interp_drop,
+        holds,
         #[cfg(unix)]
         alloc,
         #[cfg(unix)]
@@ -748,6 +758,9 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::InterpDrop {
         return interpdrop::replay(seed, args.interp_drop);
+    }
+    if args.scenario == Scenario::Holds {
+        return holds::replay(seed, args.holds);
     }
     if args.scenario == Scenario::BoardSync {
         return board_sync::replay(seed, args.board_sync);
@@ -1127,6 +1140,7 @@ fn mutations() -> ExitCode {
     add("nested_meta", NestedMetaMutation::names());
     add("gc_unwind", GcUnwindMutation::names());
     add("interp_drop", InterpDropMutation::names());
+    add("holds", HoldsMutation::names());
     #[cfg(unix)]
     {
         add("alloc", alloc::AllocMutation::names());
@@ -1201,6 +1215,7 @@ struct Totals {
     nested_meta_totals: NestedMetaStats,
     gc_unwind_totals: GcUnwindStats,
     interp_drop_totals: InterpDropStats,
+    holds_totals: HoldsStats,
     #[cfg(unix)]
     capture_totals: capture::CaptureStats,
     #[cfg(target_os = "linux")]
@@ -1254,6 +1269,7 @@ impl Totals {
         self.nested_meta_totals.add(&other.nested_meta_totals);
         self.gc_unwind_totals.add(&other.gc_unwind_totals);
         self.interp_drop_totals.add(&other.interp_drop_totals);
+        self.holds_totals.add(&other.holds_totals);
         #[cfg(unix)]
         self.capture_totals.add(&other.capture_totals);
         #[cfg(target_os = "linux")]
@@ -1531,6 +1547,13 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
             args.options.verbose,
             &mut totals.interp_drop_totals,
         ),
+        Scenario::Holds => holds::judge(
+            seed,
+            args.holds,
+            args.twice,
+            args.options.verbose,
+            &mut totals.holds_totals,
+        ),
         #[cfg(unix)]
         Scenario::Capture => capture::judge(
             seed,
@@ -1732,6 +1755,7 @@ fn main() -> ExitCode {
         || (args.scenario == Scenario::NestedMeta && args.nested_meta != NestedMetaMutation::None)
         || (args.scenario == Scenario::GcUnwind && args.gc_unwind != GcUnwindMutation::None)
         || (args.scenario == Scenario::InterpDrop && args.interp_drop != InterpDropMutation::None)
+        || (args.scenario == Scenario::Holds && args.holds != HoldsMutation::None)
         || alloc_experiment(&args);
     let (mut passed, mut failed) = (0_u64, 0_u64);
     let mut all = Totals::default();
@@ -1819,6 +1843,7 @@ fn main() -> ExitCode {
         nested_meta_totals,
         gc_unwind_totals,
         interp_drop_totals,
+        holds_totals,
         #[cfg(unix)]
         capture_totals,
         #[cfg(target_os = "linux")]
@@ -2140,6 +2165,16 @@ fn main() -> ExitCode {
             args.twice,
             args.interp_drop,
             &interp_drop_totals,
+        );
+    }
+    if args.scenario == Scenario::Holds {
+        return holds::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.holds,
+            &holds_totals,
         );
     }
     if args.scenario == Scenario::Executor {

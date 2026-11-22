@@ -3,17 +3,20 @@ mod effect;
 #[cfg(not(target_family = "wasm"))]
 mod file;
 mod fold;
+mod hold;
 mod host;
 mod image;
 pub mod parted;
 mod patch;
 mod record;
+pub mod sim;
 mod writer;
 
 pub use effect::{EffectClass, Effects};
 #[cfg(not(target_family = "wasm"))]
 pub use file::{FileLog, FileOptions};
 pub use fold::{Checkpoint, Event, Fold, OpenCall, Phase, Recovered, Retry, Segment, Turn};
+pub use hold::{Answer, Answered, HeldCall, Hold, HoldError, Resumption};
 pub use host::{
     CHECKPOINT_PART_BYTES, Compaction, Extension, LogHost, MemoryLog, MemoryWrites, Rider,
     SCAN_END, ScopeRows, SqlLog, StoredCheckpoint, Write, host_id,

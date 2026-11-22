@@ -2,7 +2,7 @@ use nanocode_durability_core::StoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::EffectClass;
+use crate::{EffectClass, Hold};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +83,10 @@ pub enum Record {
     },
     Groups {
         groups: Vec<(u64, u64, u64)>,
+    },
+    Hold {
+        hold: Hold,
+        key: String,
     },
     Host {
         key: String,

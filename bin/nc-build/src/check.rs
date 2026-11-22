@@ -643,7 +643,6 @@ fn memory_stage(combo: &str) -> String {
     format!("memory:{}", combo.replace('/', "-"))
 }
 
-/// The stages of the --full plan, in the order --list-stages prints them.
 fn stages() -> Vec<String> {
     let mut stages: Vec<String> = MAIN_STAGES
         .iter()
@@ -654,8 +653,6 @@ fn stages() -> Vec<String> {
     stages
 }
 
-/// Where a run logs: output/check, or for a --stage run a directory of its own, so stage runs
-/// in one worktree never remove each other's logs.
 pub fn logs_dir(args: &[String]) -> PathBuf {
     let stages = match parse(args) {
         Ok(Parsed::Run(options)) => options.stages,

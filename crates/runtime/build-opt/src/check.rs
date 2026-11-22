@@ -417,6 +417,9 @@ pub fn report(sim: &Simulator, jobs: &[SimJob], finished: &[Finished], units: us
     let (mut passed, mut caught, mut missed) = (0, 0, 0);
     for (at, job) in jobs.iter().enumerate() {
         let mine = || finished.iter().filter(move |done| done.unit.job == at);
+        if mine().next().is_none() {
+            continue;
+        }
         match job.kind {
             Kind::Pass => {
                 if !mine().any(|done| matches!(done.outcome, Outcome::Failed { .. })) {

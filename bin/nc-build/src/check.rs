@@ -17,6 +17,7 @@ use nanocode_build_opt::{
     check::{self as gate, Finished, Kind, Modules, Outcome, SimJob, Simulator, Unit},
     graph::Graph,
     plan::{self, Rules, Scope},
+    schedule::Shard,
 };
 
 const USAGE: &str = "usage: nc-build check [--full] [--stage NAME]... [--list-stages] [--base REF] [-j N] [--seeds N] [--no-sim] [--plan]
@@ -29,8 +30,9 @@ const USAGE: &str = "usage: nc-build check [--full] [--stage NAME]... [--list-st
   a unit that gives no result within NANOCODE_CHECK_UNIT_TIMEOUT seconds (default 120) fails; logs: output/check/<check>.log
   --plan: print the crates line, the scenarios line and the simulator jobs, and run nothing
   --list-stages: print the stages of the --full plan, one per line: check, check-wasm, test, tidy, machines, machine-canaries,
-  sim, and memory:BACKEND-MODE for each combo of bin/nanocode-sim/memory-gate.txt; --stage NAME (repeatable) runs only those
-  stages of the --full plan (sim-build first when one needs the simulator), logging to output/check-stages/<stages>/,
+  sim:KofN for each shard of the simulator's units (a pass job's 8-seed units and each whole canary, by the hash of their
+  name), and memory:BACKEND-MODE for each combo of bin/nanocode-sim/memory-gate.txt; --stage NAME (repeatable) runs only those
+  stages of the --full plan (sim-build first when one needs the simulator; sim names every sim:KofN), logging to output/check-stages/<stages>/,
   so together the stages run exactly what --full runs; runs of other stages may share the worktree at once, and a target
   dir each or one shared (cargo locks it while it builds); a target dir's .owner names the one worktree that may use it";
 
@@ -80,7 +82,8 @@ const PASS_SEEDS: u64 = 8;
 const MARKER: &str = ".owner";
 const FULL_PASS_SEEDS: u64 = 64;
 const MAIN_STAGES: [&str; 3] = ["check", "check-wasm", "test"];
-const SIM_STAGES: [&str; 4] = ["tidy", "machines", "machine-canaries", "sim"];
+const SIM_STAGES: [&str; 3] = ["tidy", "machines", "machine-canaries"];
+const SIM_SHARDS: u64 = 8;
 
 struct Options {
     full: bool,
@@ -515,6 +518,7 @@ enum SimBuild {
     },
     Built {
         done: Instant,
+        units: usize,
         tidy: Option<Step>,
         machines: Option<Step>,
         canaries: Option<Step>,
@@ -552,7 +556,15 @@ fn simulate(target: &Path, logs: &Path, options: &Options, jobs: &[SimJob]) -> S
         return SimBuild::Failed { done };
     }
     let times_path = sim_target.join("sim-times.txt");
-    let units = gate::units(jobs, &fs::read_to_string(&times_path).unwrap_or_default());
+    let known = fs::read_to_string(&times_path).unwrap_or_default();
+    let shards = sim_shards(options);
+    let units: Vec<Unit> = gate::units(jobs, &known)
+        .into_iter()
+        .filter(|unit| {
+            let key = unit_key(&jobs[unit.job], unit);
+            shards.iter().any(|shard| shard.owns(&key))
+        })
+        .collect();
     let _ = fs::write(
         logs.join("sim-units.txt"),
         units
@@ -598,14 +610,38 @@ fn simulate(target: &Path, logs: &Path, options: &Options, jobs: &[SimJob]) -> S
                 })
                 .collect::<Vec<_>>()
         });
-        let sim = options.wants("sim").then(|| {
+        let sim = (!shards.is_empty()).then(|| {
             let started = Instant::now();
             let finished = run_units(&bin, jobs, &units, options.jobs, timeout);
             let report = gate::report(&SIM, jobs, &finished, units.len());
-            let _ = fs::write(&times_path, report.times.join("\n") + "\n");
-            let _ = fs::write(logs.join("sim.log"), report.log.join("\n") + "\n");
+            let mut times = report.times.clone();
+            if shards.len() < shards_count() {
+                let ran: BTreeSet<&str> = report
+                    .times
+                    .iter()
+                    .filter_map(|line| line.rsplit_once(' ').map(|(unit, _)| unit))
+                    .collect();
+                times.extend(
+                    known
+                        .lines()
+                        .filter(|line| {
+                            line.rsplit_once(' ')
+                                .is_some_and(|(unit, _)| !ran.contains(unit))
+                        })
+                        .map(str::to_owned),
+                );
+            }
+            let staged = times_path.with_extension(format!("{}.txt", std::process::id()));
+            if fs::write(&staged, times.join("\n") + "\n").is_ok() {
+                let _ = fs::rename(&staged, &times_path);
+            }
+            let name = sim_name(&shards);
+            let _ = fs::write(
+                logs.join(format!("{name}.log")),
+                report.log.join("\n") + "\n",
+            );
             Step {
-                name: "sim".to_owned(),
+                name,
                 exit: i32::from(!report.green),
                 secs: started.elapsed().as_secs_f64(),
             }
@@ -619,6 +655,7 @@ fn simulate(target: &Path, logs: &Path, options: &Options, jobs: &[SimJob]) -> S
             .unwrap_or_else(|_| vec![(failed("memory"), String::new())]);
         SimBuild::Built {
             done,
+            units: units.len(),
             tidy,
             machines,
             canaries,
@@ -643,12 +680,54 @@ fn memory_stage(combo: &str) -> String {
     format!("memory:{}", combo.replace('/', "-"))
 }
 
+fn shards_count() -> usize {
+    usize::try_from(SIM_SHARDS).unwrap_or(usize::MAX)
+}
+
+fn sim_stage(shard: Shard) -> String {
+    format!("sim:{}of{}", shard.index, shard.count)
+}
+
+fn sim_shards(options: &Options) -> Vec<Shard> {
+    (1..=SIM_SHARDS)
+        .map(|index| Shard {
+            index,
+            count: SIM_SHARDS,
+        })
+        .filter(|shard| options.wants("sim") || options.wants(&sim_stage(*shard)))
+        .collect()
+}
+
+fn sim_name(shards: &[Shard]) -> String {
+    if shards.len() == shards_count() {
+        return "sim".to_owned();
+    }
+    shards
+        .iter()
+        .map(|shard| sim_stage(*shard))
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+fn unit_key(job: &SimJob, unit: &Unit) -> String {
+    match job.kind {
+        Kind::Pass => format!("{} {}..{}", job.name, unit.from, unit.upto),
+        Kind::Canary => job.name.clone(),
+    }
+}
+
 fn stages() -> Vec<String> {
     let mut stages: Vec<String> = MAIN_STAGES
         .iter()
         .chain(&SIM_STAGES)
         .map(|stage| (*stage).to_owned())
         .collect();
+    stages.extend((1..=SIM_SHARDS).map(|index| {
+        sim_stage(Shard {
+            index,
+            count: SIM_SHARDS,
+        })
+    }));
     stages.extend(memory_combos().iter().map(|combo| memory_stage(combo)));
     stages
 }
@@ -747,7 +826,11 @@ pub fn main(args: &[String]) -> u8 {
         Ui::print(&known);
         return 0;
     }
-    if let Some(unknown) = options.stages.iter().find(|stage| !known.contains(stage)) {
+    if let Some(unknown) = options
+        .stages
+        .iter()
+        .find(|stage| *stage != "sim" && !known.contains(stage))
+    {
         eprintln!(
             "nc-build check: no stage {unknown} in the --full plan: {}",
             known.join(" ")
@@ -884,6 +967,7 @@ pub fn main(args: &[String]) -> u8 {
             }
         };
     let simulates = SIM_STAGES.iter().any(|stage| options.wants(stage))
+        || !sim_shards(&options).is_empty()
         || memory_combos()
             .iter()
             .any(|combo| options.wants(&memory_stage(combo)));
@@ -999,6 +1083,7 @@ pub fn main(args: &[String]) -> u8 {
                 checked,
                 Ok(SimBuild::Built {
                     done,
+                    units,
                     tidy,
                     machines,
                     canaries,
@@ -1045,13 +1130,13 @@ pub fn main(args: &[String]) -> u8 {
                 ui.step(
                     &sim,
                     &format!(
-                        "{} scenarios: {passes} pass jobs x {} seeds, {} canaries",
+                        "{} scenarios: {passes} pass jobs x {} seeds, {} canaries; {units} units",
                         planned.scenarios.len(),
                         options.seeds,
                         jobs.len() - passes
                     ),
                 );
-            } else if options.wants("sim") {
+            } else if !sim_shards(&options).is_empty() {
                 ui.line(
                     Status::Skip,
                     "sim",
@@ -1075,7 +1160,7 @@ pub fn main(args: &[String]) -> u8 {
             ui.line(Status::Fail, "sim", 0.0, "the simulator runner panicked");
             ui.fail("sim");
         }
-        (None, _) if options.wants("sim") => ui.line(
+        (None, _) if !sim_shards(&options).is_empty() => ui.line(
             Status::Skip,
             "sim",
             0.0,

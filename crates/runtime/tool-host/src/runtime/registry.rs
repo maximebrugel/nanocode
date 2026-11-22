@@ -539,6 +539,9 @@ impl ToolRegistry {
         for tool in &mut self.ordered {
             *tool = holds.wrap(Arc::clone(tool));
         }
+        for provider in &mut self.providers {
+            *provider = holds.wrap_provider(Arc::clone(provider));
+        }
     }
 
     pub(super) fn without_escalation(&mut self) {

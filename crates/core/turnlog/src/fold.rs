@@ -1407,6 +1407,14 @@ impl Fold {
     }
 
     pub(crate) fn retire(&mut self, keep: usize) -> usize {
+        let excess = self.retire_turns(keep);
+        let index = &self.index;
+        self.holds
+            .retain(|_, hold| !hold.prunable(|turn| index.contains_key(turn)));
+        excess
+    }
+
+    fn retire_turns(&mut self, keep: usize) -> usize {
         let mut finished = self
             .turns
             .iter()

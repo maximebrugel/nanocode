@@ -336,6 +336,7 @@ default_table='
 2 holds_twice pass --scenario holds --twice
 1 canary_holds_forgets_answer canary:8 --scenario holds --mutation forgets_answer
 1 canary_holds_resume_ignores_answer canary:8 --scenario holds --mutation resume_ignores_answer
+1 canary_holds_prunes_unsettled canary:20 --scenario holds --mutation prunes_unsettled
 8 repo_cache pass --scenario repo_cache
 2 repo_cache_twice pass --scenario repo_cache --twice
 1 canary_repo_cache_shared_head canary:8 --scenario repo_cache --mutation shared_head

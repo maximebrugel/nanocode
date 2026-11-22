@@ -1,12 +1,16 @@
 use std::{collections::BTreeMap, ops::Range, process::ExitCode, sync::Arc};
 
-use nanocode::turnlog::{LogHost, OneLog, Policy};
+use nanocode::{
+    backend::Prompt,
+    session_host::{ImportedTurn, TurnState},
+    turnlog::{LogHost, OneLog, Policy},
+};
 use nanocode_sync::{Atom, block_on};
 use nanocode_tool_runtime::{
     Tool, ToolContext, ToolDefinition, ToolInput, ToolOutput, ToolResult, Tools,
     embedded::HostFuture,
     hold::{Answer, HoldCall, HoldError, HoldPolicy, Holds, Judgment, LedgerError, Resumption},
-    runtime::ToolRuntime,
+    runtime::{DynamicToolProvider, ToolRuntime},
     sim::{self as host_sim, Mutation as HostRule},
 };
 use nanocode_turnlog::{
@@ -23,6 +27,7 @@ use crate::{
 const SESSION: &str = "holds";
 const SCOPE: &str = "holds";
 const SEND: &str = "send";
+const RELAY: &str = "relay";
 const SENT: &str = "sent";
 const HELD: &str = "held for an answer";
 const STEPS: Range<u64> = 40..400;
@@ -31,16 +36,23 @@ const UNKNOWN_KEYS: u64 = 3;
 const SNAPSHOT_RATIO: usize = 2;
 const SNAPSHOT_ROWS_MIN: u64 = 2;
 const SNAPSHOT_ROWS_MAX: u64 = 8;
+const RETAIN_MAX: u64 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoldsMutation {
     None,
     ForgetsAnswer,
     ResumeIgnoresAnswer,
+    PrunesUnsettled,
 }
 
 impl HoldsMutation {
-    const ALL: [Self; 3] = [Self::None, Self::ForgetsAnswer, Self::ResumeIgnoresAnswer];
+    const ALL: [Self; 4] = [
+        Self::None,
+        Self::ForgetsAnswer,
+        Self::ResumeIgnoresAnswer,
+        Self::PrunesUnsettled,
+    ];
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL
@@ -53,6 +65,7 @@ impl HoldsMutation {
             Self::None => "none",
             Self::ForgetsAnswer => "forgets_answer",
             Self::ResumeIgnoresAnswer => "resume_ignores_answer",
+            Self::PrunesUnsettled => "prunes_unsettled",
         }
     }
 
@@ -67,6 +80,7 @@ impl HoldsMutation {
     const fn rule(self) -> Rule {
         match self {
             Self::ForgetsAnswer => Rule::HoldForgetsAnswer,
+            Self::PrunesUnsettled => Rule::HoldPrunesUnsettled,
             Self::None | Self::ResumeIgnoresAnswer => Rule::None,
         }
     }
@@ -74,7 +88,7 @@ impl HoldsMutation {
     const fn host_rule(self) -> HostRule {
         match self {
             Self::ResumeIgnoresAnswer => HostRule::ResumeIgnoresAnswer,
-            Self::None | Self::ForgetsAnswer => HostRule::None,
+            Self::None | Self::ForgetsAnswer | Self::PrunesUnsettled => HostRule::None,
         }
     }
 }
@@ -90,6 +104,8 @@ pub struct HoldsStats {
     pub replays: u64,
     pub restarts: u64,
     pub uncertain: u64,
+    pub relayed: u64,
+    pub pruned: u64,
 }
 
 impl HoldsStats {
@@ -103,6 +119,8 @@ impl HoldsStats {
         self.replays += other.replays;
         self.restarts += other.restarts;
         self.uncertain += other.uncertain;
+        self.relayed += other.relayed;
+        self.pruned += other.pruned;
     }
 }
 
@@ -148,6 +166,53 @@ impl Tool for Mailer {
     }
 }
 
+struct Courier {
+    runs: Runs,
+}
+
+impl Courier {
+    fn definition() -> ToolDefinition {
+        ToolDefinition::function(
+            RELAY,
+            "Relay a message through a provider",
+            json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}, "text": {"type": "string"}},
+                "required": ["text"]
+            }),
+        )
+    }
+}
+
+impl DynamicToolProvider for Courier {
+    fn available_definitions(&self) -> Vec<ToolDefinition> {
+        vec![Self::definition()]
+    }
+
+    fn execute<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 self,
+        name: &'life1 str,
+        input: Value,
+        context: ToolContext<'life2>,
+    ) -> HostFuture<'async_trait, Option<ToolOutput>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        let relays = name == RELAY;
+        let call_id = context.call_id().to_owned();
+        if relays {
+            let input = input.to_string();
+            self.runs.update(|runs| {
+                runs.entry(call_id.clone()).or_default().push(input.clone());
+            });
+        }
+        Box::pin(async move { relays.then(|| ToolOutput::text(SENT)) })
+    }
+}
+
 struct Approvals;
 
 impl HoldPolicy for Approvals {
@@ -179,6 +244,8 @@ struct Held {
     call_id: String,
     input: Value,
     phase: Phase,
+    tool: &'static str,
+    turn: String,
 }
 
 struct World {
@@ -218,6 +285,9 @@ impl World {
             .tool(Mailer {
                 runs: Arc::clone(&self.runs),
             })
+            .shared_provider(Arc::new(Courier {
+                runs: Arc::clone(&self.runs),
+            }))
             .holds(Holds::new(Arc::new(Approvals), log.ledger()))
             .build()
             .expect("the holds tools build");
@@ -239,31 +309,82 @@ impl World {
         self.log.as_ref().expect("the log is open between restarts")
     }
 
-    fn execute(&self, call_id: &str, input: &Value, nested: bool) -> ToolOutput {
-        let context = ToolContext::new("", SESSION, call_id, &[], usize::MAX);
+    fn execute(&self, held: &Held, nested: bool) -> ToolOutput {
+        let context = ToolContext::new("", SESSION, &held.call_id, &[], usize::MAX)
+            .with_turn_id(Some(&held.turn));
         if nested {
-            return block_on(
-                self.runtime()
-                    .execute_nested_tool(SEND, input.clone(), context),
-            );
+            return block_on(self.runtime().execute_nested_tool(
+                held.tool,
+                held.input.clone(),
+                context,
+            ));
         }
-        let raw = to_raw_value(input).expect("a call's input encodes");
+        let raw = to_raw_value(&held.input).expect("a call's input encodes");
         block_on(
             self.runtime()
-                .execute_tool(SEND, ToolInput::Function(raw), context),
+                .execute_tool(held.tool, ToolInput::Function(raw), context),
         )
         .unwrap_or_else(|error| ToolOutput::error(error.to_string()))
     }
 
-    fn execute_raw(&self, call_id: &str, raw: &str) -> ToolOutput {
-        let context = ToolContext::new("", SESSION, call_id, &[], usize::MAX);
+    fn execute_raw(&self, held: &Held, raw: &str) -> ToolOutput {
+        let context = ToolContext::new("", SESSION, &held.call_id, &[], usize::MAX)
+            .with_turn_id(Some(&held.turn));
         let raw = serde_json::value::RawValue::from_string(raw.to_owned())
             .expect("a journaled input is JSON");
         block_on(
             self.runtime()
-                .execute_tool(SEND, ToolInput::Function(raw), context),
+                .execute_tool(held.tool, ToolInput::Function(raw), context),
         )
         .unwrap_or_else(|error| ToolOutput::error(error.to_string()))
+    }
+
+    fn finish_turn(&self, turn: &str) -> Result<(), String> {
+        let imported = ImportedTurn {
+            request_id: turn.to_owned(),
+            state: TurnState::Completed,
+            prompt: Prompt::new(turn),
+            hand: None,
+            metadata: to_raw_value(&json!({})).expect("empty metadata encodes"),
+            cancel_requested: false,
+            note: None,
+            first_seq: None,
+            last_seq: None,
+            result: None,
+        };
+        block_on(self.log().import(&[imported]))
+            .map(drop)
+            .map_err(|error| format!("finishing turn {turn}: {error}"))
+    }
+
+    fn pruned(&mut self) -> Result<(), String> {
+        let held = block_on(self.log().read(|fold| {
+            self.model
+                .iter()
+                .map(|(key, held)| {
+                    (
+                        key.clone(),
+                        fold.hold(key).is_some(),
+                        fold.turn(&held.turn).is_some(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }));
+        for (key, present, retained) in held {
+            if present {
+                continue;
+            }
+            let phase = self.model[&key].phase.clone();
+            if phase != Phase::Settled || retained {
+                return Err(format!(
+                    "hold {key} ({phase:?}, turn retained {retained}) left the log"
+                ));
+            }
+            self.model.remove(&key);
+            self.stats.pruned += 1;
+            self.shape.push('-');
+        }
+        Ok(())
     }
 
     fn check_runs(&self) -> Result<(), String> {
@@ -301,7 +422,18 @@ impl World {
             input["key"] = json!(key);
         }
         let nested = rng.chance(500_000);
-        let output = self.execute(&call_id, &input, nested);
+        let tool = if rng.chance(400_000) { RELAY } else { SEND };
+        self.stats.relayed += u64::from(tool == RELAY);
+        let call = Held {
+            call_id: call_id.clone(),
+            input: input.clone(),
+            phase: Phase::Waiting,
+            tool,
+            turn: format!("t{step}"),
+        };
+        self.finish_turn(&call.turn)?;
+        self.pruned()?;
+        let output = self.execute(&call, nested);
         let Some(key) = key else {
             self.shape.push('r');
             if !says(&output, SENT) {
@@ -329,14 +461,7 @@ impl World {
         if !says(&output, HELD) {
             return Err(format!("held call {call_id} answered {}", text_of(&output)));
         }
-        self.model.insert(
-            key,
-            Held {
-                call_id,
-                input,
-                phase: Phase::Waiting,
-            },
-        );
+        self.model.insert(key, call);
         Ok(())
     }
 
@@ -381,7 +506,7 @@ impl World {
                 call_id,
                 input,
                 tool,
-            }) if runs && call_id == held.call_id && tool == SEND => {
+            }) if runs && call_id == held.call_id && tool == held.tool => {
                 let wanted = approved.unwrap_or_else(|| held.input.clone());
                 let given = serde_json::from_str::<Value>(input.get()).unwrap_or(Value::Null);
                 if given != wanted {
@@ -422,7 +547,7 @@ impl World {
         };
         if rng.chance(200_000) {
             self.shape.push('t');
-            let output = self.execute_raw(&held.call_id, r#"{"text":"tampered"}"#);
+            let output = self.execute_raw(&held, r#"{"text":"tampered"}"#);
             if output.success {
                 return Err(format!(
                     "key {key} ran a tampered input: {}",
@@ -433,7 +558,7 @@ impl World {
         }
         self.stats.resumed += 1;
         self.shape.push('e');
-        let output = self.execute_raw(&held.call_id, input);
+        let output = self.execute_raw(&held, input);
         if !says(&output, SENT) {
             return Err(format!("resumed key {key} answered {}", text_of(&output)));
         }
@@ -460,7 +585,7 @@ impl World {
             _ => None,
         };
         let nested = live.is_none() && rng.chance(500_000);
-        let output = self.execute(&held.call_id, &held.input, nested);
+        let output = self.execute(&held, nested);
         match (&held.phase, live) {
             (Phase::Waiting, _) if says(&output, HELD) => Ok(()),
             (Phase::Settled | Phase::Running { live: false, .. }, _) if !output.success => Ok(()),
@@ -520,9 +645,38 @@ impl World {
         }
         let phases = block_on(self.log().read(|fold| {
             fold.holds()
-                .map(|(key, hold)| (key.to_owned(), hold.phase(), hold.call_id().to_owned()))
+                .map(|(key, hold)| {
+                    (
+                        key.to_owned(),
+                        hold.phase(),
+                        hold.call_id().to_owned(),
+                        hold.turn().map(str::to_owned),
+                    )
+                })
                 .collect::<Vec<_>>()
         }));
+        for (key, phase, call_id, turn) in &phases {
+            if self.model.contains_key(key) {
+                continue;
+            }
+            if *phase != "settled" {
+                return Err(format!("the reopened log holds {key} ({phase}), which no call made"));
+            }
+            self.model.insert(
+                key.clone(),
+                Held {
+                    call_id: call_id.clone(),
+                    input: json!({"key": key, "text": "settled before a restart"}),
+                    phase: Phase::Settled,
+                    tool: SEND,
+                    turn: turn.clone().unwrap_or_default(),
+                },
+            );
+        }
+        let phases = phases
+            .into_iter()
+            .map(|(key, phase, call_id, _)| (key, phase, call_id))
+            .collect::<Vec<_>>();
         let wanted = self
             .model
             .iter()
@@ -555,11 +709,13 @@ impl World {
             .get_mut(&key)
             .expect("an uncertain key is in the model")
             .phase = Phase::Settled;
-        if !matches!(
-            block_on(self.log().read(|fold| fold.hold(&key).cloned())),
-            Some(Hold::Settled { .. })
-        ) {
-            return Err(format!("uncertain {key} did not settle"));
+        let turn = self.model[&key].turn.clone();
+        let (hold, retained) =
+            block_on(self.log().read(|fold| (fold.hold(&key).cloned(), fold.turn(&turn).is_some())));
+        match hold {
+            Some(Hold::Settled { .. }) => {}
+            None if !retained => {}
+            _ => return Err(format!("uncertain {key} did not settle")),
         }
         Ok(())
     }
@@ -573,6 +729,7 @@ impl World {
             90..95 => self.restart()?,
             _ => self.settle_uncertain(rng)?,
         }
+        self.pruned()?;
         self.check_runs()
     }
 }
@@ -584,6 +741,9 @@ fn run_seed(seed: u64, mutation: HoldsMutation) -> Outcome {
     let mut rng = Rng::derive(seed, "holds");
     let rows = usize::try_from(rng.range(SNAPSHOT_ROWS_MIN, SNAPSHOT_ROWS_MAX))
         .expect("a snapshot row count fits in usize");
+    let retain = rng.chance(500_000).then(|| {
+        usize::try_from(rng.range(1, RETAIN_MAX)).expect("a retained turn count fits in usize")
+    });
     let mut world = World {
         host: Arc::new(MemoryLog::new()),
         log: None,
@@ -594,6 +754,7 @@ fn run_seed(seed: u64, mutation: HoldsMutation) -> Outcome {
         policy: Policy {
             snapshot_ratio: SNAPSHOT_RATIO,
             snapshot_rows: Some(rows),
+            retain_finished: retain,
             ..Policy::default()
         },
         stats: HoldsStats {
@@ -617,7 +778,10 @@ fn run_seed(seed: u64, mutation: HoldsMutation) -> Outcome {
         digest: fnv(FNV_OFFSET, world.shape.as_bytes()),
         wrong,
         stats: world.stats,
-        shape: format!("steps={steps} snapshot_rows={rows} ops={}", world.shape),
+        shape: format!(
+            "steps={steps} snapshot_rows={rows} retain={retain:?} ops={}",
+            world.shape
+        ),
     }
 }
 

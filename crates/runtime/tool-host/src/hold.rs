@@ -91,6 +91,18 @@ impl Holds {
     }
 
     #[must_use]
+    #[cfg(not(target_family = "wasm"))]
+    pub fn wrap_provider(
+        &self,
+        inner: Arc<dyn nanocode_tool_provider::DynamicToolProvider>,
+    ) -> Arc<dyn nanocode_tool_provider::DynamicToolProvider> {
+        Arc::new(provider::HeldProvider {
+            holds: self.clone(),
+            inner,
+        })
+    }
+
+    #[must_use]
     pub fn wrap(&self, inner: Arc<dyn Tool>) -> Arc<dyn Tool> {
         let name = Arc::from(inner.definition().name());
         Arc::new(Holding {
@@ -116,71 +128,216 @@ pub fn raw_input(input: &ToolInput) -> Result<Box<RawValue>, String> {
     }
 }
 
-impl Holding {
-    async fn resume(
-        &self,
-        running: Running,
-        input: ToolInput,
-        context: ToolContext<'_>,
-    ) -> ToolResult {
-        let name = &self.name;
-        let Running {
+enum Admission {
+    Run,
+    Resume { key: String },
+    Answer(ToolOutput),
+}
+
+fn same_input(given: &RawValue, approved: &RawValue) -> bool {
+    given.get() == approved.get()
+        || matches!(
+            (
+                serde_json::from_str::<serde_json::Value>(given.get()),
+                serde_json::from_str::<serde_json::Value>(approved.get()),
+            ),
+            (Ok(given), Ok(approved)) if given == approved
+        )
+}
+
+impl Holds {
+    async fn admit(&self, name: &str, raw: &RawValue, context: &ToolContext<'_>) -> Admission {
+        if let Some(Running {
             input: approved,
             key,
-        } = running;
-        match raw_input(&input) {
-            Ok(raw)
-                if raw.get() == approved.get()
-                    || crate::sim::mutated(crate::sim::Mutation::ResumeIgnoresAnswer) => {}
-            Ok(_) => {
-                return Ok(ToolOutput::error(format!(
-                    "tool `{name}` was not run: its input differs from the input answered on hold `{key}`"
-                )));
+        }) = self.ledger.running(context.call_id()).await
+        {
+            if same_input(raw, &approved)
+                || crate::sim::mutated(crate::sim::Mutation::ResumeIgnoresAnswer)
+            {
+                return Admission::Resume { key };
             }
-            Err(error) => {
-                return Ok(ToolOutput::error(format!(
-                    "tool `{name}` was not run: its input could not be read: {error}"
-                )));
-            }
+            return Admission::Answer(ToolOutput::error(format!(
+                "tool `{name}` was not run: its input differs from the input answered on hold `{key}`"
+            )));
         }
-        let output = self.inner.execute(input, context).await;
-        if let Err(error) = self.holds.ledger.release(&key).await {
-            nanocode_trace::warn!(%error, key, tool = %name, "a resumed held call ran but its release was not saved; it reads as uncertain until settled");
-        }
-        output
-    }
-
-    async fn judged(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
-        let name = &self.name;
-        if let Some(running) = self.holds.ledger.running(context.call_id()).await {
-            return self.resume(running, input, context).await;
-        }
-        let raw = match raw_input(&input) {
-            Ok(raw) => raw,
-            Err(error) => {
-                return Ok(ToolOutput::error(format!(
-                    "tool `{name}` was not run: its input could not be read: {error}"
-                )));
-            }
-        };
         let call = || HoldCall {
             call_id: context.call_id(),
-            input: &raw,
+            input: raw,
             session_id: context.session_id(),
             tool: name,
             turn_id: context.turn_id(),
         };
-        match self.holds.policy.judge(call()).await {
-            Judgment::Run => self.inner.execute(input, context).await,
-            Judgment::Refuse { message } => Ok(ToolOutput::error(message)),
+        match self.policy.judge(call()).await {
+            Judgment::Run => Admission::Run,
+            Judgment::Refuse { message } => Admission::Answer(ToolOutput::error(message)),
             Judgment::Hold { card, key, message } => {
-                match self.holds.ledger.hold(&key, call(), &card).await {
-                    Ok(()) => Ok(ToolOutput::text(message)),
-                    Err(error) => Ok(ToolOutput::error(format!(
+                Admission::Answer(match self.ledger.hold(&key, call(), &card).await {
+                    Ok(()) => ToolOutput::text(message),
+                    Err(error) => ToolOutput::error(format!(
                         "tool `{name}` was not run because its hold could not be recorded: {error}"
-                    ))),
-                }
+                    )),
+                })
             }
+        }
+    }
+
+    async fn released(&self, name: &str, key: &str) {
+        if let Err(error) = self.ledger.release(key).await {
+            nanocode_trace::warn!(%error, key, tool = %name, "a resumed held call ran but its release was not saved; it reads as uncertain until settled");
+        }
+    }
+}
+
+fn unreadable(name: &str, error: impl std::fmt::Display) -> ToolOutput {
+    ToolOutput::error(format!(
+        "tool `{name}` was not run: its input could not be read: {error}"
+    ))
+}
+
+impl Holding {
+    async fn judged(&self, input: ToolInput, context: ToolContext<'_>) -> ToolResult {
+        let name = &self.name;
+        let raw = match raw_input(&input) {
+            Ok(raw) => raw,
+            Err(error) => return Ok(unreadable(name, error)),
+        };
+        match self.holds.admit(name, &raw, &context).await {
+            Admission::Run => self.inner.execute(input, context).await,
+            Admission::Resume { key } => {
+                let output = self.inner.execute(input, context).await;
+                self.holds.released(name, &key).await;
+                output
+            }
+            Admission::Answer(output) => Ok(output),
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+mod provider {
+    use std::sync::Arc;
+
+    use nanocode_tool_provider::{DynamicToolProvider, SessionEnvironment, ToolExposure};
+    use nanocode_tools::{Tool, ToolContext, ToolDefinition, ToolOutput};
+    use serde_json::Value;
+
+    use super::{Admission, Holds, unreadable};
+    use crate::embedded::HostFuture;
+
+    pub(super) struct HeldProvider {
+        pub(super) holds: Holds,
+        pub(super) inner: Arc<dyn DynamicToolProvider>,
+    }
+
+    impl HeldProvider {
+        async fn judged(
+            &self,
+            name: &str,
+            input: Value,
+            context: ToolContext<'_>,
+        ) -> Option<ToolOutput> {
+            let raw = match serde_json::value::to_raw_value(&input) {
+                Ok(raw) => raw,
+                Err(error) => return Some(unreadable(name, error)),
+            };
+            match self.holds.admit(name, &raw, &context).await {
+                Admission::Run => self.inner.execute(name, input, context).await,
+                Admission::Resume { key } => {
+                    let output = self.inner.execute(name, input, context).await;
+                    self.holds.released(name, &key).await;
+                    output
+                }
+                Admission::Answer(output) => Some(output),
+            }
+        }
+    }
+
+    impl DynamicToolProvider for HeldProvider {
+        fn start(&self) {
+            self.inner.start();
+        }
+
+        fn bind_session(&self, session: &SessionEnvironment) {
+            self.inner.bind_session(session);
+        }
+
+        fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+            self.inner.direct_tools()
+        }
+
+        fn direct_tools_for_exposure(&self, exposure: ToolExposure) -> Vec<Arc<dyn Tool>> {
+            self.inner.direct_tools_for_exposure(exposure)
+        }
+
+        fn available_definitions(&self) -> Vec<ToolDefinition> {
+            self.inner.available_definitions()
+        }
+
+        fn model_catalog_visible(&self) -> bool {
+            self.inner.model_catalog_visible()
+        }
+
+        fn catalog_revision(&self) -> Option<u64> {
+            self.inner.catalog_revision()
+        }
+
+        fn code_mode_tool_summaries(&self) -> Vec<(String, String)> {
+            self.inner.code_mode_tool_summaries()
+        }
+
+        fn contains(&self, name: &str) -> bool {
+            self.inner.contains(name)
+        }
+
+        fn supports_parallel_tool_calls(&self, name: &str) -> bool {
+            self.inner.supports_parallel_tool_calls(name)
+        }
+
+        fn resolve<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            name: &'life1 str,
+        ) -> HostFuture<'async_trait, bool>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.resolve(name)
+        }
+
+        fn execute<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            name: &'life1 str,
+            input: Value,
+            context: ToolContext<'life2>,
+        ) -> HostFuture<'async_trait, Option<ToolOutput>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(self.judged(name, input, context))
+        }
+
+        fn resumes(&self, name: &str) -> bool {
+            self.inner.resumes(name)
+        }
+
+        fn recover<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 self,
+            name: &'life1 str,
+            input: Value,
+            context: ToolContext<'life2>,
+        ) -> HostFuture<'async_trait, Option<ToolOutput>>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.inner.recover(name, input, context)
         }
     }
 }

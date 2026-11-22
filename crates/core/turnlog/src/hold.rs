@@ -67,10 +67,12 @@ pub enum Hold {
         call_id: String,
         input: Box<RawValue>,
         tool: String,
+        turn: Option<String>,
     },
     Settled {
         answered: Answered,
         call_id: String,
+        turn: Option<String>,
     },
 }
 
@@ -162,7 +164,9 @@ impl Hold {
                 Self::Running {
                     answered, call_id, ..
                 }
-                | Self::Settled { answered, call_id },
+                | Self::Settled {
+                    answered, call_id, ..
+                },
             ) if call_id == call.call_id => Err(HoldError::Answered {
                 key: key.to_owned(),
                 answered: *answered,
@@ -188,6 +192,7 @@ impl Hold {
             call_id,
             input,
             tool,
+            turn,
             ..
         } = existing
         else {
@@ -204,6 +209,7 @@ impl Hold {
             let settled = Self::Settled {
                 answered,
                 call_id: call_id.clone(),
+                turn: turn.clone(),
             };
             let resumption = Resumption::Answered {
                 answer,
@@ -221,6 +227,7 @@ impl Hold {
             call_id: call_id.clone(),
             input: input.clone(),
             tool: tool.clone(),
+            turn: turn.clone(),
         };
         let resumption = Resumption::Run {
             call_id: call_id.clone(),
@@ -236,10 +243,14 @@ impl Hold {
                 key: key.to_owned(),
             }),
             Some(Self::Running {
-                answered, call_id, ..
+                answered,
+                call_id,
+                turn,
+                ..
             }) => Ok(Self::Settled {
                 answered: *answered,
                 call_id: call_id.clone(),
+                turn: turn.clone(),
             }),
             Some(Self::Waiting { .. } | Self::Settled { .. }) => Err(HoldError::NotRunning {
                 key: key.to_owned(),
@@ -247,11 +258,32 @@ impl Hold {
         }
     }
 
+    #[must_use]
+    pub fn turn(&self) -> Option<&str> {
+        match self {
+            Self::Waiting { turn, .. } | Self::Running { turn, .. } | Self::Settled { turn, .. } => {
+                turn.as_deref()
+            }
+        }
+    }
+
+    pub(crate) fn prunable(&self, retained: impl Fn(&str) -> bool) -> bool {
+        let settled = matches!(self, Self::Settled { .. })
+            || crate::sim::mutated(crate::sim::Mutation::HoldPrunesUnsettled);
+        settled && self.turn().is_some_and(|turn| !retained(turn))
+    }
+
     pub(crate) fn follows(&self, previous: Option<&Self>) -> bool {
         let Some(previous) = previous else {
             return true;
         };
-        if previous.call_id() != self.call_id() {
+        if let (Self::Settled { turn: Some(pruned), .. }, Self::Waiting { turn, .. }) =
+            (previous, self)
+            && previous.call_id() != self.call_id()
+        {
+            return turn.as_deref() != Some(pruned.as_str());
+        }
+        if previous.call_id() != self.call_id() || previous.turn() != self.turn() {
             return false;
         }
         match (previous, self) {

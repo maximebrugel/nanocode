@@ -179,13 +179,13 @@ impl Page {
         self.span.get() * SLICE_BYTES / self.block_bytes.get()
     }
 
-    pub fn collect(&self) {
+    pub fn collect(&self) -> usize {
         if self.thread_free.load(Ordering::Relaxed).is_null() {
-            return;
+            return 0;
         }
         let list = self.thread_free.swap(null_mut(), Ordering::Acquire);
         if list.is_null() {
-            return;
+            return 0;
         }
         let capacity = self.capacity();
         let mut tail = list;
@@ -208,6 +208,7 @@ impl Page {
             "every block freed by another thread was handed out",
         );
         self.used.set(used - count);
+        count
     }
 
     pub const fn span_mask(&self) -> u64 {

@@ -358,14 +358,15 @@ impl State {
         self.slices_dirty.set(0);
     }
 
-    fn collect_all(&self, heads: Heads) {
+    fn collect_all(&self, heads: Heads) -> usize {
         self.pages_since_collect.set(0);
+        let mut collected = 0;
         for class in 0..CLASSES {
             let mut page = self.heads[class].get();
             while !page.is_null() {
                 unsafe {
                     let next = (*page).next.get();
-                    (*page).collect();
+                    collected += (*page).collect();
                     if (*page).used.get() == 0
                         && (heads == Heads::Retired || self.heads[class].get() != page)
                     {
@@ -375,6 +376,21 @@ impl State {
                 }
             }
         }
+        collected
+    }
+
+    /// Collects the blocks other threads freed into this heap's pages, retires the pages that leaves empty and
+    /// gives their memory back: for a thread about to sit idle, whose heap would otherwise collect nothing until it
+    /// allocates again. Returns the blocks collected.
+    pub fn collect_idle(&self) -> usize {
+        if self.id.get() == 0 {
+            return 0;
+        }
+        let collected = self.collect_all(Heads::Kept);
+        if self.slices_dirty.get() > 0 {
+            self.purge_all();
+        }
+        collected
     }
 
     pub fn abandon(&self) {

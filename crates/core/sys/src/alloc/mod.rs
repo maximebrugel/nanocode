@@ -35,6 +35,21 @@ pub struct Stats {
 }
 
 impl Heap {
+    /// Collects the blocks other threads freed into the calling thread's heap, retires the pages that leaves empty
+    /// and gives their memory back. A thread that goes idle calls it: blocks freed into an idle thread's pages are
+    /// otherwise held until that thread allocates again. Returns the blocks collected; zero when Heap is not the
+    /// global allocator's backing on this target.
+    pub fn collect_idle() -> usize {
+        #[cfg(unix)]
+        {
+            local::THREAD.with(local::State::collect_idle)
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
     /// The process heap's allocated and retained bytes, when Heap is the global allocator.
     /// Zero on targets where Heap forwards to the system allocator.
     pub fn stats() -> Stats {

@@ -25,6 +25,11 @@ use crate::{
 };
 
 const WORKER_THREAD: &str = "nanocode-worker";
+/// A worker with nothing to run collects the blocks other threads freed into its heap (nanocode_sys
+/// Heap::collect_idle) at most once this often, waking for it while idle, until IDLE_COLLECT_ROUNDS collections in a
+/// row find nothing; running a task starts the rounds again.
+const IDLE_COLLECT_AFTER: Duration = Duration::from_secs(1);
+const IDLE_COLLECT_ROUNDS: u32 = 3;
 const EVENT_INTERVAL: u32 = 61;
 
 const RUNNING: u8 = 0;
@@ -201,7 +206,7 @@ impl Shared {
         true
     }
 
-    fn idle(&self, slot: &Slot, main: Option<&AtomicBool>) {
+    fn idle(&self, slot: &Slot, main: Option<&AtomicBool>, within: Option<Duration>) {
         let pending = || {
             self.queue.len() > 0
                 || self.is_shutdown()
@@ -210,7 +215,10 @@ impl Shared {
         if !self.drives {
             slot.state.store(PARKED, Ordering::SeqCst);
             if !pending() {
-                std::thread::park();
+                match within {
+                    Some(within) => std::thread::park_timeout(within),
+                    None => std::thread::park(),
+                }
             }
             slot.state.store(RUNNING, Ordering::SeqCst);
             return;
@@ -224,14 +232,14 @@ impl Shared {
         let ready = || !sim::mutated(Mutation::UncheckedDrive) && pending();
         if self
             .reactor
-            .try_turn(None, ready, || slot.state.store(RUNNING, Ordering::SeqCst))
+            .try_turn(within, ready, || slot.state.store(RUNNING, Ordering::SeqCst))
         {
             slot.state.store(RUNNING, Ordering::SeqCst);
             return;
         }
         slot.state.store(PARKED, Ordering::SeqCst);
         if !pending() {
-            self.reactor.park_for_driver(pending);
+            self.reactor.park_for_driver_within(pending, within);
         }
         slot.state.store(RUNNING, Ordering::SeqCst);
     }
@@ -242,12 +250,24 @@ impl Shared {
         let _context = handle.enter();
         let _driving = Driving::enter(self.reactor, self.drives);
         let mut ticks = 0;
+        let mut collects = 0;
+        let mut collected_at = Instant::now();
         loop {
             if self.is_shutdown() {
                 break;
             }
-            if !self.run_queue(held.as_deref_mut(), &mut ticks) {
-                self.idle(slot, None);
+            if self.run_queue(held.as_deref_mut(), &mut ticks) {
+                collects = IDLE_COLLECT_ROUNDS;
+                continue;
+            }
+            let within = (collects > 0).then(|| IDLE_COLLECT_AFTER.saturating_sub(collected_at.elapsed()));
+            self.idle(slot, None, within);
+            if collects > 0 && self.queue.len() == 0 && collected_at.elapsed() >= IDLE_COLLECT_AFTER {
+                collects = match nanocode_sys::alloc::Heap::collect_idle() {
+                    0 => collects - 1,
+                    _ => IDLE_COLLECT_ROUNDS,
+                };
+                collected_at = Instant::now();
             }
         }
         slot.state.store(ABSENT, Ordering::SeqCst);
@@ -429,7 +449,7 @@ impl Handle {
                     ticks += 1;
                 }
                 if !shared.run_queue(core.consumer.as_deref_mut(), &mut ticks) {
-                    shared.idle(slot, Some(&main.woken));
+                    shared.idle(slot, Some(&main.woken), None);
                 }
             }
         }

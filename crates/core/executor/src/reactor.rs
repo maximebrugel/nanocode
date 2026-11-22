@@ -389,6 +389,12 @@ impl Reactor {
     }
 
     pub fn park_for_driver(&self, pending: impl FnOnce() -> bool) {
+        self.park_for_driver_within(pending, None);
+    }
+
+    /// park_for_driver that also returns after timeout, as a spurious wakeup would: the waiter it leaves behind is
+    /// stale, and notify_waiting skips stale waiters.
+    pub fn park_for_driver_within(&self, pending: impl FnOnce() -> bool, timeout: Option<Duration>) {
         let waiter = Arc::new(Waiter {
             thread: std::thread::current(),
             parked: AtomicBool::new(true),
@@ -404,7 +410,10 @@ impl Reactor {
             self.release(driver);
             return;
         }
-        std::thread::park();
+        match timeout {
+            Some(timeout) => std::thread::park_timeout(timeout),
+            None => std::thread::park(),
+        }
         if !waiter.leave() && pending() {
             self.notify_waiting();
         }

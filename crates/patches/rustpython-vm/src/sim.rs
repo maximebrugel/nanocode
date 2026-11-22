@@ -24,6 +24,7 @@ pub enum Mutation {
     DropFinalizesTwice,
     /// Drop finalizes while unwinding from a panic.
     DropFinalizesWhileUnwinding,
+    HidesFunctionBuiltins,
 }
 
 static MUTATION: AtomicU8 = AtomicU8::new(Mutation::None as u8);

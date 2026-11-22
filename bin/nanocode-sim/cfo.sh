@@ -329,6 +329,9 @@ default_table='
 1 canary_gc_unwind_drop_lets_panic_out canary:8 --scenario gc_unwind --mutation drop_lets_panic_out
 1 canary_gc_unwind_drop_finalizes_twice canary:8 --scenario gc_unwind --mutation drop_finalizes_twice
 1 canary_gc_unwind_drop_finalizes_while_unwinding canary:8 --scenario gc_unwind --mutation drop_finalizes_while_unwinding
+4 interp_drop pass --scenario interp_drop
+1 interp_drop_twice pass --scenario interp_drop --twice
+1 canary_interp_drop_hides_function_builtins canary:8 --scenario interp_drop --mutation hides_function_builtins
 8 repo_cache pass --scenario repo_cache
 2 repo_cache_twice pass --scenario repo_cache --twice
 1 canary_repo_cache_shared_head canary:8 --scenario repo_cache --mutation shared_head

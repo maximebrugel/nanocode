@@ -228,7 +228,19 @@ impl Board {
 }
 
 /// How many times its own encode time a save holds the encoder idle after it.
+#[cfg(not(target_family = "wasm"))]
 const ENCODE_REST: u32 = 3;
+
+/// Holds the encoder idle for ENCODE_REST times `took`, on a native host outside the simulator.
+#[cfg(not(target_family = "wasm"))]
+fn rest(took: std::time::Duration) {
+    if nanocode_platform::host().is_none() {
+        std::thread::sleep(took * ENCODE_REST);
+    }
+}
+
+#[cfg(target_family = "wasm")]
+const fn rest(_took: std::time::Duration) {}
 
 /// Held while a save encodes, so the process's boards encode one checkpoint at a time.
 static ENCODING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -297,9 +309,7 @@ async fn save(host: Arc<dyn LogHost>, scope: String, fold: Fold, saving: Saving)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let started = std::time::Instant::now();
         let saved = encode_spread(&fold, &body, crate::Spread::Inline);
-        if nanocode_platform::host().is_none() {
-            std::thread::sleep(started.elapsed() * ENCODE_REST);
-        }
+        rest(started.elapsed());
         saved
     })
     .await

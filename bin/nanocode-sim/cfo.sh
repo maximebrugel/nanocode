@@ -362,6 +362,8 @@ default_table='
 2 imports_twice pass --scenario imports --twice
 1 canary_imports_held_skips_commit canary:100 --scenario imports --mutation held_skips_commit
 1 canary_imports_reimport_advances canary:100 --scenario imports --mutation reimport_advances
+1 canary_imports_export_skips_commit canary:100 --scenario imports --mutation export_skips_commit
+1 canary_imports_export_skips_keys canary:100 --scenario imports --mutation export_skips_keys
 8 live pass --scenario live
 2 live_twice pass --scenario live --twice
 1 canary_live_settle_drops_deletes canary:20 --scenario live --mutation settle_drops_deletes

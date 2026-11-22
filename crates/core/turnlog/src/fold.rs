@@ -1461,6 +1461,15 @@ impl Fold {
             .map(|(state, checkpoint)| (state.as_str(), checkpoint))
     }
 
+    pub fn stored_of<'a>(&'a self, state: &str) -> impl Iterator<Item = (&'a str, &'a str)> {
+        let prefix = format!("{state}\n");
+        let start = prefix.len();
+        self.stored
+            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+            .take_while(move |(key, _)| key.starts_with(&prefix))
+            .map(move |(key, value)| (&key[start..], value.as_str()))
+    }
+
     #[must_use]
     pub fn stored(&self, key: &str) -> Option<&str> {
         self.stored

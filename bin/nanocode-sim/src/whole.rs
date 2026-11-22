@@ -428,6 +428,7 @@ impl Durable {
                     retain_finished: None,
                     snapshot_ratio: 2,
                     snapshot_rows: None,
+                    wakes_max: None,
                 };
                 let parts = nanocode::turnlog(host, "sim", policy)
                     .await

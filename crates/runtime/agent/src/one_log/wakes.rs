@@ -1,17 +1,20 @@
+use std::sync::Arc;
+
 use nanocode_turnlog::{
-    ArmedWake, Point, Record, Unfit, Wake,
+    ArmedWake, Lease, Point, Record, Rider, Unfit, Wake, WakeRider,
     wake_sim::{Mutation, mutated},
 };
 use serde_json::{Map, Value, value::RawValue};
 
 use super::{Lifecycle, OneLog, invalid, logged, raw, record_of};
 use crate::{
-    durability::StoreError,
+    durability::{SqlStatement, StoreError},
     session_log::{LoggedEvent, Submission, TurnRecord, now, submission_digest},
 };
 
 #[derive(Debug)]
 pub enum WakeError {
+    Full { max: usize },
     Store(StoreError),
     Unfit(Unfit),
 }
@@ -19,6 +22,10 @@ pub enum WakeError {
 impl std::fmt::Display for WakeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Full { max } => write!(
+                formatter,
+                "this session already holds its {max} wakes: disarm one or raise the policy's wakes_max"
+            ),
             Self::Store(error) => error.fmt(formatter),
             Self::Unfit(unfit) => unfit.fmt(formatter),
         }
@@ -52,17 +59,61 @@ pub enum Fire {
 }
 
 impl OneLog {
+    pub async fn index_wakes(&self, index: Arc<dyn WakeRider>) -> Result<(), StoreError> {
+        index.prepare().await?;
+        let lease = self.log.lease().await;
+        let summary = lease.fold().wakes().summary();
+        index.write(self.scope(), &summary).await?;
+        self.wake_index.set(Some(index));
+        drop(lease);
+        Ok(())
+    }
+
+    async fn commit_wakes(&self, lease: &mut Lease<'_>, point: Point) -> Result<(), StoreError> {
+        let Some(index) = self.wake_index.read(Clone::clone) else {
+            lease.commit(point).await?;
+            return Ok(());
+        };
+        let held = index.statements(self.scope(), &lease.fold().wakes().summary());
+        let statements = held
+            .iter()
+            .map(|(sql, params)| SqlStatement {
+                sql,
+                params: params.iter().map(String::as_str).collect(),
+            })
+            .collect::<Vec<_>>();
+        let rider = Rider {
+            host: index.host(),
+            statements: &statements,
+        };
+        let (_, carried) = lease.commit_carrying(point, rider).await?;
+        if !carried {
+            return Err(StoreError::NotCommitted(format!(
+                "turn log {} committed its wakes, but its host did not carry the wake index's rider; index_wakes with an index on the log's own SQL host",
+                self.scope()
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn arm(&self, key: &str, wake: Wake) -> Result<u64, WakeError> {
         wake.fit().map_err(WakeError::Unfit)?;
         let mut lease = self.log.lease().await;
         let prior = lease.fold().wakes().get(key).cloned();
+        if let Some(max) = self.wakes_max
+            && prior.is_none()
+            && lease.fold().wakes().len() >= max
+            && !mutated(Mutation::Unbounded)
+        {
+            return Err(WakeError::Full { max });
+        }
         let generation = lease.fold().wakes().next_generation();
         lease.push(Record::Armed {
             generation,
             key: key.to_owned(),
             wake,
         })?;
-        if let Err(error) = lease.commit(Point::Progress).await {
+        if let Err(error) = self.commit_wakes(&mut lease, Point::Progress).await {
             lease.unwake(key, prior);
             return Err(error.into());
         }
@@ -84,7 +135,7 @@ impl OneLog {
             generation,
             key: key.to_owned(),
         })?;
-        if let Err(error) = lease.commit(Point::Progress).await {
+        if let Err(error) = self.commit_wakes(&mut lease, Point::Progress).await {
             lease.unwake(key, Some(prior));
             return Err(error);
         }
@@ -127,7 +178,12 @@ impl OneLog {
                 key: key.clone(),
             })?;
         }
-        if let Err(error) = lease.commit(Point::Progress).await {
+        let committed = if mutated(Mutation::IndexSkipsHear) {
+            lease.commit(Point::Progress).await.map(drop)
+        } else {
+            self.commit_wakes(&mut lease, Point::Progress).await
+        };
+        if let Err(error) = committed {
             for (key, prior) in priors {
                 lease.unwake(&key, Some(prior));
             }
@@ -185,10 +241,11 @@ impl OneLog {
             kind: "queued",
             request_id: id,
         })?;
-        let fired = Self::fired(
-            &mut lease, key, generation, submission, digest, first, at, &body, next,
-        )
-        .await;
+        let fired = self
+            .fired(
+                &mut lease, key, generation, submission, digest, first, at, &body, next,
+            )
+            .await;
         let next = match fired {
             Ok(next) => next,
             Err(error) => {
@@ -220,7 +277,8 @@ impl OneLog {
         reason = "one fire's parts, pushed under one lease"
     )]
     async fn fired(
-        lease: &mut nanocode_turnlog::Lease<'_>,
+        &self,
+        lease: &mut Lease<'_>,
         key: &str,
         generation: u64,
         submission: &Submission,
@@ -265,7 +323,7 @@ impl OneLog {
             }
             None => None,
         };
-        lease.commit(Point::Admission).await?;
+        self.commit_wakes(lease, Point::Admission).await?;
         Ok(rearmed)
     }
 }

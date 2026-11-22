@@ -14,10 +14,17 @@ pub mod sim {
         None,
         FiredApart,
         SnapshotDropsWakes,
+        IndexSkipsHear,
+        Unbounded,
     }
 
     impl Mutation {
-        pub const ALL: [Self; 2] = [Self::FiredApart, Self::SnapshotDropsWakes];
+        pub const ALL: [Self; 4] = [
+            Self::FiredApart,
+            Self::SnapshotDropsWakes,
+            Self::IndexSkipsHear,
+            Self::Unbounded,
+        ];
 
         #[must_use]
         pub const fn name(self) -> &'static str {
@@ -25,6 +32,8 @@ pub mod sim {
                 Self::None => "none",
                 Self::FiredApart => "fired_apart",
                 Self::SnapshotDropsWakes => "snapshot_drops_wakes",
+                Self::IndexSkipsHear => "index_skips_hear",
+                Self::Unbounded => "unbounded",
             }
         }
 

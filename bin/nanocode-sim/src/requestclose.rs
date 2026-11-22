@@ -268,6 +268,7 @@ async fn open(disk: &Arc<Disk>, wire: &Arc<Wire>, inbox: &Arc<Inbox>) -> Result<
         retain_finished: None,
         snapshot_ratio: 2,
         snapshot_rows: None,
+        wakes_max: None,
     };
     let parts = nanocode::turnlog(log_host, "sim", policy)
         .await

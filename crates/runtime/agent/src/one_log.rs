@@ -16,6 +16,7 @@ use nanocode_tool_host::{
 };
 use nanocode_turnlog::{
     EffectClass, Effects, Fold, LogHost, Outcome, Phase, Point, Record, Rider, Stats, Status, Turn,
+    WakeRider,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json, value::RawValue};
@@ -52,6 +53,7 @@ pub struct Policy {
     pub retain_finished: Option<usize>,
     pub snapshot_ratio: usize,
     pub snapshot_rows: Option<usize>,
+    pub wakes_max: Option<usize>,
 }
 
 pub struct OneLog {
@@ -67,6 +69,8 @@ pub struct OneLog {
     recovering: Atom<BTreeSet<String>>,
     restarts: u64,
     unsaved: Atom<BTreeMap<(String, u64), u64>>,
+    wake_index: Atom<Option<Arc<dyn WakeRider>>>,
+    wakes_max: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -296,6 +300,8 @@ impl OneLog {
             recovering: Atom::new(recovering),
             restarts: policy.restarts,
             unsaved: Atom::default(),
+            wake_index: Atom::new(None),
+            wakes_max: policy.wakes_max,
         }))
     }
 

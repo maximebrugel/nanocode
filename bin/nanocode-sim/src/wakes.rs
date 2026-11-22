@@ -12,7 +12,8 @@ use nanocode::{
     backend::Prompt,
     session_host::Submission,
     turnlog::{
-        Extension, Fire, LogHost, OneLog, Policy, Trigger, Wake, WakeError,
+        Extension, Fire, LogHost, OneLog, Policy, Rider, Statements, Trigger, Wake, WakeError,
+        WakeRider, WakeSummary, Write,
         wake_sim::{self, Mutation},
     },
 };
@@ -39,6 +40,9 @@ const HEARD_MAX: u64 = 3;
 const SNAPSHOT_ROWS_MIN: u64 = 2;
 const SNAPSHOT_ROWS_MAX: u64 = 6;
 const DOOM_APPENDS_MAX: u64 = 3;
+const WAKES_MAX_MIN: u64 = 2;
+const INDEX_HOST: usize = 1;
+const INDEX_STATEMENT: &str = "wake_index";
 
 pub fn names() -> String {
     WakesMutation::ALL
@@ -59,6 +63,8 @@ pub struct WakesStats {
     pub rearmed: u64,
     pub crashes: u64,
     pub restarts: u64,
+    pub refused_full: u64,
+    pub indexed: u64,
 }
 
 impl WakesStats {
@@ -72,6 +78,8 @@ impl WakesStats {
         self.rearmed += other.rearmed;
         self.crashes += other.crashes;
         self.restarts += other.restarts;
+        self.refused_full += other.refused_full;
+        self.indexed += other.indexed;
     }
 }
 
@@ -79,6 +87,7 @@ impl WakesStats {
 struct Host {
     doom: AtomicU64,
     dead: AtomicBool,
+    index: Atom<BTreeMap<String, WakeSummary>>,
     rows: Atom<BTreeMap<u64, String>>,
 }
 
@@ -106,6 +115,95 @@ impl Host {
 
     fn died() -> StoreError {
         StoreError::Backend("the simulated host died before this row landed".to_owned())
+    }
+
+    fn appended(&self, rows: &[(u64, String)]) -> bool {
+        self.rows.update(|stored| {
+            if rows.iter().any(|(seq, _)| stored.contains_key(seq)) {
+                return true;
+            }
+            stored.extend(rows.iter().cloned());
+            false
+        })
+    }
+
+    fn extended(&self, extension: Extension<'_>) -> bool {
+        self.rows.update(|stored| {
+            if stored.contains_key(&extension.seq) {
+                return true;
+            }
+            let Some(body) = stored.remove(&extension.row) else {
+                return true;
+            };
+            let kept = body.len().checked_sub(extension.cut).unwrap_or_else(|| {
+                panic!("turn log row {} is shorter than its seal", extension.row)
+            });
+            stored.insert(
+                extension.seq,
+                format!("{}{}", &body[..kept], extension.tail),
+            );
+            false
+        })
+    }
+
+    fn summary(due: &str, topics: &str) -> WakeSummary {
+        WakeSummary {
+            next_due: (!due.is_empty()).then(|| due.parse().expect("a due time is a number")),
+            topics: topics
+                .split(',')
+                .filter(|topic| !topic.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    fn indexed(&self, statements: &[nanocode_durability_core::SqlStatement<'_>]) {
+        for statement in statements {
+            assert_eq!(statement.sql, INDEX_STATEMENT, "only the wake index rides");
+            let [scope, due, topics] = statement.params[..] else {
+                panic!("a wake index statement has a scope, a due time and topics");
+            };
+            let summary = Self::summary(due, topics);
+            self.index.update(|index| {
+                index.insert(scope.to_owned(), summary.clone());
+            });
+        }
+    }
+}
+
+struct Index(Arc<Host>);
+
+impl WakeRider for Index {
+    fn host(&self) -> usize {
+        INDEX_HOST
+    }
+
+    fn statements(&self, scope: &str, summary: &WakeSummary) -> Statements {
+        let due = summary.next_due.map(|at| at.to_string()).unwrap_or_default();
+        vec![(
+            INDEX_STATEMENT,
+            vec![scope.to_owned(), due, summary.topics.join(",")],
+        )]
+    }
+
+    fn prepare(&self) -> StoreFuture<'_, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn write<'a>(
+        &'a self,
+        scope: &'a str,
+        summary: &'a WakeSummary,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            if self.0.refuses() {
+                return Err(Host::died());
+            }
+            self.0.index.update(|index| {
+                index.insert(scope.to_owned(), summary.clone());
+            });
+            Ok(())
+        })
     }
 }
 
@@ -149,13 +247,7 @@ impl LogHost for Host {
         if self.refuses() {
             return Box::pin(async { Err(Self::died()) });
         }
-        let taken = self.rows.update(|stored| {
-            if rows.iter().any(|(seq, _)| stored.contains_key(seq)) {
-                return true;
-            }
-            stored.extend(rows.iter().cloned());
-            false
-        });
+        let taken = self.appended(rows);
         Box::pin(async move {
             if taken {
                 Err(StoreError::Fenced)
@@ -173,22 +265,35 @@ impl LogHost for Host {
         if self.refuses() {
             return Some(Box::pin(async { Err(Self::died()) }));
         }
-        let taken = self.rows.update(|stored| {
-            if stored.contains_key(&extension.seq) {
-                return true;
+        let taken = self.extended(extension);
+        Some(Box::pin(async move {
+            if taken {
+                Err(StoreError::Fenced)
+            } else {
+                Ok(())
             }
-            let Some(body) = stored.remove(&extension.row) else {
-                return true;
-            };
-            let kept = body.len().checked_sub(extension.cut).unwrap_or_else(|| {
-                panic!("turn log row {} is shorter than its seal", extension.row)
-            });
-            stored.insert(
-                extension.seq,
-                format!("{}{}", &body[..kept], extension.tail),
-            );
-            false
-        });
+        }))
+    }
+
+    fn carry<'a>(
+        &'a self,
+        _scope: &'a str,
+        write: Write<'a>,
+        rider: Rider<'a>,
+    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
+        if rider.host != INDEX_HOST {
+            return None;
+        }
+        if self.refuses() {
+            return Some(Box::pin(async { Err(Self::died()) }));
+        }
+        let taken = match write {
+            Write::Append { rows, .. } => self.appended(rows),
+            Write::Extend(extension) => self.extended(extension),
+        };
+        if !taken {
+            self.indexed(rider.statements);
+        }
         Some(Box::pin(async move {
             if taken {
                 Err(StoreError::Fenced)
@@ -256,6 +361,10 @@ impl Run {
             .map_err(|error| format!("reopen refused the log: {error}"))?;
         self.log = Some(Arc::clone(&log));
         self.recovered(&log)?;
+        self.indexed()?;
+        ready(log.index_wakes(Arc::new(Index(Arc::clone(&self.host)))))
+            .map_err(|error| format!("indexing the wakes refused: {error}"))?;
+        self.indexed()?;
         Ok(log)
     }
 
@@ -326,6 +435,41 @@ impl Run {
         Ok(())
     }
 
+    fn summary(&self) -> WakeSummary {
+        let mut topics = self
+            .expected
+            .values()
+            .filter(|wake| wake.heard < wake.heard_max)
+            .filter_map(|wake| wake.on.as_ref().map(|(topic, _)| topic.clone()))
+            .collect::<Vec<_>>();
+        topics.sort();
+        topics.dedup();
+        WakeSummary {
+            next_due: self
+                .expected
+                .values()
+                .filter_map(|wake| if wake.heard > 0 { Some(0) } else { wake.due_at })
+                .min(),
+            topics,
+        }
+    }
+
+    fn indexed(&mut self) -> Result<(), String> {
+        let held = self
+            .host
+            .index
+            .read(|index| index.get(SCOPE).cloned())
+            .unwrap_or_default();
+        let expected = self.summary();
+        if held != expected {
+            return Err(format!(
+                "the wake index holds {held:?}, the acknowledged wakes need {expected:?}"
+            ));
+        }
+        self.stats.indexed += 1;
+        Ok(())
+    }
+
     fn wake(&mut self) -> (Wake, Expected) {
         let due_at = (self.rng.below(3) > 0).then(|| self.clock + self.rng.below(DELAY_MS_MAX));
         let on = (due_at.is_none() || self.rng.below(2) == 0).then(|| {
@@ -358,14 +502,30 @@ impl Run {
         let log = self.open()?;
         let key = KEYS[self.rng.pick(KEYS.len())];
         let (wake, mut expected) = self.wake();
+        let full = self.policy.wakes_max.is_some_and(|max| {
+            !self.expected.contains_key(key) && self.expected.len() >= max
+        });
         match ready(log.arm(key, wake)) {
+            Ok(generation) if full => Err(format!(
+                "arm {key} took generation {generation} past the bound of {:?} wakes",
+                self.policy.wakes_max
+            )),
+            Err(WakeError::Full { max }) if full => {
+                self.stats.refused_full += 1;
+                self.trace(&format!("arm {key} full at {max}"));
+                Ok(())
+            }
+            Err(WakeError::Full { max }) => Err(format!(
+                "arm {key} refused as full at {max} with {} wakes",
+                self.expected.len()
+            )),
             Ok(generation) => {
                 expected.generation = generation;
                 expected.heard = self.expected.get(key).map_or(0, |prior| prior.heard);
                 self.expected.insert(key.to_owned(), expected);
                 self.stats.armed += 1;
                 self.trace(&format!("arm {key} generation={generation}"));
-                Ok(())
+                self.indexed()
             }
             Err(WakeError::Store(error)) => self.crash(&format!("arm {key}: {error}")),
             Err(WakeError::Unfit(unfit)) => Err(format!("a fit wake was refused: {unfit}")),
@@ -385,7 +545,7 @@ impl Run {
                 }
                 self.stats.disarmed += u64::from(generation.is_some());
                 self.trace(&format!("disarm {key} generation={generation:?}"));
-                Ok(())
+                self.indexed()
             }
             Err(error) => self.crash(&format!("disarm {key}: {error}")),
         }
@@ -436,7 +596,7 @@ impl Run {
                     heard.len(),
                     full.len()
                 ));
-                Ok(())
+                self.indexed()
             }
             Err(error) => self.crash(&format!("hear {topic}: {error}")),
         }
@@ -508,9 +668,13 @@ impl Run {
                         "fire {key} generation={} heard={heard} next={next:?}",
                         armed.generation
                     ));
+                    self.indexed()?;
                 }
                 Ok(Fire::NotDue | Fire::Stale | Fire::Taken(_)) => {
                     return Err(format!("due wake {key} did not fire"));
+                }
+                Err(WakeError::Full { max }) => {
+                    return Err(format!("a rearm of {key} was refused as full at {max}"));
                 }
                 Err(WakeError::Store(error)) => {
                     return self.crash(&format!("fire {key}: {error}"));
@@ -579,6 +743,9 @@ fn run(seed: u64, verbose: bool, stats: &mut WakesStats) -> Result<u64, String> 
     crate::host::enter(seed, &crate::executor::Clock::new());
     let mut rng = Rng::derive(seed, "wakes");
     let snapshot_rows = rng.range(SNAPSHOT_ROWS_MIN, SNAPSHOT_ROWS_MAX);
+    let wakes_max = (rng.below(2) == 0).then(|| {
+        usize::try_from(rng.range(WAKES_MAX_MIN, KEYS.len() as u64)).expect("a bound fits")
+    });
     let ops = rng.range(OPS_MIN, OPS_MAX);
     let mut state = Run {
         attempts: 0,
@@ -592,6 +759,7 @@ fn run(seed: u64, verbose: bool, stats: &mut WakesStats) -> Result<u64, String> 
             restarts: RESTART_CAP,
             snapshot_ratio: 2,
             snapshot_rows: Some(usize::try_from(snapshot_rows).expect("a row count fits")),
+            wakes_max,
             ..Policy::default()
         },
         rng,
@@ -602,7 +770,7 @@ fn run(seed: u64, verbose: bool, stats: &mut WakesStats) -> Result<u64, String> 
         verbose,
     };
     state.trace(&format!(
-        "seed {seed} ops={ops} snapshot_rows={snapshot_rows}"
+        "seed {seed} ops={ops} snapshot_rows={snapshot_rows} wakes_max={wakes_max:?}"
     ));
     let mut result = Ok(());
     for _ in 0..ops {

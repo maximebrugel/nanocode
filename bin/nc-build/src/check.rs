@@ -19,7 +19,7 @@ use nanocode_build_opt::{
     plan::{self, Rules, Scope},
 };
 
-const USAGE: &str = "usage: nc-build check [--full] [--base REF] [-j N] [--seeds N] [--no-sim] [--plan]
+const USAGE: &str = "usage: nc-build check [--full] [--stage NAME]... [--list-stages] [--base REF] [-j N] [--seeds N] [--no-sim] [--plan]
   changed scope: the crates the diff since REF (merge-base with the upstream, or HEAD~1 when nothing differs) and untracked files touch,
   with their dependents (cargo check --locked: --lib --bins --examples native, --lib wasm32), the simulator's --tidy and --machines walks, and the pass jobs and canaries of
   bin/nanocode-sim/cfo.sh's table for every scenario that reaches them; --full: the whole workspace, every scenario and canary, and
@@ -27,7 +27,12 @@ const USAGE: &str = "usage: nc-build check [--full] [--base REF] [-j N] [--seeds
   -j N: parallel jobs (default: CARGO_BUILD_JOBS, else the cores this process may run on); --seeds N: seeds per pass job (default 8, 64 with --full)
   a canary passes once a seed catches it, trying seeds 0, then 1..8, then the rest of its budget in units of 16 seeds;
   a unit that gives no result within NANOCODE_CHECK_UNIT_TIMEOUT seconds (default 120) fails; logs: output/check/<check>.log
-  --plan: print the crates line, the scenarios line and the simulator jobs, and run nothing";
+  --plan: print the crates line, the scenarios line and the simulator jobs, and run nothing
+  --list-stages: print the stages of the --full plan, one per line: check, check-wasm, test, tidy, machines, machine-canaries,
+  sim, and memory:BACKEND-MODE for each combo of bin/nanocode-sim/memory-gate.txt; --stage NAME (repeatable) runs only those
+  stages of the --full plan (sim-build first when one needs the simulator), logging to output/check-stages/<stages>/,
+  so together the stages run exactly what --full runs; runs of other stages may share the worktree at once, and a target
+  dir each or one shared (cargo locks it while it builds); a target dir's .owner names the one worktree that may use it";
 
 const SIM: Simulator = Simulator {
     package: "nanocode-sim",
@@ -74,6 +79,8 @@ const SIGNAL_EXIT: i32 = 128;
 const PASS_SEEDS: u64 = 8;
 const MARKER: &str = ".owner";
 const FULL_PASS_SEEDS: u64 = 64;
+const MAIN_STAGES: [&str; 3] = ["check", "check-wasm", "test"];
+const SIM_STAGES: [&str; 4] = ["tidy", "machines", "machine-canaries", "sim"];
 
 struct Options {
     full: bool,
@@ -82,6 +89,14 @@ struct Options {
     seeds: u64,
     sim: bool,
     plan: bool,
+    stages: Vec<String>,
+    list: bool,
+}
+
+impl Options {
+    fn wants(&self, stage: &str) -> bool {
+        self.stages.is_empty() || self.stages.iter().any(|wanted| wanted == stage)
+    }
 }
 
 enum Parsed {
@@ -100,6 +115,8 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
         seeds: 0,
         sim: true,
         plan: false,
+        stages: Vec::new(),
+        list: false,
     };
     let mut seeds = None;
     let mut args = args.iter();
@@ -126,6 +143,14 @@ fn parse(args: &[String]) -> Result<Parsed, String> {
             }
             "--no-sim" => options.sim = false,
             "--plan" => options.plan = true,
+            "--stage" => {
+                options.stages.push(value("--stage")?);
+                options.full = true;
+            }
+            "--list-stages" => {
+                options.list = true;
+                options.full = true;
+            }
             "-h" | "--help" => return Ok(Parsed::Help),
             other => return Err(format!("unknown option {other}")),
         }
@@ -148,6 +173,7 @@ enum Status {
 struct Ui {
     color: bool,
     logs: PathBuf,
+    shown: PathBuf,
     failed: Vec<String>,
 }
 
@@ -196,8 +222,10 @@ impl Ui {
             &step.name,
             step.secs,
             &format!(
-                "{detail} (exit {}, output/check/{}.log)",
-                step.exit, step.name
+                "{detail} (exit {}, {}/{}.log)",
+                step.exit,
+                self.shown.display(),
+                step.name
             ),
         );
         let log = fs::read_to_string(self.log(&step.name)).unwrap_or_default();
@@ -487,12 +515,20 @@ enum SimBuild {
     },
     Built {
         done: Instant,
-        tidy: Step,
-        machines: Step,
-        canaries: Step,
-        memory: Option<(Step, String)>,
-        sim: Step,
+        tidy: Option<Step>,
+        machines: Option<Step>,
+        canaries: Option<Step>,
+        memory: Vec<(Step, String)>,
+        sim: Option<Step>,
     },
+}
+
+fn failed(name: &str) -> Step {
+    Step {
+        name: name.to_owned(),
+        exit: SPAWN_EXIT,
+        secs: 0.0,
+    }
 }
 
 fn simulate(target: &Path, logs: &Path, options: &Options, jobs: &[SimJob]) -> SimBuild {
@@ -532,61 +568,55 @@ fn simulate(target: &Path, logs: &Path, options: &Options, jobs: &[SimJob]) -> S
     );
     thread::scope(|scope| {
         let tidy = scope.spawn(|| {
-            let mut command = Command::new(&bin);
-            command.arg("--tidy");
-            logged("tidy", logs, command)
-        });
-        let machines = scope.spawn(|| {
-            let mut command = Command::new(&bin);
-            command.args(["--machines", "--deep"]);
-            let walk = logged("machines", logs, command);
-            let mut command = Command::new(&bin);
-            command.args(["--machines", "--canaries"]);
-            (walk, logged("machine-canaries", logs, command))
-        });
-        let memory = scope.spawn(|| {
-            let combos = memory_combos();
-            (!combos.is_empty()).then(|| {
+            options.wants("tidy").then(|| {
                 let mut command = Command::new(&bin);
-                command
-                    .args(["--memory", "--memory-gate", "--only"])
-                    .arg(combos.join(","));
-                (logged("memory", logs, command), combos.join(" "))
+                command.arg("--tidy");
+                logged("tidy", logs, command)
             })
         });
-        let started = Instant::now();
-        let finished = run_units(&bin, jobs, &units, options.jobs, timeout);
-        let report = gate::report(&SIM, jobs, &finished, units.len());
-        let _ = fs::write(&times_path, report.times.join("\n") + "\n");
-        let _ = fs::write(logs.join("sim.log"), report.log.join("\n") + "\n");
-        let sim = Step {
-            name: "sim".to_owned(),
-            exit: i32::from(!report.green),
-            secs: started.elapsed().as_secs_f64(),
-        };
-        let tidy = tidy.join().unwrap_or(Step {
-            name: "tidy".to_owned(),
-            exit: SPAWN_EXIT,
-            secs: 0.0,
+        let machines = scope.spawn(|| {
+            let walk = options.wants("machines").then(|| {
+                let mut command = Command::new(&bin);
+                command.args(["--machines", "--deep"]);
+                logged("machines", logs, command)
+            });
+            let canaries = options.wants("machine-canaries").then(|| {
+                let mut command = Command::new(&bin);
+                command.args(["--machines", "--canaries"]);
+                logged("machine-canaries", logs, command)
+            });
+            (walk, canaries)
         });
-        let (machines, canaries) = machines.join().unwrap_or_else(|_| {
-            let failed = |name: &str| Step {
-                name: name.to_owned(),
-                exit: SPAWN_EXIT,
-                secs: 0.0,
-            };
-            (failed("machines"), failed("machine-canaries"))
+        let memory = scope.spawn(|| {
+            memory_combos()
+                .into_iter()
+                .filter(|combo| options.wants(&memory_stage(combo)))
+                .map(|combo| {
+                    let mut command = Command::new(&bin);
+                    command.args(["--memory", "--memory-gate", "--only", &combo]);
+                    (logged(&memory_stage(&combo), logs, command), combo)
+                })
+                .collect::<Vec<_>>()
         });
-        let memory = memory.join().unwrap_or_else(|_| {
-            Some((
-                Step {
-                    name: "memory".to_owned(),
-                    exit: SPAWN_EXIT,
-                    secs: 0.0,
-                },
-                String::new(),
-            ))
+        let sim = options.wants("sim").then(|| {
+            let started = Instant::now();
+            let finished = run_units(&bin, jobs, &units, options.jobs, timeout);
+            let report = gate::report(&SIM, jobs, &finished, units.len());
+            let _ = fs::write(&times_path, report.times.join("\n") + "\n");
+            let _ = fs::write(logs.join("sim.log"), report.log.join("\n") + "\n");
+            Step {
+                name: "sim".to_owned(),
+                exit: i32::from(!report.green),
+                secs: started.elapsed().as_secs_f64(),
+            }
         });
+        let tidy = tidy.join().unwrap_or_else(|_| Some(failed("tidy")));
+        let (machines, canaries) = machines
+            .join()
+            .unwrap_or_else(|_| (Some(failed("machines")), Some(failed("machine-canaries"))));
+        let memory = memory
+            .join()
+            .unwrap_or_else(|_| vec![(failed("memory"), String::new())]);
         SimBuild::Built {
             done,
             tidy,
@@ -606,6 +636,38 @@ fn memory_combos() -> Vec<String> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_owned)
         .collect()
+}
+
+fn memory_stage(combo: &str) -> String {
+    let combo = combo.split('=').next().unwrap_or(combo);
+    format!("memory:{}", combo.replace('/', "-"))
+}
+
+/// The stages of the --full plan, in the order --list-stages prints them.
+fn stages() -> Vec<String> {
+    let mut stages: Vec<String> = MAIN_STAGES
+        .iter()
+        .chain(&SIM_STAGES)
+        .map(|stage| (*stage).to_owned())
+        .collect();
+    stages.extend(memory_combos().iter().map(|combo| memory_stage(combo)));
+    stages
+}
+
+/// Where a run logs: output/check, or for a --stage run a directory of its own, so stage runs
+/// in one worktree never remove each other's logs.
+pub fn logs_dir(args: &[String]) -> PathBuf {
+    let stages = match parse(args) {
+        Ok(Parsed::Run(options)) => options.stages,
+        _ => Vec::new(),
+    };
+    if stages.is_empty() {
+        return PathBuf::from("output/check");
+    }
+    let mut stages = stages;
+    stages.sort();
+    stages.dedup();
+    PathBuf::from("output/check-stages").join(stages.join("+"))
 }
 
 const fn kind_name(kind: Kind) -> &'static str {
@@ -683,7 +745,19 @@ pub fn main(args: &[String]) -> u8 {
         return 2;
     }
     let root = PathBuf::from(root);
-    let logs = root.join("output/check");
+    let known = stages();
+    if options.list {
+        Ui::print(&known);
+        return 0;
+    }
+    if let Some(unknown) = options.stages.iter().find(|stage| !known.contains(stage)) {
+        eprintln!(
+            "nc-build check: no stage {unknown} in the --full plan: {}",
+            known.join(" ")
+        );
+        return 2;
+    }
+    let logs = root.join(logs_dir(args));
     let _ = fs::remove_dir_all(&logs);
     if let Err(error) = fs::create_dir_all(&logs) {
         eprintln!("{}: {error}", logs.display());
@@ -692,6 +766,7 @@ pub fn main(args: &[String]) -> u8 {
     let mut ui = Ui {
         color: io::stdout().is_terminal(),
         logs: logs.clone(),
+        shown: logs_dir(args),
         failed: Vec::new(),
     };
     if !options.plan {
@@ -811,7 +886,12 @@ pub fn main(args: &[String]) -> u8 {
                 )
             }
         };
+    let simulates = SIM_STAGES.iter().any(|stage| options.wants(stage))
+        || memory_combos()
+            .iter()
+            .any(|combo| options.wants(&memory_stage(combo)));
     let jobs = if options.sim
+        && simulates
         && (!planned.scenarios.is_empty() || (planned.simulator && !memory_combos().is_empty()))
     {
         let jobs = fs::read_to_string(TABLE)
@@ -866,7 +946,8 @@ pub fn main(args: &[String]) -> u8 {
         let sim = jobs
             .as_deref()
             .map(|jobs| scope.spawn(move || simulate(target, logs, options, jobs)));
-        if native_args.is_empty() {
+        if !options.wants("check") {
+        } else if native_args.is_empty() {
             ui.line(Status::Skip, "check", 0.0, &detail);
         } else {
             let mut native = cargo(options.jobs);
@@ -877,7 +958,8 @@ pub fn main(args: &[String]) -> u8 {
             let step = logged("check", logs, native);
             ui.step(&step, &detail);
         }
-        if wasm_args.is_empty() {
+        if !options.wants("check-wasm") {
+        } else if wasm_args.is_empty() {
             let why = if native_args.is_empty() {
                 detail.clone()
             } else {
@@ -899,7 +981,7 @@ pub fn main(args: &[String]) -> u8 {
                 Ui::print(&["     this clang can't build python-capi's wasm32 libc++: set NANOCODE_CC to the clang docs/RELEASE-CHAIN.md uses".to_owned()]);
             }
         }
-        if options.full {
+        if options.full && options.wants("test") {
             let mut test = cargo(options.jobs);
             test.env("CARGO_TARGET_DIR", target)
                 .args(["test", "--locked", "--no-fail-fast"])
@@ -938,30 +1020,31 @@ pub fn main(args: &[String]) -> u8 {
                     if options.full { "release" } else { "fast" }
                 ),
             );
-            ui.step(&tidy, "nanocode-sim --tidy");
-            ui.step(&machines, "nanocode-sim --machines --deep");
-            ui.step(&canaries, "nanocode-sim --machines --canaries");
-            match &memory {
-                Some((step, combos)) => ui.step(
+            for (step, detail) in [
+                (tidy, "nanocode-sim --tidy"),
+                (machines, "nanocode-sim --machines --deep"),
+                (canaries, "nanocode-sim --machines --canaries"),
+            ] {
+                if let Some(step) = step {
+                    ui.step(&step, detail);
+                }
+            }
+            for (step, combo) in &memory {
+                ui.step(
                     step,
-                    &format!("nanocode-sim --memory --memory-gate: {combos}"),
-                ),
-                None => ui.line(
+                    &format!("nanocode-sim --memory --memory-gate --only {combo}"),
+                );
+            }
+            if memory.is_empty() && options.stages.is_empty() {
+                ui.line(
                     Status::Skip,
                     "memory",
                     0.0,
                     &format!("no combos in {MEMORY_GATE}"),
-                ),
+                );
             }
             let passes = jobs.iter().filter(|job| job.kind == Kind::Pass).count();
-            if jobs.is_empty() {
-                ui.line(
-                    Status::Skip,
-                    "sim",
-                    0.0,
-                    "no simulator scenario reaches the changed crates",
-                );
-            } else {
+            if let Some(sim) = sim.filter(|_| !jobs.is_empty()) {
                 ui.step(
                     &sim,
                     &format!(
@@ -971,6 +1054,13 @@ pub fn main(args: &[String]) -> u8 {
                         jobs.len() - passes
                     ),
                 );
+            } else if options.wants("sim") {
+                ui.line(
+                    Status::Skip,
+                    "sim",
+                    0.0,
+                    "no simulator scenario reaches the changed crates",
+                );
             }
         }
         (Some((checked, Ok(SimBuild::Failed { done }))), _) => {
@@ -978,7 +1068,7 @@ pub fn main(args: &[String]) -> u8 {
                 Status::Fail,
                 "sim-build",
                 done.saturating_duration_since(checked).as_secs_f64(),
-                "(output/check/sim-build.log)",
+                &format!("({}/sim-build.log)", ui.shown.display()),
             );
             let log = fs::read_to_string(ui.log("sim-build")).unwrap_or_default();
             Ui::print(&gate::error_context(&log));
@@ -988,12 +1078,13 @@ pub fn main(args: &[String]) -> u8 {
             ui.line(Status::Fail, "sim", 0.0, "the simulator runner panicked");
             ui.fail("sim");
         }
-        (None, _) => ui.line(
+        (None, _) if options.wants("sim") => ui.line(
             Status::Skip,
             "sim",
             0.0,
             "no simulator scenario reaches the changed crates",
         ),
+        (None, _) => {}
     }
     let secs = started.elapsed().as_secs_f64();
     let (red, green, off) = if ui.color {

@@ -5,6 +5,9 @@
 #                          reach those crates: their pass jobs and every canary they list
 #   scripts/check --full   release gate: the whole workspace, every scenario and canary, and the unit tests
 #                          (cargo test --lib --bins) of the crates whose tests pass (FULL_TESTS in bin/nc-build/src/check.rs)
+#   scripts/check --list-stages      the --full plan's stages, one per line (each memory gate combo is its own)
+#   scripts/check --stage NAME ...   only those stages of --full, logging to output/check-stages/<stages>/: shards of
+#                          --full can run at once in one worktree, with a target dir each or a shared one
 # Options: --base REF (diff base; default: merge-base with the upstream, or HEAD~1 when nothing
 #   differs), -j N (parallel jobs; default: CARGO_BUILD_JOBS, else the cores it may run on),
 #   --seeds N (seeds per pass job; default 8, 64 with --full), --no-sim, --plan (print the scope only).
@@ -21,7 +24,7 @@
 set -uo pipefail
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 cd "$root"
-case " $* " in *" -h "* | *" --help "*) sed -n '2,20p' "$0"; exit 0 ;; esac
+case " $* " in *" -h "* | *" --help "*) sed -n '2,23p' "$0"; exit 0 ;; esac
 export SHIPPY_REMOTE_BUILD=0 CARGO_TERM_COLOR=never
 # python-capi's wasm32 libc++ needs clang 22 (as scripts/pin-rebuild.sh sets); an explicit NANOCODE_CC wins.
 if [ -z "${NANOCODE_CC:-}" ] && [ -x /usr/lib/llvm-22/bin/clang ]; then export NANOCODE_CC=/usr/lib/llvm-22/bin/clang PATH=/usr/lib/llvm-22/bin:$PATH; fi

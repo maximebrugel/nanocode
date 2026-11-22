@@ -104,9 +104,10 @@ pub fn main() -> ExitCode {
             let code = crate::check::main(&args[1..]);
             if !args
                 .iter()
-                .any(|arg| matches!(arg.as_str(), "--plan" | "-h" | "--help"))
+                .any(|arg| matches!(arg.as_str(), "--plan" | "--list-stages" | "-h" | "--help"))
             {
-                metric(&args, started.elapsed().as_millis(), code, compiled());
+                let logs = crate::check::logs_dir(&args[1..]);
+                metric(&args, started.elapsed().as_millis(), code, compiled(&logs));
             }
             return ExitCode::from(code);
         }
@@ -128,10 +129,10 @@ pub fn main() -> ExitCode {
     ExitCode::from(code)
 }
 
-/// After a check: whether cargo compiled nothing, from the first lines of each output/check log, where
+/// After a check: whether cargo compiled nothing, from the first lines of each log in its logs dir, where
 /// cargo prints its Compiling lines; None when no log is there.
-fn compiled() -> Option<bool> {
-    let logs = std::fs::read_dir("output/check").ok()?;
+fn compiled(logs: &Path) -> Option<bool> {
+    let logs = std::fs::read_dir(logs).ok()?;
     let mut any = false;
     for entry in logs.flatten() {
         let path = entry.path();
@@ -175,7 +176,9 @@ fn metric(args: &[String], wall_ms: u128, exit: u8, cached: Option<bool>) {
         [group, sub, ..] if group == "slots" => format!("nc-build slots {sub}"),
         // the series scripts/check wrote before it ran this engine
         [sub, rest @ ..] if sub == "check" => {
-            if rest.iter().any(|arg| arg == "--full") {
+            if rest.iter().any(|arg| arg == "--stage") {
+                "check --stage".to_owned()
+            } else if rest.iter().any(|arg| arg == "--full") {
                 "check --full".to_owned()
             } else {
                 "check".to_owned()

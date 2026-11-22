@@ -470,40 +470,40 @@ type Parked = (EventId, u64, SyncOp);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mirror {
     #[serde(with = "crate::pairs")]
-    links: BTreeMap<Target, Linked>,
-    ever: BTreeSet<(TaskId, Target)>,
-    gone: BTreeSet<Target>,
+    links: crate::cow::CowMap<Target, Linked>,
+    ever: crate::cow::CowSet<(TaskId, Target)>,
+    gone: crate::cow::CowSet<Target>,
     #[serde(with = "crate::pairs")]
-    threads: BTreeMap<Target, Target>,
+    threads: crate::cow::CowMap<Target, Target>,
     #[serde(with = "crate::pairs")]
-    messages: BTreeMap<EventId, Message>,
+    messages: crate::cow::CowMap<EventId, Message>,
     #[serde(with = "crate::pairs")]
-    by_task: BTreeMap<TaskId, Vec<EventId>>,
+    by_task: crate::cow::CowMap<TaskId, Vec<EventId>>,
     #[serde(with = "crate::pairs")]
-    status: BTreeMap<TaskId, EventId>,
+    status: crate::cow::CowMap<TaskId, EventId>,
     #[serde(with = "crate::pairs")]
-    external: BTreeMap<(Target, String), EventId>,
+    external: crate::cow::CowMap<(Target, String), EventId>,
     #[serde(with = "crate::pairs")]
-    copies: BTreeMap<(EventId, Target), Copy>,
+    copies: crate::cow::CowMap<(EventId, Target), Copy>,
     #[serde(with = "crate::pairs")]
-    attempts: BTreeMap<(EventId, Target, u64), u64>,
+    attempts: crate::cow::CowMap<(EventId, Target, u64), u64>,
     #[serde(with = "crate::pairs")]
-    dead: BTreeMap<(EventId, Target), String>,
+    dead: crate::cow::CowMap<(EventId, Target), String>,
     #[serde(with = "crate::pairs")]
-    labels: BTreeMap<(TaskId, String), u64>,
+    labels: crate::cow::CowMap<(TaskId, String), u64>,
     #[serde(with = "crate::pairs")]
-    accounts: BTreeMap<(String, String), String>,
+    accounts: crate::cow::CowMap<(String, String), String>,
     #[serde(with = "crate::pairs")]
-    members: BTreeMap<String, BTreeMap<String, String>>,
+    members: crate::cow::CowMap<String, BTreeMap<String, String>>,
     #[serde(with = "crate::pairs")]
-    read: BTreeMap<(TaskId, String), u64>,
+    read: crate::cow::CowMap<(TaskId, String), u64>,
     #[serde(with = "crate::pairs")]
-    parked: BTreeMap<(Target, Option<String>), Vec<Parked>>,
+    parked: crate::cow::CowMap<(Target, Option<String>), Vec<Parked>>,
     #[serde(with = "crate::pairs")]
-    owned: BTreeMap<(TaskId, String), u64>,
-    worded: BTreeMap<TaskId, u64>,
+    owned: crate::cow::CowMap<(TaskId, String), u64>,
+    worded: crate::cow::CowMap<TaskId, u64>,
     #[serde(with = "crate::pairs")]
-    throttled: BTreeMap<(EventId, Target, u64), u64>,
+    throttled: crate::cow::CowMap<(EventId, Target, u64), u64>,
 }
 
 pub fn spec(title: &str, body: Option<&str>) -> String {
@@ -532,7 +532,7 @@ pub fn mentions(body: &str) -> Vec<String> {
     found
 }
 
-type Tally = BTreeMap<(EventId, Target, u64), u64>;
+type Tally = crate::cow::CowMap<(EventId, Target, u64), u64>;
 
 fn sum(tally: &Tally, id: &EventId, target: &Target) -> u64 {
     let low = (id.clone(), target.clone(), 0);
@@ -553,25 +553,25 @@ fn tally(tally: &Tally, id: &EventId, target: &Target, action: &Action, revision
 impl Mirror {
     pub const fn new() -> Self {
         Self {
-            links: BTreeMap::new(),
-            ever: BTreeSet::new(),
-            gone: BTreeSet::new(),
-            threads: BTreeMap::new(),
-            messages: BTreeMap::new(),
-            by_task: BTreeMap::new(),
-            status: BTreeMap::new(),
-            external: BTreeMap::new(),
-            copies: BTreeMap::new(),
-            attempts: BTreeMap::new(),
-            dead: BTreeMap::new(),
-            labels: BTreeMap::new(),
-            accounts: BTreeMap::new(),
-            members: BTreeMap::new(),
-            read: BTreeMap::new(),
-            parked: BTreeMap::new(),
-            owned: BTreeMap::new(),
-            worded: BTreeMap::new(),
-            throttled: BTreeMap::new(),
+            links: crate::cow::CowMap::new(),
+            ever: crate::cow::CowSet::new(),
+            gone: crate::cow::CowSet::new(),
+            threads: crate::cow::CowMap::new(),
+            messages: crate::cow::CowMap::new(),
+            by_task: crate::cow::CowMap::new(),
+            status: crate::cow::CowMap::new(),
+            external: crate::cow::CowMap::new(),
+            copies: crate::cow::CowMap::new(),
+            attempts: crate::cow::CowMap::new(),
+            dead: crate::cow::CowMap::new(),
+            labels: crate::cow::CowMap::new(),
+            accounts: crate::cow::CowMap::new(),
+            members: crate::cow::CowMap::new(),
+            read: crate::cow::CowMap::new(),
+            parked: crate::cow::CowMap::new(),
+            owned: crate::cow::CowMap::new(),
+            worded: crate::cow::CowMap::new(),
+            throttled: crate::cow::CowMap::new(),
         }
     }
 
@@ -591,23 +591,23 @@ impl Mirror {
         })
     }
 
-    pub const fn links(&self) -> &BTreeMap<Target, Linked> {
+    pub const fn links(&self) -> &crate::cow::CowMap<Target, Linked> {
         &self.links
     }
 
-    pub const fn messages(&self) -> &BTreeMap<EventId, Message> {
+    pub const fn messages(&self) -> &crate::cow::CowMap<EventId, Message> {
         &self.messages
     }
 
-    pub const fn copies(&self) -> &BTreeMap<(EventId, Target), Copy> {
+    pub const fn copies(&self) -> &crate::cow::CowMap<(EventId, Target), Copy> {
         &self.copies
     }
 
-    pub const fn dead(&self) -> &BTreeMap<(EventId, Target), String> {
+    pub const fn dead(&self) -> &crate::cow::CowMap<(EventId, Target), String> {
         &self.dead
     }
 
-    pub const fn read(&self) -> &BTreeMap<(TaskId, String), u64> {
+    pub const fn read(&self) -> &crate::cow::CowMap<(TaskId, String), u64> {
         &self.read
     }
 

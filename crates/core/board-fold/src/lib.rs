@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub mod access;
 pub mod brief;
 mod compact;
+pub mod cow;
+
+use cow::{CowMap, CowSet, CowVec};
 pub mod deliver;
 pub mod delivery;
 pub mod intent;
@@ -387,21 +390,21 @@ pub struct Fold {
     next: u64,
     now_ms: u64,
     #[serde(with = "crate::pairs")]
-    tasks: BTreeMap<TaskId, Task>,
+    tasks: CowMap<TaskId, Task>,
     #[serde(with = "crate::pairs")]
-    children: BTreeMap<TaskId, BTreeSet<TaskId>>,
+    children: CowMap<TaskId, BTreeSet<TaskId>>,
     #[serde(with = "crate::pairs")]
-    dependents: BTreeMap<TaskId, BTreeSet<TaskId>>,
+    dependents: CowMap<TaskId, BTreeSet<TaskId>>,
     #[serde(with = "crate::pairs")]
-    seen: BTreeMap<EventId, Result<u64, Rejection>>,
-    entries: Vec<Entry>,
+    seen: CowMap<EventId, Result<u64, Rejection>>,
+    entries: CowVec<Entry>,
     access: access::Access,
     mirror: mirror::Mirror,
-    live: BTreeSet<TaskId>,
+    live: CowSet<TaskId>,
     #[serde(skip)]
-    posted: BTreeMap<TaskId, usize>,
+    posted: CowMap<TaskId, usize>,
     #[serde(with = "crate::pairs")]
-    labelled: BTreeMap<String, BTreeMap<String, BTreeSet<TaskId>>>,
+    labelled: CowMap<String, BTreeMap<String, BTreeSet<TaskId>>>,
     said: messages::Said,
     marks: watch::Marks,
     #[serde(default)]
@@ -423,16 +426,16 @@ impl Fold {
         Self {
             next: FIRST,
             now_ms: 0,
-            tasks: BTreeMap::new(),
-            children: BTreeMap::new(),
-            dependents: BTreeMap::new(),
-            seen: BTreeMap::new(),
-            entries: Vec::new(),
+            tasks: CowMap::new(),
+            children: CowMap::new(),
+            dependents: CowMap::new(),
+            seen: CowMap::new(),
+            entries: CowVec::new(),
             access: access::Access::new(),
             mirror: mirror::Mirror::new(),
-            live: BTreeSet::new(),
-            posted: BTreeMap::new(),
-            labelled: BTreeMap::new(),
+            live: CowSet::new(),
+            posted: CowMap::new(),
+            labelled: CowMap::new(),
             said: messages::Said::new(),
             marks: watch::Marks::new(),
             steers: steer::Steers::new(),
@@ -449,7 +452,7 @@ impl Fold {
         self.now_ms
     }
 
-    pub const fn tasks(&self) -> &BTreeMap<TaskId, Task> {
+    pub const fn tasks(&self) -> &CowMap<TaskId, Task> {
         &self.tasks
     }
 
@@ -465,7 +468,7 @@ impl Fold {
         self.seen.get(event)
     }
 
-    pub fn entries(&self) -> &[Entry] {
+    pub const fn entries(&self) -> &CowVec<Entry> {
         &self.entries
     }
 
@@ -778,8 +781,8 @@ impl Fold {
         Ok(())
     }
 
-    fn posted_order(&self) -> BTreeMap<TaskId, usize> {
-        let mut posted = BTreeMap::new();
+    fn posted_order(&self) -> CowMap<TaskId, usize> {
+        let mut posted = CowMap::new();
         for (index, entry) in self.entries.iter().enumerate() {
             if entry.change == Change::Posted {
                 posted.entry(entry.task.clone()).or_insert(index);
@@ -1314,25 +1317,26 @@ impl Pending {
     }
 }
 
-mod pairs {
-    use std::collections::BTreeMap;
+pub(crate) mod pairs {
+    use serde::{Deserialize, Deserializer, Serializer};
 
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use crate::cow::Pairs;
 
-    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
-        map: &BTreeMap<K, V>,
+    pub fn serialize<M: Pairs<K, V>, K, V, S: Serializer>(
+        map: &M,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(map)
+        map.serialize_pairs(serializer)
     }
 
-    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    pub fn deserialize<'de, M, K, V, D>(deserializer: D) -> Result<M, D::Error>
     where
-        K: Deserialize<'de> + Ord,
+        M: Pairs<K, V>,
+        K: Deserialize<'de>,
         V: Deserialize<'de>,
         D: Deserializer<'de>,
     {
-        Vec::<(K, V)>::deserialize(deserializer).map(|pairs| pairs.into_iter().collect())
+        M::deserialize_pairs(deserializer)
     }
 }
 

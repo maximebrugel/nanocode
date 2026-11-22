@@ -236,23 +236,23 @@ fn closeness(who: &[Who], actor: &Actor) -> Option<u8> {
 pub struct Access {
     owner: Option<String>,
     #[serde(with = "crate::pairs")]
-    grants: BTreeMap<EventId, Grant>,
+    grants: crate::cow::CowMap<EventId, Grant>,
     #[serde(with = "crate::pairs")]
-    posters: BTreeMap<TaskId, Actor>,
+    posters: crate::cow::CowMap<TaskId, Actor>,
     #[serde(with = "crate::pairs")]
-    holders: BTreeMap<TaskId, Actor>,
+    holders: crate::cow::CowMap<TaskId, Actor>,
     #[serde(default, with = "crate::pairs")]
-    epochs: BTreeMap<u32, u64>,
+    epochs: crate::cow::CowMap<u32, u64>,
 }
 
 impl Access {
     pub const fn new() -> Self {
         Self {
             owner: None,
-            grants: BTreeMap::new(),
-            posters: BTreeMap::new(),
-            holders: BTreeMap::new(),
-            epochs: BTreeMap::new(),
+            grants: crate::cow::CowMap::new(),
+            posters: crate::cow::CowMap::new(),
+            holders: crate::cow::CowMap::new(),
+            epochs: crate::cow::CowMap::new(),
         }
     }
 
@@ -264,7 +264,7 @@ impl Access {
         self.owner.as_deref()
     }
 
-    pub const fn grants(&self) -> &BTreeMap<EventId, Grant> {
+    pub const fn grants(&self) -> &crate::cow::CowMap<EventId, Grant> {
         &self.grants
     }
 

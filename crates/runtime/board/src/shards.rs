@@ -446,12 +446,11 @@ impl ReadyIndex {
             let partition = Partition(index as u32);
             let entries = fold.entries();
             let from = entries.partition_point(|entry| entry.seq < self.folded[index]);
-            let fresh = &entries[from..];
-            let Some(last) = fresh.last() else {
+            let Some(last) = entries.last().filter(|_| from < entries.len()) else {
                 continue;
             };
             let skip = usize::from(mutated(Mutation::MergedIndexSkipsRows));
-            for entry in &fresh[..fresh.len() - skip] {
+            for entry in entries.iter_from(from).take(entries.len() - from - skip) {
                 self.refresh(partition, fold, &entry.task);
             }
             self.folded[index] = last.seq + 1;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -65,19 +65,19 @@ struct Posted {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intents {
     #[serde(default, with = "crate::pairs")]
-    posts: BTreeMap<TaskId, Posted>,
+    posts: crate::cow::CowMap<TaskId, Posted>,
     #[serde(default)]
-    goals: BTreeSet<TaskId>,
+    goals: crate::cow::CowSet<TaskId>,
     #[serde(default, with = "crate::pairs")]
-    reports: BTreeMap<TaskId, BTreeMap<TaskId, Report>>,
+    reports: crate::cow::CowMap<TaskId, BTreeMap<TaskId, Report>>,
 }
 
 impl Intents {
     pub const fn new() -> Self {
         Self {
-            posts: BTreeMap::new(),
-            goals: BTreeSet::new(),
-            reports: BTreeMap::new(),
+            posts: crate::cow::CowMap::new(),
+            goals: crate::cow::CowSet::new(),
+            reports: crate::cow::CowMap::new(),
         }
     }
 }

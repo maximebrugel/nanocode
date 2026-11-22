@@ -327,10 +327,11 @@ impl Fold {
             .iter()
             .map(|(key, value)| self.labelled.get(key).and_then(|values| values.get(value)))
             .collect::<Option<Vec<_>>>()?;
-        let candidates = sets
-            .into_iter()
-            .min_by_key(|ids| ids.len())
-            .unwrap_or(&self.live);
+        let candidates: Box<dyn Iterator<Item = &TaskId>> =
+            match sets.into_iter().min_by_key(|ids| ids.len()) {
+                Some(ids) => Box::new(ids.iter()),
+                None => Box::new(self.live.iter()),
+            };
         let mut tier = None;
         let mut head: Vec<(usize, &TaskId)> = Vec::new();
         for id in candidates {

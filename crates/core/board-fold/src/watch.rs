@@ -306,10 +306,10 @@ impl Schedule {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marks {
     #[serde(with = "pairs")]
-    cursors: BTreeMap<Key, u64>,
-    watchers: BTreeMap<String, Watcher>,
-    schedules: BTreeMap<String, Schedule>,
-    authors: BTreeMap<EventId, String>,
+    cursors: crate::cow::CowMap<Key, u64>,
+    watchers: crate::cow::CowMap<String, Watcher>,
+    schedules: crate::cow::CowMap<String, Schedule>,
+    authors: crate::cow::CowMap<EventId, String>,
     dead: Vec<DeadLetter>,
     indexed: usize,
 }
@@ -317,20 +317,20 @@ pub struct Marks {
 impl Marks {
     pub const fn new() -> Self {
         Self {
-            cursors: BTreeMap::new(),
-            watchers: BTreeMap::new(),
-            schedules: BTreeMap::new(),
-            authors: BTreeMap::new(),
+            cursors: crate::cow::CowMap::new(),
+            watchers: crate::cow::CowMap::new(),
+            schedules: crate::cow::CowMap::new(),
+            authors: crate::cow::CowMap::new(),
             dead: Vec::new(),
             indexed: 0,
         }
     }
 
-    pub const fn watchers(&self) -> &BTreeMap<String, Watcher> {
+    pub const fn watchers(&self) -> &crate::cow::CowMap<String, Watcher> {
         &self.watchers
     }
 
-    pub const fn schedules(&self) -> &BTreeMap<String, Schedule> {
+    pub const fn schedules(&self) -> &crate::cow::CowMap<String, Schedule> {
         &self.schedules
     }
 
@@ -349,35 +349,13 @@ impl Marks {
 
 /// Maps with structured keys, written as a list of pairs since JSON object
 /// keys must be strings.
-mod pairs {
-    use std::collections::BTreeMap;
-
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
-        map: &BTreeMap<K, V>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(map.iter())
-    }
-
-    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
-    where
-        K: Deserialize<'de> + Ord,
-        V: Deserialize<'de>,
-        D: Deserializer<'de>,
-    {
-        Ok(Vec::<(K, V)>::deserialize(deserializer)?
-            .into_iter()
-            .collect())
-    }
-}
+use crate::pairs;
 
 /// `id` and the tasks above it, nearest first. The move check keeps parent
 /// links acyclic, so a chain longer than the board has tasks means a move let
 /// a cycle in: stop there with a panic that says so rather than walk it forever.
 pub fn ancestors<'a>(
-    tasks: &'a BTreeMap<TaskId, Task>,
+    tasks: &'a crate::cow::CowMap<TaskId, Task>,
     id: &'a TaskId,
 ) -> impl Iterator<Item = &'a TaskId> + 'a {
     std::iter::successors(Some(id), |at| {
@@ -393,16 +371,16 @@ pub fn ancestors<'a>(
     })
 }
 
-pub fn root(tasks: &BTreeMap<TaskId, Task>, id: &TaskId) -> TaskId {
+pub fn root(tasks: &crate::cow::CowMap<TaskId, Task>, id: &TaskId) -> TaskId {
     ancestors(tasks, id).last().unwrap_or(id).clone()
 }
 
-pub fn under(tasks: &BTreeMap<TaskId, Task>, id: &TaskId, above: &TaskId) -> bool {
+pub fn under(tasks: &crate::cow::CowMap<TaskId, Task>, id: &TaskId, above: &TaskId) -> bool {
     ancestors(tasks, id).any(|at| at == above)
 }
 
 impl Filter {
-    pub fn matches(&self, tasks: &BTreeMap<TaskId, Task>, entry: &Entry) -> bool {
+    pub fn matches(&self, tasks: &crate::cow::CowMap<TaskId, Task>, entry: &Entry) -> bool {
         if !self.kinds.is_empty() && !self.kinds.contains(&entry.change.kind()) {
             return false;
         }
@@ -945,7 +923,7 @@ impl Fold {
             access,
             ..
         } = self;
-        for entry in &entries[marks.indexed..] {
+        for entry in entries.iter_from(marks.indexed) {
             let author = marks.authors.get(&entry.event);
             let thread = root(tasks, &entry.task);
             for (name, watcher) in &mut marks.watchers {

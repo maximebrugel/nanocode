@@ -177,24 +177,24 @@ impl From<Refusal> for Rejection {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Said {
-    messages: BTreeMap<MessageId, Message>,
-    order: BTreeSet<(u64, MessageId)>,
-    replies: BTreeMap<MessageId, Vec<MessageId>>,
-    channels: BTreeMap<String, Channel>,
+    messages: crate::cow::CowMap<MessageId, Message>,
+    order: crate::cow::CowSet<(u64, MessageId)>,
+    replies: crate::cow::CowMap<MessageId, Vec<MessageId>>,
+    channels: crate::cow::CowMap<String, Channel>,
     #[serde(with = "crate::pairs")]
-    schemas: BTreeMap<(String, u64), Schema>,
-    files: BTreeMap<String, File>,
+    schemas: crate::cow::CowMap<(String, u64), Schema>,
+    files: crate::cow::CowMap<String, File>,
 }
 
 impl Said {
     pub const fn new() -> Self {
         Self {
-            messages: BTreeMap::new(),
-            order: BTreeSet::new(),
-            replies: BTreeMap::new(),
-            channels: BTreeMap::new(),
-            schemas: BTreeMap::new(),
-            files: BTreeMap::new(),
+            messages: crate::cow::CowMap::new(),
+            order: crate::cow::CowSet::new(),
+            replies: crate::cow::CowMap::new(),
+            channels: crate::cow::CowMap::new(),
+            schemas: crate::cow::CowMap::new(),
+            files: crate::cow::CowMap::new(),
         }
     }
 
@@ -864,7 +864,7 @@ impl Fold {
             .collect()
     }
 
-    pub const fn channels(&self) -> &BTreeMap<String, Channel> {
+    pub const fn channels(&self) -> &crate::cow::CowMap<String, Channel> {
         &self.said.channels
     }
 

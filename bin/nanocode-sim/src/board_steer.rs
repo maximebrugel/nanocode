@@ -488,8 +488,10 @@ fn cancel(host: &mut Host, oracle: &mut Oracle, now: u64, task: TaskId) -> Resul
     if !left.is_empty() {
         return Err(format!("cancelled {task} still holds steers {left:?}"));
     }
-    let drops: Vec<(u64, u64)> = host.fold.entries()[before..]
-        .iter()
+    let drops: Vec<(u64, u64)> = host
+        .fold
+        .entries()
+        .iter_from(before)
         .filter(|entry| entry.task == task)
         .filter_map(|entry| match &entry.change {
             Change::Steered(Steered::Dropped { upto, count }) => Some((*upto, *count)),

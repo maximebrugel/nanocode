@@ -6,7 +6,9 @@ use serde::ser::{self, Serialize};
 use serde::{Deserialize, Serializer};
 
 use crate::{
-    Entry, EventId, Fold, Rejection, Task, TaskId, access, intent, messages, mirror, steer, watch,
+    Entry, EventId, Fold, Rejection, Task, TaskId, access,
+    cow::{CowMap, CowSet, CowVec, chunked},
+    intent, messages, mirror, steer, watch,
 };
 
 pub const MAGIC: &[u8; 8] = b"NCFOLD\x00\x01";
@@ -60,35 +62,21 @@ fn fail<T>(message: impl Into<String>) -> Result<T, Error> {
     Err(Error(message.into()))
 }
 
-struct Pairs<'a, K, V>(&'a BTreeMap<K, V>);
-
-impl<K: Serialize, V: Serialize> Serialize for Pairs<'_, K, V> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.0)
-    }
-}
-
-fn map<K: Ord, V>(pairs: Vec<(K, V)>) -> BTreeMap<K, V> {
-    pairs.into_iter().collect()
-}
-
-type Labelled = BTreeMap<String, BTreeMap<String, BTreeSet<TaskId>>>;
-
 type Head = (
     u64,
     u64,
-    Vec<(TaskId, BTreeSet<TaskId>)>,
-    Vec<(TaskId, BTreeSet<TaskId>)>,
-    BTreeSet<TaskId>,
-    Vec<(String, BTreeMap<String, BTreeSet<TaskId>>)>,
+    CowMap<TaskId, BTreeSet<TaskId>>,
+    CowMap<TaskId, BTreeSet<TaskId>>,
+    CowSet<TaskId>,
+    CowMap<String, BTreeMap<String, BTreeSet<TaskId>>>,
     watch::Marks,
 );
 
 enum Part {
     Head(Head),
-    Tasks(Vec<(TaskId, Task)>),
-    Seen(Vec<(EventId, Result<u64, Rejection>)>),
-    Entries(Vec<Entry>),
+    Tasks(CowMap<TaskId, Task>),
+    Seen(CowMap<EventId, Result<u64, Rejection>>),
+    Entries(CowVec<Entry>),
     Access(access::Access),
     Mirror(mirror::Mirror),
     Said(messages::Said),
@@ -109,7 +97,7 @@ pub enum Spread {
 }
 
 impl Spread {
-    pub fn for_fold(fold: &Fold) -> Self {
+    pub const fn for_fold(fold: &Fold) -> Self {
         if fold.seen.len() < THREADS_FROM_EVENTS {
             Self::Inline
         } else {
@@ -126,7 +114,14 @@ impl Spread {
     }
 }
 
+/// Runs every job, each with Cow collections (de)serializing as their chunk blobs: a snapshot
+/// encodes and a restore decodes each chunk on its own, so a chunk's cached encoding stands in
+/// for it until a write clears it.
 fn all<T: Send>(spread: Spread, jobs: Vec<Job<'_, T>>) -> Vec<T> {
+    let jobs: Vec<Job<'_, T>> = jobs
+        .into_iter()
+        .map(|job| -> Job<'_, T> { Box::new(move || chunked(job)) })
+        .collect();
     match spread {
         Spread::Inline => jobs.into_iter().map(|job| job()).collect(),
         Spread::Threads => threads(jobs),
@@ -174,19 +169,9 @@ pub fn snapshot(fold: &Fold, spread: Spread) -> Result<Vec<u8>, Error> {
         refused: _,
     } = fold;
     let jobs: Vec<Job<'_, Result<Vec<u8>, Error>>> = vec![
-        Box::new(move || {
-            encode(&(
-                next,
-                now_ms,
-                Pairs(children),
-                Pairs(dependents),
-                live,
-                Pairs(labelled),
-                marks,
-            ))
-        }),
-        Box::new(move || encode(&Pairs(tasks))),
-        Box::new(move || encode(&Pairs(seen))),
+        Box::new(move || encode(&(next, now_ms, children, dependents, live, labelled, marks))),
+        Box::new(move || encode(tasks)),
+        Box::new(move || encode(seen)),
         Box::new(move || encode(entries)),
         Box::new(move || encode(access)),
         Box::new(move || encode(mirror)),
@@ -296,19 +281,18 @@ pub fn restore(snapshot: &[u8], spread: Spread) -> Result<Fold, Error> {
     let Part::Intents(intents) = part()? else {
         return fail("snapshot intents out of order");
     };
-    let labelled: Labelled = map(labelled);
     Ok(Fold {
         next,
         now_ms,
-        tasks: map(tasks),
-        children: map(children),
-        dependents: map(dependents),
-        seen: map(seen),
+        tasks,
+        children,
+        dependents,
+        seen,
         entries,
         access,
         mirror,
         live,
-        posted: BTreeMap::new(),
+        posted: crate::cow::CowMap::new(),
         labelled,
         said,
         marks,

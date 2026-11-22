@@ -17,11 +17,10 @@ use std::{
     cell::Cell,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use nanocode_sync::Slot;
 use nanocode_sys::base64::STANDARD_NO_PAD;
 use nanocode_turnlog::{LogHost, StoredCheckpoint};
 
@@ -189,6 +188,11 @@ impl Board {
     /// Hands a save to the board's saver once the fold is [`checkpoint_every`] events (none by
     /// default), or as many as the last checkpoint covered, past it. Skipped while the last save
     /// still runs; a failed save only means the next reopen folds more.
+    ///
+    /// The save freezes the board's own fold, which costs one pointer per chunk of its
+    /// copy-on-write collections, and encodes it off this thread: only the chunks written since
+    /// the last save encode again, the rest reuse the encoding they cached. The board keeps
+    /// folding meanwhile, copying a chunk the save still holds the first time it writes to it.
     pub(crate) fn keep_checkpoint(&mut self) {
         let every = every();
         let next = self.fold.next();
@@ -200,42 +204,37 @@ impl Board {
         if every == 0 || !self.checkpoints || next < self.checkpointed + wait {
             return;
         }
-        let Some(shadow) = self.saver.take() else {
-            return;
-        };
-        if let Shadow::Unsupported = shadow {
-            let _ = self.saver.put(shadow);
+        if self.saver.unsupported.load(Ordering::Acquire) {
             self.checkpoints = false;
             return;
         }
+        if self.saver.busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.checkpointed = next;
-        let lent = Lent {
-            home: Arc::clone(&self.saver),
-            shadow,
-        };
-        spawn(save(Arc::clone(&self.host), self.scope.clone(), lent, next));
+        let saving = Saving(Arc::clone(&self.saver));
+        spawn(save(
+            Arc::clone(&self.host),
+            self.scope.clone(),
+            self.fold.clone(),
+            saving,
+        ));
     }
 }
 
-/// The saver's own fold, which only it folds, from the log's rows.
-pub(crate) enum Shadow {
-    /// Not built yet, or lost with a save that did not finish.
-    Unbuilt,
-    Folded(Fold),
-    /// The host keeps no checkpoints.
-    Unsupported,
+/// What a board's saves share with it: whether one runs, and whether the host keeps none.
+#[derive(Default)]
+pub(crate) struct Saver {
+    busy: AtomicBool,
+    unsupported: AtomicBool,
 }
 
-/// The shadow while a save holds it; dropping it gives the saver its shadow back.
-struct Lent {
-    home: Arc<Slot<Shadow>>,
-    shadow: Shadow,
-}
+/// A running save; dropping it lets the next one start.
+struct Saving(Arc<Saver>);
 
-impl Drop for Lent {
+impl Drop for Saving {
     fn drop(&mut self) {
-        let shadow = std::mem::replace(&mut self.shadow, Shadow::Unbuilt);
-        let _ = self.home.put(shadow);
+        self.0.busy.store(false, Ordering::Release);
     }
 }
 
@@ -251,8 +250,8 @@ fn spawn(save: impl Future<Output = ()> + 'static) {
     nanocode_platform::spawn_local(save);
 }
 
-/// Runs CPU-bound work (folding rows, encoding the fold) on a blocking thread, so a large save
-/// never holds an executor thread the committers need; inline under a simulated host.
+/// Runs CPU-bound work (encoding the fold) on a blocking thread, so a large save never holds an
+/// executor thread the committers need; inline under a simulated host.
 #[cfg(not(target_family = "wasm"))]
 async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
     if nanocode_platform::host().is_some() {
@@ -266,73 +265,28 @@ async fn off_thread<T: 'static>(work: impl FnOnce() -> T + 'static) -> Option<T>
     Some(work())
 }
 
-/// Folds `rows` into `fold` and encodes it as the checkpoint at the seq after the last one.
-fn fold_and_encode(
-    mut fold: Fold,
-    rows: Vec<(u64, String)>,
-    mut last: Option<String>,
-) -> Option<(Fold, Option<StoredCheckpoint>)> {
-    for (seq, body) in rows {
-        fold.apply(seq, &body).ok()?;
-        last = Some(body);
-    }
-    let saved = last.map(|last| {
-        let mut saved = encode(&fold, &last);
-        if mutated(Mutation::CheckpointAhead) {
-            saved.seq += 1;
-        }
-        saved
-    });
-    Some((fold, saved))
-}
-
-/// Folds the log's rows before `target` into the shadow, building it from the scope's checkpoint
-/// or the whole log first, and saves it as the checkpoint at the seq it folded to.
-async fn save(host: Arc<dyn LogHost>, scope: String, mut lent: Lent, target: u64) {
-    let (fold, mut rows) = match std::mem::replace(&mut lent.shadow, Shadow::Unbuilt) {
-        Shadow::Folded(fold) => (fold, Vec::new()),
-        Shadow::Unsupported => {
-            lent.shadow = Shadow::Unsupported;
-            return;
-        }
-        Shadow::Unbuilt => match reopen(&host, &scope).await {
-            Ok((fold, mut rows)) => {
-                rows.retain(|(seq, _)| *seq < target);
-                (fold, rows)
-            }
-            Err(Fallback::Unsupported) => {
-                lent.shadow = Shadow::Unsupported;
-                return;
-            }
-            Err(_) => (Fold::new(), Vec::new()),
-        },
-    };
-    let from = rows.last().map_or(fold.next(), |(seq, _)| seq + 1);
-    if from < target {
-        let Ok(more) = host.scan(&scope, from, target).await else {
-            if rows.is_empty() {
-                lent.shadow = Shadow::Folded(fold);
-            }
-            return;
-        };
-        rows.extend(more);
-    }
-    if rows.is_empty() {
-        lent.shadow = Shadow::Folded(fold);
+/// Saves a frozen fold as the scope's checkpoint at its next seq, hashing the row before it.
+async fn save(host: Arc<dyn LogHost>, scope: String, fold: Fold, saving: Saving) {
+    let next = fold.next();
+    if next == 0 {
         return;
     }
-    let Some(Some((fold, saved))) = off_thread(move || fold_and_encode(fold, rows, None)).await
-    else {
+    let Ok(last) = host.scan(&scope, next - 1, next).await else {
         return;
     };
-    let Some(saved) = saved else {
-        lent.shadow = Shadow::Folded(fold);
+    let Some((_, body)) = last.into_iter().find(|(seq, _)| *seq == next - 1) else {
         return;
     };
+    let Some(mut saved) = off_thread(move || encode(&fold, &body)).await else {
+        return;
+    };
+    if mutated(Mutation::CheckpointAhead) {
+        saved.seq += 1;
+    }
     let Some(write) = host.save_checkpoint(&scope, &saved) else {
-        lent.shadow = Shadow::Unsupported;
+        saving.0.unsupported.store(true, Ordering::Release);
         return;
     };
     let _ = write.await;
-    lent.shadow = Shadow::Folded(fold);
+    drop(saving);
 }

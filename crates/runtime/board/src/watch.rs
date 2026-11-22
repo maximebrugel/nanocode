@@ -77,8 +77,9 @@ impl Board {
         let fold = &self.fold;
         let from = fold.position(&key);
         let start = fold.entries().partition_point(|entry| entry.seq <= from);
-        let entries = fold.entries()[start..]
-            .iter()
+        let entries = fold
+            .entries()
+            .iter_from(start)
             .filter(|entry| fold.access().reads(self.identity.actor(), &entry.task.0))
             .filter(|entry| scope.is_none_or(|above| under(fold.tasks(), &entry.task, above)))
             .filter(|entry| filter.matches(fold.tasks(), entry))
@@ -243,8 +244,9 @@ impl Board {
             })));
         }
         let start = fold.entries().partition_point(|entry| entry.seq < at);
-        let entries = fold.entries()[start..]
-            .iter()
+        let entries = fold
+            .entries()
+            .iter_from(start)
             .take_while(|entry| entry.seq <= upto)
             .filter(|entry| rows.contains(&entry.seq))
             .cloned()
@@ -373,8 +375,9 @@ impl Board {
             self.fire_due(timer.now_ms()).await?;
             let fold = &self.fold;
             let start = fold.entries().partition_point(|entry| entry.seq <= after);
-            let found = fold.entries()[start..]
-                .iter()
+            let found = fold
+                .entries()
+                .iter_from(start)
                 .filter(|entry| fold.access().reads(self.identity.actor(), &entry.task.0))
                 .filter(|entry| scope.is_none_or(|above| under(fold.tasks(), &entry.task, above)))
                 .filter(|entry| filter.matches(fold.tasks(), entry))

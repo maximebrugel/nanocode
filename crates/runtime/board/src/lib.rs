@@ -37,8 +37,8 @@ pub struct Board {
     checkpointed: u64,
     /// Cleared once the host says it keeps no checkpoints.
     checkpoints: bool,
-    /// The saver's fold while no save runs; empty while one does.
-    saver: Arc<nanocode_sync::Slot<checkpoint::Shadow>>,
+    /// What this board's checkpoint saves share with it.
+    saver: Arc<checkpoint::Saver>,
 }
 
 impl Board {
@@ -98,7 +98,7 @@ impl Board {
             opened: checkpoint::Opened::Resumed,
             checkpointed: 0,
             checkpoints: true,
-            saver: Arc::new(nanocode_sync::Slot::new(Some(checkpoint::Shadow::Unbuilt))),
+            saver: Arc::new(checkpoint::Saver::default()),
         };
         board.fold_rows(rows)?;
         if !mutated(Mutation::MintedRestarts) {

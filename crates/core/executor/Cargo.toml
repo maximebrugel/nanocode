@@ -21,3 +21,7 @@ workspace = true
 test = false
 doctest = false
 bench = false
+
+[[test]]
+name = "idle_collect"
+path = "tests/idle_collect.rs"

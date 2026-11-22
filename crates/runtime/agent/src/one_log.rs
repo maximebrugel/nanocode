@@ -39,8 +39,10 @@ use crate::{
     turn_log::{EventLog, Logged, Recording, TurnLog},
 };
 
+mod import;
 mod wakes;
 
+pub use import::{Imported, sim as import_sim};
 pub use wakes::{Fire, Heard, WakeError};
 
 const TOOLS_MARK: &str = "$nanocode_tools";

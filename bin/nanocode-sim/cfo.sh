@@ -358,6 +358,10 @@ default_table='
 1 canary_wakes_snapshot_drops_wakes canary:50 --scenario wakes --mutation snapshot_drops_wakes
 1 canary_wakes_index_skips_hear canary:100 --scenario wakes --mutation index_skips_hear
 1 canary_wakes_unbounded canary:100 --scenario wakes --mutation unbounded
+8 imports pass --scenario imports
+2 imports_twice pass --scenario imports --twice
+1 canary_imports_held_skips_commit canary:100 --scenario imports --mutation held_skips_commit
+1 canary_imports_reimport_advances canary:100 --scenario imports --mutation reimport_advances
 8 live pass --scenario live
 2 live_twice pass --scenario live --twice
 1 canary_live_settle_drops_deletes canary:20 --scenario live --mutation settle_drops_deletes

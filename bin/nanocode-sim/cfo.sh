@@ -332,6 +332,11 @@ default_table='
 4 interp_drop pass --scenario interp_drop
 1 interp_drop_twice pass --scenario interp_drop --twice
 1 canary_interp_drop_hides_function_builtins canary:8 --scenario interp_drop --mutation hides_function_builtins
+8 holds pass --scenario holds
+2 holds_twice pass --scenario holds --twice
+1 canary_holds_forgets_answer canary:8 --scenario holds --mutation forgets_answer
+1 canary_holds_resume_ignores_answer canary:8 --scenario holds --mutation resume_ignores_answer
+1 canary_holds_prunes_unsettled canary:20 --scenario holds --mutation prunes_unsettled
 8 repo_cache pass --scenario repo_cache
 2 repo_cache_twice pass --scenario repo_cache --twice
 1 canary_repo_cache_shared_head canary:8 --scenario repo_cache --mutation shared_head
@@ -351,6 +356,16 @@ default_table='
 2 secrets_twice pass --scenario secrets --twice
 1 canary_secrets_paths_ignored canary:20 --scenario secrets --mutation paths_ignored
 1 canary_secrets_debug_shows_value canary:20 --scenario secrets --mutation debug_shows_value
+8 wakes pass --scenario wakes
+2 wakes_twice pass --scenario wakes --twice
+1 canary_wakes_fired_apart canary:100 --scenario wakes --mutation fired_apart
+1 canary_wakes_snapshot_drops_wakes canary:50 --scenario wakes --mutation snapshot_drops_wakes
+1 canary_wakes_index_skips_hear canary:100 --scenario wakes --mutation index_skips_hear
+1 canary_wakes_unbounded canary:100 --scenario wakes --mutation unbounded
+8 imports pass --scenario imports
+2 imports_twice pass --scenario imports --twice
+1 canary_imports_held_skips_commit canary:100 --scenario imports --mutation held_skips_commit
+1 canary_imports_reimport_advances canary:100 --scenario imports --mutation reimport_advances
 8 live pass --scenario live
 2 live_twice pass --scenario live --twice
 1 canary_live_settle_drops_deletes canary:20 --scenario live --mutation settle_drops_deletes

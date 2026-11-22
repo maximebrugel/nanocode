@@ -8,7 +8,7 @@ use std::{
 use nanocode_durability_core::{EncodedPayload, StoreError};
 use serde_json::value::RawValue;
 
-use crate::{EffectClass, Outcome, Record, Status};
+use crate::{ArmedWake, EffectClass, Hold, Outcome, Record, Status, Wakes};
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -167,6 +167,7 @@ pub struct Fold {
     filters: BTreeMap<u64, Box<[u64]>>,
     forgets: BTreeSet<String>,
     groups: BTreeMap<u64, (u64, u64)>,
+    holds: BTreeMap<String, Hold>,
     hot_bytes: usize,
     hosts: BTreeMap<String, Box<RawValue>>,
     index: BTreeMap<String, usize>,
@@ -184,6 +185,7 @@ pub struct Fold {
     seq: u64,
     stored: BTreeMap<String, String>,
     turns: Vec<Turn>,
+    wakes: Wakes,
 }
 
 #[derive(serde::Deserialize)]
@@ -1406,6 +1408,14 @@ impl Fold {
     }
 
     pub(crate) fn retire(&mut self, keep: usize) -> usize {
+        let excess = self.retire_turns(keep);
+        let index = &self.index;
+        self.holds
+            .retain(|_, hold| !hold.prunable(|turn| index.contains_key(turn)));
+        excess
+    }
+
+    fn retire_turns(&mut self, keep: usize) -> usize {
         let mut finished = self
             .turns
             .iter()
@@ -1460,6 +1470,15 @@ impl Fold {
     }
 
     #[must_use]
+    pub const fn wakes(&self) -> &Wakes {
+        &self.wakes
+    }
+
+    pub(crate) fn restore_wake(&mut self, key: &str, held: Option<ArmedWake>) {
+        self.wakes.restore(key, held);
+    }
+
+    #[must_use]
     pub fn host(&self, key: &str) -> Option<&RawValue> {
         self.hosts.get(key).map(AsRef::as_ref)
     }
@@ -1489,6 +1508,21 @@ impl Fold {
     #[must_use]
     pub fn models(&self, turn: &str) -> &[Box<RawValue>] {
         self.models.get(turn).map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn hold(&self, key: &str) -> Option<&Hold> {
+        self.holds.get(key)
+    }
+
+    pub fn holds(&self) -> impl Iterator<Item = (&str, &Hold)> {
+        self.holds.iter().map(|(key, hold)| (key.as_str(), hold))
+    }
+
+    #[must_use]
+    pub fn running_hold(&self, call_id: &str) -> Option<(&str, &Hold)> {
+        self.holds()
+            .find(|(_, hold)| matches!(hold, Hold::Running { .. }) && hold.call_id() == call_id)
     }
 
     pub fn open_calls(&self) -> impl Iterator<Item = (&str, &OpenCall)> {
@@ -1676,6 +1710,21 @@ impl Fold {
                     }
                 }
             }
+            Record::Hold { hold, key } => {
+                let previous = self.holds.get(key);
+                if !hold.follows(previous) {
+                    return Err(invalid(format!(
+                        "hold {key} moves from {} to {}",
+                        previous.map_or("nothing", Hold::phase),
+                        hold.phase()
+                    )));
+                }
+                let forgets = crate::sim::mutated(crate::sim::Mutation::HoldForgetsAnswer)
+                    && matches!(hold, Hold::Running { .. });
+                if !forgets {
+                    self.holds.insert(key.clone(), hold.clone());
+                }
+            }
             Record::Host { key, value } => {
                 self.hosts.insert(key.clone(), value.clone());
             }
@@ -1763,6 +1812,18 @@ impl Fold {
                 });
             }
             Record::Status { status, turn } => self.status(turn, status)?,
+            Record::Fired { key, turn, .. } => {
+                if self.turn(turn).is_none() {
+                    return Err(invalid(format!(
+                        "wake {key} fired turn {turn}, which the log did not admit"
+                    )));
+                }
+                self.wakes.apply(record).map_err(invalid)?;
+            }
+            Record::Armed { .. }
+            | Record::Disarmed { .. }
+            | Record::Heard { .. }
+            | Record::Woken { .. } => self.wakes.apply(record).map_err(invalid)?,
             Record::Stored { key, value } => {
                 self.dead.remove(key);
                 self.stored.insert(key.clone(), value.clone());
@@ -1981,6 +2042,12 @@ impl Fold {
                 turn: call.turn.clone(),
             })?;
         }
+        for (key, hold) in &self.holds {
+            take(Record::Hold {
+                hold: hold.clone(),
+                key: key.clone(),
+            })?;
+        }
         for ((session, cell), updates) in self.cells.iter().filter(|_| owned) {
             for (position, update) in updates.iter().enumerate() {
                 take(Record::Cell {
@@ -1997,6 +2064,7 @@ impl Fold {
                 value: value.clone(),
             })?;
         }
+        self.wakes.records(&mut take)?;
         for event in self.events.iter().filter(|event| event.seq >= keep) {
             take(Record::Event {
                 at: event.at,

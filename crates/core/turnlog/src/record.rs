@@ -2,7 +2,7 @@ use nanocode_durability_core::StoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::EffectClass;
+use crate::{EffectClass, Hold, Wake};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,6 +50,11 @@ pub enum Record {
         prompt: Box<RawValue>,
         turn: String,
     },
+    Armed {
+        generation: u64,
+        key: String,
+        wake: Wake,
+    },
     Call {
         call_id: String,
         effect: EffectClass,
@@ -68,11 +73,20 @@ pub enum Record {
         revision: u64,
         state: String,
     },
+    Disarmed {
+        generation: u64,
+        key: String,
+    },
     Event {
         at: u64,
         event: Box<RawValue>,
         seq: u64,
         turn: Option<String>,
+    },
+    Fired {
+        generation: u64,
+        key: String,
+        turn: String,
     },
     Floor {
         seq: u64,
@@ -83,6 +97,15 @@ pub enum Record {
     },
     Groups {
         groups: Vec<(u64, u64, u64)>,
+    },
+    Heard {
+        event: Box<RawValue>,
+        generation: u64,
+        key: String,
+    },
+    Hold {
+        hold: Hold,
+        key: String,
     },
     Host {
         key: String,
@@ -144,6 +167,9 @@ pub enum Record {
     Stored {
         key: String,
         value: String,
+    },
+    Woken {
+        generation: u64,
     },
 }
 

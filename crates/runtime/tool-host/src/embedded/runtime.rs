@@ -138,6 +138,11 @@ impl EmbeddedToolRuntime {
                 model_visible: registered.exposure.unwrap_or_else(|| tools.exposure())
                     != ToolExposure::Hidden,
             }));
+        if let Some(holds) = tools.holds() {
+            for tool in &mut self.local {
+                tool.handler = holds.wrap(Arc::clone(&tool.handler));
+            }
+        }
         self
     }
 

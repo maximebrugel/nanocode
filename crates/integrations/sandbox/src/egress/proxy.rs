@@ -284,17 +284,17 @@ impl<A: Authority> Proxy<A> {
         ))
     }
 
-    fn secrets<'a>(&self, client: &'a Client, host: &str) -> Vec<&'a Secret> {
+    fn secrets<'a>(&self, client: &'a Client, host: &str, path: &str) -> Vec<&'a Secret> {
         match self.rules.injecting {
-            Injecting::Swap { .. } => client.bound(host),
-            Injecting::Set => client.set(host),
+            Injecting::Swap { .. } => client.bound(host, path),
+            Injecting::Set => client.set(host, path),
         }
     }
 
     fn intercepts(&self, client: &Client, host: &str, port: u16) -> bool {
         let bound = match self.rules.injecting {
             Injecting::Swap { .. } => client.pattern(host).is_some(),
-            Injecting::Set => !client.set(host).is_empty(),
+            Injecting::Set => client.sets_any(host),
         };
         let passthrough = self
             .rules
@@ -516,17 +516,15 @@ impl<A: Authority> Proxy<A> {
             Verdict::Unreachable => return Err(self.unreachable()),
         };
         let (upgrade, mut request) = outgoing(request)?;
-        let headers = &mut request.headers;
-        headers.insert(
+        request.headers.insert(
             header::ACCEPT_ENCODING,
             HeaderValue::from_static("identity"),
         );
         let injecting = self.rules.injecting;
-        let bound = self.secrets(&client, host);
-        let written = redact::inject(headers, &bound, injecting);
-        let pairs = redact::redactions(&bound, &written, injecting);
+        let bound = self.secrets(&client, host, &request.target);
+        let pairs = redact::substitute(&mut request.headers, &bound, injecting);
         if let Ok(value) = HeaderValue::try_from(host) {
-            headers.insert(header::HOST, value);
+            request.headers.insert(header::HOST, value);
         }
         let stream = self.dial(host, port).await?;
         let name = ServerName::try_from(host.to_owned())

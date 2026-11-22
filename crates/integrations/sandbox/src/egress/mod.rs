@@ -7,6 +7,7 @@ mod lookup;
 mod proxy;
 mod redact;
 mod sandbox;
+pub mod sim;
 mod tls;
 mod wire;
 
@@ -22,10 +23,10 @@ pub use nanocode_sync::pipe;
 pub use proxy::{
     Dial, Dialing, Identity, Limits, Proxy, Reach, Resolving, Rules, Slot, Texts, Upstream,
 };
-pub use redact::{Injecting, Masker, Redactions, mask, masks};
+pub use redact::{Injecting, Masker, Redactions, mask, masks, substitute};
 pub use sandbox::{Allowlist, Egress};
 pub use tls::{BadCa, Leaves, Lifetime, Tls};
 pub use wire::{
-    Ca, Called, Calls, Credential, Grant, Report, Secret, binds, framing, normalize_hosts,
-    valid_header, valid_host,
+    Ca, Called, Calls, Credential, EXACT_PATH, Grant, Report, Secret, binds, framing,
+    normalize_hosts, path_reached, valid_header, valid_host,
 };

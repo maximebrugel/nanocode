@@ -347,6 +347,10 @@ default_table='
 1 canary_plog_snapshot_skipped canary:50 --scenario plog --mutation snapshot_skipped
 1 canary_plog_prune_ignores_cursors canary:400 --scenario plog --mutation prune_ignores_cursors
 1 canary_plog_lost_ack_rejected canary:100 --scenario plog --mutation lost_ack_rejected
+8 secrets pass --scenario secrets
+2 secrets_twice pass --scenario secrets --twice
+1 canary_secrets_paths_ignored canary:20 --scenario secrets --mutation paths_ignored
+1 canary_secrets_debug_shows_value canary:20 --scenario secrets --mutation debug_shows_value
 8 live pass --scenario live
 2 live_twice pass --scenario live --twice
 1 canary_live_settle_drops_deletes canary:20 --scenario live --mutation settle_drops_deletes

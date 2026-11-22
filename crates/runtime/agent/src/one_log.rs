@@ -37,6 +37,10 @@ use crate::{
     turn_log::{EventLog, Logged, Recording, TurnLog},
 };
 
+mod import;
+
+pub use import::{Imported, sim as import_sim};
+
 const TOOLS_MARK: &str = "$nanocode_tools";
 const STORED_MARK: &str = "$nanocode_stored";
 

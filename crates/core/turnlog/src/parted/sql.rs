@@ -25,7 +25,7 @@ use crate::host::{
 pub const CHANNEL: &str = "nanocode_log";
 
 const PREPARE_PG: [&str; 9] = [
-    "SELECT pg_advisory_xact_lock(7_061_636_192)",
+    "SELECT CAST(pg_advisory_xact_lock(7_061_636_192) AS TEXT)",
     "CREATE SEQUENCE IF NOT EXISTS nanocode_log_pos",
     "CREATE TABLE IF NOT EXISTS nanocode_log_fence (part INTEGER PRIMARY KEY, epoch BIGINT NOT NULL DEFAULT 0, holder TEXT, expires_ms BIGINT NOT NULL DEFAULT 0)",
     "CREATE TABLE IF NOT EXISTS nanocode_log_cursor (part INTEGER NOT NULL, reader TEXT NOT NULL, pos BIGINT NOT NULL, PRIMARY KEY (part, reader))",

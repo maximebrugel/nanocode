@@ -24,6 +24,7 @@ pub struct WorldCounts {
     pub child_crashes: u64,
     pub child_model_calls: u64,
     pub hedges: u64,
+    pub reconciles: u64,
 }
 
 #[derive(Default)]

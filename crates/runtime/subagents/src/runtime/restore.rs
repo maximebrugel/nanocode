@@ -1,4 +1,5 @@
 use super::*;
+use nanocode_board::sim::{Mutation, mutated};
 
 pub async fn resumable_sessions(
     journal: &nanocode_agent_core::backend::ChildJournal,
@@ -369,11 +370,12 @@ pub(super) fn restore_inner<'a>(
         let registry = reg.shared();
         let root = root_session_id.to_owned();
         let records_sessions = store.records_sessions();
-        let (report, restored_sessions, written) = reg
+        let (report, restored_sessions, waited, written) = reg
             .state
             .call(move |state| -> std::io::Result<_> {
                 let root_session_id = root.as_str();
                 let mut report = RestoreReport::default();
+                let mut waited = Vec::new();
                 let mut checkpoints = Vec::new();
                 if state
                     .scopes
@@ -424,6 +426,9 @@ pub(super) fn restore_inner<'a>(
                         (None, None) => {}
                     }
                     restored_sessions.push(session.descriptor.session_id.clone());
+                    if mutated(Mutation::RestoredWaitsReported) {
+                        waited.extend(handed_out(root_session_id, id, &session));
+                    }
                     if matches!(session.stored_runtime, StoredRuntime::Unstarted(_)) {
                         report.unstarted.push(id);
                     }
@@ -470,7 +475,7 @@ pub(super) fn restore_inner<'a>(
                         });
                     }
                 }
-                Ok((report, restored_sessions, written))
+                Ok((report, restored_sessions, waited, written))
             })
             .await?;
         if let Some(written) = written {
@@ -484,6 +489,10 @@ pub(super) fn restore_inner<'a>(
                 roots.insert(session_id.clone(), root_session_id.to_owned());
             }
         });
+        if !waited.is_empty() {
+            reg.wait_reported
+                .update(|reported| reported.extend(waited.iter().cloned()));
+        }
 
         if !report.interrupted.is_empty() || !report.completed.is_empty() {
             reg.save_scope(root_session_id).await.map_err(|error| {
@@ -663,4 +672,17 @@ pub(super) fn await_restored<'a>(
         }
         Ok(())
     })
+}
+
+fn handed_out<'a>(
+    root_session_id: &'a str,
+    id: AgentId,
+    session: &'a ChildSession,
+) -> impl Iterator<Item = ((String, AgentId), u64)> + 'a {
+    let unread = session.completion.revision().is_some() && session.status.wakes_parent();
+    session
+        .waited
+        .iter()
+        .filter(move |waited| !(unread && waited.session == root_session_id))
+        .map(move |waited| ((waited.session.clone(), id), waited.mark))
 }

@@ -16,6 +16,9 @@ const DURABLE_MARK: &str = "\"durable\":true";
 const RECEIPT_MARK: &str = "\"accepted\":true";
 const REMINDER_LEAD: &str = "Before finishing, call `submit_result`";
 const RUNNING_MARK: &str = "Script running with cell ID ";
+const INTERRUPTED_MARK: &str = "Tool execution interrupted by a host crash";
+const RECONCILE_LEAD: &str = "const listed = await tools.list_agents({ include_completed: true });";
+const OUTPUTS: &str = "const outputs = waited.filter((r) => r.status === \"fulfilled\").flatMap((r) => (r.value.agents ?? []).map((agent) => agent.status?.output).filter((output) => output !== undefined));";
 pub const EFFECTS_MAX: u64 = 2;
 pub const CHILDREN_MAX: u64 = 3;
 pub const WAIT_YIELD_MS: u64 = 30_000;
@@ -123,6 +126,7 @@ struct Conversation {
     steps: u64,
     running_cell: Option<String>,
     reminded: bool,
+    interrupted: bool,
     prefix: u64,
 }
 
@@ -170,6 +174,10 @@ fn read(messages: &[Value]) -> Option<Conversation> {
                     blocks.iter().any(|block| {
                         block.get("type").and_then(Value::as_str) == Some("tool_use")
                             && block.get("name").and_then(Value::as_str) == Some("exec")
+                            && !block
+                                .pointer("/input/code")
+                                .and_then(Value::as_str)
+                                .is_some_and(|code| code.starts_with(RECONCILE_LEAD))
                     })
                 })
         })
@@ -188,6 +196,8 @@ fn read(messages: &[Value]) -> Option<Conversation> {
         && text_of(last.get("content").unwrap_or(&Value::Null))
             .trim_start()
             .starts_with(REMINDER_LEAD);
+    let interrupted = (last.get("role").and_then(Value::as_str) == Some("user"))
+        && text_of(last.get("content").unwrap_or(&Value::Null)).contains(INTERRUPTED_MARK);
     let prefix = messages.iter().fold(FNV_OFFSET, |hash, message| {
         fnv(hash, canonical(message).to_string().as_bytes())
     });
@@ -196,6 +206,7 @@ fn read(messages: &[Value]) -> Option<Conversation> {
         steps: u64::try_from(steps).expect("a step count fits in u64"),
         running_cell,
         reminded,
+        interrupted,
         prefix,
     })
 }
@@ -244,7 +255,7 @@ fn code(action: &Action, label: &str) -> String {
             json!(keys)
         ),
         Action::Spawn(tasks) => format!(
-            "const settled = await Promise.allSettled({}.map((task) => tools.spawn_agent({{ role: \"worker\", task, harness: null, model: null, thinking: null, reasoning_mode: null, output_contract: {{ kind: \"string\" }} }})));\nconst ids = settled.filter((r) => r.status === \"fulfilled\").map((r) => r.value.agent_id);\nconst waited = await Promise.allSettled(ids.map((id) => tools.wait_agent({{ agent_ids: [id], timeout_ms: {WAIT_AGENT_TIMEOUT_MS} }})));\ntext(\"spawned \" + ids.length + \" waited \" + waited.filter((r) => r.status === \"fulfilled\").length);",
+            "const settled = await Promise.allSettled({}.map((task) => tools.spawn_agent({{ role: \"worker\", task, harness: null, model: null, thinking: null, reasoning_mode: null, output_contract: {{ kind: \"string\" }} }})));\nconst ids = settled.filter((r) => r.status === \"fulfilled\").map((r) => r.value.agent_id);\nconst waited = await Promise.allSettled(ids.map((id) => tools.wait_agent({{ agent_ids: [id], timeout_ms: {WAIT_AGENT_TIMEOUT_MS} }})));\n{OUTPUTS}\ntext(\"spawned \" + ids.length + \" waited \" + waited.filter((r) => r.status === \"fulfilled\").length + \" outputs \" + JSON.stringify(outputs));",
             json!(tasks)
         ),
         Action::Message => format!(
@@ -254,6 +265,24 @@ fn code(action: &Action, label: &str) -> String {
             "const result = await tools.submit_result({{ output: \"{label} done\" }});\ntext(JSON.stringify(result));"
         ),
     }
+}
+
+fn reconcile() -> String {
+    format!(
+        "{RECONCILE_LEAD}\nconst ids = (listed.agents ?? []).filter((agent) => agent.parent_agent_id == null).map((agent) => agent.agent_id);\nconst waited = await Promise.allSettled(ids.map((id) => tools.wait_agent({{ agent_ids: [id], timeout_ms: {WAIT_AGENT_TIMEOUT_MS} }})));\n{OUTPUTS}\ntext(\"reconciled \" + ids.length + \" outputs \" + JSON.stringify(outputs));"
+    )
+}
+
+fn children_of(actions: &[Action]) -> Vec<String> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Spawn(tasks) => Some(tasks),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|task| word_after(task, CHILD_MARK).map(str::to_owned))
+        .collect()
 }
 
 pub(crate) fn events(
@@ -491,6 +520,26 @@ impl ModelServer {
         }
     }
 
+    fn check_delivered(&self, label: &str, turn: u64, messages: &[Value]) {
+        let texts: Vec<String> = messages
+            .iter()
+            .filter(|message| role(message) == Some("user"))
+            .map(|message| text_of(message.get("content").unwrap_or(&Value::Null)))
+            .collect();
+        let agent = Agent::Root {
+            label: label.to_owned(),
+            turn,
+        };
+        for child in children_of(&plan(self.seed, &agent)) {
+            let output = format!("{child} done");
+            if self.world.receipted(&child) && !texts.iter().any(|text| text.contains(&output)) {
+                self.world.wrong(format!(
+                    "child_result_undelivered: {label} turn {turn} answered while its child {child} had finished and its result never reached {label}"
+                ));
+            }
+        }
+    }
+
     fn drop_cancelled_prompts(&self, label: &str, messages: &mut [Value]) {
         for cancelled in self.world.cancelled_turns(label) {
             let prompt = root_prompt(label, cancelled);
@@ -572,6 +621,11 @@ impl ModelServer {
         }
         let id = format!("{:016x}", fnv(conversation.prefix, label.as_bytes()));
         let (block, delta, stop, message) = self.decide(&conversation, &id);
+        if let Agent::Root { turn, .. } = conversation.agent
+            && stop == "end_turn"
+        {
+            self.check_delivered(&label, turn, &messages);
+        }
         self.world.sent(&label, message_digest(&label, &message));
         self.world.trace(&format!(
             "model {label} steps {} -> {}",
@@ -604,6 +658,17 @@ impl ModelServer {
         }
         let actions = plan(self.seed, &conversation.agent);
         let step = usize::try_from(conversation.steps).expect("a step count fits in usize");
+        if conversation.interrupted
+            && matches!(conversation.agent, Agent::Root { .. })
+            && actions
+                .iter()
+                .take(step)
+                .any(|action| matches!(action, Action::Spawn(_)))
+        {
+            self.world.count(|counts| counts.reconciles += 1);
+            let input = json!({"code": reconcile()});
+            return tool_use(&tool_id, "exec", &input);
+        }
         if let Some(action) = actions.get(step) {
             match action {
                 Action::Spawn(tasks) => self.world.count(|counts| {

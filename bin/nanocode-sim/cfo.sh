@@ -166,6 +166,8 @@ default_table='
 1 canary_child_forgets_notice canary:100 --scenario runtime --children remote --mutation child-forgets-notice
 1 canary_child_respawns_fresh canary:400 --scenario runtime --children remote --mutation child-respawns-fresh
 1 canary_child_settles_lazily canary:100 --scenario runtime --children remote --mutation child-settles-lazily
+4 runtime_kv_no_continuation pass --scenario runtime --store kv --no-continuation
+1 canary_restored_waits_reported canary:400 --scenario runtime --store kv --no-continuation --mutation restored-waits-reported
 1 canary_hands_ack_before_store canary:100 --scenario hands --mutation ack_before_store
 1 canary_hands_skip_record canary:200 --scenario hands --mutation skip_record
 1 canary_hands_forget_pending canary:200 --scenario hands --mutation forget_pending

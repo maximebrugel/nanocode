@@ -134,6 +134,7 @@ pub struct WholeOptions {
     pub child_mutation: ChildMutation,
     pub store_mutation: Mutation,
     pub deferred_start: bool,
+    pub continuation: bool,
 }
 
 impl Default for WholeOptions {
@@ -148,6 +149,7 @@ impl Default for WholeOptions {
             child_mutation: ChildMutation::None,
             store_mutation: Mutation::None,
             deferred_start: false,
+            continuation: true,
         }
     }
 }
@@ -179,6 +181,7 @@ struct Shape {
     children: ChildMode,
     child_faults: ChildFaults,
     lost_acks: u64,
+    continuation: bool,
 }
 
 const LOST_ACK_PPM_MAX: u64 = 150_000;
@@ -239,12 +242,13 @@ impl Shape {
                 }
                 _ => 0,
             },
+            continuation: options.continuation,
         }
     }
 
     fn describe(&self) -> String {
         format!(
-            "scenario=runtime wire={} children={} stop={:?} stop_after_ms={} resident<={:?} roots={} turns={} store={} crashes_ms={:?} lost_acks_ppm={} calm_network={} cancel_turn={:?}{}",
+            "scenario=runtime wire={} children={} stop={:?} stop_after_ms={} resident<={:?} roots={} turns={} store={} crashes_ms={:?} lost_acks_ppm={} calm_network={} cancel_turn={:?}{}{}",
             self.wire.name(),
             self.children.name(),
             self.stop,
@@ -263,6 +267,11 @@ impl Shape {
                 WireKind::Http => self.http_faults.calm(),
             },
             self.cancel_turn,
+            if self.continuation {
+                ""
+            } else {
+                " continuation=false"
+            },
             match self.children {
                 ChildMode::Local => String::new(),
                 ChildMode::Remote => format!(
@@ -310,6 +319,7 @@ impl WholeStats {
         self.world.child_crashes += other.world.child_crashes;
         self.world.child_model_calls += other.world.child_model_calls;
         self.world.hedges += other.world.hedges;
+        self.world.reconciles += other.world.reconciles;
     }
 }
 
@@ -579,6 +589,7 @@ fn runtime(
     claude: ClaudeClient,
     world: &Arc<World>,
     children: Option<&Arc<SimChildren>>,
+    continuation: bool,
 ) -> Result<Nanocode, String> {
     let hedging = Arc::new(nanocode::hedge::Hedging::new(
         nanocode::hedge::HedgePolicy::DEFAULT,
@@ -592,6 +603,11 @@ fn runtime(
         .thinking(Thinking::Low)
         .workspace(PathBuf::from("/nonexistent/nanocode-sim"))
         .durability(store);
+    let builder = if continuation {
+        builder
+    } else {
+        builder.without_subagent_continuation()
+    };
     let builder = match crate::boardagents::plane() {
         Some(plane) => builder.subagent_coordination(plane),
         None => builder,
@@ -1089,6 +1105,7 @@ async fn verify(
         claude(wire)?,
         world,
         children.as_ref(),
+        shape.continuation,
     )?;
     let mut agents = Vec::new();
     for root in 0..shape.roots {
@@ -1170,6 +1187,7 @@ async fn epoch(
         model,
         world,
         children.as_ref(),
+        shape.continuation,
     )?;
     if let (Some(control), Some(resident_max)) = (runtime.subagents(), shape.hibernation) {
         control.set_hibernation(true);
@@ -1220,6 +1238,9 @@ fn drop_spawned() {
 pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
     if options.mutation == WireMutation::ReopenForgetsAgents {
         nanocode_board::sim::mutate(nanocode_board::sim::Mutation::ReopenForgetsAgents);
+    }
+    if options.mutation == WireMutation::RestoredWaitsReported {
+        nanocode_board::sim::mutate(nanocode_board::sim::Mutation::RestoredWaitsReported);
     }
     let shape = Shape::of(seed, options);
     if std::env::var_os("NANOCODE_SIM_POLLS").is_some() {

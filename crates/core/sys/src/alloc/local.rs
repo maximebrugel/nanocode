@@ -673,6 +673,31 @@ mod collect_tests {
 
     use super::{Exit, State};
 
+    /// A page of a class past one slice's blocks is at least 128 KiB, and every long-lived thread keeps one queue head
+    /// per class it used: an empty head of such a class goes back at the owner's next collection instead of staying
+    /// allocated for as long as the thread lives (a busy server kept ~14 empty heads per big class, a third of its page overhead).
+    #[test]
+    fn an_owners_collection_retires_an_empty_head_page_of_a_multi_slice_class() {
+        let _alone = super::super::HEAP_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = State::new();
+        let big = Layout::from_size_align(100 << 10, 8).unwrap();
+        let small = Layout::from_size_align(64, 8).unwrap();
+        let kept = unsafe { owner.allocate(small, Exit::Unwatched) };
+        let block = unsafe { owner.allocate(big, Exit::Unwatched) };
+        unsafe { owner.deallocate(block) };
+        assert_eq!(owner.census().pages, 2, "an emptied head page stays queued until a collection");
+        owner.collect_all(super::Heads::Kept);
+        assert_eq!(
+            owner.census().pages,
+            1,
+            "the collection retires the empty multi-slice head and keeps the one-slice head that holds a block"
+        );
+        unsafe { owner.deallocate(kept) };
+        owner.abandon();
+    }
+
     /// Blocks another thread freed wait on their pages until the owner collects them: the owner's own new pages
     /// must collect them within COLLECT_PAGES_MAX, however many pages it holds, or they stay allocated forever.
     #[test]

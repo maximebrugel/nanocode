@@ -13,6 +13,7 @@ pub mod deadline;
 pub mod effects;
 pub mod embedded;
 mod function_tool;
+pub mod hold;
 
 pub trait ToolRecovery: Send + Sync + 'static {
     fn recover<'a>(

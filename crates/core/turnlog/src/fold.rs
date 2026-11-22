@@ -8,7 +8,7 @@ use std::{
 use nanocode_durability_core::{EncodedPayload, StoreError};
 use serde_json::value::RawValue;
 
-use crate::{EffectClass, Outcome, Record, Status};
+use crate::{ArmedWake, EffectClass, Outcome, Record, Status, Wakes};
 
 #[derive(Clone, Debug)]
 pub struct Checkpoint {
@@ -184,6 +184,7 @@ pub struct Fold {
     seq: u64,
     stored: BTreeMap<String, String>,
     turns: Vec<Turn>,
+    wakes: Wakes,
 }
 
 #[derive(serde::Deserialize)]
@@ -1460,6 +1461,15 @@ impl Fold {
     }
 
     #[must_use]
+    pub const fn wakes(&self) -> &Wakes {
+        &self.wakes
+    }
+
+    pub(crate) fn restore_wake(&mut self, key: &str, held: Option<ArmedWake>) {
+        self.wakes.restore(key, held);
+    }
+
+    #[must_use]
     pub fn host(&self, key: &str) -> Option<&RawValue> {
         self.hosts.get(key).map(AsRef::as_ref)
     }
@@ -1763,6 +1773,18 @@ impl Fold {
                 });
             }
             Record::Status { status, turn } => self.status(turn, status)?,
+            Record::Fired { key, turn, .. } => {
+                if self.turn(turn).is_none() {
+                    return Err(invalid(format!(
+                        "wake {key} fired turn {turn}, which the log did not admit"
+                    )));
+                }
+                self.wakes.apply(record).map_err(invalid)?;
+            }
+            Record::Armed { .. }
+            | Record::Disarmed { .. }
+            | Record::Heard { .. }
+            | Record::Woken { .. } => self.wakes.apply(record).map_err(invalid)?,
             Record::Stored { key, value } => {
                 self.dead.remove(key);
                 self.stored.insert(key.clone(), value.clone());
@@ -1997,6 +2019,7 @@ impl Fold {
                 value: value.clone(),
             })?;
         }
+        self.wakes.records(&mut take)?;
         for event in self.events.iter().filter(|event| event.seq >= keep) {
             take(Record::Event {
                 at: event.at,

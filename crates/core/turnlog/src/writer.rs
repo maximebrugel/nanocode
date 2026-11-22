@@ -1432,6 +1432,18 @@ impl Lease<'_> {
         writer.fold.unadmit(turn, seq);
     }
 
+    pub fn unwake(&mut self, key: &str, held: Option<crate::ArmedWake>) {
+        let writer = &mut *self.writer;
+        writer.buffer.retain(|record| match record {
+            Record::Armed { key: buffered, .. }
+            | Record::Disarmed { key: buffered, .. }
+            | Record::Fired { key: buffered, .. }
+            | Record::Heard { key: buffered, .. } => buffered != key,
+            _ => true,
+        });
+        writer.fold.restore_wake(key, held);
+    }
+
     #[must_use]
     pub fn floor_pending(&self) -> bool {
         self.writer.floor.is_some()

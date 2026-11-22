@@ -37,6 +37,10 @@ use crate::{
     turn_log::{EventLog, Logged, Recording, TurnLog},
 };
 
+mod wakes;
+
+pub use wakes::{Fire, Heard, WakeError};
+
 const TOOLS_MARK: &str = "$nanocode_tools";
 const STORED_MARK: &str = "$nanocode_stored";
 

@@ -148,7 +148,7 @@ pub fn session_store<S: durability::StateStore + 'static>(
 }
 
 pub mod turnlog {
-    pub use nanocode_agent::{OneLog, OneLogJournals, OneLogStore, Policy};
+    pub use nanocode_agent::{Fire, Heard, OneLog, OneLogJournals, OneLogStore, Policy, WakeError};
     pub use nanocode_tool_runtime::effects::{EffectCall, EffectGate};
     pub use nanocode_turnlog::*;
 

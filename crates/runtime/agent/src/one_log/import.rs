@@ -12,10 +12,17 @@ pub mod sim {
         None,
         HeldSkipsCommit,
         ReimportAdvances,
+        ExportSkipsCommit,
+        ExportSkipsKeys,
     }
 
     impl Mutation {
-        pub const ALL: [Self; 2] = [Self::HeldSkipsCommit, Self::ReimportAdvances];
+        pub const ALL: [Self; 4] = [
+            Self::HeldSkipsCommit,
+            Self::ReimportAdvances,
+            Self::ExportSkipsCommit,
+            Self::ExportSkipsKeys,
+        ];
 
         #[must_use]
         pub const fn name(self) -> &'static str {
@@ -23,6 +30,8 @@ pub mod sim {
                 Self::None => "none",
                 Self::HeldSkipsCommit => "held_skips_commit",
                 Self::ReimportAdvances => "reimport_advances",
+                Self::ExportSkipsCommit => "export_skips_commit",
+                Self::ExportSkipsKeys => "export_skips_keys",
             }
         }
 
@@ -64,10 +73,7 @@ impl OneLog {
                 "state {state_id} is imported at revision 0, which holds no checkpoint"
             )));
         }
-        if self
-            .owners
-            .read(|owners| owners.get(state_id).is_some())
-        {
+        if self.owners.read(|owners| owners.get(state_id).is_some()) {
             return Err(StoreError::Fenced);
         }
         let mut lease = self.log.lease().await;
@@ -124,7 +130,10 @@ impl OneLog {
             })?;
         }
         let owed = lease.buffered() > 0;
-        assert!(!pushed || owed, "an import that pushed records has them buffered");
+        assert!(
+            !pushed || owed,
+            "an import that pushed records has them buffered"
+        );
         if owed && (pushed || !sim::mutated(sim::Mutation::HeldSkipsCommit)) {
             lease.commit(Point::Progress).await?;
         }

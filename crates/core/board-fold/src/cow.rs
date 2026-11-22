@@ -15,6 +15,10 @@ use std::{
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// The zstd level a chunk's encoding is packed at: the fastest, as a checkpoint packs only the
+/// chunks written since the last one.
+const PACK_LEVEL: i32 = 1;
+
 /// The most entries a chunk holds before it splits in two.
 pub const CHUNK: usize = 32;
 
@@ -453,8 +457,8 @@ impl<K: Serialize, V: Serialize> Serialize for CowMap<K, V> {
 
 impl<'de, K, V> Deserialize<'de> for CowMap<K, V>
 where
-    K: Deserialize<'de> + Ord + Clone,
-    V: Deserialize<'de> + Clone,
+    K: serde::de::DeserializeOwned + Ord + Clone,
+    V: serde::de::DeserializeOwned + Clone,
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if is_chunked() {
@@ -599,7 +603,7 @@ impl<T: Serialize> Serialize for CowSet<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de> + Ord + Clone> Deserialize<'de> for CowSet<T> {
+impl<'de, T: serde::de::DeserializeOwned + Ord + Clone> Deserialize<'de> for CowSet<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if is_chunked() {
             return CowMap::deserialize(deserializer).map(Self);
@@ -777,7 +781,7 @@ impl<T: Serialize> Serialize for CowVec<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de> + Clone> Deserialize<'de> for CowVec<T> {
+impl<'de, T: serde::de::DeserializeOwned + Clone> Deserialize<'de> for CowVec<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if is_chunked() {
             // Every chunk but the last is full, as push leaves them, so an index maps to its
@@ -821,7 +825,10 @@ fn blob<T: Serialize>(chunk: &Chunk<T>) -> Result<Arc<[u8]>, crate::compact::Err
     if let Some(encoded) = chunk.encoded.get() {
         return Ok(Arc::clone(encoded));
     }
-    let encoded: Arc<[u8]> = crate::compact::encode(&chunk.items)?.into();
+    let plain = crate::compact::encode(&chunk.items)?;
+    let encoded: Arc<[u8]> = nanocode_zstd::compress(&plain, PACK_LEVEL)
+        .map_err(|error| crate::compact::Error::from(error.to_string()))?
+        .into();
     let _ = chunk.encoded.set(Arc::clone(&encoded));
     Ok(encoded)
 }
@@ -871,13 +878,19 @@ impl<'de> Deserialize<'de> for Borrowed<'de> {
 }
 
 /// Decodes chunk blobs into chunks that keep their blob as their cached encoding.
-fn deserialize_chunks<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+fn deserialize_chunks<'de, T: serde::de::DeserializeOwned, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<Arc<Chunk<T>>>, D::Error> {
     Vec::<Borrowed<'de>>::deserialize(deserializer)?
         .into_iter()
         .map(|Borrowed(bytes)| {
-            let items: Vec<T> = crate::compact::decode(bytes).map_err(serde::de::Error::custom)?;
+            let mut decoder = nanocode_zstd::StreamingDecoder::default();
+            decoder
+                .push(bytes)
+                .and_then(|()| decoder.finish())
+                .map_err(serde::de::Error::custom)?;
+            let plain = decoder.take_output();
+            let items: Vec<T> = crate::compact::decode_owned(&plain).map_err(serde::de::Error::custom)?;
             let chunk = Chunk::new(items);
             let _ = chunk.encoded.set(Arc::from(bytes));
             Ok(Arc::new(chunk))
@@ -890,27 +903,28 @@ fn deserialize_chunks<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
 /// for a Cow map inside a compact snapshot, as its chunk blobs.
 pub trait Pairs<K, V>: Sized {
     fn serialize_pairs<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;
-    fn deserialize_pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>
-    where
-        K: Deserialize<'de>,
-        V: Deserialize<'de>;
+    fn deserialize_pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>;
 }
 
-impl<K: Serialize + Ord, V: Serialize> Pairs<K, V> for std::collections::BTreeMap<K, V> {
+impl<K, V> Pairs<K, V> for std::collections::BTreeMap<K, V>
+where
+    K: Serialize + serde::de::DeserializeOwned + Ord,
+    V: Serialize + serde::de::DeserializeOwned,
+{
     fn serialize_pairs<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self)
     }
 
-    fn deserialize_pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>
-    where
-        K: Deserialize<'de>,
-        V: Deserialize<'de>,
-    {
+    fn deserialize_pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Vec::<(K, V)>::deserialize(deserializer).map(|pairs| pairs.into_iter().collect())
     }
 }
 
-impl<K: Serialize + Ord + Clone, V: Serialize + Clone> Pairs<K, V> for CowMap<K, V> {
+impl<K, V> Pairs<K, V> for CowMap<K, V>
+where
+    K: Serialize + serde::de::DeserializeOwned + Ord + Clone,
+    V: Serialize + serde::de::DeserializeOwned + Clone,
+{
     fn serialize_pairs<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if is_chunked() {
             serialize_chunks(&self.chunks, serializer)
@@ -919,11 +933,7 @@ impl<K: Serialize + Ord + Clone, V: Serialize + Clone> Pairs<K, V> for CowMap<K,
         }
     }
 
-    fn deserialize_pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>
-    where
-        K: Deserialize<'de>,
-        V: Deserialize<'de>,
-    {
+    fn deserialize_pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if is_chunked() {
             let chunks = deserialize_chunks(deserializer)?;
             let len = chunks.iter().map(|chunk| chunk.items.len()).sum();

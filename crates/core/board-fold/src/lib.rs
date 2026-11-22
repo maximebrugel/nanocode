@@ -1318,7 +1318,7 @@ impl Pending {
 }
 
 pub(crate) mod pairs {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
 
     use crate::cow::Pairs;
 
@@ -1332,8 +1332,6 @@ pub(crate) mod pairs {
     pub fn deserialize<'de, M, K, V, D>(deserializer: D) -> Result<M, D::Error>
     where
         M: Pairs<K, V>,
-        K: Deserialize<'de>,
-        V: Deserialize<'de>,
         D: Deserializer<'de>,
     {
         M::deserialize_pairs(deserializer)

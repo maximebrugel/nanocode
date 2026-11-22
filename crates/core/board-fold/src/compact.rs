@@ -308,6 +308,17 @@ pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
     Ok(writer.out)
 }
 
+/// Decodes a value that borrows nothing from `input`.
+pub fn decode_owned<T: de::DeserializeOwned>(input: &[u8]) -> Result<T, Error> {
+    decode(input)
+}
+
+impl From<String> for Error {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
+
 pub fn decode<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T, Error> {
     let mut reader = Reader::new(input);
     let value = T::deserialize(&mut reader)?;

@@ -71,7 +71,12 @@ fn row_hash(body: &str) -> u64 {
 
 /// A checkpoint of a fold whose last row, the one before its next seq, has the body `last_body`.
 pub fn encode(fold: &Fold, last_body: &str) -> StoredCheckpoint {
-    let snapshot = fold.snapshot();
+    encode_spread(fold, last_body, crate::Spread::for_fold(fold))
+}
+
+/// [`encode`] with the fold's sections encoded inline or on threads of their own.
+pub fn encode_spread(fold: &Fold, last_body: &str, spread: crate::Spread) -> StoredCheckpoint {
+    let snapshot = fold.snapshot_spread(spread);
     let mut body = format!("{:016x}:", row_hash(last_body));
     STANDARD_NO_PAD.encode_string(snapshot, &mut body);
     StoredCheckpoint {
@@ -222,6 +227,9 @@ impl Board {
     }
 }
 
+/// Held while a save encodes, so the process's boards encode one checkpoint at a time.
+static ENCODING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What a board's saves share with it: whether one runs, and whether the host keeps none.
 #[derive(Default)]
 pub(crate) struct Saver {
@@ -277,7 +285,14 @@ async fn save(host: Arc<dyn LogHost>, scope: String, fold: Fold, saving: Saving)
     let Some((_, body)) = last.into_iter().find(|(seq, _)| *seq == next - 1) else {
         return;
     };
-    let Some(mut saved) = off_thread(move || encode(&fold, &body)).await else {
+    // One save encodes at a time in the process, on one thread: the boards' commits keep the
+    // rest of the host's cores.
+    let Some(mut saved) = off_thread(move || {
+        let _one = ENCODING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        encode_spread(&fold, &body, crate::Spread::Inline)
+    })
+    .await
+    else {
         return;
     };
     if mutated(Mutation::CheckpointAhead) {

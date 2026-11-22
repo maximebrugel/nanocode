@@ -486,6 +486,7 @@ dependencies = [
  "nanocode-durability-core",
  "nanocode-machine",
  "nanocode-schema",
+ "nanocode-zstd",
  "serde",
  "serde_json",
 ]

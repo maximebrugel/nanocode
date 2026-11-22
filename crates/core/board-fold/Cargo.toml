@@ -17,6 +17,7 @@ nanocode-machine.workspace = true
 nanocode-schema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+nanocode-zstd.workspace = true
 
 [lints]
 workspace = true

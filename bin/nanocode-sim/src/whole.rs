@@ -1217,6 +1217,12 @@ fn drop_spawned() {
     }
 }
 
+/// The most a seed loses of its journal head writes (each lands while its writer sees an
+/// error). Drawn per seed from 0 up to every write: a lost cell or subagent head followed by a
+/// crash is what the journal canaries need, and failed turns barely move with it (1328 to 1334
+/// of 14376 over 4800 seeds against a 6% cap).
+const JOURNAL_LOST_PPM_MAX: u64 = 1_000_000;
+
 pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
     if options.mutation == WireMutation::ReopenForgetsAgents {
         nanocode_board::sim::mutate(nanocode_board::sim::Mutation::ReopenForgetsAgents);
@@ -1286,7 +1292,7 @@ pub fn simulate(seed: u64, options: WholeOptions) -> WholeOutcome {
             );
             // Journal heads that land while their writer sees an error are the
             // only store fault here: the runtime must read the head back.
-            let lost = Rng::derive(seed, "whole journal lost").range(0, 60_000);
+            let lost = Rng::derive(seed, "whole journal lost").range(0, JOURNAL_LOST_PPM_MAX);
             kv.with(|kv| kv.journal_lost_ppm = lost);
             kv
         }),

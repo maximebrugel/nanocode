@@ -303,8 +303,8 @@ default_table='
 1 canary_board_fenced_unsettled canary:40 --scenario board --mutation fenced_unsettled
 1 canary_runtime_kv_power_loss_drops_acked canary:100 --scenario runtime --store kv --mutation power_loss_drops_acked
 1 canary_runtime_kv_power_loss_drops_acceptance canary:100 --scenario runtime --store kv --mutation power_loss_drops_acceptance
-1 canary_runtime_kv_subagent_journal_keeps_revision canary:100 --scenario runtime --store kv --mutation subagent_journal_keeps_revision
-1 canary_runtime_kv_cell_journal_keeps_head canary:100 --scenario runtime --store kv --mutation cell_journal_keeps_head
+1 canary_runtime_kv_subagent_journal_keeps_revision canary:100:31 --scenario runtime --store kv --mutation subagent_journal_keeps_revision
+1 canary_runtime_kv_cell_journal_keeps_head canary:200:17 --scenario runtime --store kv --mutation cell_journal_keeps_head
 1 canary_runtime_kv_record_insert_drops canary:100 --scenario runtime --store kv --mutation record_insert_drops
 1 canary_capture_redact_then_trim canary:4000 --scenario capture --mutation redact_then_trim
 8 cell_calls pass --scenario cell_calls

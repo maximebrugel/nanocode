@@ -358,6 +358,9 @@ impl State {
         self.slices_dirty.set(0);
     }
 
+    /// Collects every queued page and retires the empty ones: every one when the heap is given up, else all but the
+    /// one-slice queue heads (an empty head past one slice is 128 KiB or more that a long-lived thread would keep for
+    /// as long as it lives; the next block of its class carves a new page).
     fn collect_all(&self, heads: Heads) {
         self.pages_since_collect.set(0);
         for class in 0..CLASSES {
@@ -367,7 +370,9 @@ impl State {
                     let next = (*page).next.get();
                     (*page).collect();
                     if (*page).used.get() == 0
-                        && (heads == Heads::Retired || self.heads[class].get() != page)
+                        && (heads == Heads::Retired
+                            || self.heads[class].get() != page
+                            || (*page).span.get() > 1)
                     {
                         self.retire(page);
                     }

@@ -367,6 +367,10 @@ default_table='
 1 canary_imports_reimport_advances canary:100 --scenario imports --mutation reimport_advances
 1 canary_imports_export_skips_commit canary:100 --scenario imports --mutation export_skips_commit
 1 canary_imports_export_skips_keys canary:100 --scenario imports --mutation export_skips_keys
+8 secrets pass --scenario secrets
+2 secrets_twice pass --scenario secrets --twice
+1 canary_secrets_paths_ignored canary:20 --scenario secrets --mutation paths_ignored
+1 canary_secrets_debug_shows_value canary:20 --scenario secrets --mutation debug_shows_value
 8 live pass --scenario live
 2 live_twice pass --scenario live --twice
 1 canary_live_settle_drops_deletes canary:20 --scenario live --mutation settle_drops_deletes

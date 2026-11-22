@@ -45,22 +45,17 @@ impl Client {
     }
 
     #[must_use]
-    pub fn bound(&self, host: &str) -> Vec<&Secret> {
-        self.grant
-            .secrets
-            .iter()
-            .filter(|secret| secret.injects(host))
-            .collect()
+    pub fn bound(&self, host: &str, path: &str) -> Vec<&Secret> {
+        self.grant.bound(host, path)
     }
 
     #[must_use]
-    pub fn set(&self, host: &str) -> Vec<&Secret> {
-        self.grant
-            .secrets
-            .iter()
-            .filter(|secret| secret.sets(host))
-            .take(1)
-            .collect()
+    pub fn set(&self, host: &str, path: &str) -> Vec<&Secret> {
+        self.grant.set(host, path)
+    }
+
+    pub(crate) fn sets_any(&self, host: &str) -> bool {
+        self.grant.secrets.iter().any(|secret| secret.sets(host))
     }
 }
 

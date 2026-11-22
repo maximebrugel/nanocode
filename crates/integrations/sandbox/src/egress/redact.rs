@@ -193,6 +193,12 @@ impl Error for Failed {
     }
 }
 
+#[must_use]
+pub fn substitute(headers: &mut HeaderMap, secrets: &[&Secret], injecting: Injecting) -> Redactions {
+    let written = inject(headers, secrets, injecting);
+    redactions(secrets, &written, injecting)
+}
+
 pub(crate) fn inject(
     headers: &mut HeaderMap,
     secrets: &[&Secret],

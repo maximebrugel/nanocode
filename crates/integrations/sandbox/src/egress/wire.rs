@@ -25,17 +25,88 @@ pub struct Grant {
     pub secrets: Vec<Secret>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Secret {
     pub header: String,
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     pub placeholder: String,
     pub value: String,
 }
 
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = if crate::egress::sim::mutated(crate::egress::sim::Mutation::DebugShowsValue) {
+            self.value.as_str()
+        } else {
+            "<redacted>"
+        };
+        formatter
+            .debug_struct("Secret")
+            .field("header", &self.header)
+            .field("hosts", &self.hosts)
+            .field("name", &self.name)
+            .field("paths", &self.paths)
+            .field("placeholder", &self.placeholder)
+            .field("value", &value)
+            .finish()
+    }
+}
+
+pub const EXACT_PATH: &str = "$";
+
+#[must_use]
+pub fn path_reached(paths: &[String], path: &str) -> bool {
+    if paths.is_empty() || crate::egress::sim::mutated(crate::egress::sim::Mutation::PathsIgnored)
+    {
+        return true;
+    }
+    let path = path.to_ascii_lowercase();
+    paths.iter().any(|prefix| {
+        let prefix = prefix.to_ascii_lowercase();
+        if let Some(exact) = prefix.strip_suffix(EXACT_PATH) {
+            return path
+                .strip_prefix(exact)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'));
+        }
+        path.strip_prefix(prefix.as_str()).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with('/')
+                || rest.starts_with('?')
+                || rest.starts_with(".git/")
+                || rest == ".git"
+        })
+    })
+}
+
+impl Grant {
+    #[must_use]
+    pub fn bound(&self, host: &str, path: &str) -> Vec<&Secret> {
+        self.secrets
+            .iter()
+            .filter(|secret| secret.injects(host) && secret.reaches(path))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn set(&self, host: &str, path: &str) -> Vec<&Secret> {
+        self.secrets
+            .iter()
+            .filter(|secret| secret.sets(host) && secret.reaches(path))
+            .take(1)
+            .collect()
+    }
+}
+
 impl Secret {
+    #[must_use]
+    pub fn reaches(&self, path: &str) -> bool {
+        path_reached(&self.paths, path)
+    }
+
     #[must_use]
     pub fn binds(&self, host: &str) -> Option<&str> {
         self.hosts

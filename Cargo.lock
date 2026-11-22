@@ -1188,6 +1188,7 @@ dependencies = [
  "nanocode-process",
  "nanocode-process-contracts",
  "nanocode-python",
+ "nanocode-python-data",
  "nanocode-repo-cache",
  "nanocode-sandbox",
  "nanocode-shell",

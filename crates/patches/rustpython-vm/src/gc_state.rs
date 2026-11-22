@@ -489,6 +489,7 @@ impl GcState {
         let Some(_guard) = self.collecting.try_lock() else {
             return CollectResult::default();
         };
+        let keeps_leftover_bits = crate::sim::mutated(crate::sim::Mutation::KeepsLeftoverBits);
 
         // A busy collector must not consume another interpreter's request.
         // Clear only after acquiring the lock, before callbacks can request
@@ -570,7 +571,7 @@ impl GcState {
                     if !obj.is_gc_collecting() {
                         obj.start_gc_refs(strong_count);
                         candidate_ptrs.push(GcPtr(NonNull::from(obj)));
-                    } else {
+                    } else if !keeps_leftover_bits {
                         already_collecting.push(GcPtr(NonNull::from(obj)));
                     }
                 }
@@ -602,7 +603,7 @@ impl GcState {
         // no header leaves this pass still claiming a count or an index.
         let mut clear_on_unwind = ClearOnUnwind {
             ptrs: &candidate_ptrs,
-            armed: true,
+            armed: !keeps_leftover_bits,
         };
 
         // A full collection is the only one that sees every generation, so it
@@ -681,6 +682,8 @@ impl GcState {
             referent_ranges.push((start, end));
         }
 
+        crate::sim::unwind_if_asked();
+
         if let Some(holds) = HOST_HOLDS.get() {
             (holds.visit)(&mut |held| {
                 let held = unsafe { held.as_ref() };
@@ -735,8 +738,8 @@ impl GcState {
                         let child_idx = child.gc_refs() as usize;
                         // Only an index this pass wrote names this child: any
                         // other value is a header this pass does not own.
-                        if child_idx < candidates
-                            && candidate_ptrs[child_idx].0 == child_ptr
+                        if (keeps_leftover_bits
+                            || (child_idx < candidates && candidate_ptrs[child_idx].0 == child_ptr))
                             && !reached[child_idx]
                         {
                             reached[child_idx] = true;

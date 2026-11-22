@@ -51,6 +51,7 @@ nanocode-cost-fold.workspace = true
 nanocode-hands.workspace = true
 nanocode-workspace.workspace = true
 nanocode-python.workspace = true
+nanocode-python-data.workspace = true
 nanocode-board-sync.workspace = true
 nanocode-machine.workspace = true
 nanocode-dispatch.workspace = true

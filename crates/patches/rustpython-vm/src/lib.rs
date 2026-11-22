@@ -81,6 +81,7 @@ pub mod recursion;
 pub mod scope;
 pub mod sequence;
 pub mod signal;
+pub mod sim;
 pub mod sliceable;
 pub mod sorting;
 pub mod stdlib;

@@ -23,6 +23,7 @@ mod drive;
 mod egress;
 mod executor;
 mod faults;
+mod gcunwind;
 mod gitremote;
 mod handauto;
 mod handrouter;
@@ -82,6 +83,7 @@ use crate::{
     controlplane::{ControlplaneMutation, ControlplaneStats},
     cost::{CostMutation, CostStats},
     dispatcher::{DispatcherMutation, DispatcherStats},
+    gcunwind::{GcUnwindMutation, GcUnwindStats},
     gitremote::{GitRemoteMutation, GitRemoteStats},
     handauto::{HandAutoMutation, HandAutoStats},
     handrouter::{HandRouterMutation, HandRouterStats},
@@ -161,6 +163,7 @@ enum Scenario {
     Scale,
     HandAuto,
     NestedMeta,
+    GcUnwind,
 }
 
 struct Args {
@@ -210,6 +213,7 @@ struct Args {
     scale: ScaleConfig,
     hand_auto: HandAutoMutation,
     nested_meta: NestedMetaMutation,
+    gc_unwind: GcUnwindMutation,
     #[cfg(unix)]
     alloc: alloc::AllocMutation,
     #[cfg(unix)]
@@ -224,7 +228,7 @@ type Caught = BTreeMap<Invariant, (u64, u64, (u64, u64))>;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|scale] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
+        "usage: nanocode-sim --tidy | --mutations | (--seed S | --seeds A..B) [--scenario store|agents|turns|runtime|websocket|http_server|alloc|egress|mpp|sync|streams|hands|cell_calls|long_thread|request_close|inbox_stress|capture|executor|dns|board|board_shards|controlplane|cost|plog|hand_router|workspace_host|board_sync|dispatcher|board_steer|board_brief|workspace_fs|repo_cache|workspace_sql|git_remote|workspace_stack|workspace_crash|live|partitions|scale|gc_unwind] [--ops N] [--twice] [--seed-lines] [--jobs N] [--mutation {}] [--records content|slots] [--verbose]\n       turns: [--mutation {}] [--without {}]... [--live-seqs temporary|floor|gap|reuse] [--calm] [--policy reference|turnlog] [--row-limit BYTES] [--reopen-row-limit BYTES] [--long TURNS] [--snapshot-ratio K] [--snapshot-rows N] [--takeover] [--retain TURNS] [--state-bytes N] [--event-bytes N] [--owners N]\n       runtime: [--store memory|kv|log] [--deferred-start] [--calm] [--wire transport|http] [--children local|remote] [--mutation {}|{}]\n       agents: [--mutation {}]
        websocket: [--mutation {}]
        http_server: [--mutation {}]
        alloc: [--mutation overstate_size|forget_free|scribble]
@@ -255,7 +259,8 @@ fn usage() -> ExitCode {
        partitions: [--mutation {}]
        scale: [--load uniform|skewed] [--nodes 1,2,..,10] [--mutation {}]
        hand_auto: [--mutation {}]
-       nested_meta: [--mutation {}]",
+       nested_meta: [--mutation {}]
+       gc_unwind: [--mutation {}]",
         Mutation::names(),
         TurnMutation::names(),
         onelog::PROTECTIONS.join("|"),
@@ -288,7 +293,8 @@ fn usage() -> ExitCode {
         PartitionsMutation::names(),
         ScaleMutation::names(),
         HandAutoMutation::names(),
-        NestedMetaMutation::names()
+        NestedMetaMutation::names(),
+        GcUnwindMutation::names()
     );
     ExitCode::from(2)
 }
@@ -367,6 +373,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut scale = ScaleConfig::default();
     let mut hand_auto = HandAutoMutation::None;
     let mut nested_meta = NestedMetaMutation::None;
+    let mut gc_unwind = GcUnwindMutation::None;
     #[cfg(unix)]
     let mut capture = capture::CaptureMutation::None;
     #[cfg(target_os = "linux")]
@@ -461,6 +468,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
                     "scale" => Scenario::Scale,
                     "hand_auto" => Scenario::HandAuto,
                     "nested_meta" => Scenario::NestedMeta,
+                    "gc_unwind" => Scenario::GcUnwind,
                     #[cfg(unix)]
                     "capture" => Scenario::Capture,
                     #[cfg(target_os = "linux")]
@@ -535,6 +543,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         }
         (Scenario::HandAuto, Some(name)) => hand_auto = HandAutoMutation::parse(name)?,
         (Scenario::NestedMeta, Some(name)) => nested_meta = NestedMetaMutation::parse(name)?,
+        (Scenario::GcUnwind, Some(name)) => gc_unwind = GcUnwindMutation::parse(name)?,
         #[cfg(unix)]
         (Scenario::Capture, Some(name)) => capture = capture::CaptureMutation::parse(name)?,
         #[cfg(not(unix))]
@@ -606,6 +615,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         scale,
         hand_auto,
         nested_meta,
+        gc_unwind,
         #[cfg(unix)]
         alloc,
         #[cfg(unix)]
@@ -722,6 +732,9 @@ fn scenario_replay(seed: u64, args: &Args) -> String {
     }
     if args.scenario == Scenario::NestedMeta {
         return nestedmeta::replay(seed, args.nested_meta);
+    }
+    if args.scenario == Scenario::GcUnwind {
+        return gcunwind::replay(seed, args.gc_unwind);
     }
     if args.scenario == Scenario::BoardSync {
         return board_sync::replay(seed, args.board_sync);
@@ -1099,6 +1112,7 @@ fn mutations() -> ExitCode {
     add("scale", ScaleMutation::names());
     add("hand_auto", HandAutoMutation::names());
     add("nested_meta", NestedMetaMutation::names());
+    add("gc_unwind", GcUnwindMutation::names());
     #[cfg(unix)]
     {
         add("alloc", alloc::AllocMutation::names());
@@ -1171,6 +1185,7 @@ struct Totals {
     scale_totals: ScaleStats,
     hand_auto_totals: HandAutoStats,
     nested_meta_totals: NestedMetaStats,
+    gc_unwind_totals: GcUnwindStats,
     #[cfg(unix)]
     capture_totals: capture::CaptureStats,
     #[cfg(target_os = "linux")]
@@ -1222,6 +1237,7 @@ impl Totals {
         self.scale_totals.add(&other.scale_totals);
         self.hand_auto_totals.add(&other.hand_auto_totals);
         self.nested_meta_totals.add(&other.nested_meta_totals);
+        self.gc_unwind_totals.add(&other.gc_unwind_totals);
         #[cfg(unix)]
         self.capture_totals.add(&other.capture_totals);
         #[cfg(target_os = "linux")]
@@ -1485,6 +1501,13 @@ fn judge_one(seed: u64, args: &Args, totals: &mut Totals, caught: &mut Caught) -
             args.options.verbose,
             &mut totals.nested_meta_totals,
         ),
+        Scenario::GcUnwind => gcunwind::judge(
+            seed,
+            args.gc_unwind,
+            args.twice,
+            args.options.verbose,
+            &mut totals.gc_unwind_totals,
+        ),
         #[cfg(unix)]
         Scenario::Capture => capture::judge(
             seed,
@@ -1684,6 +1707,7 @@ fn main() -> ExitCode {
             && args.workspace_crash != WorkspaceCrashMutation::None)
         || (args.scenario == Scenario::HandAuto && args.hand_auto != HandAutoMutation::None)
         || (args.scenario == Scenario::NestedMeta && args.nested_meta != NestedMetaMutation::None)
+        || (args.scenario == Scenario::GcUnwind && args.gc_unwind != GcUnwindMutation::None)
         || alloc_experiment(&args);
     let (mut passed, mut failed) = (0_u64, 0_u64);
     let mut all = Totals::default();
@@ -1692,13 +1716,18 @@ fn main() -> ExitCode {
         || experiment
         || matches!(
             args.scenario,
-            Scenario::Executor | Scenario::Alloc | Scenario::Runtime | Scenario::Controlplane
+            Scenario::Executor
+                | Scenario::Alloc
+                | Scenario::Runtime
+                | Scenario::Controlplane
+                | Scenario::GcUnwind
         ) {
         // Mutations flip process-wide switches, the executor and alloc scenarios measure the
         // process itself, and runtime drives the whole runtime, whose ID counters are
         // process-wide and shift its schedules when seeds share a process, so those runs keep
         // to one seed at a time. Controlplane prints a SCORE line with wall-clock rates from
-        // inside each seed, so it keeps one too.
+        // inside each seed, so it keeps one too. Python's collector is process-wide and a
+        // collection skips while another holds it, so gc_unwind keeps one too.
         1
     } else {
         args.jobs
@@ -1763,6 +1792,7 @@ fn main() -> ExitCode {
         scale_totals,
         hand_auto_totals,
         nested_meta_totals,
+        gc_unwind_totals,
         #[cfg(unix)]
         capture_totals,
         #[cfg(target_os = "linux")]
@@ -2064,6 +2094,16 @@ fn main() -> ExitCode {
             args.twice,
             args.nested_meta,
             &nested_meta_totals,
+        );
+    }
+    if args.scenario == Scenario::GcUnwind {
+        return gcunwind::report(
+            &args.seeds,
+            passed,
+            failed,
+            args.twice,
+            args.gc_unwind,
+            &gc_unwind_totals,
         );
     }
     if args.scenario == Scenario::Executor {

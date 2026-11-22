@@ -331,7 +331,33 @@ pub fn decode<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T, Error> {
 #[derive(Default)]
 struct Writer {
     out: Vec<u8>,
-    shared: HashMap<Box<str>, u64>,
+    shared: HashMap<Box<str>, u64, std::hash::BuildHasherDefault<Fx>>,
+}
+
+/// FxHash: the string-sharing table hashes every short string a snapshot writes, and SipHash's
+/// resistance to chosen keys buys nothing for a fold the board wrote itself.
+#[derive(Default)]
+struct Fx(u64);
+
+impl std::hash::Hasher for Fx {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let (words, rest) = bytes.as_chunks::<8>();
+        for word in words {
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(K);
+        }
+        for &byte in rest {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(byte)).wrapping_mul(K);
+        }
+    }
+
+    fn write_u8(&mut self, byte: u8) {
+        self.write(&[byte]);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl Writer {

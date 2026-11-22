@@ -227,6 +227,9 @@ impl Board {
     }
 }
 
+/// How many times its own encode time a save holds the encoder idle after it.
+const ENCODE_REST: u32 = 3;
+
 /// Held while a save encodes, so the process's boards encode one checkpoint at a time.
 static ENCODING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -285,11 +288,19 @@ async fn save(host: Arc<dyn LogHost>, scope: String, fold: Fold, saving: Saving)
     let Some((_, body)) = last.into_iter().find(|(seq, _)| *seq == next - 1) else {
         return;
     };
-    // One save encodes at a time in the process, on one thread: the boards' commits keep the
-    // rest of the host's cores.
+    // One save encodes at a time in the process, on one thread, and the next waits
+    // ENCODE_REST times as long as this one took: checkpoints use at most 1 / (1 + ENCODE_REST)
+    // of one core, and the boards' commits keep the rest.
     let Some(mut saved) = off_thread(move || {
-        let _one = ENCODING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        encode_spread(&fold, &body, crate::Spread::Inline)
+        let _one = ENCODING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = std::time::Instant::now();
+        let saved = encode_spread(&fold, &body, crate::Spread::Inline);
+        if nanocode_platform::host().is_none() {
+            std::thread::sleep(started.elapsed() * ENCODE_REST);
+        }
+        saved
     })
     .await
     else {

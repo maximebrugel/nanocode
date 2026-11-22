@@ -890,7 +890,8 @@ fn deserialize_chunks<'de, T: serde::de::DeserializeOwned, D: Deserializer<'de>>
                 .and_then(|()| decoder.finish())
                 .map_err(serde::de::Error::custom)?;
             let plain = decoder.take_output();
-            let items: Vec<T> = crate::compact::decode_owned(&plain).map_err(serde::de::Error::custom)?;
+            let items: Vec<T> =
+                crate::compact::decode_owned(&plain).map_err(serde::de::Error::custom)?;
             let chunk = Chunk::new(items);
             let _ = chunk.encoded.set(Arc::from(bytes));
             Ok(Arc::new(chunk))

@@ -535,6 +535,15 @@ impl ToolRegistry {
         })
     }
 
+    pub(super) fn hold(&mut self, holds: &crate::hold::Holds) {
+        for tool in &mut self.ordered {
+            *tool = holds.wrap(Arc::clone(tool));
+        }
+        for provider in &mut self.providers {
+            *provider = holds.wrap_provider(Arc::clone(provider));
+        }
+    }
+
     pub(super) fn without_escalation(&mut self) {
         for (tool, definition) in self.ordered.iter_mut().zip(&mut self.definitions) {
             *tool = crate::escalation::Unescalated::wrap(Arc::clone(tool));

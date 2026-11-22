@@ -657,6 +657,9 @@ impl NativeToolRuntime {
             tools.process_route_store.clone(),
             tools.runner_pool.as_ref(),
         );
+        if let Some(holds) = tools.holds() {
+            registry.hold(&holds);
+        }
         if tools.without_escalation {
             registry.without_escalation();
         }

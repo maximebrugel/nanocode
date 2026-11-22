@@ -18,6 +18,9 @@ const COLLECT_LIVE_DIVISOR: usize = 4;
 /// many pages it holds: COLLECT_LIVE_DIVISOR alone let a thread holding N pages leave remote frees uncollected
 /// (allocated, unusable) for N / 4 new pages, which on a long-lived thread holding gigabytes is never.
 const COLLECT_PAGES_MAX: usize = 256;
+/// An empty queue head whose page spans at least this many slices (512 KiB) goes back at a collection; a smaller one
+/// stays for the next block of its class, since retiring it can purge memory that is about to be reused.
+const HEAD_RETIRE_SLICES_MIN: usize = 8;
 const DIRTY_SLICES_MAX: usize = 4;
 const SHRINK_IN_PLACE_DIVISOR: usize = 2;
 
@@ -359,8 +362,8 @@ impl State {
     }
 
     /// Collects every queued page and retires the empty ones: every one when the heap is given up, else all but the
-    /// one-slice queue heads (an empty head past one slice is 128 KiB or more that a long-lived thread would keep for
-    /// as long as it lives; the next block of its class carves a new page).
+    /// queue heads under HEAD_RETIRE_SLICES_MIN slices (an empty head of 512 KiB or more is memory a long-lived thread
+    /// would keep for as long as it lives; the next block of its class carves a new page).
     fn collect_all(&self, heads: Heads) {
         self.pages_since_collect.set(0);
         for class in 0..CLASSES {
@@ -372,7 +375,7 @@ impl State {
                     if (*page).used.get() == 0
                         && (heads == Heads::Retired
                             || self.heads[class].get() != page
-                            || (*page).span.get() > 1)
+                            || (*page).span.get() >= HEAD_RETIRE_SLICES_MIN)
                     {
                         self.retire(page);
                     }
@@ -678,11 +681,11 @@ mod collect_tests {
 
     use super::{Exit, State};
 
-    /// A page of a class past one slice's blocks is at least 128 KiB, and every long-lived thread keeps one queue head
+    /// A big class's page is 512 KiB or more, and every long-lived thread keeps one queue head
     /// per class it used: an empty head of such a class goes back at the owner's next collection instead of staying
     /// allocated for as long as the thread lives (a busy server kept ~14 empty heads per big class, a third of its page overhead).
     #[test]
-    fn an_owners_collection_retires_an_empty_head_page_of_a_multi_slice_class() {
+    fn an_owners_collection_retires_an_empty_head_page_of_a_big_class() {
         let _alone = super::super::HEAP_TESTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -692,12 +695,16 @@ mod collect_tests {
         let kept = unsafe { owner.allocate(small, Exit::Unwatched) };
         let block = unsafe { owner.allocate(big, Exit::Unwatched) };
         unsafe { owner.deallocate(block) };
-        assert_eq!(owner.census().pages, 2, "an emptied head page stays queued until a collection");
+        assert_eq!(
+            owner.census().pages,
+            2,
+            "an emptied head page stays queued until a collection"
+        );
         owner.collect_all(super::Heads::Kept);
         assert_eq!(
             owner.census().pages,
             1,
-            "the collection retires the empty multi-slice head and keeps the one-slice head that holds a block"
+            "the collection retires the empty big-class head and keeps the one-slice head that holds a block"
         );
         unsafe { owner.deallocate(kept) };
         owner.abandon();

@@ -12,10 +12,17 @@ pub mod sim {
         None,
         HeldSkipsCommit,
         ReimportAdvances,
+        ExportSkipsCommit,
+        ExportSkipsKeys,
     }
 
     impl Mutation {
-        pub const ALL: [Self; 2] = [Self::HeldSkipsCommit, Self::ReimportAdvances];
+        pub const ALL: [Self; 4] = [
+            Self::HeldSkipsCommit,
+            Self::ReimportAdvances,
+            Self::ExportSkipsCommit,
+            Self::ExportSkipsKeys,
+        ];
 
         #[must_use]
         pub const fn name(self) -> &'static str {
@@ -23,6 +30,8 @@ pub mod sim {
                 Self::None => "none",
                 Self::HeldSkipsCommit => "held_skips_commit",
                 Self::ReimportAdvances => "reimport_advances",
+                Self::ExportSkipsCommit => "export_skips_commit",
+                Self::ExportSkipsKeys => "export_skips_keys",
             }
         }
 

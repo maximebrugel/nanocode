@@ -39,9 +39,11 @@ use crate::{
     turn_log::{EventLog, Logged, Recording, TurnLog},
 };
 
+mod export;
 mod import;
 mod wakes;
 
+pub use export::Exported;
 pub use import::{Imported, sim as import_sim};
 pub use wakes::{Fire, Heard, WakeError};
 
@@ -1743,6 +1745,22 @@ impl StateStore for OneLogStore {
                         .collect()
                 })
                 .await)
+        })
+    }
+
+    fn list_records<'a>(
+        &'a mut self,
+        state_id: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<String>, StoreError>> {
+        Box::pin(async move {
+            self.0
+                .log
+                .read_owner(state_id, |fold| {
+                    export::records_of(fold, state_id)
+                        .map(|(key, _)| key.to_owned())
+                        .collect()
+                })
+                .await
         })
     }
 

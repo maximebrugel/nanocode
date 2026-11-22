@@ -9,7 +9,7 @@ use std::{
 };
 
 use nanocode::turnlog::{
-    Extension, Imported, LogHost, OneLog, Policy,
+    Exported, Extension, Imported, LogHost, OneLog, Policy,
     import_sim::{self, Mutation},
 };
 use nanocode_durability_core::{OwnerId, StateStore, StoreError, StoreFuture, StoreRecord};
@@ -23,7 +23,13 @@ use crate::{
 pub use import_sim::Mutation as ImportsMutation;
 
 const SCOPE: &str = "imports";
-const STATES: [&str; 5] = ["root", "root:child-a", "root:child-b", "other", "other:child"];
+const STATES: [&str; 5] = [
+    "root",
+    "root:child-a",
+    "root:child-b",
+    "other",
+    "other:child",
+];
 const OPS_MIN: u64 = 30;
 const OPS_MAX: u64 = 90;
 const REVISION_MAX: u64 = 400;
@@ -48,6 +54,8 @@ pub struct ImportsStats {
     pub held: u64,
     pub conflicts: u64,
     pub fenced: u64,
+    pub exports: u64,
+    pub copy_exports: u64,
     pub blips: u64,
     pub crashes: u64,
     pub sessions: u64,
@@ -60,6 +68,8 @@ impl ImportsStats {
         self.held += other.held;
         self.conflicts += other.conflicts;
         self.fenced += other.fenced;
+        self.exports += other.exports;
+        self.copy_exports += other.copy_exports;
         self.blips += other.blips;
         self.crashes += other.crashes;
         self.sessions += other.sessions;
@@ -221,6 +231,27 @@ impl State {
     }
 }
 
+impl From<Option<Exported>> for State {
+    fn from(exported: Option<Exported>) -> Self {
+        exported.map_or_else(
+            || Self {
+                revision: 0,
+                payload: String::new(),
+                records: BTreeMap::new(),
+            },
+            |exported| Self {
+                revision: exported.revision,
+                payload: exported.payload,
+                records: exported
+                    .records
+                    .into_iter()
+                    .map(|record| (record.key, record.value.to_string()))
+                    .collect(),
+            },
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kept {
     Imported,
@@ -288,7 +319,11 @@ impl Run {
     }
 
     fn keys(&self, state: &str) -> Vec<String> {
-        let mut keys = self.sources[state].records.keys().cloned().collect::<Vec<_>>();
+        let mut keys = self.sources[state]
+            .records
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         if let Some((kept, _)) = self.acknowledged.get(state) {
             keys.extend(kept.records.keys().cloned());
         }
@@ -361,12 +396,8 @@ impl Run {
         let owned = self.owned.contains(state);
         let blip = self.fault();
         self.attempted.insert(state.to_owned());
-        let result = ready(log.import_state(
-            state,
-            source.revision,
-            &source.payload,
-            &source.records(),
-        ));
+        let result =
+            ready(log.import_state(state, source.revision, &source.payload, &source.records()));
         self.host.doom.store(0, Ordering::SeqCst);
         let blipped = blip && !self.host.blip.swap(false, Ordering::SeqCst);
         self.trace(&format!("import {state} r{} {result:?}", source.revision));
@@ -376,9 +407,11 @@ impl Run {
                 Ok(())
             }
             (_, _, true) => Err(format!("import of {state} ran while a session owns it")),
-            (Err(StoreError::Conflict { expected, actual }), Some((held, Kept::Advanced)), false)
-                if expected == source.revision && actual == held.revision =>
-            {
+            (
+                Err(StoreError::Conflict { expected, actual }),
+                Some((held, Kept::Advanced)),
+                false,
+            ) if expected == source.revision && actual == held.revision => {
                 self.stats.conflicts += 1;
                 Ok(())
             }
@@ -399,9 +432,79 @@ impl Run {
                 source.revision, held.revision
             )),
             (Err(_), _, false) if self.host.dead.load(Ordering::SeqCst) => self.crash(),
+            (Err(_), _, false) if blipped && self.rng.below(2) == 0 => self.export(state, false),
             (Err(_), _, false) if blipped => Ok(()),
-            (Err(error), _, false) => Err(format!("import of {state} failed on a healthy host: {error}")),
+            (Err(error), _, false) => Err(format!(
+                "import of {state} failed on a healthy host: {error}"
+            )),
         }
+    }
+
+    fn export(&mut self, state: &str, copy: bool) -> Result<(), String> {
+        let (log, blip) = if copy {
+            let host: Arc<dyn LogHost> = Arc::new(self.host.copy());
+            let reader = ready(OneLog::open(host, SCOPE, self.policy.clone()))
+                .map_err(|error| format!("an exporting reader refused the log: {error}"))?;
+            (reader, false)
+        } else {
+            let log = self.open()?;
+            (log, self.fault())
+        };
+        let result = ready(log.export_state(state));
+        self.host.doom.store(0, Ordering::SeqCst);
+        let blipped = blip && !self.host.blip.swap(false, Ordering::SeqCst);
+        let shown = result
+            .as_ref()
+            .map(|exported| exported.as_ref().map(|exported| exported.revision));
+        self.trace(&format!("export {state} copy={copy} {shown:?}"));
+        let exported = match result {
+            Ok(exported) => State::from(exported),
+            Err(_) if !copy && self.host.dead.load(Ordering::SeqCst) => return self.crash(),
+            Err(_) if blipped => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "export of {state} failed on a healthy host: {error}"
+                ));
+            }
+        };
+        let mut listed = ready(log.store().list_records(state))
+            .map_err(|error| format!("list records of {state}: {error}"))?;
+        listed.sort();
+        if listed.iter().ne(exported.records.keys()) {
+            return Err(format!(
+                "{state} lists records {listed:?} but exports {:?}",
+                exported.records.keys().collect::<Vec<_>>()
+            ));
+        }
+        match self.acknowledged.get(state) {
+            Some((kept, _)) if exported != *kept => {
+                return Err(format!(
+                    "export of {state} at revision {} differs from the acknowledged revision {}",
+                    exported.revision, kept.revision
+                ));
+            }
+            Some(_) => {}
+            None if exported.revision == 0 => {}
+            None if self.attempted.contains(state) && exported == self.sources[state] => {}
+            None => {
+                return Err(format!(
+                    "export of {state} at revision {} that no import wrote",
+                    exported.revision
+                ));
+            }
+        }
+        self.stats.exports += 1;
+        if copy {
+            self.stats.copy_exports += 1;
+        }
+        if exported.revision == 0 {
+            return Ok(());
+        }
+        self.durable(state, &exported)?;
+        self.acknowledged
+            .entry(state.to_owned())
+            .or_insert((exported, Kept::Imported));
+        Ok(())
     }
 
     fn session(&mut self, state: &str) -> Result<(), String> {
@@ -428,7 +531,10 @@ impl Run {
             .map_err(|error| format!("replace {state}: {error}"))?;
         ready(store.flush()).map_err(|error| format!("flush {state}: {error}"))?;
         if revision != next.revision {
-            return Err(format!("a session advanced {state} to {revision}, not {}", next.revision));
+            return Err(format!(
+                "a session advanced {state} to {revision}, not {}",
+                next.revision
+            ));
         }
         self.stats.sessions += 1;
         self.trace(&format!("session {state} r{revision}"));
@@ -448,7 +554,11 @@ impl Run {
         let state = STATES[self.rng.pick(STATES.len())];
         match self.rng.below(10) {
             0 => self.session(state),
-            1 => {
+            1 | 2 => {
+                let copy = self.rng.below(2) == 0;
+                self.export(state, copy)
+            }
+            3 => {
                 self.log = None;
                 self.stats.crashes += 1;
                 self.trace("restart");
@@ -463,7 +573,12 @@ fn source(rng: &mut Rng, state: &str) -> State {
     let revision = rng.range(1, REVISION_MAX + 1);
     let pad = "x".repeat(usize::try_from(rng.below(PAYLOAD_PAD_MAX)).expect("a pad fits"));
     let records = (0..rng.below(RECORDS_MAX + 1))
-        .map(|index| (format!("record-{index}"), format!("{state}/{index}/{}", rng.below(1000))))
+        .map(|index| {
+            (
+                format!("record-{index}"),
+                format!("{state}/{index}/{}", rng.below(1000)),
+            )
+        })
         .collect();
     State {
         revision,
@@ -502,7 +617,9 @@ fn run(seed: u64, verbose: bool, stats: &mut ImportsStats) -> Result<u64, String
         },
         verbose,
     };
-    run.trace(&format!("seed {seed} ops={ops} snapshot_rows={snapshot_rows}"));
+    run.trace(&format!(
+        "seed {seed} ops={ops} snapshot_rows={snapshot_rows}"
+    ));
     let mut result = Ok(());
     for _ in 0..ops {
         result = run.step();

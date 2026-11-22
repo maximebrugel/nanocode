@@ -28,13 +28,15 @@ const MULTI_PPM: u64 = 300_000;
 const STALL: Duration = Duration::from_secs(1);
 const WATCH: Duration = Duration::from_millis(1);
 const ACK_WAIT: Duration = Duration::from_millis(10);
-const SLEEPERS_PPM: u64 = 500_000;
+const SLEEPERS_PPM: u64 = 1_000_000;
 const SLEEPERS_MIN: u64 = 4;
 const SLEEPERS_MAX: u64 = 12;
 const NAPS_MIN: u64 = 20;
 const NAPS_MAX: u64 = 160;
 const NAP_US_MIN: u64 = 50;
 const NAP_US_MAX: u64 = 1_000;
+const ROUNDS_MIN: u64 = 16;
+const ROUNDS_MAX: u64 = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Busy {
@@ -53,6 +55,7 @@ pub struct Threads {
 #[derive(Clone, Debug)]
 pub struct Sleepers {
     pub naps: Vec<Vec<u64>>,
+    pub rounds: u64,
 }
 
 pub fn sleepers_of(rng: &mut Rng) -> Option<Sleepers> {
@@ -67,7 +70,8 @@ pub fn sleepers_of(rng: &mut Rng) -> Option<Sleepers> {
         }
         naps.push(thread);
     }
-    Some(Sleepers { naps })
+    let rounds = rng.range(ROUNDS_MIN, ROUNDS_MAX);
+    Some(Sleepers { naps, rounds })
 }
 
 impl Sleepers {
@@ -77,7 +81,7 @@ impl Sleepers {
             .iter()
             .map(|naps| naps.len().to_string())
             .collect();
-        format!("sleepers=[{}]", naps.join(","))
+        format!("sleepers=[{}] rounds={}", naps.join(","), self.rounds)
     }
 
     fn total(&self) -> u64 {
@@ -409,7 +413,11 @@ pub struct Slept {
 
 pub fn sleepers(plan: &Sleepers) -> Slept {
     let progress = Arc::new(AtomicU64::new(0));
+    let arrived = Arc::new(AtomicU64::new(0));
+    let gave_up = Arc::new(AtomicBool::new(false));
     let total = plan.total();
+    let threads = u64::try_from(plan.naps.len()).expect("a thread count fits in 64 bits");
+    let rounds = plan.rounds;
     let mut stalled = None;
     std::thread::scope(|scope| {
         let sleepers: Vec<_> = plan
@@ -417,30 +425,54 @@ pub fn sleepers(plan: &Sleepers) -> Slept {
             .iter()
             .map(|naps| {
                 let progress = Arc::clone(&progress);
+                let arrived = Arc::clone(&arrived);
+                let gave_up = Arc::clone(&gave_up);
                 scope.spawn(move || {
-                    runtime(false).block_on(async {
-                        for nap in naps {
-                            nanocode_executor::sleep(Duration::from_micros(*nap)).await;
-                            progress.fetch_add(1, Ordering::SeqCst);
+                    let runtime = runtime(false);
+                    let count = u64::try_from(naps.len()).expect("a nap count fits in 64 bits");
+                    for round in 0..rounds {
+                        if gave_up.load(Ordering::SeqCst) {
+                            return;
                         }
-                    });
+                        let start = usize::try_from(count * round / rounds).expect("a nap index fits");
+                        let end = usize::try_from(count * (round + 1) / rounds).expect("a nap index fits");
+                        runtime.block_on(async {
+                            for nap in &naps[start..end] {
+                                nanocode_executor::sleep(Duration::from_micros(*nap)).await;
+                                progress.fetch_add(1, Ordering::SeqCst);
+                            }
+                        });
+                        arrived.fetch_add(1, Ordering::SeqCst);
+                        while arrived.load(Ordering::SeqCst) < threads * (round + 1)
+                            && !gave_up.load(Ordering::SeqCst)
+                        {
+                            std::thread::yield_now();
+                        }
+                    }
                 })
             })
             .collect();
-        let mut seen = 0;
+        let mut seen = (0, 0);
         let mut since = Instant::now();
         while sleepers.iter().any(|sleeper| !sleeper.is_finished()) {
             std::thread::sleep(WATCH);
-            let now = progress.load(Ordering::SeqCst);
+            let now = (
+                progress.load(Ordering::SeqCst),
+                arrived.load(Ordering::SeqCst),
+            );
             if now != seen {
                 seen = now;
                 since = Instant::now();
             } else if since.elapsed() >= STALL {
                 if stalled.is_none() {
                     stalled = Some(format!(
-                        "{} sleeping runtimes stalled for {STALL:?} after {now} of {total} naps: the reactor's driver was released to no waiting thread",
-                        plan.naps.len()
+                        "{} sleeping runtimes stalled for {STALL:?} after {} of {total} naps and {} of {} round ends: the reactor's driver was released to no waiting thread",
+                        plan.naps.len(),
+                        now.0,
+                        now.1,
+                        threads * rounds
                     ));
+                    gave_up.store(true, Ordering::SeqCst);
                 }
                 runtime(false).block_on(nanocode_executor::sleep(WATCH));
                 since = Instant::now();

@@ -209,6 +209,7 @@ default_table='
 1 canary_executor_leak_cancelled canary --scenario executor --mutation leak_cancelled
 1 canary_executor_uncounted_polls canary:100 --scenario executor --mutation uncounted_polls
 1 canary_executor_unchecked_drive canary:40 --scenario executor --mutation unchecked_drive
+1 canary_executor_stale_waiters canary:100:16 --scenario executor --mutation stale_waiters
 8 board pass --scenario board
 2 board_twice pass --scenario board --twice
 1 board_pinned_squatted_ids pass --scenario board --seed 1795147396000000556
@@ -506,7 +507,7 @@ known_failure() {
 run_job() {
   local at=$1 sha=$2 bin=$3 seed=$4 count=$5
   local name=${names[$at]} kind=${kinds[$at]} flags=${flags[$at]}
-  local end=$(( seed + count )) out started status wall ok passed failed message timed_out
+  local end=$(( seed + count )) out started status wall ok passed failed message timed_out caught=0 floor=1
   out=$(mktemp "$root/tmp/job.XXXXXX")
   started=$(now)
   timeout --verbose --signal=KILL "$job_secs_max" taskset -c "$fuzz_cpus" "$bin" --seeds "$seed..$end" $flags >"$out" 2>&1
@@ -533,10 +534,17 @@ run_job() {
   message=""
   case $kind in
     pass) [ "$status" -eq 0 ] && ok=true ;;
-    canary*) [ "$status" -eq 0 ] && grep -q '^MUTATION .* caught by' "$out" && ok=true ;;
+    canary*)
+      caught=$(sed -n 's/^MUTATION .* caught by \([0-9]*\) seeds.*/\1/p' "$out" | tail -1)
+      floor=1
+      case $kind in canary:*:*) floor=${kind##*:} ;; esac
+      [ "$status" -eq 0 ] && [ "${caught:-0}" -ge "$floor" ] && ok=true
+      ;;
   esac
   if [ "$timed_out" = true ]; then
     message="killed: timeout after ${job_secs_max}s"
+  elif [ "$ok" = false ] && [ "${caught:-0}" -gt 0 ]; then
+    message="MUTATION caught by $caught seeds, below the floor of $floor"
   elif [ "$ok" = false ]; then
     message=$(grep -m1 '^FAIL\|^MUTATION\|panicked\|^error' "$out")
     [ -z "$message" ] && message="exit $status: $(tail -3 "$out")"
@@ -605,7 +613,7 @@ run() {
       local count=${batch[$at]}
       case ${kinds[$at]} in
         canary) count=$canary_seeds ;;
-        canary:*) count=${kinds[$at]#canary:} ;;
+        canary:*) count=${kinds[$at]#canary:}; count=${count%%:*} ;;
       esac
       local seed
       seed=$(random_seed)

@@ -300,6 +300,9 @@ pub fn sim_jobs(
                 Some(budget) => (
                     Kind::Canary,
                     budget
+                        .split(':')
+                        .next()
+                        .unwrap_or(budget)
                         .parse()
                         .map_err(|_| TableError::Budget(row.join(" ")))?,
                 ),

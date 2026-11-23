@@ -382,3 +382,56 @@ async fn chained(
     }
     Ok(pages.into_iter().rev().flatten().collect())
 }
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn keys(log: &SequenceLog) -> Vec<String> {
+        log.frontier().map(|entry| entry.key().to_owned()).collect()
+    }
+
+    #[test]
+    fn resumed_sequence_log_matches_full_log() {
+        let items = (0..=300_u32)
+            .map(|item| EncodedPayload::encode(&format!("item {item}")).unwrap())
+            .collect::<Vec<_>>();
+        let mut full = SequenceLog::default();
+        let mut expected = vec![(
+            serde_json::to_string(&full.sequence()).unwrap(),
+            keys(&full),
+        )];
+        for item in &items {
+            full.push(item.clone()).unwrap();
+            expected.push((
+                serde_json::to_string(&full.sequence()).unwrap(),
+                keys(&full),
+            ));
+            assert_eq!(full.sequence().count(), Some(full.len()));
+        }
+        let mut head = SequenceLog::default();
+        for split in 0..=items.len() {
+            if split > 0 {
+                head.push(items[split - 1].clone()).unwrap();
+            }
+            let mut released = head.clone();
+            released.release();
+            let mut resumed = SequenceLog::resume(&released.sequence()).unwrap();
+            assert_eq!(resumed.len(), split, "split {split}");
+            assert_eq!(resumed.held(), keys(&resumed).len(), "split {split}");
+            for n in split..=items.len() {
+                if n > split {
+                    resumed.push(items[n - 1].clone()).unwrap();
+                }
+                assert_eq!(resumed.len(), n, "n {n} split {split}");
+                let (sequence, frontier) = &expected[n];
+                assert_eq!(
+                    &serde_json::to_string(&resumed.sequence()).unwrap(),
+                    sequence,
+                    "n {n} split {split}"
+                );
+                assert_eq!(&keys(&resumed), frontier, "n {n} split {split}");
+            }
+        }
+    }
+}

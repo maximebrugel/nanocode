@@ -2122,3 +2122,50 @@ mod scan_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod compacted_tests {
+    use super::*;
+
+    const KEY_BYTES: usize = 64;
+    const TURNS: usize = 500;
+    const PER_TURN: usize = 4;
+
+    fn compacted_message(turn: usize, index: usize) -> HistoryMessage {
+        HistoryMessage::from(Message::text(
+            Role::User,
+            format!("turn {turn} message {index} {}", "x".repeat(2048)),
+        ))
+    }
+
+    fn held_compacted_bytes(snapshot: &Snapshot, paging: &Paging) -> usize {
+        let tail = snapshot
+            .conversation
+            .compacted
+            .iter()
+            .map(|message| serde_json::to_string(message).unwrap().len())
+            .sum::<usize>();
+        tail + paging.compacted.log.items().len() * KEY_BYTES
+    }
+
+    #[test]
+    fn a_running_conversation_holds_only_its_unpersisted_compacted_tail() {
+        let mut paging = Paging::default();
+        let mut snapshot = Snapshot::default();
+        for turn in 0..TURNS {
+            for index in 0..PER_TURN {
+                snapshot
+                    .conversation
+                    .compacted
+                    .push(compacted_message(turn, index));
+            }
+            encode_snapshot(&mut snapshot, true, &mut paging).unwrap();
+            paging.committed();
+            let held = held_compacted_bytes(&snapshot, &paging);
+            assert!(
+                held <= 64 * 1024,
+                "turn {turn}: the conversation holds {held} bytes of compacted history"
+            );
+        }
+    }
+}

@@ -82,7 +82,7 @@ const KEPT_LABELS: [&str; 3] = ["root", "session", "agent"];
 /// The retention BoardCoordination::new gives the dispatcher's and the workers' folds: SETTLED_MAX settled tasks and
 /// ENTRIES_MAX entries, every gone id kept, so an evicted task's post is still refused and its labels still say whose
 /// it was.
-pub fn bounded() -> Retain {
+pub const fn bounded() -> Retain {
     Retain {
         settled: SETTLED_MAX,
         entries: ENTRIES_MAX,
@@ -638,7 +638,7 @@ impl Inner {
 }
 
 /// The phase a task the bounded fold evicted reads as: it settled before it left, and its result left with it.
-fn evicted_phase() -> Phase {
+const fn evicted_phase() -> Phase {
     Phase::Done {
         result: String::new(),
         worker: None,

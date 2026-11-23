@@ -1585,6 +1585,15 @@ impl Fold {
     }
 
     #[must_use]
+    pub fn stored_bytes(&self) -> usize {
+        self.stored
+            .iter()
+            .chain(&self.dead)
+            .map(|(key, value)| key.len() + value.len())
+            .sum()
+    }
+
+    #[must_use]
     pub fn stored(&self, key: &str) -> Option<&str> {
         self.stored
             .get(key)
@@ -2159,5 +2168,61 @@ fn retrying(retry: &Retry) -> Status {
         error: retry.error.clone(),
         kind: retry.kind.clone(),
         retry_at: retry.retry_at,
+    }
+}
+
+#[cfg(test)]
+mod stored_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn stored_bytes_counts_every_stored_record_once() {
+        let mut fold = Fold::default();
+        assert_eq!(fold.stored_bytes(), 0);
+        let stored = |key: &str, value: &str| Record::Stored {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
+        fold.apply(
+            &stored(
+                "state
+b3:a",
+                "1234",
+            ),
+            None,
+        )
+        .unwrap();
+        fold.apply(
+            &stored(
+                "state
+b3:b",
+                "12",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.stored_bytes(),
+            2 * "state
+b3:a"
+                .len()
+                + 6
+        );
+        fold.apply(
+            &stored(
+                "state
+b3:a",
+                "1",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.stored_bytes(),
+            2 * "state
+b3:a"
+                .len()
+                + 3
+        );
     }
 }

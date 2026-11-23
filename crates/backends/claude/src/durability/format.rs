@@ -358,26 +358,33 @@ pub(super) async fn hydrate_paged(
         .map(|(head, conversation, _)| (head, conversation))
 }
 
+fn take_compacted_pages(stored: &mut Value) -> Result<Option<Sequence>> {
+    stored
+        .pointer_mut("/conversation")
+        .and_then(Value::as_object_mut)
+        .and_then(|conversation| conversation.remove("compacted_pages"))
+        .map(|pages| serde_json::from_value(pages).map_err(Error::InvalidPayload))
+        .transpose()
+}
+
+fn splice_compacted(stored: &mut Value, mut compacted: Vec<Value>) -> Result<()> {
+    let conversation = object(stored, "/conversation")?;
+    if let Some(Value::Array(tail)) = conversation.remove("compacted") {
+        compacted.extend(tail);
+    }
+    conversation.insert("compacted".into(), Value::Array(compacted));
+    Ok(())
+}
+
 async fn materialize_compacted(
     reader: PayloadReader<'_>,
     stored: &mut Value,
     read: &mut HashSet<String>,
 ) -> Result<()> {
-    let Some(conversation) = stored
-        .pointer_mut("/conversation")
-        .and_then(Value::as_object_mut)
-    else {
-        return Ok(());
-    };
-    let Some(pages) = conversation.remove("compacted_pages") else {
-        return Ok(());
-    };
-    let sequence: Sequence = serde_json::from_value(pages).map_err(Error::InvalidPayload)?;
-    let mut compacted: Vec<Value> = load_sequence(reader, sequence, read).await?;
-    if let Some(Value::Array(tail)) = conversation.remove("compacted") {
-        compacted.extend(tail);
+    if let Some(sequence) = take_compacted_pages(stored)? {
+        let compacted = load_sequence(reader, sequence, read).await?;
+        splice_compacted(stored, compacted)?;
     }
-    conversation.insert("compacted".into(), Value::Array(compacted));
     Ok(())
 }
 

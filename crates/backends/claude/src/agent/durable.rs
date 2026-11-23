@@ -1105,6 +1105,17 @@ pub(super) fn decode_pages<T: serde::de::DeserializeOwned>(
     Ok(decoded)
 }
 
+pub(super) fn prepend_compacted(
+    conversation: &mut Conversation,
+    persisted: Vec<EncodedPayload>,
+) -> Result<()> {
+    let mut compacted: Vec<HistoryMessage> = decode_pages(persisted)?;
+    compacted.append(&mut conversation.compacted);
+    conversation.compacted = compacted;
+    conversation.compacted_pages = None;
+    Ok(())
+}
+
 const PAGED_VERSION: u32 = 4;
 
 #[derive(Serialize)]

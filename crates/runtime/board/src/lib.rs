@@ -47,8 +47,27 @@ impl Board {
         scope: &str,
         identity: access::Identity,
     ) -> Result<Self, BoardError> {
+        Self::open_into(host, scope, identity, Fold::new()).await
+    }
+
+    /// Opens as open does, folding the scope's rows into fold (a retaining one, say) rather than an empty fold. A
+    /// fold reopened from a checkpoint takes fold's retention and kept labels.
+    pub async fn open_into(
+        host: Arc<dyn LogHost>,
+        scope: &str,
+        identity: access::Identity,
+        fold: Fold,
+    ) -> Result<Self, BoardError> {
         let mut board = match checkpoint::reopen(&host, scope).await {
-            Ok((fold, rows)) => {
+            Ok((mut reopened, rows)) => {
+                if reopened.retain().is_none() {
+                    reopened.set_retain(fold.retain().cloned());
+                }
+                if reopened.kept_labels().is_empty() {
+                    let keys: Vec<&str> = fold.kept_labels().iter().map(String::as_str).collect();
+                    reopened.keep_labels(&keys);
+                }
+                let fold = reopened;
                 let seq = fold.next();
                 let tail = rows.len() as u64;
                 let mut board = Self::start(host, scope, identity, fold, rows)?;
@@ -58,7 +77,7 @@ impl Board {
             }
             Err(fallback) => {
                 let rows = host.load(scope).await?;
-                let mut board = Self::start(host, scope, identity, Fold::new(), rows)?;
+                let mut board = Self::start(host, scope, identity, fold, rows)?;
                 board.opened = checkpoint::Opened::Replay(fallback);
                 board
             }

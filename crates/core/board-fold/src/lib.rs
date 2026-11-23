@@ -48,7 +48,7 @@ mod ids;
 pub mod messages;
 
 pub use compact::Spread;
-pub use retain::Retain;
+pub use retain::{Evicted, Retain};
 
 /// The version a board writes its fold checkpoints under, and the only one it reopens from: the
 /// snapshot format and a hash of the fold's source, so a build whose fold changed replays the

@@ -1,8 +1,8 @@
 mod board;
 pub use board::{
     BoardAgents, BoardCoordination, BoardStats, Coordination, DISPATCH_LABEL, DISPATCH_POLL_MS,
-    DISPATCH_POSTER, DISPATCH_ROLE, Dispatching, HostedView, MAX_WORKER_BOARDS, dispatch_policy,
-    dispatch_scope,
+    DISPATCH_POSTER, DISPATCH_ROLE, Dispatching, ENTRIES_MAX, HostedView, MAX_WORKER_BOARDS,
+    SETTLED_MAX, bounded, dispatch_policy, dispatch_scope,
 };
 mod capacity;
 mod diagnostics;

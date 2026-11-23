@@ -49,6 +49,18 @@ pub struct Retention {
     gone: BTreeSet<TaskId>,
     #[serde(default)]
     gone_order: VecDeque<(usize, TaskId)>,
+    /// Label keys each evicted task keeps (Fold::keep_labels), with its parent, while its id stays gone.
+    #[serde(default)]
+    keep: Vec<String>,
+    #[serde(default, with = "crate::pairs")]
+    kept: BTreeMap<TaskId, Evicted>,
+}
+
+/// What a fold keeps of a task it evicted, with Fold::keep_labels: the kept labels it had and its parent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evicted {
+    pub labels: BTreeMap<String, String>,
+    pub parent: Option<TaskId>,
 }
 
 impl Retention {
@@ -64,6 +76,8 @@ impl Retention {
             posted: BTreeMap::new(),
             gone: BTreeSet::new(),
             gone_order: VecDeque::new(),
+            keep: Vec::new(),
+            kept: BTreeMap::new(),
         }
     }
 
@@ -122,6 +136,28 @@ impl Fold {
 
     pub const fn retain(&self) -> Option<&Retain> {
         self.retention.policy.as_ref()
+    }
+
+    /// Keeps, for each task this fold evicts from now on, its labels named in keys and its parent, for as long as
+    /// its id stays gone: a reader can still tell what an evicted task was (whose, and under what) for a few dozen
+    /// bytes rather than the whole task.
+    pub fn keep_labels(&mut self, keys: &[&str]) {
+        self.retention.keep = keys.iter().map(|key| (*key).to_owned()).collect();
+    }
+
+    /// The label keys keep_labels set.
+    pub fn kept_labels(&self) -> &[String] {
+        &self.retention.keep
+    }
+
+    /// Whether the fold evicted task and still refuses a re-post of it (Retain::gone).
+    pub fn gone(&self, task: &TaskId) -> bool {
+        self.retention.gone(task)
+    }
+
+    /// The gone tasks this fold keeps labels of (keep_labels), by id.
+    pub fn evicted_tasks(&self) -> impl Iterator<Item = (&TaskId, &Evicted)> + '_ {
+        self.retention.kept.iter()
     }
 
     pub const fn entries_base(&self) -> usize {
@@ -361,6 +397,15 @@ impl Fold {
             }
         }
         self.retention.evicted += 1;
+        if !self.retention.keep.is_empty() {
+            let labels = (self.retention.keep.iter())
+                .filter_map(|key| task.spec.labels.get_key_value(key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let parent = task.spec.parent.clone();
+            let evicted = Evicted { labels, parent };
+            self.retention.kept.insert(id.clone(), evicted);
+        }
         let keep = self.retention.policy.as_ref().map_or(0, |policy| policy.gone);
         if keep == 0 || mutated(Mutation::GoneUnbounded) {
             self.retention.gone.insert(id.clone());
@@ -389,6 +434,7 @@ impl Fold {
         {
             if let Some((_, old)) = self.retention.gone_order.pop_front() {
                 self.retention.gone.remove(&old);
+                self.retention.kept.remove(&old);
             }
         }
     }

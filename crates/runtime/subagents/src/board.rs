@@ -8,8 +8,8 @@ use nanocode_board::access::{Identity, Verifier};
 use nanocode_board::sim::{Mutation, mutated};
 use nanocode_board::tasks::Terms;
 use nanocode_board::{
-    Applied, Board, BoardError, Change, ClaimId, EventId, NewTask, Op, Outcome, Phase, Rejection,
-    TaskId, Write,
+    Applied, Board, BoardError, Change, ClaimId, EventId, Fold, NewTask, Op, Outcome, Phase,
+    Rejection, Retain, TaskId, Write,
 };
 use nanocode_sync::{Owned, mpsc, oneshot, watch};
 use nanocode_turnlog::LogHost;
@@ -70,6 +70,38 @@ pub const LEASE_MS: u64 = 1 << 30;
 /// reopens it from the log.
 pub const MAX_WORKER_BOARDS: usize = 8;
 pub const PRINCIPAL: &str = "nanocode:subagents";
+/// Settled tasks the dispatcher's and each worker's fold keep: past it the oldest settled leave the fold, keeping
+/// their root, session and agent labels and parent (Fold::keep_labels), so a board opened on a long-lived scope holds
+/// a bounded fold rather than every task the scope ever had. An evicted task reads as settled.
+pub const SETTLED_MAX: usize = 1_024;
+/// Entries (applied changes, newest last) each board fold keeps.
+pub const ENTRIES_MAX: usize = 4_096;
+/// The labels an evicted task keeps.
+const KEPT_LABELS: [&str; 3] = ["root", "session", "agent"];
+
+/// The retention BoardCoordination::new gives the dispatcher's and the workers' folds: SETTLED_MAX settled tasks and
+/// ENTRIES_MAX entries, every gone id kept, so an evicted task's post is still refused and its labels still say whose
+/// it was.
+pub fn bounded() -> Retain {
+    Retain {
+        settled: SETTLED_MAX,
+        entries: ENTRIES_MAX,
+        only: None,
+        events: 0,
+        gone: 0,
+        label_events: None,
+    }
+}
+
+/// The fold a board opens into: retaining under retain, keeping evicted tasks' labels, or every task without one.
+fn fold_under(retain: Option<&Retain>) -> Fold {
+    let Some(retain) = retain else {
+        return Fold::new();
+    };
+    let mut fold = Fold::retaining(retain.clone());
+    fold.keep_labels(&KEPT_LABELS);
+    fold
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoardStats {
@@ -199,6 +231,8 @@ fn root_task(root: &str) -> TaskId {
 struct Inner {
     host: Arc<dyn LogHost>,
     scope: String,
+    /// What the dispatcher's and the workers' folds retain; None holds every task.
+    retain: Option<Retain>,
     clock: u64,
     dispatcher: Option<Board>,
     workers: BTreeMap<String, Board>,
@@ -258,9 +292,10 @@ async fn open(
     host: &Arc<dyn LogHost>,
     scope: &str,
     profile: Option<&str>,
+    retain: Option<&Retain>,
 ) -> Result<Option<Board>, String> {
     let identity = identity(profile)?;
-    let opening = Board::open(Arc::clone(host), scope, identity);
+    let opening = Board::open_into(Arc::clone(host), scope, identity, fold_under(retain));
     let opened = if mutated(Mutation::BoardPolledOnce) && profile != Some("auditor") {
         match polled_once(opening) {
             Some(opened) => opened,
@@ -295,7 +330,14 @@ impl BoardCoordination {
         self.hosts.post(root, task).await
     }
 
+    /// Coordinates through the board at scope, its folds bounded (bounded()).
     pub fn new(host: Arc<dyn LogHost>, scope: &str) -> Arc<Self> {
+        Self::retaining(host, scope, Some(bounded()))
+    }
+
+    /// Coordinates through the board at scope, its dispatcher's and workers' folds retaining under retain, or holding
+    /// every task the scope ever had with None.
+    pub fn retaining(host: Arc<dyn LogHost>, scope: &str, retain: Option<Retain>) -> Arc<Self> {
         let changes = watch::Sender::new(0);
         let (letters, received) = mpsc::unbounded_channel();
         let hosts = Arc::new(hosting::Hosts::new(Arc::clone(&host), scope));
@@ -308,6 +350,7 @@ impl BoardCoordination {
                 inner: Inner {
                     host,
                     scope: scope.to_owned(),
+                    retain,
                     clock: 0,
                     dispatcher: None,
                     workers: BTreeMap::new(),
@@ -385,6 +428,15 @@ impl BoardCoordination {
         self.call(|inner| Box::pin(async move { inner.workers.len() }))
             .await
             .unwrap_or_default()
+    }
+
+    /// What the dispatcher's fold holds (Fold::holding), or None before it opens.
+    pub async fn holding(&self) -> Option<nanocode_board::retain::Holding> {
+        self.call(|inner| {
+            Box::pin(async move { (inner.dispatcher.as_ref()).map(|board| board.fold().holding()) })
+        })
+        .await
+        .flatten()
     }
 
     pub async fn stats(&self) -> BoardStats {
@@ -502,17 +554,32 @@ impl Inner {
                 latest.insert(agent, (k, &task.phase));
             }
         }
-        latest
+        // An agent whose every task the bounded fold evicted settled long ago: it stays listed, as Closed, which
+        // leaves its status to the runtime's own.
+        let evicted = fold
+            .evicted_tasks()
+            .filter(|(_, task)| task.labels.get("root").map(String::as_str) == Some(root))
+            .filter_map(|(_, task)| task.labels.get("agent")?.parse::<u64>().ok())
+            .map(AgentId::new)
+            .filter(|agent| !latest.contains_key(agent))
+            .collect::<BTreeSet<_>>();
+        let mut agents = latest
             .into_iter()
             .map(|(agent, (_, phase))| Ok((agent, finished(phase)?)))
-            .collect()
+            .collect::<Result<BoardAgents, String>>()?;
+        agents.extend(
+            evicted
+                .into_iter()
+                .map(|agent| (agent, Some(AgentStatus::Closed))),
+        );
+        Ok(agents)
     }
 
     async fn audit(&self) -> Result<BoardStats, String> {
         if let Some(error) = self.errors.first() {
             return Err(format!("board coordination error: {error}"));
         }
-        let board = match open(&self.host, &self.scope, Some("auditor")).await {
+        let board = match open(&self.host, &self.scope, Some("auditor"), None).await {
             Ok(Some(board)) => board,
             Ok(None) => return Err("board audit open is pending".to_owned()),
             Err(error) => return Err(format!("board audit open: {error}")),
@@ -570,6 +637,14 @@ impl Inner {
     }
 }
 
+/// The phase a task the bounded fold evicted reads as: it settled before it left, and its result left with it.
+fn evicted_phase() -> Phase {
+    Phase::Done {
+        result: String::new(),
+        worker: None,
+    }
+}
+
 fn finished(phase: &Phase) -> Result<Option<AgentStatus>, String> {
     match phase {
         Phase::Done { result, .. } => serde_json::from_str(result)
@@ -601,7 +676,14 @@ impl Inner {
             return;
         };
         if !self.workers.contains_key(&held.session) {
-            match open(&self.host, &self.scope, Some(&profile_of(&held.session))).await {
+            match open(
+                &self.host,
+                &self.scope,
+                Some(&profile_of(&held.session)),
+                self.retain.as_ref(),
+            )
+            .await
+            {
                 Ok(Some(board)) => self.keep_worker(&held.session, board),
                 Ok(None) => return,
                 Err(error) => {
@@ -663,7 +745,7 @@ impl Inner {
     async fn dispatcher_board(&mut self) -> Option<&mut Board> {
         self.settle().await;
         if self.dispatcher.is_none() {
-            match open(&self.host, &self.scope, None).await {
+            match open(&self.host, &self.scope, None, self.retain.as_ref()).await {
                 Ok(Some(mut board)) => {
                     let now = board.fold().now_ms();
                     let start = if now > 0 { now + LEASE_MS + 1 } else { 0 };
@@ -778,6 +860,31 @@ impl Inner {
                 k,
             ));
         }
+        // Tasks the bounded fold evicted keep their labels and parent: their sessions are restored as a full fold's are.
+        for (id, task) in board.fold().evicted_tasks() {
+            let labels = &task.labels;
+            let (Some(root), Some(session), Some(agent), Some(parent)) = (
+                labels.get("root"),
+                labels.get("session"),
+                labels.get("agent"),
+                task.parent.clone(),
+            ) else {
+                continue;
+            };
+            let k =
+                id.0.strip_prefix(session.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .and_then(|k| k.parse::<u64>().ok());
+            if let (Some(k), Ok(agent)) = (k, agent.parse::<u64>()) {
+                attempts.push((
+                    root.clone(),
+                    AgentId::new(agent),
+                    session.clone(),
+                    parent,
+                    k,
+                ));
+            }
+        }
         self.roots.extend(roots);
         for error in errors {
             self.fail(error);
@@ -821,7 +928,14 @@ impl Inner {
     async fn worker(&mut self, session: &str) -> Option<&mut Board> {
         self.settle().await;
         if !self.workers.contains_key(session) {
-            match open(&self.host, &self.scope, Some(&profile_of(session))).await {
+            match open(
+                &self.host,
+                &self.scope,
+                Some(&profile_of(session)),
+                self.retain.as_ref(),
+            )
+            .await
+            {
                 Ok(Some(board)) => self.keep_worker(session, board),
                 Ok(None) => return None,
                 Err(error) => {
@@ -850,7 +964,9 @@ impl Inner {
         // A lagging read fails now and then: catch_up retries it, so a reuse or finish does not
         // decide from a fold that misses the task's last phase (seed 1795200000000686281).
         let _ = board.catch_up().await;
-        board.fold().task(task).map(|task| task.phase.clone())
+        let fold = board.fold();
+        (fold.task(task).map(|task| task.phase.clone()))
+            .or_else(|| fold.gone(task).then(evicted_phase))
     }
 
     async fn ensure_root(&mut self, root: &str) -> TaskId {
@@ -1018,6 +1134,7 @@ impl Inner {
             .fold()
             .task(&id)
             .map(|task| (task.phase.clone(), task.attempts))
+            .or_else(|| board.fold().gone(&id).then(|| (evicted_phase(), 0)))
             .unzip();
         let mut claims = 0;
         let mut took_over = false;
@@ -1118,7 +1235,10 @@ impl Inner {
         let mut k = 0;
         if let Some(board) = self.dispatcher_board().await {
             let _ = board.catch_up().await;
-            while board.fold().task(&task_of(session, k + 1)).is_some() {
+            let fold = board.fold();
+            while fold.task(&task_of(session, k + 1)).is_some()
+                || fold.gone(&task_of(session, k + 1))
+            {
                 k += 1;
             }
         }
@@ -1231,18 +1351,21 @@ impl Inner {
                 let _ = board.catch_up().await;
                 let fold = board.fold();
                 fold.outcome(&event).map(|outcome| {
-                    let seq = match outcome {
-                        Ok(seq) => Some(*seq),
-                        Err(_) => None,
+                    let Ok(seq) = outcome else {
+                        return false;
                     };
-                    seq.and_then(|seq| fold.entries().iter().find(|entry| entry.seq == seq))
-                        .zip(current.as_ref())
-                        .is_some_and(|(entry, current)| {
-                            entry.task != *current
-                                && fold
-                                    .task(current)
-                                    .is_some_and(|task| !task.phase.terminal())
-                        })
+                    let unsettled = |current: &TaskId| {
+                        fold.task(current)
+                            .is_some_and(|task| !task.phase.terminal())
+                    };
+                    current.as_ref().is_some_and(|current| {
+                        match fold.entries().iter().find(|entry| entry.seq == *seq) {
+                            Some(entry) => entry.task != *current && unsettled(current),
+                            // The entry left the bounded fold, so the event finished a task that settled
+                            // long ago: an open current task is not it.
+                            None => unsettled(current),
+                        }
+                    })
                 })
             }
             None => None,

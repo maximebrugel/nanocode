@@ -92,6 +92,17 @@ pub(super) fn fork(
         if !snapshot.has_conversation() {
             return Err(NanocodeError::ForkBeforeCompletedTurn);
         }
+        if let Some(sequence) = snapshot.conversation.compacted_pages.take() {
+            let parent = state.policy.as_ref().ok_or_else(|| {
+                NanocodeError::InvalidRequest(
+                    "a paged compacted history needs its parent's execution policy".into(),
+                )
+            })?;
+            let mut compacted: Vec<HistoryMessage> =
+                durable::decode_pages(parent.load_sequence(sequence).await?)?;
+            compacted.append(&mut snapshot.conversation.compacted);
+            snapshot.conversation.compacted = compacted;
+        }
 
         snapshot.tasks = None;
         snapshot.conversation.pending_continuation = false;

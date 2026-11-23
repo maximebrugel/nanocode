@@ -78,22 +78,49 @@ impl<'a> PayloadReader<'a> {
 
 const GROUP: usize = 16;
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 pub struct Sequence {
     tail: Option<Tail>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+impl Sequence {
+    #[must_use]
+    pub fn count(&self) -> Option<usize> {
+        match &self.tail {
+            None => Some(0),
+            Some(Tail::Chained(_)) => None,
+            Some(Tail::Sealed(sealed)) => Some(sealed.counts()[0]),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(untagged)]
 enum Tail {
     Sealed(Sealed),
     Chained(EncodedPayload),
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 struct Sealed {
     levels: Vec<Vec<EncodedPayload>>,
     items: Vec<EncodedPayload>,
+}
+
+impl Sealed {
+    fn counts(&self) -> Vec<usize> {
+        let unsealed = std::iter::once(&self.items)
+            .chain(&self.levels)
+            .map(Vec::len)
+            .collect::<Vec<_>>();
+        let mut counts = vec![0; unsealed.len()];
+        let mut above = 0;
+        for (level, unsealed) in unsealed.iter().enumerate().rev() {
+            above = above * GROUP + unsealed;
+            counts[level] = above;
+        }
+        counts
+    }
 }
 
 #[derive(Deserialize)]
@@ -121,12 +148,56 @@ struct GroupRef<'a> {
 pub struct SequenceLog {
     levels: Vec<Vec<EncodedPayload>>,
     released: Vec<usize>,
+    skipped: Vec<usize>,
 }
 
 impl SequenceLog {
     #[must_use]
+    pub fn resume(sequence: &Sequence) -> Option<Self> {
+        let sealed = match &sequence.tail {
+            None => return Some(Self::default()),
+            Some(Tail::Chained(_)) => return None,
+            Some(Tail::Sealed(sealed)) => sealed,
+        };
+        let counts = sealed.counts();
+        let levels = std::iter::once(&sealed.items)
+            .chain(&sealed.levels)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(EncodedPayload::reference)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let skipped = counts
+            .iter()
+            .zip(&levels)
+            .map(|(count, entries)| count - entries.len())
+            .collect();
+        Some(Self {
+            released: levels.iter().map(Vec::len).collect(),
+            levels,
+            skipped,
+        })
+    }
+
+    #[must_use]
+    pub fn forget_sealed(&self) -> Option<Self> {
+        Self::resume(&self.sequence())
+    }
+
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.levels.iter().map(Vec::len).sum()
+    }
+
+    fn skipped(&self, level: usize) -> usize {
+        self.skipped.get(level).copied().unwrap_or(0)
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.levels.first().map_or(0, Vec::len)
+        self.skipped(0) + self.levels.first().map_or(0, Vec::len)
     }
 
     #[must_use]
@@ -140,12 +211,18 @@ impl SequenceLog {
     }
 
     pub fn truncate(&mut self, len: usize) {
+        assert!(
+            len >= self.skipped(0),
+            "a resumed sequence log truncated into the prefix it no longer holds"
+        );
         let mut count = len;
-        for level in &mut self.levels {
-            level.truncate(count);
+        for (level, entries) in self.levels.iter_mut().enumerate() {
+            entries.truncate(count - self.skipped.get(level).copied().unwrap_or(0));
             count /= GROUP;
         }
-        while self.levels.last().is_some_and(Vec::is_empty) {
+        while self.levels.len() > self.skipped.len()
+            && self.levels.last().is_some_and(Vec::is_empty)
+        {
             self.levels.pop();
         }
         self.released.truncate(self.levels.len());
@@ -170,9 +247,10 @@ impl SequenceLog {
                 self.levels.push(Vec::new());
                 self.released.push(0);
             }
+            let skipped = self.skipped(level);
             let entries = &mut self.levels[level];
             entries.push(entry);
-            if !entries.len().is_multiple_of(GROUP) {
+            if !(skipped + entries.len()).is_multiple_of(GROUP) {
                 return Ok(());
             }
             let group = &entries[entries.len() - GROUP..];
@@ -207,33 +285,33 @@ impl SequenceLog {
         Ok(())
     }
 
-    fn unsealed(entries: &[EncodedPayload]) -> &[EncodedPayload] {
-        &entries[entries.len() / GROUP * GROUP..]
+    fn unsealed(&self, level: usize) -> &[EncodedPayload] {
+        let skipped = self.skipped(level);
+        let entries = &self.levels[level];
+        &entries[(skipped + entries.len()) / GROUP * GROUP - skipped..]
     }
 
     #[must_use]
     pub fn sequence(&self) -> Sequence {
-        let Some((items, pages)) = self.levels.split_first() else {
+        if self.levels.is_empty() {
             return Sequence::default();
-        };
-        let refs = |entries: &[EncodedPayload]| {
-            Self::unsealed(entries)
+        }
+        let refs = |level: usize| {
+            self.unsealed(level)
                 .iter()
                 .map(EncodedPayload::reference)
                 .collect::<Vec<_>>()
         };
         Sequence {
             tail: Some(Tail::Sealed(Sealed {
-                levels: pages.iter().map(|pages| refs(pages)).collect(),
-                items: refs(items),
+                levels: (1..self.levels.len()).map(refs).collect(),
+                items: refs(0),
             })),
         }
     }
 
     pub fn frontier(&self) -> impl Iterator<Item = &EncodedPayload> {
-        self.levels
-            .iter()
-            .flat_map(|entries| Self::unsealed(entries))
+        (0..self.levels.len()).flat_map(move |level| self.unsealed(level))
     }
 
     pub fn release(&mut self) {

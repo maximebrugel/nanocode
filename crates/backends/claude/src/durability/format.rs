@@ -65,6 +65,7 @@ pub(crate) struct HydratedConversation {
     messages: LoadedSequence,
     code_calls: Option<LoadedSequence>,
     compacted: Option<LoadedSequence>,
+    compacted_pages: Option<Sequence>,
 }
 
 #[derive(Clone, Default)]
@@ -106,6 +107,11 @@ impl HydratedConversation {
         }
         if let Some(compacted) = self.compacted() {
             conversation.insert("compacted".into(), decode(compacted)?);
+        } else if let Some(pages) = &self.compacted_pages {
+            conversation.insert(
+                "compacted_pages".into(),
+                serde_json::to_value(pages).map_err(Error::InvalidPayload)?,
+            );
         }
         Ok(checkpoint)
     }
@@ -199,6 +205,7 @@ impl PagedConversation {
         read: &mut HashSet<String>,
         previous: Option<HydratedConversation>,
         reuse: &mut Reuse,
+        lazy: bool,
     ) -> Result<HydratedConversation> {
         let previous = previous.unwrap_or_default();
         let messages =
@@ -207,14 +214,22 @@ impl PagedConversation {
             messages,
             code_calls: None,
             compacted: None,
+            compacted_pages: None,
         };
         if let Some(code_calls) = self.code_calls {
             hydrated.code_calls =
                 Some(advance_sequence(reader, code_calls, read, previous.code_calls, reuse).await?);
         }
         if let Some(compacted) = self.compacted {
-            hydrated.compacted =
-                Some(advance_sequence(reader, compacted, read, previous.compacted, reuse).await?);
+            let resumable = compacted.count().is_some();
+            if resumable {
+                hydrated.compacted_pages = Some(compacted.clone());
+            }
+            if !(lazy && resumable) {
+                hydrated.compacted = Some(
+                    advance_sequence(reader, compacted, read, previous.compacted, reuse).await?,
+                );
+            }
         }
         if self.version >= 3 {
             let mut admitted = match self.admitted_base {
@@ -338,9 +353,32 @@ pub(super) async fn hydrate_paged(
     stored: Value,
     read: &mut HashSet<String>,
 ) -> Result<(Value, Option<HydratedConversation>)> {
-    advance_snapshot(reader, stored, read, None)
+    advance_snapshot(reader, stored, read, None, true)
         .await
         .map(|(head, conversation, _)| (head, conversation))
+}
+
+async fn materialize_compacted(
+    reader: PayloadReader<'_>,
+    stored: &mut Value,
+    read: &mut HashSet<String>,
+) -> Result<()> {
+    let Some(conversation) = stored
+        .pointer_mut("/conversation")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let Some(pages) = conversation.remove("compacted_pages") else {
+        return Ok(());
+    };
+    let sequence: Sequence = serde_json::from_value(pages).map_err(Error::InvalidPayload)?;
+    let mut compacted: Vec<Value> = load_sequence(reader, sequence, read).await?;
+    if let Some(Value::Array(tail)) = conversation.remove("compacted") {
+        compacted.extend(tail);
+    }
+    conversation.insert("compacted".into(), Value::Array(compacted));
+    Ok(())
 }
 
 pub(super) fn hydrate_snapshot<'a>(
@@ -350,6 +388,8 @@ pub(super) fn hydrate_snapshot<'a>(
 ) -> crate::agent::AgentFuture<'a, Result<Value>> {
     Box::pin(async move {
         if !paged(&stored) {
+            let mut stored = stored;
+            materialize_compacted(reader, &mut stored, read).await?;
             return Ok(stored);
         }
         let conversation: PagedConversation =
@@ -382,8 +422,13 @@ async fn advance_snapshot(
     stored: Value,
     read: &mut HashSet<String>,
     previous: Option<HydratedConversation>,
+    lazy: bool,
 ) -> Result<(Value, Option<HydratedConversation>, Option<Reuse>)> {
     if !paged(&stored) {
+        let mut stored = stored;
+        if !lazy {
+            materialize_compacted(reader, &mut stored, read).await?;
+        }
         return Ok((stored, None, None));
     }
     let conversation: PagedConversation =
@@ -398,6 +443,7 @@ async fn advance_snapshot(
             read,
             previous,
             &mut reuse,
+            lazy,
         )
         .await?;
     if let Some(instructions) = paged.instructions {
@@ -439,6 +485,7 @@ pub(super) async fn hydrate_cursor_paged(
             read,
             None,
             &mut Reuse::default(),
+            true,
         )
         .await?;
     insert(&mut cursor, "", "pending", pending)?;
@@ -451,7 +498,11 @@ impl HydratedConversation {
         crate::agent::ContinuationPages {
             messages: self.messages.loaded,
             code_calls: self.code_calls.map(|sequence| sequence.loaded),
-            compacted: self.compacted.map(|sequence| sequence.loaded),
+            compacted: match self.compacted_pages {
+                Some(_) => None,
+                None => self.compacted.map(|sequence| sequence.loaded),
+            },
+            compacted_pages: self.compacted_pages,
         }
     }
 }
@@ -474,6 +525,12 @@ pub(super) fn assemble_cursor(
     }
     if let Some(compacted) = &pages.compacted {
         conversation.insert("compacted".into(), decode(compacted)?);
+    }
+    if let Some(sequence) = &pages.compacted_pages {
+        conversation.insert(
+            "compacted_pages".into(),
+            serde_json::to_value(sequence).map_err(Error::InvalidPayload)?,
+        );
     }
     Ok(head)
 }
@@ -578,7 +635,8 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
         read: &'a mut HashSet<String>,
     ) -> FormatFuture<'a, Result<(Checkpoint, Option<Hydrated>)>> {
         Box::pin(async move {
-            let (head, conversation, _) = advance_snapshot(reader, stored, read, None).await?;
+            let (head, conversation, _) =
+                advance_snapshot(reader, stored, read, None, false).await?;
             Ok(typed_checkpoint(head, conversation))
         })
     }
@@ -596,7 +654,7 @@ impl CheckpointFormat for ClaudeCheckpointFormat {
                 .and_then(Hydrated::take::<TypedSnapshot>)
                 .map(|typed| typed.conversation);
             let (head, conversation, reuse) =
-                advance_snapshot(reader, stored, read, earlier).await?;
+                advance_snapshot(reader, stored, read, earlier, false).await?;
             let (checkpoint, hydrated) = typed_checkpoint(head, conversation);
             Ok(match reuse {
                 Some(reuse) if reuse.reused > 0 => Advanced {

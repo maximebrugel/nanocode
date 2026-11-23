@@ -613,6 +613,13 @@ impl ClaudeExecutionPolicy for LazyClaudeExecution {
             .and_then(|acquired| acquired.execution.stored.take())
     }
 
+    fn load_sequence(
+        &self,
+        sequence: nanocode_durability::Sequence,
+    ) -> PolicyFuture<'_, Vec<EncodedPayload>> {
+        Box::pin(async move { self.get().await?.load_sequence(sequence).await })
+    }
+
     fn holds_back_formats(&self) -> bool {
         self.store.holds_back_formats()
     }
@@ -1307,6 +1314,21 @@ impl ClaudeExecutionPolicy for ClaudeExecution {
 
     fn take_stored_records(&self) -> Option<HashSet<String>> {
         self.stored.take()
+    }
+
+    fn load_sequence(
+        &self,
+        sequence: nanocode_durability::Sequence,
+    ) -> PolicyFuture<'_, Vec<EncodedPayload>> {
+        Box::pin(async move {
+            nanocode_durability::load_sequence_payloads(
+                PayloadReader::from(&self.owner),
+                sequence,
+                &mut HashSet::new(),
+            )
+            .await
+            .map_err(agent_error)
+        })
     }
 
     fn holds_back_formats(&self) -> bool {

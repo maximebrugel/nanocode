@@ -2990,6 +2990,7 @@ pub(crate) struct ContinuationPages {
     pub(crate) messages: Vec<nanocode_durability::EncodedPayload>,
     pub(crate) code_calls: Option<Vec<nanocode_durability::EncodedPayload>>,
     pub(crate) compacted: Option<Vec<nanocode_durability::EncodedPayload>>,
+    pub(crate) compacted_pages: Option<nanocode_durability::Sequence>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -3018,6 +3019,8 @@ struct Conversation {
     messages: Vec<HistoryMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     compacted: Vec<HistoryMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compacted_pages: Option<nanocode_durability::Sequence>,
     summary: String,
     active_context_tokens: u64,
     #[serde(default, skip_serializing_if = "is_zero")]

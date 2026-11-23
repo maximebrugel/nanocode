@@ -3285,6 +3285,11 @@ impl Registry {
         root_session_id: &str,
         entries: Vec<AgentDirectoryEntry>,
     ) -> std::io::Result<Vec<AgentDirectoryEntry>> {
+        // A listing that names no agent has nothing to overlay: reading the board would open
+        // the dispatcher, which replays the whole scope, for a root that never used subagents.
+        if entries.is_empty() {
+            return Ok(entries);
+        }
         let Some(board) = self.board_agents(root_session_id).await? else {
             return Ok(entries);
         };

@@ -2291,4 +2291,94 @@ mod compacted_tests {
         let whole = Snapshot::decode(serde_json::to_value(&snapshot).unwrap()).unwrap();
         assert!(whole == snapshot);
     }
+
+    fn page_turns(
+        snapshot: &mut Snapshot,
+        paging: &mut Paging,
+        turns: std::ops::Range<usize>,
+        paged: bool,
+    ) -> Vec<HistoryMessage> {
+        let mut added = Vec::new();
+        for turn in turns {
+            for index in 0..PER_TURN {
+                let message = compacted_message(turn, index);
+                added.push(message.clone());
+                snapshot.conversation.compacted.push(message);
+            }
+            encode_snapshot(snapshot, paged, paging).unwrap();
+            paging.committed();
+        }
+        added
+    }
+
+    fn full_sequence(messages: &[HistoryMessage]) -> String {
+        let mut full = SequenceLog::default();
+        for message in messages {
+            full.push(message.record().unwrap().reference()).unwrap();
+        }
+        serde_json::to_string(&full.sequence()).unwrap()
+    }
+
+    #[test]
+    fn restoring_an_earlier_snapshot_resumes_its_compacted_pages() {
+        let mut paging = Paging::default();
+        let mut snapshot = Snapshot::default();
+        let mut kept = page_turns(&mut snapshot, &mut paging, 0..10, true);
+        let earlier = snapshot.clone();
+        page_turns(&mut snapshot, &mut paging, 10..20, true);
+        snapshot = earlier;
+        kept.extend(page_turns(&mut snapshot, &mut paging, 100..101, true));
+        assert!(snapshot.conversation.compacted.is_empty());
+        let sequence = snapshot.conversation.compacted_pages.clone().unwrap();
+        assert_eq!(sequence.count(), Some(kept.len()));
+        assert_eq!(
+            serde_json::to_string(&sequence).unwrap(),
+            full_sequence(&kept)
+        );
+    }
+
+    #[test]
+    fn a_non_paged_policy_keeps_every_compacted_message() {
+        let mut paging = Paging::default();
+        let mut snapshot = Snapshot::default();
+        let added = page_turns(&mut snapshot, &mut paging, 0..10, false);
+        assert!(snapshot.conversation.compacted_pages.is_none());
+        assert_eq!(snapshot.conversation.compacted.len(), added.len());
+        let encoded = encode_snapshot(&mut snapshot, false, &mut paging).unwrap();
+        let stored: Value = serde_json::from_str(encoded.json.get()).unwrap();
+        assert_eq!(
+            stored["conversation"]["compacted"].as_array().map(Vec::len),
+            Some(added.len())
+        );
+        assert!(stored["conversation"].get("compacted_pages").is_none());
+    }
+
+    #[test]
+    fn a_fork_writes_the_whole_compacted_history_into_its_child() {
+        let mut paging = Paging::default();
+        let mut snapshot = Snapshot::default();
+        let persisted = page_turns(&mut snapshot, &mut paging, 0..10, true);
+        let tail = (0..PER_TURN)
+            .map(|index| compacted_message(10, index))
+            .collect::<Vec<_>>();
+        snapshot.conversation.compacted.extend(tail.iter().cloned());
+        let pages = snapshot.conversation.compacted_pages.clone().unwrap();
+        assert_eq!(
+            serde_json::to_string(&pages).unwrap(),
+            full_sequence(&persisted)
+        );
+        let loaded = persisted
+            .iter()
+            .map(|message| message.record().unwrap())
+            .collect();
+        prepend_compacted(&mut snapshot.conversation, loaded).unwrap();
+        let child = serde_json::to_value(&snapshot).unwrap();
+        assert!(child["conversation"].get("compacted_pages").is_none());
+        let expected = persisted
+            .iter()
+            .chain(&tail)
+            .map(|message| serde_json::to_value(message).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(child["conversation"]["compacted"], Value::Array(expected));
+    }
 }

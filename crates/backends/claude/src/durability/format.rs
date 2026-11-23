@@ -1103,3 +1103,39 @@ fn claude_transcript(checkpoint: &Value, prompts: &[AdmittedPrompt]) -> Vec<Tran
     }
     items
 }
+
+#[cfg(test)]
+mod compacted_tests {
+    use super::*;
+    use nanocode_durability::SequenceLog;
+    use serde_json::json;
+
+    #[test]
+    fn a_whole_checkpoint_reads_its_paged_compacted_history_in_full() {
+        let persisted = (0..40)
+            .map(|index| json!({"index": index}))
+            .collect::<Vec<_>>();
+        let mut log = SequenceLog::default();
+        for item in &persisted {
+            log.push(EncodedPayload::encode(item).unwrap()).unwrap();
+        }
+        let tail = vec![json!({"index": 40}), json!({"index": 41})];
+        let mut stored = json!({
+            "conversation": {"compacted": tail, "compacted_pages": log.sequence()},
+        });
+        let sequence = take_compacted_pages(&mut stored).unwrap().unwrap();
+        assert!(sequence == log.sequence());
+        assert_eq!(sequence.count(), Some(persisted.len()));
+        splice_compacted(&mut stored, persisted).unwrap();
+        let expected = (0..42)
+            .map(|index| json!({"index": index}))
+            .collect::<Vec<_>>();
+        assert_eq!(stored, json!({"conversation": {"compacted": expected}}));
+        let mut plain = json!({"conversation": {"compacted": [json!({"index": 0})]}});
+        assert!(take_compacted_pages(&mut plain).unwrap().is_none());
+        assert_eq!(
+            plain,
+            json!({"conversation": {"compacted": [json!({"index": 0})]}})
+        );
+    }
+}

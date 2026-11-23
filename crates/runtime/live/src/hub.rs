@@ -290,6 +290,11 @@ impl<V: ViewSet, S: SealPolicy> Hub<V, S> {
         self.counters.snapshot()
     }
 
+    /// Letters (commits, backfills, subscribes, acks) waiting in the hub's mailbox for its core.
+    pub fn queued(&self) -> usize {
+        self.core.queued()
+    }
+
     pub fn connect(&self, outbound: Arc<dyn Outbound>) -> ConnId {
         let conn = ConnId(self.conns.fetch_add(1, Ordering::Relaxed));
         self.core.send(move |core| {

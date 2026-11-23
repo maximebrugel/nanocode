@@ -951,6 +951,12 @@ impl<S> Mailbox<S> {
             queued: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
+
+    /// Letters posted and not yet delivered, counting the one being delivered.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.0.queued.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl<S: Send + 'static> Mailbox<S> {

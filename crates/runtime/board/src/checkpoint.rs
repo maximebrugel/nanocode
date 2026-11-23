@@ -26,7 +26,7 @@ use nanocode_sys::base64::STANDARD_NO_PAD;
 use nanocode_turnlog::{LogHost, StoredCheckpoint};
 
 use crate::{
-    Board, BoardError, CHECKPOINT_VERSION, END, Fold,
+    Board, BoardError, CHECKPOINT_VERSION, END, Fold, Retain,
     sim::{Mutation, mutated},
 };
 
@@ -157,6 +157,24 @@ pub async fn reopen(
     Ok((fold, rows))
 }
 
+pub(crate) fn adopt(mut reopened: Fold, retain: Option<&Retain>, keep: &[String]) -> Fold {
+    if reopened.retain().is_none() {
+        reopened.set_retain(retain.cloned());
+    }
+    if reopened.kept_labels().is_empty() {
+        let keys: Vec<&str> = keep.iter().map(String::as_str).collect();
+        reopened.keep_labels(&keys);
+    }
+    reopened
+}
+
+fn fresh(retain: Option<&Retain>, keep: &[String]) -> Fold {
+    let mut fold = retain.cloned().map_or_else(Fold::new, Fold::retaining);
+    let keys: Vec<&str> = keep.iter().map(String::as_str).collect();
+    fold.keep_labels(&keys);
+    fold
+}
+
 impl Board {
     /// How this board came to its fold when it opened: from a checkpoint, from a fold its
     /// caller held, or from a full replay and why.
@@ -192,7 +210,7 @@ impl Board {
     pub(crate) fn keep_checkpoint(&mut self) {
         let every = every();
         let next = self.fold.next();
-        let wait = if mutated(Mutation::CheckpointEveryFixed) {
+        let wait = if mutated(Mutation::CheckpointEveryFixed) || self.fold.retain().is_some() {
             every
         } else {
             every.max(self.checkpointed)
@@ -213,7 +231,17 @@ impl Board {
             home: Arc::clone(&self.saver),
             shadow,
         };
-        spawn(save(Arc::clone(&self.host), self.scope.clone(), lent, next));
+        let like = Like {
+            retain: self.fold.retain().cloned(),
+            keep: self.fold.kept_labels().to_vec(),
+        };
+        spawn(save(
+            Arc::clone(&self.host),
+            self.scope.clone(),
+            lent,
+            next,
+            like,
+        ));
     }
 }
 
@@ -224,6 +252,11 @@ pub(crate) enum Shadow {
     Folded(Fold),
     /// The host keeps no checkpoints.
     Unsupported,
+}
+
+struct Like {
+    retain: Option<Retain>,
+    keep: Vec<String>,
 }
 
 /// The shadow while a save holds it; dropping it gives the saver its shadow back.
@@ -288,7 +321,7 @@ fn fold_and_encode(
 
 /// Folds the log's rows before `target` into the shadow, building it from the scope's checkpoint
 /// or the whole log first, and saves it as the checkpoint at the seq it folded to.
-async fn save(host: Arc<dyn LogHost>, scope: String, mut lent: Lent, target: u64) {
+async fn save(host: Arc<dyn LogHost>, scope: String, mut lent: Lent, target: u64, like: Like) {
     let (fold, mut rows) = match std::mem::replace(&mut lent.shadow, Shadow::Unbuilt) {
         Shadow::Folded(fold) => (fold, Vec::new()),
         Shadow::Unsupported => {
@@ -298,13 +331,13 @@ async fn save(host: Arc<dyn LogHost>, scope: String, mut lent: Lent, target: u64
         Shadow::Unbuilt => match reopen(&host, &scope).await {
             Ok((fold, mut rows)) => {
                 rows.retain(|(seq, _)| *seq < target);
-                (fold, rows)
+                (adopt(fold, like.retain.as_ref(), &like.keep), rows)
             }
             Err(Fallback::Unsupported) => {
                 lent.shadow = Shadow::Unsupported;
                 return;
             }
-            Err(_) => (Fold::new(), Vec::new()),
+            Err(_) => (fresh(like.retain.as_ref(), &like.keep), Vec::new()),
         },
     };
     let from = rows.last().map_or(fold.next(), |(seq, _)| seq + 1);

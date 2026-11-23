@@ -59,15 +59,8 @@ impl Board {
         fold: Fold,
     ) -> Result<Self, BoardError> {
         let mut board = match checkpoint::reopen(&host, scope).await {
-            Ok((mut reopened, rows)) => {
-                if reopened.retain().is_none() {
-                    reopened.set_retain(fold.retain().cloned());
-                }
-                if reopened.kept_labels().is_empty() {
-                    let keys: Vec<&str> = fold.kept_labels().iter().map(String::as_str).collect();
-                    reopened.keep_labels(&keys);
-                }
-                let fold = reopened;
+            Ok((reopened, rows)) => {
+                let fold = checkpoint::adopt(reopened, fold.retain(), fold.kept_labels());
                 let seq = fold.next();
                 let tail = rows.len() as u64;
                 let mut board = Self::start(host, scope, identity, fold, rows)?;

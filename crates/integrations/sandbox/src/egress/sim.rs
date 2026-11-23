@@ -6,10 +6,15 @@ pub enum Mutation {
     None,
     PathsIgnored,
     DebugShowsValue,
+    AmbiguityIgnored,
 }
 
 impl Mutation {
-    pub const ALL: [Self; 2] = [Self::PathsIgnored, Self::DebugShowsValue];
+    pub const ALL: [Self; 3] = [
+        Self::PathsIgnored,
+        Self::DebugShowsValue,
+        Self::AmbiguityIgnored,
+    ];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -17,6 +22,7 @@ impl Mutation {
             Self::None => "none",
             Self::PathsIgnored => "paths_ignored",
             Self::DebugShowsValue => "debug_shows_value",
+            Self::AmbiguityIgnored => "ambiguity_ignored",
         }
     }
 

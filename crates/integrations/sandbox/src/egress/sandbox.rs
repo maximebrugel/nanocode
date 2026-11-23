@@ -50,7 +50,7 @@ fn private(host: &str) -> String {
     )
 }
 
-fn proxy(allowlist: Allowlist, log: &Arc<Log>) -> Arc<Proxy<Fixed>> {
+fn proxy(allowlist: Allowlist, log: &Arc<Log>) -> io::Result<Arc<Proxy<Fixed>>> {
     let Allowlist {
         hosts,
         private_hosts,
@@ -61,6 +61,13 @@ fn proxy(allowlist: Allowlist, log: &Arc<Log>) -> Arc<Proxy<Fixed>> {
         limits,
     } = allowlist;
     secrets.retain(|secret| secret.hosts.iter().any(|host| secret.sets(host)));
+    let grant = Grant { secrets };
+    if let Some(path) = grant.invalid_path() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a secret is scoped to {path:?}, which is not a path"),
+        ));
+    }
     let rules = Rules {
         caching: Caching {
             granted: Duration::ZERO,
@@ -95,8 +102,10 @@ fn proxy(allowlist: Allowlist, log: &Arc<Log>) -> Arc<Proxy<Fixed>> {
         },
         limits,
     };
-    let fixed = Arc::new(Fixed(Grant { secrets }));
-    Arc::new(Proxy::new(fixed, tls, rules).logged(Arc::clone(log)))
+    let fixed = Arc::new(Fixed(grant));
+    Ok(Arc::new(
+        Proxy::new(fixed, tls, rules).logged(Arc::clone(log)),
+    ))
 }
 
 impl Egress {
@@ -104,7 +113,7 @@ impl Egress {
         let listener = Arc::new(TcpListener::bind(("127.0.0.1", 0)).await?);
         let port = listener.local_addr()?.port();
         let log = Arc::default();
-        let proxy = proxy(allowlist, &log);
+        let proxy = proxy(allowlist, &log)?;
         let task = nanocode_platform::spawn_task(proxy.accept(move || {
             let listener = Arc::clone(&listener);
             async move {
@@ -125,7 +134,7 @@ impl Egress {
         std::fs::remove_file(path).ok();
         let listener = Arc::new(UnixListener::bind(path)?);
         let log = Arc::default();
-        let proxy = proxy(allowlist, &log);
+        let proxy = proxy(allowlist, &log)?;
         let task = nanocode_platform::spawn_task(proxy.accept(move || {
             let listener = Arc::clone(&listener);
             async move { Some((listener.accept().await.ok()?.0, LOCAL)) }

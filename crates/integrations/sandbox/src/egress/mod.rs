@@ -28,5 +28,5 @@ pub use sandbox::{Allowlist, Egress};
 pub use tls::{BadCa, Leaves, Lifetime, Tls};
 pub use wire::{
     Ca, Called, Calls, Credential, EXACT_PATH, Grant, Report, Secret, binds, framing,
-    normalize_hosts, path_reached, valid_header, valid_host,
+    normalize_hosts, path_reached, valid_header, valid_host, valid_path,
 };

@@ -234,10 +234,17 @@ impl<A: Authority> Asker<A> {
             at: Instant::now(),
         };
         let verdict = match self.authority.grant(key).await {
-            Ok(Some(grant)) => Verdict::Granted(Arc::new(Client {
-                credential: Arc::clone(key),
-                grant,
-            })),
+            Ok(Some(grant)) => match grant.invalid_path() {
+                Some(path) => {
+                    let (client, name) = (self.client, &key.name);
+                    error!(%name, "{client} {name}'s grant scopes a secret to {path:?}, which is not a path");
+                    Verdict::Unreachable
+                }
+                None => Verdict::Granted(Arc::new(Client {
+                    credential: Arc::clone(key),
+                    grant,
+                })),
+            },
             Ok(None) => Verdict::Refused,
             Err(error) => {
                 let (client, name) = (self.client, &key.name);

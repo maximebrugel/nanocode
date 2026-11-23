@@ -59,30 +59,88 @@ impl std::fmt::Debug for Secret {
 pub const EXACT_PATH: &str = "$";
 
 #[must_use]
-pub fn path_reached(paths: &[String], path: &str) -> bool {
-    if paths.is_empty() || crate::egress::sim::mutated(crate::egress::sim::Mutation::PathsIgnored)
-    {
+pub fn valid_path(entry: &str) -> bool {
+    let path = entry.strip_suffix(EXACT_PATH).unwrap_or(entry);
+    path == "/"
+        || path.strip_prefix('/').is_some_and(|rest| {
+            rest.split('/').all(|segment| {
+                !segment.is_empty()
+                    && segment != "."
+                    && segment != ".."
+                    && segment
+                        .bytes()
+                        .all(|b| b.is_ascii_graphic() && !b"$%;?#\\".contains(&b))
+            })
+        })
+}
+
+fn decoded(segment: &str) -> Option<Vec<u8>> {
+    let hex = |b: u8| char::from(b).to_digit(16);
+    let mut bytes = segment.bytes();
+    let mut out = Vec::with_capacity(segment.len());
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let high = hex(bytes.next()?)?;
+            let low = hex(bytes.next()?)?;
+            out.push(u8::try_from(high * 16 + low).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    Some(out)
+}
+
+fn plain_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.contains('\\')
+        && decoded(segment).is_some_and(|bytes| {
+            let name = bytes.split(|&b| b == b';').next().unwrap_or_default();
+            !bytes.iter().any(|b| b"/\\%".contains(b)) && name != b"." && name != b".."
+        })
+}
+
+fn plain_path(target: &str) -> Option<&str> {
+    let path = target.split(['?', '#']).next().unwrap_or_default();
+    let rest = path.strip_prefix('/')?;
+    let last = rest.split('/').count() - 1;
+    let plain = crate::egress::sim::mutated(crate::egress::sim::Mutation::AmbiguityIgnored)
+        || rest.split('/').enumerate().all(|(index, segment)| {
+            (index == last && segment.is_empty()) || plain_segment(segment)
+        });
+    plain.then_some(path)
+}
+
+#[must_use]
+pub fn path_reached(paths: &[String], target: &str) -> bool {
+    if paths.is_empty() || crate::egress::sim::mutated(crate::egress::sim::Mutation::PathsIgnored) {
         return true;
     }
+    let Some(path) = plain_path(target) else {
+        return false;
+    };
     let path = path.to_ascii_lowercase();
-    paths.iter().any(|prefix| {
-        let prefix = prefix.to_ascii_lowercase();
-        if let Some(exact) = prefix.strip_suffix(EXACT_PATH) {
-            return path
-                .strip_prefix(exact)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'));
+    paths.iter().filter(|entry| valid_path(entry)).any(|entry| {
+        let entry = entry.to_ascii_lowercase();
+        if let Some(exact) = entry.strip_suffix(EXACT_PATH) {
+            return path == exact;
         }
-        path.strip_prefix(prefix.as_str()).is_some_and(|rest| {
-            rest.is_empty()
-                || rest.starts_with('/')
-                || rest.starts_with('?')
-                || rest.starts_with(".git/")
-                || rest == ".git"
+        let prefix = entry.strip_suffix('/').unwrap_or(&entry);
+        path.strip_prefix(prefix).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with('/') || rest.starts_with(".git/") || rest == ".git"
         })
     })
 }
 
 impl Grant {
+    #[must_use]
+    pub fn invalid_path(&self) -> Option<&str> {
+        self.secrets
+            .iter()
+            .flat_map(|secret| &secret.paths)
+            .find(|entry| !valid_path(entry))
+            .map(String::as_str)
+    }
+
     #[must_use]
     pub fn bound(&self, host: &str, path: &str) -> Vec<&Secret> {
         self.secrets

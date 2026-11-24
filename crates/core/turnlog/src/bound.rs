@@ -10,6 +10,23 @@ pub(crate) struct Bounded {
     pub(crate) within: Duration,
 }
 
+pub(crate) fn own(host: &dyn LogHost) -> Option<Duration> {
+    if crate::sim::mutated(crate::sim::Mutation::HostBoundIgnored) {
+        return None;
+    }
+    host.call_bound()
+}
+
+pub(crate) fn bounded(raw: &Arc<dyn LogHost>, within: Option<Duration>) -> Arc<dyn LogHost> {
+    match within {
+        Some(within) => Arc::new(Bounded {
+            host: Arc::clone(raw),
+            within,
+        }),
+        None => Arc::clone(raw),
+    }
+}
+
 pub(crate) fn unanswered(call: &str, scope: &str, within: Duration) -> StoreError {
     StoreError::Backend(format!(
         "turn log host {call} of {scope} did not answer within {} ms, so its outcome is unknown",
@@ -36,6 +53,10 @@ pub(crate) async fn within<T>(
 }
 
 impl LogHost for Bounded {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        Some(self.within)
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

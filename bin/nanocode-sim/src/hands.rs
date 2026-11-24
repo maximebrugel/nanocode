@@ -803,6 +803,10 @@ impl StepHost {
 }
 
 impl LogHost for StepHost {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         _scope: &'a str,

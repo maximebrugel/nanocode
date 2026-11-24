@@ -144,6 +144,10 @@ impl Notifying {
 }
 
 impl LogHost for Notifying {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        self.inner.call_bound()
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

@@ -60,10 +60,14 @@ pub enum Fire {
 
 impl OneLog {
     pub async fn index_wakes(&self, index: Arc<dyn WakeRider>) -> Result<(), StoreError> {
-        index.prepare().await?;
+        self.log
+            .answered_within("wake index prepare", index.prepare())
+            .await?;
         let lease = self.log.lease_within().await?;
         let summary = lease.fold().wakes().summary();
-        index.write(self.scope(), &summary).await?;
+        self.log
+            .answered_within("wake index write", index.write(self.scope(), &summary))
+            .await?;
         self.wake_index.set(Some(index));
         drop(lease);
         Ok(())
@@ -92,7 +96,11 @@ impl OneLog {
         // only leaves the index stale until the next index_wakes.
         if !carried {
             let summary = lease.fold().wakes().summary();
-            if let Err(error) = index.write(self.scope(), &summary).await {
+            let written = self
+                .log
+                .answered_within("wake index write", index.write(self.scope(), &summary))
+                .await;
+            if let Err(error) = written {
                 nanocode_trace::warn!(
                     %error,
                     scope = self.scope(),

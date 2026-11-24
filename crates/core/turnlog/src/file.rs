@@ -100,6 +100,10 @@ impl Drop for FileLog {
 }
 
 impl LogHost for FileLog {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

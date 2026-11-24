@@ -581,6 +581,10 @@ impl Drop for Leading<'_> {
 }
 
 impl<S: PartStore + ?Sized> LogHost for PartedLog<S> {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

@@ -71,6 +71,10 @@ struct Counted {
 }
 
 impl Sql for Counted {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        self.inner.call_bound()
+    }
+
     fn dialect(&self) -> SqlDialect {
         self.inner.dialect()
     }

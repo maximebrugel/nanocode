@@ -69,6 +69,10 @@ impl Sql for PgSql {
         Box::pin(self.transact(&self.writes, operation, Settle::Durable, statements))
     }
 
+    fn call_bound(&self) -> Option<Duration> {
+        None
+    }
+
     fn run<'a>(
         &'a self,
         access: SqlAccess,
@@ -130,6 +134,10 @@ impl Sql for PgTransaction<'_> {
                 .await
                 .map_err(backend)
         })
+    }
+
+    fn call_bound(&self) -> Option<Duration> {
+        None
     }
 
     fn dialect(&self) -> SqlDialect {

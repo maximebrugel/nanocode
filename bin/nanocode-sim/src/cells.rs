@@ -174,6 +174,10 @@ impl CellHost {
 }
 
 impl LogHost for CellHost {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         _scope: &'a str,

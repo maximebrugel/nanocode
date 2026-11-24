@@ -157,6 +157,10 @@ impl Delayed {
 }
 
 impl LogHost for Delayed {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

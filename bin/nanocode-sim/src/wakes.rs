@@ -214,6 +214,10 @@ impl WakeRider for Index {
 }
 
 impl LogHost for Host {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         _scope: &'a str,

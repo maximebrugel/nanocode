@@ -46,6 +46,8 @@ pub struct Rider<'a> {
 }
 
 pub trait LogHost: Send + Sync {
+    fn call_bound(&self) -> Option<std::time::Duration>;
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,
@@ -131,6 +133,8 @@ pub const CHECKPOINT_PART_BYTES: usize = 1 << 20;
 pub const SCAN_END: u64 = i64::MAX as u64;
 
 type Dialects = [&'static str; 2];
+
+const SQL_TRANSACTIONS_PER_CALL: u32 = 2;
 
 /// Serializes schema preparation across processes on Postgres: two loads that create nanocode_log at once otherwise
 /// race in CREATE TABLE IF NOT EXISTS (duplicate key in pg_type for the table's row type). SQLite has one writer.
@@ -299,6 +303,12 @@ fn row(cells: Vec<Option<String>>) -> Result<(u64, String), StoreError> {
 }
 
 impl<H: Sql + Send + Sync + ?Sized> LogHost for SqlLog<H> {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        self.host
+            .call_bound()
+            .and_then(|bound| bound.checked_mul(SQL_TRANSACTIONS_PER_CALL))
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,
@@ -645,6 +655,10 @@ impl MemoryLog {
 }
 
 impl LogHost for MemoryLog {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

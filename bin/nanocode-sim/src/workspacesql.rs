@@ -656,6 +656,10 @@ impl SimSql {
 }
 
 impl Sql for SimSql {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn transaction<'a>(
         &'a self,
         _: &'static str,

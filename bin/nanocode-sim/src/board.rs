@@ -698,6 +698,10 @@ impl FaultLog {
 }
 
 impl LogHost for FaultLog {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

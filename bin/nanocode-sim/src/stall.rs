@@ -24,6 +24,7 @@ use crate::{
 
 const STALL_BOUND: Duration = Duration::from_secs(30);
 const WRITERS: u64 = 2;
+const READS: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -77,6 +78,10 @@ impl StallHost {
 }
 
 impl LogHost for StallHost {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        Some(STALL_BOUND)
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,
@@ -150,9 +155,11 @@ pub fn bounded(scope: &str, stored: &[(u64, String)], seq: u64) {
         let clock = Clock::new();
         crate::host::entered(seq, &clock, || probe(scope, stored, seq, stall, &clock));
     }
+    let clock = Clock::new();
+    crate::host::entered(seq, &clock, || held(scope, stored, seq, &clock));
 }
 
-fn probe(scope: &str, stored: &[(u64, String)], seq: u64, stall: Stall, clock: &Arc<Clock>) {
+fn opened(scope: &str, stored: &[(u64, String)]) -> (Arc<StallHost>, TurnLog) {
     let disk = Disk::new();
     disk.with(|rows| rows.insert(scope, stored));
     let host = Arc::new(StallHost {
@@ -161,8 +168,62 @@ fn probe(scope: &str, stored: &[(u64, String)], seq: u64, stall: Stall, clock: &
     });
     let opened: Arc<dyn LogHost> = host.clone();
     let log = ready(TurnLog::open(opened, scope))
-        .unwrap_or_else(|error| panic!("{scope} does not reopen before a stall probe: {error}"))
-        .host_calls_within(Some(STALL_BOUND));
+        .unwrap_or_else(|error| panic!("{scope} does not reopen before a stall probe: {error}"));
+    (host, log)
+}
+
+async fn read(log: &TurnLog, scope: &str, read: usize) -> Result<(), StoreError> {
+    let owners = [scope.to_owned()];
+    match read {
+        0 => log.load_owner(scope).await,
+        1 => log.read_owner(scope, |_| ()).await,
+        2 => log.read_owners(&owners, |_| ()).await,
+        3 => log.history(0, |_| true).await,
+        _ => log.load_index().await,
+    }
+}
+
+fn held(scope: &str, stored: &[(u64, String)], seq: u64, clock: &Arc<Clock>) {
+    let (_host, log) = opened(scope, stored);
+    let lease = ready(log.lease());
+    let ended: Rc<Vec<Cell<Option<(u64, bool)>>>> =
+        Rc::new((0..READS).map(|_| Cell::new(None)).collect());
+    let mut tasks = (0..READS)
+        .map(|index| {
+            let (log, clock, ended) = (&log, Arc::clone(clock), Rc::clone(&ended));
+            Box::pin(async move {
+                let answered = read(log, scope, index).await;
+                ended[index].set(Some((clock.now_ns(), answered.is_ok())));
+            }) as Task<'_>
+        })
+        .collect::<Vec<_>>();
+    tasks.push(Box::pin(async move {
+        nanocode_platform::sleep(STALL_BOUND * 2).await;
+        drop(lease);
+    }));
+    let run = Executor::new(Arc::clone(clock), Rng::derive(seq, "stall reads")).run(tasks, None);
+    assert!(
+        run == Ended::Finished,
+        "{scope} reads wait on a stalled lease holder past every bound after commit {seq}: {run:?}"
+    );
+    let bound_ns = u64::try_from(STALL_BOUND.as_nanos()).expect("the stall bound fits in u64");
+    for (index, end) in ended.iter().enumerate() {
+        let (at_ns, answered) = end
+            .get()
+            .unwrap_or_else(|| panic!("{scope} read {index} behind a stalled lease never ended"));
+        assert!(
+            at_ns <= bound_ns,
+            "{scope} read {index} behind a stalled lease ended at {at_ns} ns, past the bound of {bound_ns} ns"
+        );
+        assert!(
+            !answered,
+            "{scope} read {index} answered while a stalled lease still held the writer"
+        );
+    }
+}
+
+fn probe(scope: &str, stored: &[(u64, String)], seq: u64, stall: Stall, clock: &Arc<Clock>) {
+    let (host, log) = opened(scope, stored);
     host.stall.store(stall as u8, Ordering::SeqCst);
     let ended: Rc<Vec<Cell<Option<(u64, bool)>>>> =
         Rc::new((0..WRITERS).map(|_| Cell::new(None)).collect());

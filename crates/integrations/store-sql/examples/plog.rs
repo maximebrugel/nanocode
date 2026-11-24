@@ -33,6 +33,10 @@ struct Counted {
 }
 
 impl Sql for Counted {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        self.inner.call_bound()
+    }
+
     fn dialect(&self) -> nanocode_durability_core::SqlDialect {
         self.inner.dialect()
     }

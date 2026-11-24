@@ -817,12 +817,14 @@ pub struct Follower {
     host: Arc<dyn LogHost>,
     next: u64,
     previous: Option<Previous>,
+    raw: Arc<dyn LogHost>,
     scope: Arc<str>,
     snapshot: usize,
     snapshot_row: Option<u64>,
     state: usize,
     stats: Stats,
     tail: usize,
+    within: Option<Duration>,
 }
 
 impl Follower {
@@ -990,11 +992,13 @@ impl Follower {
             history,
             host,
             previous,
+            raw,
             scope,
             snapshot,
             state,
             mut stats,
             tail,
+            within,
             ..
         } = self;
         for owner in fold.forgetting() {
@@ -1004,8 +1008,8 @@ impl Follower {
         let floor = Some(fold.last_event());
         let (riding, riders) = mpsc::unbounded_channel();
         Ok(TurnLog {
-            host: Arc::clone(&host),
-            raw: host,
+            host,
+            raw,
             limit: None,
             ratio: 2,
             retain: None,
@@ -1013,7 +1017,7 @@ impl Follower {
             rows: None,
             scope,
             whole: false,
-            within: None,
+            within,
             writer: Owned::new(Writer {
                 bases: BTreeMap::new(),
                 buffer: Vec::new(),
@@ -1111,6 +1115,9 @@ impl TurnLog {
         scope: impl Into<Arc<str>>,
     ) -> Result<Follower, StoreError> {
         let scope = scope.into();
+        let within = crate::bound::own(&*host);
+        let raw = host;
+        let host = crate::bound::bounded(&raw, within);
         let stored = host.load(&scope).await?;
         let mut follower = Follower {
             decoded: History::default(),
@@ -1121,12 +1128,14 @@ impl TurnLog {
             host,
             next: 1,
             previous: None,
+            raw,
             scope,
             snapshot: 0,
             snapshot_row: None,
             state: 0,
             stats: Stats::default(),
             tail: 0,
+            within,
         };
         follower.take(stored)?;
         Ok(follower)
@@ -1158,13 +1167,8 @@ impl TurnLog {
 
     #[must_use]
     pub fn host_calls_within(mut self, within: Option<Duration>) -> Self {
-        self.host = match within {
-            Some(within) => Arc::new(crate::bound::Bounded {
-                host: Arc::clone(&self.raw),
-                within,
-            }),
-            None => Arc::clone(&self.raw),
-        };
+        let within = within.or_else(|| crate::bound::own(&*self.raw));
+        self.host = crate::bound::bounded(&self.raw, within);
         self.within = within;
         self
     }
@@ -1200,28 +1204,47 @@ impl TurnLog {
         self.leased(self.writer.acquire().await)
     }
 
+    #[must_use]
+    pub const fn host_call_bound(&self) -> Option<Duration> {
+        self.within
+    }
+
+    pub async fn answered_within<T>(
+        &self,
+        call: &'static str,
+        answer: impl std::future::Future<Output = Result<T, StoreError>>,
+    ) -> Result<T, StoreError> {
+        match self.within {
+            Some(within) => crate::bound::within(within, call, &self.scope, answer).await,
+            None => answer.await,
+        }
+    }
+
     pub async fn lease_within(&self) -> Result<Lease<'_>, StoreError> {
+        Ok(self.leased(self.acquired(false).await?))
+    }
+
+    async fn acquired(&self, reading: bool) -> Result<Held<'_, Writer>, StoreError> {
         let Some(within) = self.within else {
-            return Ok(self.lease().await);
+            return Ok(self.writer.acquire().await);
         };
         if let Some(writer) = self.writer.try_acquire() {
-            return Ok(self.leased(writer));
+            return Ok(writer);
         }
-        let unbounded = crate::sim::mutated(crate::sim::Mutation::HostUnbounded);
-        let writer = if unbounded {
-            self.writer.acquire().await
-        } else {
-            nanocode_platform::timeout(within, self.writer.acquire())
-                .await
-                .map_err(|_| {
-                    StoreError::Backend(format!(
-                        "turn log writer of {} stayed held past {} ms",
-                        self.scope,
-                        within.as_millis()
-                    ))
-                })?
-        };
-        Ok(self.leased(writer))
+        let unbounded = crate::sim::mutated(crate::sim::Mutation::HostUnbounded)
+            || (reading && crate::sim::mutated(crate::sim::Mutation::ReadsUnbounded));
+        if unbounded {
+            return Ok(self.writer.acquire().await);
+        }
+        nanocode_platform::timeout(within, self.writer.acquire())
+            .await
+            .map_err(|_| {
+                StoreError::Backend(format!(
+                    "turn log writer of {} stayed held past {} ms",
+                    self.scope,
+                    within.as_millis()
+                ))
+            })
     }
 
     fn leased<'a>(&'a self, writer: Held<'a, Writer>) -> Lease<'a> {
@@ -1242,7 +1265,7 @@ impl TurnLog {
     }
 
     pub async fn load_owner(&self, owner: &str) -> Result<(), StoreError> {
-        let mut writer = self.writer.acquire().await;
+        let mut writer = self.acquired(true).await?;
         let writer = &mut *writer;
         warm_state(
             &*self.host,
@@ -1255,7 +1278,7 @@ impl TurnLog {
     }
 
     pub async fn load_index(&self) -> Result<(), StoreError> {
-        let mut writer = self.writer.acquire().await;
+        let mut writer = self.acquired(true).await?;
         let writer = &mut *writer;
         root(
             &*self.host,
@@ -1277,7 +1300,7 @@ impl TurnLog {
         owners: &[String],
         read: impl FnOnce(&Fold) -> R,
     ) -> Result<R, StoreError> {
-        let mut writer = self.writer.acquire().await;
+        let mut writer = self.acquired(true).await?;
         let writer = &mut *writer;
         if writer.fenced {
             return Err(StoreError::Fenced);
@@ -1300,7 +1323,7 @@ impl TurnLog {
         owner: &str,
         read: impl FnOnce(&Fold) -> R,
     ) -> Result<R, StoreError> {
-        let mut writer = self.writer.acquire().await;
+        let mut writer = self.acquired(true).await?;
         let writer = &mut *writer;
         warm_state(
             &*self.host,
@@ -1322,7 +1345,7 @@ impl TurnLog {
         after: u64,
         mut take: impl FnMut(&Event) -> bool,
     ) -> Result<(), StoreError> {
-        let mut writer = self.writer.acquire().await;
+        let mut writer = self.acquired(true).await?;
         let unsealed = writer.fold.unsealed();
         let end = match unsealed {
             Some(_) => writer.next,

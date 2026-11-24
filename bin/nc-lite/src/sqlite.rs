@@ -87,6 +87,10 @@ fn stopped() -> StoreError {
 }
 
 impl Sql for Sqlite {
+    fn call_bound(&self) -> Option<Duration> {
+        None
+    }
+
     fn transaction<'a>(
         &'a self,
         _operation: &'static str,

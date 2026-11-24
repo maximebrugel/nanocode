@@ -471,6 +471,10 @@ impl LostAcks {
 }
 
 impl nanocode::turnlog::LogHost for TracedHost {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        self.0.call_bound()
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use nanocode_platform::{MaybeSend, MaybeSync};
 
@@ -55,6 +55,8 @@ pub trait Sql: MaybeSend + MaybeSync {
         operation: &'static str,
         statements: &'a [SqlStatement<'a>],
     ) -> StoreFuture<'a, Result<Vec<Vec<SqlRow>>, StoreError>>;
+
+    fn call_bound(&self) -> Option<Duration>;
 
     fn run<'a>(
         &'a self,

@@ -123,6 +123,10 @@ impl SimHost {
 }
 
 impl LogHost for SimHost {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

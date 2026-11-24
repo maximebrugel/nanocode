@@ -286,6 +286,10 @@ impl Early {
 }
 
 impl LogHost for Early {
+    fn call_bound(&self) -> Option<std::time::Duration> {
+        self.inner.call_bound()
+    }
+
     fn scan<'a>(
         &'a self,
         scope: &'a str,

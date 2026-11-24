@@ -1323,7 +1323,7 @@ fn eager_pack(cache: &Path, directory: &str, key: &str, source: &[u8]) -> io::Re
 }
 
 fn stale_pointer(scripts: &Path, args: &[OsString]) -> Option<ExitCode> {
-    let helper = env::current_exe().ok()?;
+    let helper = env::current_exe().ok()?.canonicalize().ok()?;
     let checksum: u32 = helper.file_name()?.to_str()?.strip_prefix("buildcache-")?.parse().ok()?;
     let source = fs::read(scripts.join("buildcache.rs")).ok()?;
     let pointer = scripts.join(".buildcache");
@@ -2131,7 +2131,7 @@ fn publish_head(to: &Path, name: &str, helper: &str, eager: &[u8], index: &[u8])
 }
 
 fn publish_helper(to: &Path) -> io::Result<Option<String>> {
-    let helper = env::current_exe()?;
+    let helper = env::current_exe()?.canonicalize()?;
     let Some(checksum) = helper.file_name().and_then(OsStr::to_str).and_then(|name| name.strip_prefix("buildcache-")) else {
         return Ok(None);
     };

@@ -38,6 +38,7 @@ pub struct Config {
     pub catalog: Catalog,
     pub builtins: Option<Arc<Builtins>>,
     pub root: bool,
+    pub spill: Option<std::path::PathBuf>,
     pub zone: String,
     pub today: crate::harness::Clock,
     pub session: String,
@@ -590,6 +591,15 @@ impl Inner {
                     note: notice,
                 } = self.execute(call, &request_id).await;
                 let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let output = match call.name == "Read" && self.config.builtins.is_some() {
+                    true => output,
+                    false => crate::tools::spill::truncate(
+                        &call.name,
+                        &call.id,
+                        output,
+                        self.config.spill.as_deref(),
+                    ),
+                };
                 let mut running = streak.clone();
                 for key in &keys[..=index] {
                     advance(&mut running, key);

@@ -78,6 +78,15 @@ const TOOL_ERROR_STATUS: &str = "<system>ERROR: Tool execution failed.</system>"
 const TOOL_EMPTY_STATUS: &str = "<system>Tool output is empty.</system>";
 const TOOL_EMPTY_ERROR_STATUS: &str =
     "<system>ERROR: Tool execution failed. Tool output is empty.</system>";
+const WALL_TIME_TOOLS: [&str; 7] = [
+    "Agent",
+    "AgentSwarm",
+    "Bash",
+    "FetchURL",
+    "Glob",
+    "Grep",
+    "WebSearch",
+];
 pub const TOOL_OUTPUT_EMPTY: &str = "Tool output is empty.";
 
 /// Kimi Code's `normalizeLegacyResult`: an empty tool output is stored as "Tool output is empty.".
@@ -110,7 +119,13 @@ impl Message {
         }
     }
 
-    fn wire(&self) -> Value {
+    /// The message as sent; `wall` is the `Wall time` header Kimi Code puts before a tool result's first
+    /// text part when it projects history for compaction.
+    fn wire(&self, wall: Option<&str>) -> Value {
+        let timed = |text: String| match wall {
+            Some(header) => format!("{header}\n{text}"),
+            None => text,
+        };
         match self {
             Self::User { content, .. } => json!({"role": "user", "content": content}),
             Self::Tool {
@@ -130,6 +145,7 @@ impl Message {
                             .into_iter()
                             .collect();
                         parts.extend([format!("{}{note}", stored(content)), notice.clone()]);
+                        parts[0] = timed(std::mem::take(&mut parts[0]));
                         json!(
                             parts
                                 .iter()
@@ -137,7 +153,7 @@ impl Message {
                                 .collect::<Vec<_>>()
                         )
                     }
-                    None => json!(render_tool_output(content, *failed) + note),
+                    None => json!(timed(render_tool_output(content, *failed) + note)),
                 };
                 json!({"role": "tool", "tool_call_id": tool_call_id, "content": content})
             }
@@ -196,7 +212,37 @@ impl Request<'_> {
     #[must_use]
     pub fn encode(&self) -> String {
         let mut messages = vec![json!({"role": "system", "content": self.system})];
-        messages.extend(self.messages.iter().chain(self.extra).map(Message::wire));
+        let names = self
+            .messages
+            .iter()
+            .flat_map(|message| match message {
+                Message::Assistant { tool_calls, .. } => tool_calls
+                    .iter()
+                    .map(|call| (call.id.as_str(), call.name.as_str()))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let wall = |message: &Message| match message {
+            Message::Tool {
+                tool_call_id,
+                duration_ms: Some(duration),
+                ..
+            } if self.extra.is_some()
+                && names.get(tool_call_id.as_str()).is_some_and(|name| {
+                    WALL_TIME_TOOLS.contains(name) || name.starts_with("mcp__")
+                }) =>
+            {
+                Some(format!("Wall time: {:.3} seconds", *duration as f64 / 1000.0))
+            }
+            _ => None,
+        };
+        messages.extend(
+            self.messages
+                .iter()
+                .chain(self.extra)
+                .map(|message| message.wire(wall(message).as_deref())),
+        );
         let mut body = Map::new();
         body.insert("model".to_owned(), json!(self.model));
         body.insert("messages".to_owned(), Value::Array(messages));

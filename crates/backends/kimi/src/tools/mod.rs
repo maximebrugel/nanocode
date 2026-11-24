@@ -5,6 +5,7 @@
 mod files;
 mod search;
 mod shell;
+pub mod spill;
 mod todo;
 
 use serde_json::Value;

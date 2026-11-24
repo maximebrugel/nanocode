@@ -299,6 +299,7 @@ impl KimiHarness {
             catalog,
             builtins,
             root,
+            spill: spill_directory(&session),
             zone,
             today,
             session,
@@ -344,6 +345,23 @@ fn default_shell() -> Option<(String, String)> {
 
 #[cfg(target_family = "wasm")]
 const fn default_shell() -> Option<(String, String)> {
+    None
+}
+
+/// Where results over Kimi Code's 50 000-character limit are saved for the model to Read back; none on
+/// wasm, where Kimi Code's could-not-save preview applies.
+#[cfg(not(target_family = "wasm"))]
+fn spill_directory(session: &str) -> Option<std::path::PathBuf> {
+    Some(
+        std::env::temp_dir()
+            .join("nanocode-kimi")
+            .join(session)
+            .join("tool-results"),
+    )
+}
+
+#[cfg(target_family = "wasm")]
+const fn spill_directory(_session: &str) -> Option<std::path::PathBuf> {
     None
 }
 

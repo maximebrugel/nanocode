@@ -474,6 +474,8 @@ dependencies = [
  "nanocode-agent-core",
  "nanocode-backend-kimi-client",
  "nanocode-durability",
+ "nanocode-executor",
+ "nanocode-io",
  "nanocode-platform",
  "nanocode-sync",
  "nanocode-tool-contracts",

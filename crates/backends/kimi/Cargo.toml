@@ -23,8 +23,12 @@ serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+dom_query.workspace = true
+dom_smoothie.workspace = true
 nanocode-executor.workspace = true
+nanocode-http.workspace = true
 nanocode-io.workspace = true
+nanocode-tls.workspace = true
 
 [lints]
 workspace = true

@@ -80,6 +80,15 @@ const TOOL_EMPTY_ERROR_STATUS: &str =
     "<system>ERROR: Tool execution failed. Tool output is empty.</system>";
 pub const TOOL_OUTPUT_EMPTY: &str = "Tool output is empty.";
 
+/// Kimi Code's `normalizeLegacyResult`: an empty tool output is stored as "Tool output is empty.".
+const fn stored(content: &str) -> &str {
+    if content.is_empty() {
+        TOOL_OUTPUT_EMPTY
+    } else {
+        content
+    }
+}
+
 #[must_use]
 pub fn render_tool_output(output: &str, failed: bool) -> String {
     match failed {
@@ -112,15 +121,25 @@ impl Message {
                 notice,
                 ..
             } => {
-                let text = render_tool_output(content, *failed) + note;
-                json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": match notice {
-                        Some(notice) => json!([{"type": "text", "text": text}, {"type": "text", "text": notice}]),
-                        None => json!(text),
-                    },
-                })
+                let content = match notice {
+                    // With a note, Kimi Code sends the stored parts as they are, behind an error status
+                    // part when the tool failed.
+                    Some(notice) => {
+                        let mut parts: Vec<String> = failed
+                            .then(|| TOOL_ERROR_STATUS.to_owned())
+                            .into_iter()
+                            .collect();
+                        parts.extend([format!("{}{note}", stored(content)), notice.clone()]);
+                        json!(
+                            parts
+                                .iter()
+                                .map(|text| json!({"type": "text", "text": text}))
+                                .collect::<Vec<_>>()
+                        )
+                    }
+                    None => json!(render_tool_output(content, *failed) + note),
+                };
+                json!({"role": "tool", "tool_call_id": tool_call_id, "content": content})
             }
             Self::Assistant {
                 content,
@@ -233,7 +252,7 @@ fn estimate(message: &Message, arguments: impl Fn(&str) -> u64) -> u64 {
             ..
         } => {
             estimate_text("tool")
-                + estimate_text(&format!("{content}{note}"))
+                + estimate_text(&format!("{}{note}", stored(content)))
                 + notice.as_deref().map_or(0, estimate_text)
         }
         Message::Assistant {

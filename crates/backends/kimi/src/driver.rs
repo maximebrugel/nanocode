@@ -472,7 +472,7 @@ impl Inner {
             return Outcome::error(format!("Invalid args for tool \"{}\": {errors}", call.name));
         }
         if let Some(builtins) = builtin {
-            return builtins.call(&call.name, &args).await;
+            return builtins.call(&call.id, &call.name, &args).await;
         }
         let context = ToolContext::new(
             self.config.model.as_str(),
@@ -507,6 +507,9 @@ impl Inner {
         state
             .messages
             .push(Message::user(prompt_text(&input), Origin::Prompt));
+        if let Some(builtins) = &self.config.builtins {
+            builtins.turn();
+        }
         let mut streak: (Option<String>, u32) = (None, 0);
         let mut final_message = String::new();
         let mut floor = None;

@@ -96,15 +96,15 @@ impl Builtins {
         )
     }
 
-    /// Runs a built-in tool on arguments that already passed schema validation.
-    pub async fn call(&self, name: &str, args: &Value) -> Outcome {
+    /// Runs a built-in tool on arguments that already passed schema validation; `id` is the tool call's.
+    pub async fn call(&self, id: &str, name: &str, args: &Value) -> Outcome {
         match name {
             "Read" => files::read(self, args),
             "Write" => files::write(self, args),
             "Edit" => files::edit(self, args),
             "Glob" => search::glob(self, args).await,
             "Grep" => search::grep(self, args).await,
-            "Bash" => self.shell.bash(self, args).await,
+            "Bash" => self.shell.bash(self, id, args).await,
             "TaskList" => self.shell.list(args),
             "TaskOutput" => self.shell.output(args),
             "TaskStop" => self.shell.stop(args).await,
@@ -118,6 +118,11 @@ impl Builtins {
     /// messages Kimi Code injects before its next model request.
     pub fn notifications(&self) -> Vec<String> {
         self.shell.notifications()
+    }
+
+    /// A new turn began (a prompt); Kimi Code counts repeated WaitFor calls per turn.
+    pub fn turn(&self) {
+        self.shell.turn();
     }
 
     /// Stops every background task; called when the agent shuts down.

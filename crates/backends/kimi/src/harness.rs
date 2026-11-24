@@ -11,7 +11,9 @@ use std::sync::Arc;
 pub const FAMILY: &str = "kimi";
 pub const DEFAULT_MODEL: &str = "k3";
 
-#[derive(Clone, Debug, Default)]
+pub type Clock = Arc<dyn Fn() -> String + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct Environment {
     pub os: Option<String>,
     pub shell: Option<(String, String)>,
@@ -19,6 +21,7 @@ pub struct Environment {
     pub cwd_listing: Option<String>,
     pub agents_md: Option<String>,
     pub timezone: Option<String>,
+    pub today: Option<Clock>,
 }
 
 #[derive(Clone, Default)]
@@ -254,6 +257,9 @@ impl KimiHarness {
             .clone()
             .or_else(nanocode_platform::time_zone_name)
             .unwrap_or_else(|| "UTC".to_owned());
+        let today = given.today.clone().unwrap_or_else(|| {
+            Arc::new(|| crate::driver::local_date(nanocode_platform::system_time()))
+        });
         let checkpoint = spec.checkpoint.clone();
         let (runtime, events) = BackendRuntime::new(session.clone());
         let driver = Driver::new(Config {
@@ -265,6 +271,7 @@ impl KimiHarness {
             system: prompts::system(&environment),
             tools,
             zone,
+            today,
             session,
         });
         let driver = match checkpoint {
@@ -279,7 +286,7 @@ impl KimiHarness {
 const OS: &str = std::env::consts::OS;
 
 #[cfg(target_family = "wasm")]
-const OS: &str = "";
+const OS: &str = "linux";
 
 #[cfg(not(target_family = "wasm"))]
 fn native_sender() -> Result<Arc<dyn Sender>> {

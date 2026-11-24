@@ -34,6 +34,7 @@ pub struct Config {
     pub system: String,
     pub tools: NanoTools,
     pub zone: String,
+    pub today: crate::harness::Clock,
     pub session: String,
 }
 
@@ -114,7 +115,7 @@ fn advance(streak: &mut (Option<String>, u32), key: &str) {
     }
 }
 
-fn local_date(at: std::time::SystemTime) -> String {
+pub fn local_date(at: std::time::SystemTime) -> String {
     let seconds = at
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -180,7 +181,7 @@ impl Inner {
     }
 
     fn remind(&self, state: &mut State) {
-        let today = local_date(nanocode_platform::system_time());
+        let today = (self.config.today)();
         let zone = &self.config.zone;
         if !state.disclosed {
             state

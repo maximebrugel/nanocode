@@ -40,7 +40,7 @@ pub mod antigravity {
 }
 pub mod kimi {
     pub use nanocode_backend_kimi::{
-        Client, ClientError, DEFAULT_BASE_URL, DEFAULT_MODEL, Endpoint, Environment, FAMILY,
+        Client, ClientError, Clock, DEFAULT_BASE_URL, DEFAULT_MODEL, Endpoint, Environment, FAMILY,
         KimiCheckpointFormat, KimiHarness, RetryPolicy, Sender,
     };
 

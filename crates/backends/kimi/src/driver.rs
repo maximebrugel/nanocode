@@ -581,20 +581,38 @@ impl Inner {
             let keys = calls.iter().map(call_key).collect::<Vec<_>>();
             let mut stop = false;
             let mut injected = None;
-            for (index, call) in calls.iter().enumerate() {
+            // Kimi Code starts every call of a step at once and records the results in call order; the
+            // tools that hold its environment's process capability (Bash, Glob, Grep, Write, Edit) still
+            // run one at a time, in call order.
+            for call in &calls {
                 emit(
                     &events,
                     AgentEventKind::ToolCall,
                     json!({"call_id": call.id, "tool": call.name, "arguments": call.arguments, "model_call_index": call_index}),
                 );
+            }
+            let process = nanocode_sync::Semaphore::new(1);
+            let outcomes = nanocode_sync::future::join_all(calls.iter().map(|call| async {
                 let started = nanocode_platform::now();
+                let _turn = match matches!(
+                    call.name.as_str(),
+                    "Bash" | "Glob" | "Grep" | "Write" | "Edit"
+                ) {
+                    true => process.acquire().await.ok(),
+                    false => None,
+                };
+                let outcome = self.execute(call, &request_id).await;
+                let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                (outcome, elapsed)
+            }))
+            .await;
+            for ((index, call), (outcome, duration_ms)) in calls.iter().enumerate().zip(outcomes) {
                 let crate::tools::Outcome {
                     output,
                     failed,
                     note: notice,
                     media,
-                } = self.execute(call, &request_id).await;
-                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                } = outcome;
                 let output = match call.name == "Read" && self.config.builtins.is_some() {
                     true => output,
                     false => crate::tools::spill::truncate(

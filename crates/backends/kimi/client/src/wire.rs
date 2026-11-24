@@ -67,6 +67,10 @@ pub enum Message {
         failed: bool,
         #[serde(default)]
         note: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
 }
 
@@ -105,11 +109,19 @@ impl Message {
                 content,
                 failed,
                 note,
-            } => json!({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": render_tool_output(content, *failed) + note,
-            }),
+                notice,
+                ..
+            } => {
+                let text = render_tool_output(content, *failed) + note;
+                json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": match notice {
+                        Some(notice) => json!([{"type": "text", "text": text}, {"type": "text", "text": notice}]),
+                        None => json!(text),
+                    },
+                })
+            }
             Self::Assistant {
                 content,
                 reasoning,
@@ -214,8 +226,15 @@ pub fn estimate_request_message(message: &Message) -> u64 {
 fn estimate(message: &Message, arguments: impl Fn(&str) -> u64) -> u64 {
     match message {
         Message::User { content, .. } => estimate_text("user") + estimate_text(content),
-        Message::Tool { content, note, .. } => {
-            estimate_text("tool") + estimate_text(&format!("{content}{note}"))
+        Message::Tool {
+            content,
+            note,
+            notice,
+            ..
+        } => {
+            estimate_text("tool")
+                + estimate_text(&format!("{content}{note}"))
+                + notice.as_deref().map_or(0, estimate_text)
         }
         Message::Assistant {
             content,

@@ -1,5 +1,6 @@
 use crate::compaction;
-use crate::nanotools::NanoTools;
+use crate::nanotools::{Catalog, NanoTools};
+use crate::tools::Builtins;
 use crate::prompts;
 use nanocode_agent_core::{
     Agent, AgentSessionContext, Capabilities, CostStatus, ForkRequest, HarnessFamily, Lineage,
@@ -34,6 +35,9 @@ pub struct Config {
     pub window: u64,
     pub system: String,
     pub tools: NanoTools,
+    pub catalog: Catalog,
+    pub builtins: Option<Arc<Builtins>>,
+    pub root: bool,
     pub zone: String,
     pub today: crate::harness::Clock,
     pub session: String,
@@ -141,6 +145,45 @@ pub fn local_date(at: std::time::SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// V8's `JSON.parse` message where it can be told from serde's error, serde's otherwise.
+fn json_error(error: &serde_json::Error) -> String {
+    match error.classify() {
+        serde_json::error::Category::Eof => "Unexpected end of JSON input".to_owned(),
+        _ => error.to_string(),
+    }
+}
+
+/// Assistant steps since the last TodoList write and since the last stale todo-list reminder, counted
+/// the way Kimi Code's `getTodoListReminderStepCounts` walks the history.
+fn todo_steps(messages: &[Message]) -> (usize, usize) {
+    let mut found_write = false;
+    let mut found_reminder = false;
+    let (mut since_write, mut since_reminder) = (0, 0);
+    let marker = format!("<system-reminder>\n{}", crate::tools::TODO_REMINDER_PREFIX);
+    for message in messages.iter().rev() {
+        match message {
+            Message::Assistant { tool_calls, .. } => {
+                let wrote = tool_calls.iter().any(|call| {
+                    call.name == "TodoList"
+                        && serde_json::from_str::<Value>(&call.arguments)
+                            .is_ok_and(|args| args.get("todos").is_some_and(Value::is_array))
+                });
+                found_write |= wrote;
+                since_write += usize::from(!found_write);
+                since_reminder += usize::from(!found_reminder);
+            }
+            Message::User { content, .. } => {
+                found_reminder |= content.starts_with(&marker);
+                if found_write && found_reminder {
+                    break;
+                }
+            }
+            Message::Tool { .. } => {}
+        }
+    }
+    (since_write, since_reminder)
+}
+
 fn unique(calls: &mut [ToolCall], messages: &[Message]) {
     let mut used = messages
         .iter()
@@ -180,7 +223,7 @@ impl Inner {
     }
 
     fn overhead(&self) -> u64 {
-        estimate_text(&self.config.system) + self.config.tools.sizes
+        estimate_text(&self.config.system) + self.config.catalog.sizes
     }
 
     fn remind(&self, state: &mut State) {
@@ -205,6 +248,28 @@ impl Inner {
         }
     }
 
+    /// Kimi Code's per-step injections: completion notices of background tasks, then the stale todo-list
+    /// reminder (main agent only).
+    fn inject(&self, state: &mut State) {
+        let Some(builtins) = &self.config.builtins else {
+            return;
+        };
+        for notice in builtins.notifications() {
+            state.messages.push(Message::user(notice, Origin::Reminder));
+        }
+        if !self.config.root {
+            return;
+        }
+        let (since_write, since_reminder) = todo_steps(&state.messages);
+        if let Some(text) =
+            crate::tools::todo_reminder(&builtins.open_todos(), since_write, since_reminder)
+        {
+            state
+                .messages
+                .push(Message::user(prompts::reminder(&text), Origin::Reminder));
+        }
+    }
+
     async fn request(
         &self,
         messages: &[Message],
@@ -219,7 +284,7 @@ impl Inner {
             system: &config.system,
             messages,
             extra,
-            tools: &config.tools.declarations,
+            tools: &config.catalog.declarations,
             max_completion_tokens,
             prompt_cache_key: &config.session,
             effort: config.effort,
@@ -377,17 +442,37 @@ impl Inner {
         Ok(after)
     }
 
-    async fn execute(&self, call: &ToolCall, turn: &str) -> (String, bool) {
-        let args = match call.arguments.trim() {
+    async fn execute(&self, call: &ToolCall, turn: &str) -> crate::tools::Outcome {
+        use crate::tools::Outcome;
+        let args = match call.arguments.as_str() {
             "" => Ok(json!({})),
             text => serde_json::from_str::<Value>(text),
         };
         let args = match args {
             Ok(args) => args,
-            Err(error) => return (format!("Invalid JSON in tool arguments: {error}"), true),
+            Err(error) => {
+                return Outcome::error(format!(
+                    "Invalid args for tool \"{}\": {}",
+                    call.name,
+                    json_error(&error)
+                ));
+            }
         };
-        if !self.config.tools.handles(&call.name) {
-            return (format!("Tool `{}` not found.", call.name), true);
+        let builtin = self
+            .config
+            .builtins
+            .as_ref()
+            .filter(|_| Builtins::handles(&call.name));
+        if builtin.is_none() && !self.config.tools.handles(&call.name) {
+            return Outcome::error(format!("Tool \"{}\" not found", call.name));
+        }
+        if let Some(schema) = self.config.catalog.schemas.get(&call.name)
+            && let Some(errors) = crate::validate::errors(schema, &args)
+        {
+            return Outcome::error(format!("Invalid args for tool \"{}\": {errors}", call.name));
+        }
+        if let Some(builtins) = builtin {
+            return builtins.call(&call.name, &args).await;
         }
         let context = ToolContext::new(
             self.config.model.as_str(),
@@ -401,9 +486,13 @@ impl Inner {
             Ok(body) => (body, false),
             Err(error) => (error, true),
         };
-        match output.is_empty() {
-            true => (TOOL_OUTPUT_EMPTY.to_owned(), failed),
-            false => (output, failed),
+        Outcome {
+            output: match output.is_empty() {
+                true => TOOL_OUTPUT_EMPTY.to_owned(),
+                false => output,
+            },
+            failed,
+            note: None,
         }
     }
 
@@ -433,6 +522,7 @@ impl Inner {
         };
         loop {
             self.remind(&mut state);
+            self.inject(&mut state);
             let counted = compaction::counted(&state.messages, state.rebase);
             if floor.is_none_or(|floor| counted > floor)
                 && compaction::should_compact(counted, window)
@@ -444,7 +534,7 @@ impl Inner {
             let used = compaction::request_used(
                 &state.messages,
                 estimate_text(&self.config.system),
-                self.config.tools.listing,
+                self.config.catalog.listing,
             );
             let call_index = state.calls;
             let mut reply = self
@@ -493,7 +583,13 @@ impl Inner {
                     AgentEventKind::ToolCall,
                     json!({"call_id": call.id, "tool": call.name, "arguments": call.arguments, "model_call_index": call_index}),
                 );
-                let (output, failed) = self.execute(call, &request_id).await;
+                let started = nanocode_platform::now();
+                let crate::tools::Outcome {
+                    output,
+                    failed,
+                    note: notice,
+                } = self.execute(call, &request_id).await;
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let mut running = streak.clone();
                 for key in &keys[..=index] {
                     advance(&mut running, key);
@@ -511,7 +607,10 @@ impl Inner {
                         }
                     }
                 }
-                let content = render_tool_output(&output, failed) + &note;
+                let mut content = render_tool_output(&output, failed) + &note;
+                if let Some(notice) = &notice {
+                    content = format!("{content}\n{notice}");
+                }
                 emit(
                     &events,
                     AgentEventKind::ToolResult,
@@ -522,6 +621,8 @@ impl Inner {
                     content: output,
                     failed,
                     note,
+                    notice,
+                    duration_ms: Some(duration_ms),
                 });
             }
             for key in &keys {
@@ -580,6 +681,7 @@ impl Inner {
             "date": state.date,
             "disclosed": state.disclosed,
             "rebase": state.rebase,
+            "todos": self.config.builtins.as_ref().map(|builtins| builtins.todos()),
         })
     }
 }
@@ -635,6 +737,9 @@ impl Driver {
                 .get("rebase")
                 .cloned()
                 .and_then(|rebase| serde_json::from_value(rebase).ok());
+        }
+        if let (Some(builtins), Some(todos)) = (&self.inner.config.builtins, payload.get("todos")) {
+            builtins.restore_todos(todos);
         }
         Ok(self)
     }
@@ -805,7 +910,13 @@ impl LifecycleBackend for Driver {
 
     fn shutdown(&self) -> BackendFuture<Result<()>> {
         self.inner.stopped.store(true, Ordering::SeqCst);
-        done()
+        let builtins = self.inner.config.builtins.clone();
+        Box::pin(async move {
+            if let Some(builtins) = builtins {
+                builtins.shutdown().await;
+            }
+            Ok(())
+        })
     }
 
     fn set_parking(&self, _parking: bool) {}

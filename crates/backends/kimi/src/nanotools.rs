@@ -4,14 +4,93 @@ use nanocode_tool_host::embedded::{CodeModeObserver, CodeModeUpdate, OwnedToolCo
 use nanocode_tool_host::runtime::ToolRuntime;
 use nanocode_tool_host::{ToolContext, ToolDefinition, ToolInput};
 use serde_json::{Value, json};
+use crate::validate::Node;
 use std::collections::BTreeMap;
 
 pub struct NanoTools {
     runtime: ToolRuntime,
     routes: BTreeMap<String, Route>,
+    pub entries: Vec<Entry>,
+}
+
+/// One declared tool: its name, description, the schema its arguments are validated against, and the
+/// declaration sent to Kimi.
+pub struct Entry {
+    pub name: String,
+    pub description: String,
+    pub schema: Value,
+    pub ordered: Node,
+    pub declaration: Value,
+}
+
+/// Every tool the model sees, in the order Kimi Code declares them (by name, ignoring case), with the
+/// token estimates its context accounting uses.
+pub struct Catalog {
     pub declarations: Vec<Value>,
+    pub schemas: BTreeMap<String, Node>,
     pub sizes: u64,
     pub listing: u64,
+}
+
+impl Catalog {
+    pub fn new(mut entries: Vec<Entry>) -> Self {
+        entries.sort_by_key(|entry| entry.name.to_lowercase());
+        let estimate = nanocode_backend_kimi_client::estimate_text;
+        let sizes = entries
+            .iter()
+            .map(|entry| {
+                estimate(&entry.name)
+                    + estimate(&entry.description)
+                    + estimate(&entry.schema.to_string())
+            })
+            .sum();
+        let listing = match entries.is_empty() {
+            true => 0,
+            false => estimate(
+                &Value::Array(
+                    entries
+                        .iter()
+                        .map(|entry| json!({"name": entry.name, "description": entry.description, "parameters": entry.schema}))
+                        .collect(),
+                )
+                .to_string(),
+            ),
+        };
+        Self {
+            declarations: entries.iter().map(|entry| entry.declaration.clone()).collect(),
+            schemas: entries
+                .into_iter()
+                .map(|entry| (entry.name, entry.ordered))
+                .collect(),
+            sizes,
+            listing,
+        }
+    }
+}
+
+pub fn builtin_entries() -> Vec<Entry> {
+    let ordered = match Node::parse(crate::tools::CONTRACTS) {
+        Ok(Node::List(tools)) => tools,
+        _ => Vec::new(),
+    };
+    crate::tools::Builtins::declarations()
+        .into_iter()
+        .zip(ordered)
+        .map(|(declaration, ordered)| Entry {
+            ordered: ordered
+                .get("function")
+                .and_then(|function| function.get("parameters"))
+                .cloned()
+                .unwrap_or(Node::Leaf(json!({}))),
+            name: declaration["function"]["name"].as_str().unwrap_or_default().to_owned(),
+            description: declaration["function"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            schema: declaration["function"]["parameters"].clone(),
+            declaration,
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -42,11 +121,9 @@ fn exec_schema() -> Value {
 impl NanoTools {
     pub fn new(runtime: ToolRuntime, session: &str) -> Result<Self, String> {
         let mut routes = BTreeMap::new();
-        let mut declarations = Vec::new();
-        let mut sizes = 0;
-        let mut listing = Vec::new();
+        let mut entries = Vec::new();
         for definition in flatten(runtime.model_specs(session)) {
-            let (name, description, schema, route) = match definition {
+            let (name, description, schema, text, route) = match definition {
                 ToolDefinition::Function {
                     name,
                     description,
@@ -55,11 +132,12 @@ impl NanoTools {
                 } => {
                     let schema =
                         serde_json::to_value(&parameters).unwrap_or(json!({"type": "object"}));
+                    let text = serde_json::to_string(&parameters).unwrap_or_default();
                     let route = match &*name {
                         "wait" => Route::Wait,
                         _ => Route::Function(name.to_string()),
                     };
-                    (name.to_string(), description.to_string(), schema, route)
+                    (name.to_string(), description.to_string(), schema, text, route)
                 }
                 ToolDefinition::Custom {
                     name, description, ..
@@ -67,6 +145,7 @@ impl NanoTools {
                     name.to_string(),
                     description.to_string(),
                     exec_schema(),
+                    exec_schema().to_string(),
                     Route::Exec,
                 ),
                 _ => continue,
@@ -74,30 +153,26 @@ impl NanoTools {
             if routes.contains_key(&name) {
                 continue;
             }
-            sizes += nanocode_backend_kimi_client::estimate_text(&name)
-                + nanocode_backend_kimi_client::estimate_text(&description)
-                + nanocode_backend_kimi_client::estimate_text(&schema.to_string());
-            listing.push(json!({"name": name, "description": description, "parameters": schema}));
             let parameters = normalize_tool_schema(&schema)
                 .map_err(|error| format!("tool {name:?} has a schema Kimi refuses: {error}"))?;
-            declarations.push(json!({
+            let declaration = json!({
                 "type": "function",
                 "function": {"name": name, "description": description, "parameters": parameters},
-            }));
-            routes.insert(name, route);
+            });
+            routes.insert(name.clone(), route);
+            let ordered = Node::parse(&text).unwrap_or(Node::Leaf(json!({})));
+            entries.push(Entry {
+                name,
+                description,
+                schema,
+                ordered,
+                declaration,
+            });
         }
-        let listing = match listing.is_empty() {
-            true => 0,
-            false => {
-                nanocode_backend_kimi_client::estimate_text(&Value::Array(listing).to_string())
-            }
-        };
         Ok(Self {
             runtime,
             routes,
-            declarations,
-            sizes,
-            listing,
+            entries,
         })
     }
 

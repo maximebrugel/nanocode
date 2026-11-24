@@ -4,6 +4,8 @@ mod durability;
 mod harness;
 mod nanotools;
 mod prompts;
+mod tools;
+mod validate;
 
 pub use durability::KimiCheckpointFormat;
 pub use harness::{Clock, DEFAULT_MODEL, Environment, FAMILY, KimiHarness};

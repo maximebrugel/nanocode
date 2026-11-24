@@ -60,10 +60,17 @@ pub fn render(template: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
-pub fn system(environment: &Environment) -> String {
+const TODO_LIST_GUIDANCE: &str = "When you track work in `TodoList`, keep it in step with what you have actually done: mark an item done as soon as it is finished, before you start the next one, and make sure the list matches what you did before you write your final message.\n\n";
+
+/// The system prompt; `todo_list` adds Kimi Code's TodoList guidance, present whenever the tool is.
+pub fn system(environment: &Environment, todo_list: bool) -> String {
+    let todo_list_guidance = if todo_list { TODO_LIST_GUIDANCE } else { "" };
     let delivering_work = render(
         DELIVERING_WORK,
-        &[("plan_mode_guidance", ""), ("todo_list_guidance", "")],
+        &[
+            ("plan_mode_guidance", ""),
+            ("todo_list_guidance", todo_list_guidance),
+        ],
     );
     let agents_section = render(
         PROJECT_INFORMATION,
@@ -89,7 +96,7 @@ pub fn system(environment: &Environment) -> String {
             ("product_name", PRODUCT_NAME),
             ("reply_style_guide", REPLY_STYLE_GUIDE),
             ("notify_user_guidance", ""),
-            ("todo_list_guidance", ""),
+            ("todo_list_guidance", todo_list_guidance),
             ("coding_section", &format!("{CODING}\n")),
             ("delivering_work_section", &format!("{delivering_work}\n")),
             ("os", &environment.os),

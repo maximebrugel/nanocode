@@ -202,6 +202,13 @@ impl KimiHarness {
         let handle = AgentHandle::new(session.clone(), model.clone(), spec.spawn_factory.clone())
             .with_root_session_id(root)
             .with_spawn_factory(spec.spawn_factory.clone());
+        let builtins = match (&settings.tools, cfg!(target_family = "wasm")) {
+            (None, false) => Some(Arc::new(crate::tools::Builtins::new(
+                std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.to_path_buf()),
+                home(),
+            ))),
+            _ => None,
+        };
         let selected = match &settings.tools {
             Some(tools) => tools.materialize(handle.clone()),
             None => Tools::builder().without_defaults().build(),
@@ -229,7 +236,12 @@ impl KimiHarness {
             false => selected,
         };
         let runtime = ToolRuntime::new_with_tools(workspace.to_path_buf(), Vec::new(), &selected);
-        let tools = NanoTools::new(runtime, &session).map_err(invalid)?;
+        let mut tools = NanoTools::new(runtime, &session).map_err(invalid)?;
+        let mut entries = std::mem::take(&mut tools.entries);
+        if builtins.is_some() {
+            entries.extend(crate::nanotools::builtin_entries());
+        }
+        let catalog = crate::nanotools::Catalog::new(entries);
         let given = &self.environment;
         let environment = prompts::Environment {
             os: given.os.clone().unwrap_or_else(|| prompts::os_name(OS)),
@@ -274,6 +286,7 @@ impl KimiHarness {
             None => (None, None),
         };
         let checkpoint = spec.checkpoint.clone();
+        let root = spec.parent.is_none();
         let (runtime, events) = BackendRuntime::new(session.clone());
         let driver = Driver::new(Config {
             client,
@@ -281,8 +294,11 @@ impl KimiHarness {
             thinking: spec.thinking,
             effort,
             window,
-            system: prompts::system(&environment),
+            system: prompts::system(&environment, builtins.is_some()),
             tools,
+            catalog,
+            builtins,
+            root,
             zone,
             today,
             session,

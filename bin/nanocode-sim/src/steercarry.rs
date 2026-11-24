@@ -512,6 +512,7 @@ impl Media {
                     Arc::new(SimHost::new(Arc::clone(&self.disk)));
                 let policy = nanocode::turnlog::Policy {
                     effects: nanocode::turnlog::Effects::default(),
+                    host_call_bound: None,
                     max_row_bytes: None,
                     restarts: u64::MAX,
                     retain_finished: None,

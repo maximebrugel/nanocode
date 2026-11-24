@@ -1,3 +1,4 @@
+mod bound;
 mod codec;
 mod effect;
 #[cfg(not(target_family = "wasm"))]

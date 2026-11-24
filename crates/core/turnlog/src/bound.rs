@@ -1,0 +1,135 @@
+use std::{future::Future, sync::Arc, time::Duration};
+
+use nanocode_durability_core::{StoreError, StoreFuture};
+use nanocode_sync::FutureExt;
+
+use crate::{Compaction, Extension, LogHost, Rider, ScopeRows, StoredCheckpoint, Write};
+
+pub(crate) struct Bounded {
+    pub(crate) host: Arc<dyn LogHost>,
+    pub(crate) within: Duration,
+}
+
+pub(crate) fn unanswered(call: &str, scope: &str, within: Duration) -> StoreError {
+    StoreError::Backend(format!(
+        "turn log host {call} of {scope} did not answer within {} ms, so its outcome is unknown",
+        within.as_millis()
+    ))
+}
+
+pub(crate) async fn within<T>(
+    within: Duration,
+    call: &'static str,
+    scope: &str,
+    future: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, StoreError> {
+    let mut future = std::pin::pin!(future);
+    if let Some(done) = future.as_mut().now_or_never() {
+        return done;
+    }
+    if crate::sim::mutated(crate::sim::Mutation::HostUnbounded) {
+        return future.await;
+    }
+    nanocode_platform::timeout(within, future)
+        .await
+        .unwrap_or_else(|_| Err(unanswered(call, scope, within)))
+}
+
+impl LogHost for Bounded {
+    fn scan<'a>(
+        &'a self,
+        scope: &'a str,
+        from: u64,
+        to: u64,
+    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
+        Box::pin(within(
+            self.within,
+            "scan",
+            scope,
+            self.host.scan(scope, from, to),
+        ))
+    }
+
+    fn scans<'a>(
+        &'a self,
+        scans: &'a [(&'a str, u64)],
+    ) -> StoreFuture<'a, Result<Vec<ScopeRows>, StoreError>> {
+        let scope = scans.first().map_or("", |(scope, _)| *scope);
+        Box::pin(within(self.within, "scans", scope, self.host.scans(scans)))
+    }
+
+    fn load<'a>(
+        &'a self,
+        scope: &'a str,
+    ) -> StoreFuture<'a, Result<Vec<(u64, String)>, StoreError>> {
+        Box::pin(within(self.within, "load", scope, self.host.load(scope)))
+    }
+
+    fn append<'a>(
+        &'a self,
+        scope: &'a str,
+        rows: &'a [(u64, String)],
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(within(
+            self.within,
+            "append",
+            scope,
+            self.host.append(scope, rows),
+        ))
+    }
+
+    fn append_compacting<'a>(
+        &'a self,
+        scope: &'a str,
+        rows: &'a [(u64, String)],
+        compaction: Compaction<'a>,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(within(
+            self.within,
+            "append",
+            scope,
+            self.host.append_compacting(scope, rows, compaction),
+        ))
+    }
+
+    fn extend<'a>(
+        &'a self,
+        scope: &'a str,
+        extension: Extension<'a>,
+    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
+        let extending = self.host.extend(scope, extension)?;
+        Some(Box::pin(within(self.within, "extend", scope, extending)))
+    }
+
+    fn carry<'a>(
+        &'a self,
+        scope: &'a str,
+        write: Write<'a>,
+        rider: Rider<'a>,
+    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
+        let carrying = self.host.carry(scope, write, rider)?;
+        Some(Box::pin(within(self.within, "append", scope, carrying)))
+    }
+
+    fn checkpoint<'a>(
+        &'a self,
+        scope: &'a str,
+    ) -> Option<StoreFuture<'a, Result<Option<StoredCheckpoint>, StoreError>>> {
+        let reading = self.host.checkpoint(scope)?;
+        Some(Box::pin(within(self.within, "checkpoint", scope, reading)))
+    }
+
+    fn save_checkpoint<'a>(
+        &'a self,
+        scope: &'a str,
+        checkpoint: &'a StoredCheckpoint,
+    ) -> Option<StoreFuture<'a, Result<(), StoreError>>> {
+        let saving = self.host.save_checkpoint(scope, checkpoint)?;
+        Some(Box::pin(within(
+            self.within,
+            "checkpoint save",
+            scope,
+            saving,
+        )))
+    }
+}

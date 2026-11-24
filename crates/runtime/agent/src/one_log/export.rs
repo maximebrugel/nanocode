@@ -12,7 +12,7 @@ pub struct Exported {
 
 impl OneLog {
     pub async fn export_state(&self, state_id: &str) -> Result<Option<Exported>, StoreError> {
-        let mut lease = self.log.lease().await;
+        let mut lease = self.log.lease_within().await?;
         if sim::mutated(sim::Mutation::ExportSkipsKeys) {
             lease.load_owners(&[state_id.to_owned()]).await?;
         } else {

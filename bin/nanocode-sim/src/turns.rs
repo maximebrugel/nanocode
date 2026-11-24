@@ -69,6 +69,7 @@ pub enum TurnMutation {
     IdempotentReportedUnknown,
     OpenDropsJournals,
     PartReadUnloaded,
+    HostUnbounded,
     RecoverySkipsClientless,
     ResumeRedispatchesRunning,
     RetireSkipped,
@@ -85,7 +86,7 @@ pub enum TurnMutation {
 }
 
 impl TurnMutation {
-    const ALL: [Self; 28] = [
+    const ALL: [Self; 29] = [
         Self::None,
         Self::AckBufferedAdmission,
         Self::AckBufferedResult,
@@ -101,6 +102,7 @@ impl TurnMutation {
         Self::IdempotentReportedUnknown,
         Self::OpenDropsJournals,
         Self::PartReadUnloaded,
+        Self::HostUnbounded,
         Self::RecoverySkipsClientless,
         Self::ResumeRedispatchesRunning,
         Self::RetireSkipped,
@@ -139,6 +141,7 @@ impl TurnMutation {
             Self::IdempotentReportedUnknown => "idempotent_reported_unknown",
             Self::OpenDropsJournals => "open_drops_journals",
             Self::PartReadUnloaded => "part_read_unloaded",
+            Self::HostUnbounded => "host_unbounded",
             Self::RecoverySkipsClientless => "recovery_skips_clientless",
             Self::ResumeRedispatchesRunning => "resume_redispatches_running",
             Self::RetireSkipped => "retire_skipped",
@@ -1222,6 +1225,10 @@ impl Sim {
         if self.oracle.wrong.is_some() {
             return false;
         }
+        nanocode_turnlog::sim::mutate(match self.options.mutation {
+            TurnMutation::HostUnbounded => nanocode_turnlog::sim::Mutation::HostUnbounded,
+            _ => nanocode_turnlog::sim::Mutation::None,
+        });
         let policy: Box<dyn TurnDurability> = match self.options.policy {
             PolicyKind::Reference => Box::new(OneLog::new(
                 self.options.protections,

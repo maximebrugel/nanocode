@@ -152,6 +152,14 @@ pub fn enter(seed: u64, clock: &Arc<Clock>) {
     });
 }
 
+pub fn entered<R>(seed: u64, clock: &Arc<Clock>, run: impl FnOnce() -> R) -> R {
+    let kept = Restore(CURRENT.with_borrow_mut(Option::take));
+    enter(seed, clock);
+    let ran = run();
+    drop(kept);
+    ran
+}
+
 pub fn spawned() -> Vec<(HostFuture, String)> {
     CURRENT.with_borrow(|current| {
         current

@@ -75,7 +75,7 @@ impl OneLog {
         }
         // Checked under the lease, which acquire also holds while it adds an owner, so no session
         // can take the state between this check and the import's commit.
-        let mut lease = self.log.lease().await;
+        let mut lease = self.log.lease_within().await?;
         if self.owners.read(|owners| owners.get(state_id).is_some()) {
             return Err(StoreError::Fenced);
         }

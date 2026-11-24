@@ -56,6 +56,7 @@ mod secrets;
 mod server;
 mod simulate;
 mod socket;
+mod stall;
 mod steercarry;
 mod store;
 mod streams;

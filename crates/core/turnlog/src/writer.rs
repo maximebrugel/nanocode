@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Range,
     sync::Arc,
+    time::Duration,
 };
 
 use nanocode_durability_core::{SqlStatement, StoreError};
@@ -1003,7 +1004,8 @@ impl Follower {
         let floor = Some(fold.last_event());
         let (riding, riders) = mpsc::unbounded_channel();
         Ok(TurnLog {
-            host,
+            host: Arc::clone(&host),
+            raw: host,
             limit: None,
             ratio: 2,
             retain: None,
@@ -1011,6 +1013,7 @@ impl Follower {
             rows: None,
             scope,
             whole: false,
+            within: None,
             writer: Owned::new(Writer {
                 bases: BTreeMap::new(),
                 buffer: Vec::new(),
@@ -1072,6 +1075,7 @@ struct Writer {
 
 pub struct TurnLog {
     host: Arc<dyn LogHost>,
+    raw: Arc<dyn LogHost>,
     limit: Option<usize>,
     ratio: usize,
     retain: Option<usize>,
@@ -1079,6 +1083,7 @@ pub struct TurnLog {
     rows: Option<usize>,
     scope: Arc<str>,
     whole: bool,
+    within: Option<Duration>,
     writer: Owned<Writer>,
 }
 
@@ -1152,6 +1157,19 @@ impl TurnLog {
     }
 
     #[must_use]
+    pub fn host_calls_within(mut self, within: Option<Duration>) -> Self {
+        self.host = match within {
+            Some(within) => Arc::new(crate::bound::Bounded {
+                host: Arc::clone(&self.raw),
+                within,
+            }),
+            None => Arc::clone(&self.raw),
+        };
+        self.within = within;
+        self
+    }
+
+    #[must_use]
     pub const fn whole_checkpoints(mut self, whole: bool) -> Self {
         self.whole = whole;
         self
@@ -1179,6 +1197,34 @@ impl TurnLog {
     }
 
     pub async fn lease(&self) -> Lease<'_> {
+        self.leased(self.writer.acquire().await)
+    }
+
+    pub async fn lease_within(&self) -> Result<Lease<'_>, StoreError> {
+        let Some(within) = self.within else {
+            return Ok(self.lease().await);
+        };
+        if let Some(writer) = self.writer.try_acquire() {
+            return Ok(self.leased(writer));
+        }
+        let unbounded = crate::sim::mutated(crate::sim::Mutation::HostUnbounded);
+        let writer = if unbounded {
+            self.writer.acquire().await
+        } else {
+            nanocode_platform::timeout(within, self.writer.acquire())
+                .await
+                .map_err(|_| {
+                    StoreError::Backend(format!(
+                        "turn log writer of {} stayed held past {} ms",
+                        self.scope,
+                        within.as_millis()
+                    ))
+                })?
+        };
+        Ok(self.leased(writer))
+    }
+
+    fn leased<'a>(&'a self, writer: Held<'a, Writer>) -> Lease<'a> {
         Lease {
             host: &*self.host,
             limit: self.limit,
@@ -1187,7 +1233,7 @@ impl TurnLog {
             rows: self.rows,
             scope: &self.scope,
             whole: self.whole,
-            writer: self.writer.acquire().await,
+            writer,
         }
     }
 

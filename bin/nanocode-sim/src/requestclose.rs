@@ -263,6 +263,7 @@ async fn open(disk: &Arc<Disk>, wire: &Arc<Wire>, inbox: &Arc<Inbox>) -> Result<
     let log_host: Arc<dyn nanocode::turnlog::LogHost> = Arc::new(SimHost::new(Arc::clone(disk)));
     let policy = nanocode::turnlog::Policy {
         effects: nanocode::turnlog::Effects::default(),
+        host_call_bound: None,
         max_row_bytes: None,
         restarts: u64::MAX,
         retain_finished: None,

@@ -61,7 +61,7 @@ pub enum Fire {
 impl OneLog {
     pub async fn index_wakes(&self, index: Arc<dyn WakeRider>) -> Result<(), StoreError> {
         index.prepare().await?;
-        let lease = self.log.lease().await;
+        let lease = self.log.lease_within().await?;
         let summary = lease.fold().wakes().summary();
         index.write(self.scope(), &summary).await?;
         self.wake_index.set(Some(index));
@@ -105,7 +105,7 @@ impl OneLog {
 
     pub async fn arm(&self, key: &str, wake: Wake) -> Result<u64, WakeError> {
         wake.fit().map_err(WakeError::Unfit)?;
-        let mut lease = self.log.lease().await;
+        let mut lease = self.log.lease_within().await?;
         let prior = lease.fold().wakes().get(key).cloned();
         if let Some(max) = self.wakes_max
             && prior.is_none()
@@ -133,7 +133,7 @@ impl OneLog {
     }
 
     pub async fn disarm(&self, key: &str) -> Result<Option<u64>, StoreError> {
-        let mut lease = self.log.lease().await;
+        let mut lease = self.log.lease_within().await?;
         let Some(prior) = lease.fold().wakes().get(key).cloned() else {
             return Ok(None);
         };
@@ -159,7 +159,7 @@ impl OneLog {
         fields: &Map<String, Value>,
         event: Box<RawValue>,
     ) -> Result<Heard, StoreError> {
-        let mut lease = self.log.lease().await;
+        let mut lease = self.log.lease_within().await?;
         let mut heard = Heard::default();
         let mut priors = Vec::new();
         for (key, armed) in lease.fold().wakes().iter() {
@@ -231,7 +231,7 @@ impl OneLog {
         }
         let id = submission.request_id.as_str();
         let digest = submission_digest(&submission.prompt, submission.hand.as_deref())?;
-        let mut lease = self.log.lease().await;
+        let mut lease = self.log.lease_within().await?;
         let prior = match lease.fold().wakes().get(key) {
             Some(armed) if armed.generation == generation => armed.clone(),
             _ => return Ok(Fire::Stale),

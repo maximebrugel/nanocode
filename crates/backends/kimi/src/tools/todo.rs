@@ -60,7 +60,10 @@ fn hint(todos: &[Todo]) -> Option<String> {
         .collect::<Vec<_>>();
     Some(match active.as_slice() {
         [] => "No item is in_progress. Mark the one you are working on as in_progress.".to_owned(),
-        [_, _, ..] => "Several items are in_progress. Keep only the one you are working on now in_progress.".to_owned(),
+        [_, _, ..] => {
+            "Several items are in_progress. Keep only the one you are working on now in_progress."
+                .to_owned()
+        }
         [current] if open == 1 => format!(
             "\"{}\" is the last open item. Once it is finished, mark it done before you write your final message; if it stays blocked or unfinished, keep it in_progress and say what remains in your reply.",
             current.title
@@ -78,9 +81,16 @@ const STEPS_BETWEEN_REMINDERS: usize = 10;
 
 /// Kimi Code's stale todo-list reminder text, given the todos and how many assistant steps passed since
 /// the last TodoList write and since the last such reminder; `None` when no reminder is due.
-pub fn reminder(todos: &[(String, String)], since_write: usize, since_reminder: usize) -> Option<String> {
+pub fn reminder(
+    todos: &[(String, String)],
+    since_write: usize,
+    since_reminder: usize,
+) -> Option<String> {
     let done = todos.iter().filter(|(_, status)| status == "done").count();
-    if done == todos.len() || since_write < STEPS_SINCE_WRITE || since_reminder < STEPS_BETWEEN_REMINDERS {
+    if done == todos.len()
+        || since_write < STEPS_SINCE_WRITE
+        || since_reminder < STEPS_BETWEEN_REMINDERS
+    {
         return None;
     }
     let progress = format!("{done}/{} done", todos.len());

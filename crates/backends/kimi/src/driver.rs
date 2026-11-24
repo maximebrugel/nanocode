@@ -1,7 +1,7 @@
 use crate::compaction;
 use crate::nanotools::{Catalog, NanoTools};
-use crate::tools::Builtins;
 use crate::prompts;
+use crate::tools::Builtins;
 use nanocode_agent_core::{
     Agent, AgentSessionContext, Capabilities, CostStatus, ForkRequest, HarnessFamily, Lineage,
     ModelSelection, NanocodeError, ReportedTurnUsage, Result, SessionCheckpoint, SpawnOptions,

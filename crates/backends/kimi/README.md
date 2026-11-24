@@ -1,9 +1,10 @@
 # nanocode-backend-kimi
 
 A nanocode harness that reproduces the engine of Kimi Code CLI (`@moonshot-ai/kimi-code` 2.7.3) for Kimi models: its
-system prompt, its reminders, its repeated-call guard, its compaction and its Chat Completions request shape. Kimi Code's
-own tools (Bash, Read, Edit, …) are not part of it yet: the model gets nanocode's tools, in Code Mode or directly
-(`KimiHarness::direct_tools`), as Kimi Code calls tools. Subagents, Code Mode and MCP stay nanocode's own.
+system prompt, its reminders, its repeated-call guard, its compaction, its Chat Completions request shape and its
+built-in workspace tools: Read, Write, Edit, Glob, Grep, Bash, TaskList, TaskOutput, TaskStop, WaitFor and TodoList.
+Those are installed when the caller selects no tools (native targets only); with a tool selection, the model gets that
+selection, in Code Mode or directly (`KimiHarness::direct_tools`). Subagents, Code Mode and MCP stay nanocode's own.
 
 ## Selecting it
 
@@ -32,7 +33,9 @@ default) or `max`; K3 always reasons, so other levels are refused.
 | Request: `thinking: {type: enabled, effort, keep: all}`, `max_completion_tokens` = window − estimated request, `prompt_cache_key` = session, `stream_options.include_usage` | The same |
 | Tool schemas: local `$ref`s inlined, a `type` inferred for every child schema from its `enum`, `const` or structure | The same (`normalize_tool_schema`) |
 | History: assistant `reasoning_content` always replayed, no `content` beside tool calls when it is blank, tool call IDs sanitized and made unique | The same |
-| Tool results: `<system>` markers for failed and empty outputs | The same; nanocode's tools get no wall-time header, as Kimi Code's non-MCP external tools |
+| Built-in tools: the declarations Kimi Code sends (`prompts/tools.json`, verbatim), their outputs, notes, errors and path guards, Bash's background tasks and their completion notifications, TodoList's guidance and stale-list reminder | The same, checked call by call against the release CLI; Glob and Grep run `rg` from `PATH`. Not ported: FetchURL, ReadMediaFile, WebSearch, Agent, AskUserQuestion, plan mode, goals, cron, skills |
+| Tool calls: arguments parsed, unknown tools refused, then validated as AJV does (`allErrors`, every error joined with `; `) for every tool, nanocode's included | The same; a malformed-JSON message uses serde's wording except at end of input |
+| Tool results: `<system>` markers for failed and empty outputs, a note as a second text part, results over 50 000 characters saved to a file with a head and tail preview (a preview alone when they cannot be saved, as on wasm), a `Wall time` header for Bash, Glob, Grep and MCP tools in compaction requests | The same; results are saved under the system temp directory instead of Kimi Code's session directory |
 | Reminders: the date at the start and when it changes, auto permission mode, both again after a compaction | The same |
 | Repeated-call guard: reminders on the 3rd, 5th and 8th identical call in a row, a separate one at the 12th, the turn stopped after the 13th | The same |
 | Compaction at 85% of the window (or within 50k tokens of it): the whole history plus the pinned instruction, then the user's messages (20k tokens, head and tail), the summary and a continuation reminder | The same, without Kimi Code's pointer to its on-disk event log |

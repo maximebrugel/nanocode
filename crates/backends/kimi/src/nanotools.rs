@@ -1,10 +1,10 @@
+use crate::validate::Node;
 use nanocode_backend_kimi_client::normalize_tool_schema;
 use nanocode_tool_host::contract::{ToolOutputBody, ToolOutputContent};
 use nanocode_tool_host::embedded::{CodeModeObserver, CodeModeUpdate, OwnedToolContext};
 use nanocode_tool_host::runtime::ToolRuntime;
 use nanocode_tool_host::{ToolContext, ToolDefinition, ToolInput};
 use serde_json::{Value, json};
-use crate::validate::Node;
 use std::collections::BTreeMap;
 
 pub struct NanoTools {
@@ -57,7 +57,10 @@ impl Catalog {
             ),
         };
         Self {
-            declarations: entries.iter().map(|entry| entry.declaration.clone()).collect(),
+            declarations: entries
+                .iter()
+                .map(|entry| entry.declaration.clone())
+                .collect(),
             schemas: entries
                 .into_iter()
                 .map(|entry| (entry.name, entry.ordered))
@@ -82,7 +85,10 @@ pub fn builtin_entries() -> Vec<Entry> {
                 .and_then(|function| function.get("parameters"))
                 .cloned()
                 .unwrap_or(Node::Leaf(json!({}))),
-            name: declaration["function"]["name"].as_str().unwrap_or_default().to_owned(),
+            name: declaration["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
             description: declaration["function"]["description"]
                 .as_str()
                 .unwrap_or_default()
@@ -137,7 +143,13 @@ impl NanoTools {
                         "wait" => Route::Wait,
                         _ => Route::Function(name.to_string()),
                     };
-                    (name.to_string(), description.to_string(), schema, text, route)
+                    (
+                        name.to_string(),
+                        description.to_string(),
+                        schema,
+                        text,
+                        route,
+                    )
                 }
                 ToolDefinition::Custom {
                     name, description, ..

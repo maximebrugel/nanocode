@@ -9,8 +9,8 @@ use serde_json::Value;
 /// the schema declares the properties, and `serde_json::Value` (without `preserve_order`) sorts them.
 #[derive(Clone, Debug)]
 pub enum Node {
-    Map(Vec<(String, Node)>),
-    List(Vec<Node>),
+    Map(Vec<(String, Self)>),
+    List(Vec<Self>),
     Leaf(Value),
 }
 
@@ -19,9 +19,12 @@ impl Node {
         serde_json::from_str(json)
     }
 
-    pub fn get(&self, key: &str) -> Option<&Node> {
+    pub fn get(&self, key: &str) -> Option<&Self> {
         match self {
-            Self::Map(entries) => entries.iter().find(|(name, _)| name == key).map(|(_, node)| node),
+            Self::Map(entries) => entries
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, node)| node),
             _ => None,
         }
     }
@@ -38,7 +41,7 @@ impl Node {
                     .map(|(key, node)| (key.clone(), node.value()))
                     .collect(),
             ),
-            Self::List(items) => Value::Array(items.iter().map(Node::value).collect()),
+            Self::List(items) => Value::Array(items.iter().map(Self::value).collect()),
             Self::Leaf(value) => value.clone(),
         }
     }
@@ -57,7 +60,7 @@ impl Node {
         }
     }
 
-    fn list(&self) -> Option<&[Node]> {
+    fn list(&self) -> Option<&[Self]> {
         match self {
             Self::List(items) => Some(items),
             _ => None,
@@ -137,7 +140,7 @@ fn is_type(kind: &str, value: &Value) -> bool {
     }
 }
 
-fn group_of(value: &Value) -> Option<&'static str> {
+const fn group_of(value: &Value) -> Option<&'static str> {
     match value {
         Value::Number(_) => Some("number"),
         Value::String(_) => Some("string"),
@@ -286,7 +289,11 @@ fn typed(group: &str, schema: &Node, data: &Value, path: &str, found: &mut Vec<S
         "number" => {
             let value = data.as_f64().unwrap_or_default();
             for (key, operator, fails) in [
-                ("maximum", "<=", (|v: f64, l: f64| v > l) as fn(f64, f64) -> bool),
+                (
+                    "maximum",
+                    "<=",
+                    (|v: f64, l: f64| v > l) as fn(f64, f64) -> bool,
+                ),
                 ("minimum", ">=", |v, l| v < l),
                 ("exclusiveMaximum", "<", |v, l| v >= l),
                 ("exclusiveMinimum", ">", |v, l| v <= l),
@@ -294,14 +301,22 @@ fn typed(group: &str, schema: &Node, data: &Value, path: &str, found: &mut Vec<S
                 if let Some(bound) = limit(key)
                     && fails(value, bound)
                 {
-                    push(found, path, format!("must be {operator} {}", format_number(bound)));
+                    push(
+                        found,
+                        path,
+                        format!("must be {operator} {}", format_number(bound)),
+                    );
                 }
             }
             if let Some(step) = limit("multipleOf")
                 && step != 0.0
                 && (value / step).fract() != 0.0
             {
-                push(found, path, format!("must be multiple of {}", format_number(step)));
+                push(
+                    found,
+                    path,
+                    format!("must be multiple of {}", format_number(step)),
+                );
             }
         }
         "string" => {
@@ -309,12 +324,26 @@ fn typed(group: &str, schema: &Node, data: &Value, path: &str, found: &mut Vec<S
             if let Some(bound) = limit("maxLength")
                 && length > bound
             {
-                push(found, path, format!("must NOT have more than {} characters", format_number(bound)));
+                push(
+                    found,
+                    path,
+                    format!(
+                        "must NOT have more than {} characters",
+                        format_number(bound)
+                    ),
+                );
             }
             if let Some(bound) = limit("minLength")
                 && length < bound
             {
-                push(found, path, format!("must NOT have fewer than {} characters", format_number(bound)));
+                push(
+                    found,
+                    path,
+                    format!(
+                        "must NOT have fewer than {} characters",
+                        format_number(bound)
+                    ),
+                );
             }
         }
         "array" => {
@@ -323,24 +352,44 @@ fn typed(group: &str, schema: &Node, data: &Value, path: &str, found: &mut Vec<S
             if let Some(bound) = limit("maxItems")
                 && count > bound
             {
-                push(found, path, format!("must NOT have more than {} items", format_number(bound)));
+                push(
+                    found,
+                    path,
+                    format!("must NOT have more than {} items", format_number(bound)),
+                );
             }
             if let Some(bound) = limit("minItems")
                 && count < bound
             {
-                push(found, path, format!("must NOT have fewer than {} items", format_number(bound)));
+                push(
+                    found,
+                    path,
+                    format!("must NOT have fewer than {} items", format_number(bound)),
+                );
             }
-            if matches!(schema.get("uniqueItems"), Some(Node::Leaf(Value::Bool(true)))) {
+            if matches!(
+                schema.get("uniqueItems"),
+                Some(Node::Leaf(Value::Bool(true)))
+            ) {
                 'unique: for later in (0..items.len()).rev() {
                     for earlier in (0..later).rev() {
                         if equal(&items[earlier], &items[later]) {
-                            push(found, path, format!("must NOT have duplicate items (items ## {earlier} and {later} are identical)"));
+                            push(
+                                found,
+                                path,
+                                format!(
+                                    "must NOT have duplicate items (items ## {earlier} and {later} are identical)"
+                                ),
+                            );
                             break 'unique;
                         }
                     }
                 }
             }
-            if let Some(item) = schema.get("items").filter(|item| !matches!(item, Node::List(_))) {
+            if let Some(item) = schema
+                .get("items")
+                .filter(|item| !matches!(item, Node::List(_)))
+            {
                 for (index, value) in items.iter().enumerate() {
                     check(item, value, &format!("{path}/{index}"), found);
                 }
@@ -398,7 +447,9 @@ fn equal(left: &Value, right: &Value) -> bool {
             a.len() == b.len() && a.iter().zip(b).all(|(a, b)| equal(a, b))
         }
         (Value::Object(a), Value::Object(b)) => {
-            a.len() == b.len() && a.iter().all(|(key, value)| b.get(key).is_some_and(|other| equal(value, other)))
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(key, value)| b.get(key).is_some_and(|other| equal(value, other)))
         }
         (a, b) => a == b,
     }
@@ -415,35 +466,101 @@ mod tests {
         tools
             .into_iter()
             .find(|tool| {
-                tool.get("function").and_then(|function| function.get("name")).and_then(Node::as_str) == Some(name)
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Node::as_str)
+                    == Some(name)
             })
-            .and_then(|tool| tool.get("function").and_then(|function| function.get("parameters")).cloned())
+            .and_then(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("parameters"))
+                    .cloned()
+            })
             .unwrap()
     }
     #[test]
     fn matches_kimi_code_messages() {
         let cases = [
             ("Read", json!({}), "must have required property 'path'"),
-            ("Read", json!({"extra": 1}), "must have required property 'path'; must NOT have additional property 'extra'"),
-            ("Read", json!({"path": 5, "extra": 1}), "must NOT have additional property 'extra'; /path must be string"),
-            ("Read", json!({"path": 5, "line_offset": 0}), "/path must be string; /line_offset must be >= 1; /line_offset must be < 0; /line_offset must match a schema in anyOf"),
-            ("Read", json!({"path": "a", "line_offset": "x"}), "/line_offset must be integer; /line_offset must be integer; /line_offset must match a schema in anyOf"),
-            ("Read", json!({"path": "a", "line_offset": 1.5}), "/line_offset must be integer; /line_offset must be integer; /line_offset must be < 0; /line_offset must match a schema in anyOf"),
-            ("Write", json!({"path": "x.txt"}), "must have required property 'content'"),
+            (
+                "Read",
+                json!({"extra": 1}),
+                "must have required property 'path'; must NOT have additional property 'extra'",
+            ),
+            (
+                "Read",
+                json!({"path": 5, "extra": 1}),
+                "must NOT have additional property 'extra'; /path must be string",
+            ),
+            (
+                "Read",
+                json!({"path": 5, "line_offset": 0}),
+                "/path must be string; /line_offset must be >= 1; /line_offset must be < 0; /line_offset must match a schema in anyOf",
+            ),
+            (
+                "Read",
+                json!({"path": "a", "line_offset": "x"}),
+                "/line_offset must be integer; /line_offset must be integer; /line_offset must match a schema in anyOf",
+            ),
+            (
+                "Read",
+                json!({"path": "a", "line_offset": 1.5}),
+                "/line_offset must be integer; /line_offset must be integer; /line_offset must be < 0; /line_offset must match a schema in anyOf",
+            ),
+            (
+                "Write",
+                json!({"path": "x.txt"}),
+                "must have required property 'content'",
+            ),
             ("Write", json!([1]), "must be object"),
-            ("TodoList", json!({"todos": [{"title": "", "status": "pending"}]}), "/todos/0/title must NOT have fewer than 1 characters"),
+            (
+                "TodoList",
+                json!({"todos": [{"title": "", "status": "pending"}]}),
+                "/todos/0/title must NOT have fewer than 1 characters",
+            ),
             ("TodoList", json!({"todos": "x"}), "/todos must be array"),
-            ("TodoList", json!({"todos": [{"title": "a"}]}), "must have required property 'status'"),
-            ("Edit", json!({"path": "README.md", "old_string": "hello", "new_string": "bye", "extra": 1}), "must NOT have additional property 'extra'"),
-            ("Bash", json!({"command": "echo hi", "timeout": 0}), "/timeout must be > 0"),
-            ("Bash", json!({"command": "", "timeout": 400}), "/command must NOT have fewer than 1 characters"),
-            ("Grep", json!({"pattern": "x", "output_mode": "bad"}), "/output_mode must be equal to one of the allowed values"),
-            ("Glob", json!({"pattern": "x", "head_limit": -1}), "/head_limit must be >= 0"),
+            (
+                "TodoList",
+                json!({"todos": [{"title": "a"}]}),
+                "must have required property 'status'",
+            ),
+            (
+                "Edit",
+                json!({"path": "README.md", "old_string": "hello", "new_string": "bye", "extra": 1}),
+                "must NOT have additional property 'extra'",
+            ),
+            (
+                "Bash",
+                json!({"command": "echo hi", "timeout": 0}),
+                "/timeout must be > 0",
+            ),
+            (
+                "Bash",
+                json!({"command": "", "timeout": 400}),
+                "/command must NOT have fewer than 1 characters",
+            ),
+            (
+                "Grep",
+                json!({"pattern": "x", "output_mode": "bad"}),
+                "/output_mode must be equal to one of the allowed values",
+            ),
+            (
+                "Glob",
+                json!({"pattern": "x", "head_limit": -1}),
+                "/head_limit must be >= 0",
+            ),
             ("WaitFor", json!({"timeout": 91}), "/timeout must be <= 90"),
         ];
         for (name, args, expected) in cases {
-            assert_eq!(errors(&tool(name), &args).as_deref(), Some(expected), "{name} {args}");
+            assert_eq!(
+                errors(&tool(name), &args).as_deref(),
+                Some(expected),
+                "{name} {args}"
+            );
         }
-        assert_eq!(errors(&tool("Bash"), &json!({"command": "x", "timeout": 400})), None);
+        assert_eq!(
+            errors(&tool("Bash"), &json!({"command": "x", "timeout": 400})),
+            None
+        );
     }
 }

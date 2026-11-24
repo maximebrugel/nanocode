@@ -103,13 +103,27 @@ fn preview(lines: &mut Vec<String>, text: &str) {
     let first = head(text, PREVIEW_HEAD_CHARS);
     let first_units = units(first);
     let total = units(text);
-    let (start, last) = tail(text, first_units.max(total.saturating_sub(PREVIEW_TAIL_CHARS)));
-    lines.extend(["".to_owned(), format!("[preview: chars [0, {first_units})]"), first.to_owned()]);
+    let (start, last) = tail(
+        text,
+        first_units.max(total.saturating_sub(PREVIEW_TAIL_CHARS)),
+    );
+    lines.extend([
+        "".to_owned(),
+        format!("[preview: chars [0, {first_units})]"),
+        first.to_owned(),
+    ]);
     if !last.is_empty() {
         if start > first_units {
-            lines.extend(["".to_owned(), format!("[elided: chars [{first_units}, {start})]")]);
+            lines.extend([
+                "".to_owned(),
+                format!("[elided: chars [{first_units}, {start})]"),
+            ]);
         }
-        lines.extend(["".to_owned(), format!("[preview: chars [{start}, {total})]"), last.to_owned()]);
+        lines.extend([
+            "".to_owned(),
+            format!("[preview: chars [{start}, {total})]"),
+            last.to_owned(),
+        ]);
     }
 }
 
@@ -127,7 +141,9 @@ pub fn truncate(tool: &str, call: &str, output: String, directory: Option<&Path>
     let preserved = units(retained);
     let Some(path) = save(directory, tool, call, retained) else {
         let mut lines = vec![
-            format!("Tool output exceeded {MAX_CHARS} characters and could not be saved to a file; only this preview is available."),
+            format!(
+                "Tool output exceeded {MAX_CHARS} characters and could not be saved to a file; only this preview is available."
+            ),
             format!("tool_name: {tool}"),
             format!("tool_call_id: {call}"),
             format!("output_size_chars: {total}"),
@@ -154,13 +170,19 @@ pub fn truncate(tool: &str, call: &str, output: String, directory: Option<&Path>
     let partial = preserved < total;
     let mut lines = vec![
         match partial {
-            true => format!("Tool output exceeded {MAX_CHARS} characters; the first {preserved} characters (of {total}) were saved to a file."),
-            false => format!("Tool output exceeded {MAX_CHARS} characters; the full output was saved to a file."),
+            true => format!(
+                "Tool output exceeded {MAX_CHARS} characters; the first {preserved} characters (of {total}) were saved to a file."
+            ),
+            false => format!(
+                "Tool output exceeded {MAX_CHARS} characters; the full output was saved to a file."
+            ),
         },
         format!("tool_name: {tool}"),
         format!("tool_call_id: {call}"),
         match partial {
-            true => format!("output_size_chars: {total} (only the first {preserved} characters were preserved)"),
+            true => format!(
+                "output_size_chars: {total} (only the first {preserved} characters were preserved)"
+            ),
             false => format!("output_size_chars: {total}"),
         },
         format!("output_size_bytes: {}", retained.len()),
@@ -188,7 +210,14 @@ mod tests {
     fn shapes_long_lines() {
         let line = "x".repeat(2500);
         let shaped = shape(&format!("{line}\nshort\n{line}"));
-        assert_eq!(shaped, format!("{}[...truncated]\nshort\n{}[...truncated]", "x".repeat(1985), "x".repeat(1986)));
+        assert_eq!(
+            shaped,
+            format!(
+                "{}[...truncated]\nshort\n{}[...truncated]",
+                "x".repeat(1985),
+                "x".repeat(1986)
+            )
+        );
     }
 
     #[test]
@@ -196,6 +225,8 @@ mod tests {
         let output = "y".repeat(60_000);
         let text = truncate("Bash", "c1", output, None);
         assert!(text.starts_with("Tool output exceeded 50000 characters and could not be saved to a file; only this preview is available.\ntool_name: Bash\ntool_call_id: c1\noutput_size_chars: 60000\n\n[preview: chars [0, 4096)]\n"));
-        assert!(text.contains("\n\n[elided: chars [4096, 58976)]\n\n[preview: chars [58976, 60000)]\n"));
+        assert!(
+            text.contains("\n\n[elided: chars [4096, 58976)]\n\n[preview: chars [58976, 60000)]\n")
+        );
     }
 }

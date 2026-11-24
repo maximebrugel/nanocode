@@ -77,7 +77,8 @@ impl Builtins {
 
     /// The declarations Kimi Code sends for these tools, verbatim.
     pub fn declarations() -> Vec<Value> {
-        serde_json::from_str::<Vec<Value>>(CONTRACTS).expect("verified upstream Kimi tool contracts")
+        serde_json::from_str::<Vec<Value>>(CONTRACTS)
+            .expect("verified upstream Kimi tool contracts")
     }
 
     pub fn handles(name: &str) -> bool {
@@ -132,7 +133,11 @@ impl Builtins {
     }
 
     pub fn todos(&self) -> Value {
-        let todos = self.todos.lock().map(|todos| todos.clone()).unwrap_or_default();
+        let todos = self
+            .todos
+            .lock()
+            .map(|todos| todos.clone())
+            .unwrap_or_default();
         serde_json::to_value(todos).unwrap_or(Value::Null)
     }
 
@@ -155,10 +160,6 @@ impl Builtins {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
     }
 
     /// Kimi Code's `resolvePathAccessPath`: expands `~`, resolves against the working directory,
@@ -201,12 +202,6 @@ impl Builtins {
         }
         Ok(canonical)
     }
-
-    /// How Kimi Code shows a path it resolved: relative to the working directory when inside it.
-    pub fn display(&self, path: &Path) -> String {
-        path.strip_prefix(&self.cwd)
-            .map_or_else(|_| path.display().to_string(), |relative| relative.display().to_string())
-    }
 }
 
 /// Node's `path.normalize` on an absolute path: drops `.`, folds `..`, keeps symlinks unresolved.
@@ -231,7 +226,16 @@ pub fn sensitive(path: &Path) -> bool {
     const EXEMPT: [&str; 3] = [".env.example", ".env.sample", ".env.template"];
     const PUBLIC: [&str; 3] = ["id_rsa.pub", "id_ed25519.pub", "id_ecdsa.pub"];
     const VARIANTS: [&str; 10] = [
-        ".bak", ".backup", ".copy", ".disabled", ".key", ".old", ".orig", ".pem", ".save", ".tmp",
+        ".bak",
+        ".backup",
+        ".copy",
+        ".disabled",
+        ".key",
+        ".old",
+        ".orig",
+        ".pem",
+        ".save",
+        ".tmp",
     ];
     let name = path
         .file_name()
@@ -258,7 +262,9 @@ pub fn sensitive(path: &Path) -> bool {
     }
     [".aws/credentials", ".gcp/credentials"]
         .iter()
-        .any(|suffix| whole.ends_with(&format!("/{suffix}")) || whole.contains(&format!("/{suffix}/")))
+        .any(|suffix| {
+            whole.ends_with(&format!("/{suffix}")) || whole.contains(&format!("/{suffix}/"))
+        })
 }
 
 /// Deserializes validated arguments into a tool's input struct.

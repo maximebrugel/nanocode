@@ -233,7 +233,10 @@ impl Request<'_> {
                     WALL_TIME_TOOLS.contains(name) || name.starts_with("mcp__")
                 }) =>
             {
-                Some(format!("Wall time: {:.3} seconds", *duration as f64 / 1000.0))
+                Some(format!(
+                    "Wall time: {:.3} seconds",
+                    *duration as f64 / 1000.0
+                ))
             }
             _ => None,
         };

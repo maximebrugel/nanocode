@@ -7,7 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Kimi Code (kimi-code 2.7.3) engine harness for nanocode: pinned prompts, Kimi requests, reminders, repeated-call guard and compaction"
+description = "Kimi Code (kimi-code 2.7.3) engine harness for nanocode: pinned prompts, Kimi requests, reminders, repeated-call guard, compaction and built-in tools"
 
 [dependencies]
 nanocode-backend-kimi-client.workspace = true

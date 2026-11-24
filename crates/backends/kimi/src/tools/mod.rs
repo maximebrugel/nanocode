@@ -18,13 +18,15 @@ pub const CONTRACTS: &str = include_str!("../../prompts/tools.json");
 
 pub use todo::{REMINDER_PREFIX as TODO_REMINDER_PREFIX, reminder as todo_reminder};
 
-/// What a tool hands back to the model: its output, whether it failed, and the `note` Kimi Code sends as
-/// a second text part of the tool message.
+/// What a tool hands back to the model: its output, whether it failed, the `note` Kimi Code sends as
+/// a second text part of the tool message, and the media parts that follow the output's first text part
+/// (`Message::Tool::media`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
     pub output: String,
     pub failed: bool,
     pub note: Option<String>,
+    pub media: Vec<Value>,
 }
 
 impl Outcome {
@@ -39,7 +41,7 @@ impl Outcome {
         Self {
             output: output.into(),
             failed: true,
-            note: None,
+            ..Self::default()
         }
     }
 
@@ -63,16 +65,20 @@ pub enum Access {
 pub struct Builtins {
     cwd: PathBuf,
     home: Option<PathBuf>,
+    /// The session's media store (Kimi Code's `<session>/media`), where ReadMediaFile saves what it cannot
+    /// send inline.
+    media: Option<PathBuf>,
     todos: Mutex<Vec<todo::Todo>>,
     shell: shell::Shell,
 }
 
 impl Builtins {
-    pub fn new(cwd: PathBuf, home: Option<PathBuf>) -> Self {
+    pub fn new(cwd: PathBuf, home: Option<PathBuf>, media: Option<PathBuf>) -> Self {
         Self {
             shell: shell::Shell::new(&cwd),
             cwd,
             home,
+            media,
             todos: Mutex::default(),
         }
     }

@@ -206,6 +206,7 @@ impl KimiHarness {
             (None, false) => Some(Arc::new(crate::tools::Builtins::new(
                 std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.to_path_buf()),
                 home(),
+                spill_directory(&session).map(|spill| spill.with_file_name("media")),
             ))),
             _ => None,
         };

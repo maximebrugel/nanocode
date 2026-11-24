@@ -755,7 +755,7 @@ fn completion(task: &Task, call: &str) -> Outcome {
     Outcome {
         output,
         failed,
-        note: None,
+        ..Outcome::default()
     }
 }
 

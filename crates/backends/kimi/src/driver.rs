@@ -493,7 +493,7 @@ impl Inner {
                 false => output,
             },
             failed,
-            note: None,
+            ..Outcome::default()
         }
     }
 
@@ -592,6 +592,7 @@ impl Inner {
                     output,
                     failed,
                     note: notice,
+                    media,
                 } = self.execute(call, &request_id).await;
                 let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let output = match call.name == "Read" && self.config.builtins.is_some() {
@@ -635,6 +636,7 @@ impl Inner {
                     failed,
                     note,
                     notice,
+                    media,
                     duration_ms: Some(duration_ms),
                 });
             }

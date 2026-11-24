@@ -72,6 +72,7 @@ pub enum TurnMutation {
     HostUnbounded,
     HostBoundIgnored,
     ReadsUnbounded,
+    AnswersUnbounded,
     RecoverySkipsClientless,
     ResumeRedispatchesRunning,
     RetireSkipped,
@@ -88,7 +89,7 @@ pub enum TurnMutation {
 }
 
 impl TurnMutation {
-    const ALL: [Self; 31] = [
+    const ALL: [Self; 32] = [
         Self::None,
         Self::AckBufferedAdmission,
         Self::AckBufferedResult,
@@ -107,6 +108,7 @@ impl TurnMutation {
         Self::HostUnbounded,
         Self::HostBoundIgnored,
         Self::ReadsUnbounded,
+        Self::AnswersUnbounded,
         Self::RecoverySkipsClientless,
         Self::ResumeRedispatchesRunning,
         Self::RetireSkipped,
@@ -148,6 +150,7 @@ impl TurnMutation {
             Self::HostUnbounded => "host_unbounded",
             Self::HostBoundIgnored => "host_bound_ignored",
             Self::ReadsUnbounded => "reads_unbounded",
+            Self::AnswersUnbounded => "answers_unbounded",
             Self::RecoverySkipsClientless => "recovery_skips_clientless",
             Self::ResumeRedispatchesRunning => "resume_redispatches_running",
             Self::RetireSkipped => "retire_skipped",
@@ -1235,6 +1238,7 @@ impl Sim {
             TurnMutation::HostUnbounded => nanocode_turnlog::sim::Mutation::HostUnbounded,
             TurnMutation::HostBoundIgnored => nanocode_turnlog::sim::Mutation::HostBoundIgnored,
             TurnMutation::ReadsUnbounded => nanocode_turnlog::sim::Mutation::ReadsUnbounded,
+            TurnMutation::AnswersUnbounded => nanocode_turnlog::sim::Mutation::AnswersUnbounded,
             _ => nanocode_turnlog::sim::Mutation::None,
         });
         let policy: Box<dyn TurnDurability> = match self.options.policy {

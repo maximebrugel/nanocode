@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use nanocode::turnlog::{OneLog, Policy, Statements, WakeRider, WakeSummary};
 use nanocode_durability_core::{StoreError, StoreFuture};
 use nanocode_sync::FutureExt;
 use nanocode_turnlog::{
@@ -157,6 +158,84 @@ pub fn bounded(scope: &str, stored: &[(u64, String)], seq: u64) {
     }
     let clock = Clock::new();
     crate::host::entered(seq, &clock, || held(scope, stored, seq, &clock));
+    let clock = Clock::new();
+    crate::host::entered(seq, &clock, || indexed(scope, seq, &clock));
+}
+
+struct StalledIndex;
+
+impl WakeRider for StalledIndex {
+    fn host(&self) -> usize {
+        usize::MAX
+    }
+
+    fn statements(&self, _scope: &str, _summary: &WakeSummary) -> Statements {
+        Vec::new()
+    }
+
+    fn prepare(&self) -> StoreFuture<'_, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn write<'a>(
+        &'a self,
+        _scope: &'a str,
+        _summary: &'a WakeSummary,
+    ) -> StoreFuture<'a, Result<(), StoreError>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn indexed(scope: &str, seq: u64, clock: &Arc<Clock>) {
+    let (host, _) = opened(scope, &[]);
+    let host: Arc<dyn LogHost> = host;
+    let log = ready(OneLog::open(host, scope, Policy::default()))
+        .unwrap_or_else(|error| panic!("{scope} does not open as a OneLog for a stall probe: {error}"));
+    let indexed = Rc::new(Cell::new(None));
+    let read = Rc::new(Cell::new(None));
+    let tasks = vec![
+        {
+            let (log, clock, indexed) = (&log, Arc::clone(clock), Rc::clone(&indexed));
+            Box::pin(async move {
+                let written = log.index_wakes(Arc::new(StalledIndex)).await;
+                indexed.set(Some((clock.now_ns(), written.is_ok())));
+            }) as Task<'_>
+        },
+        {
+            let (log, clock, read) = (&log, Arc::clone(clock), Rc::clone(&read));
+            Box::pin(async move {
+                nanocode_platform::sleep(STALL_BOUND / 2).await;
+                let due = log.next_due().await;
+                let stats = log.stats().await;
+                read.set(Some((clock.now_ns(), due.is_none() && stats.admissions == 0)));
+            }) as Task<'_>
+        },
+    ];
+    let run = Executor::new(Arc::clone(clock), Rng::derive(seq, "stall index")).run(tasks, None);
+    assert!(
+        run == Ended::Finished,
+        "{scope} reads wait on a stalled wake index write past every bound after commit {seq}: {run:?}"
+    );
+    let bound_ns = u64::try_from(STALL_BOUND.as_nanos()).expect("the stall bound fits in u64");
+    let (indexed_ns, written) = indexed
+        .get()
+        .unwrap_or_else(|| panic!("{scope} index_wakes over a stalled index never ended"));
+    assert!(
+        !written,
+        "{scope} index_wakes reports a write its stalled index never answered"
+    );
+    assert!(
+        indexed_ns <= bound_ns,
+        "{scope} index_wakes over a stalled index ended at {indexed_ns} ns, past the bound of {bound_ns} ns"
+    );
+    let (read_ns, empty) = read
+        .get()
+        .unwrap_or_else(|| panic!("{scope} reads behind a stalled index never ended"));
+    assert!(
+        read_ns <= bound_ns,
+        "{scope} reads behind a stalled wake index ended at {read_ns} ns, past the bound of {bound_ns} ns"
+    );
+    assert!(empty, "{scope} a fresh log reads wakes or appends it never wrote");
 }
 
 fn opened(scope: &str, stored: &[(u64, String)]) -> (Arc<StallHost>, TurnLog) {

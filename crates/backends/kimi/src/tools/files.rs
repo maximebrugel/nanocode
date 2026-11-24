@@ -59,11 +59,11 @@ pub fn read(builtins: &Builtins, args: &Value) -> Outcome {
         Err(error) => return Outcome::error(fs_error(&error, "read")),
     };
     let header = &bytes[..bytes.len().min(512)];
-    let kind = file_kind(&path.to_string_lossy(), header);
-    // Kimi models take images but not videos, and ReadMediaFile is not active here.
+    let (kind, _) = file_kind(&path.to_string_lossy(), header, false);
+    // K3 takes images but not videos (Kimi Code's `image_in`, no `video_in`), and ReadMediaFile is active.
     if kind == "image" {
         return Outcome::error(format!(
-            "\"{shown}\" is an image file. Only text files can be read."
+            "\"{shown}\" is an image file. Only text files can be read; use ReadMediaFile for image and video files."
         ));
     }
     if kind == "video" {
@@ -386,8 +386,8 @@ fn finish_page(
             };
             return Outcome {
                 output,
-                failed: false,
                 note,
+                ..Outcome::default()
             };
         }
         if count == 1 && !tail {
@@ -417,6 +417,7 @@ fn finish_page(
                     output: output.to_owned(),
                     failed: true,
                     note,
+                    ..Outcome::default()
                 };
             }
             return Outcome::error(format!(
@@ -627,16 +628,43 @@ fn sniff_utf16(header: &[u8]) -> Option<bool> {
     }
 }
 
-/// Kimi Code's `detectFileType(path, header)`: `text`, `image`, `video` or `unknown`.
-fn file_kind(path: &str, header: &[u8]) -> &'static str {
-    const IMAGE: [&str; 13] = [
-        ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico", ".heic",
-        ".heif", ".avif", ".svgz",
-    ];
-    const VIDEO: [&str; 13] = [
-        ".mp4", ".mpg", ".mpeg", ".mkv", ".avi", ".mov", ".ogv", ".wmv", ".webm", ".m4v", ".flv",
-        ".3gp", ".3g2",
-    ];
+/// Kimi Code's `IMAGE_MIME_BY_SUFFIX` and `VIDEO_MIME_BY_SUFFIX`.
+pub const IMAGE_SUFFIXES: [(&str, &str); 13] = [
+    (".png", "image/png"),
+    (".jpg", "image/jpeg"),
+    (".jpeg", "image/jpeg"),
+    (".gif", "image/gif"),
+    (".bmp", "image/bmp"),
+    (".tif", "image/tiff"),
+    (".tiff", "image/tiff"),
+    (".webp", "image/webp"),
+    (".ico", "image/x-icon"),
+    (".heic", "image/heic"),
+    (".heif", "image/heif"),
+    (".avif", "image/avif"),
+    (".svgz", "image/svg+xml"),
+];
+pub const VIDEO_SUFFIXES: [(&str, &str); 13] = [
+    (".mp4", "video/mp4"),
+    (".mpg", "video/mpeg"),
+    (".mpeg", "video/mpeg"),
+    (".mkv", "video/x-matroska"),
+    (".avi", "video/x-msvideo"),
+    (".mov", "video/quicktime"),
+    (".ogv", "video/ogg"),
+    (".wmv", "video/x-ms-wmv"),
+    (".webm", "video/webm"),
+    (".m4v", "video/x-m4v"),
+    (".flv", "video/x-flv"),
+    (".3gp", "video/3gpp"),
+    (".3g2", "video/3gpp2"),
+];
+
+/// Kimi Code's `detectFileType(path, header, type)`: the kind (`text`, `image`, `video` or `unknown`) and
+/// MIME type. In `media` mode a sniffed signature wins over the extension, and a video extension stands
+/// without one.
+pub fn file_kind(path: &str, header: &[u8], media: bool) -> (&'static str, &'static str) {
+    const UNKNOWN: (&str, &str) = ("unknown", "");
     const NON_TEXT: &[&str] = &[
         ".icns", ".psd", ".ai", ".eps", ".pdf", ".doc", ".docx", ".dot", ".dotx", ".rtf", ".odt",
         ".xls", ".xlsx", ".xlsm", ".xlt", ".xltx", ".xltm", ".ods", ".ppt", ".pptx", ".pptm",
@@ -653,50 +681,72 @@ fn file_kind(path: &str, header: &[u8]) -> &'static str {
         _ => String::new(),
     };
     let suffix = suffix.as_str();
-    let hint = if suffix == ".svg" {
-        Some("text")
-    } else if IMAGE.contains(&suffix) {
-        Some("image")
-    } else if VIDEO.contains(&suffix) {
-        Some("video")
-    } else {
-        None
+    let find = |table: &[(&'static str, &'static str)], kind| {
+        table
+            .iter()
+            .find(|(known, _)| *known == suffix)
+            .map(|&(_, mime)| (kind, mime))
+    };
+    let hint = match suffix {
+        ".svg" => Some(("text", "image/svg+xml")),
+        _ => find(&IMAGE_SUFFIXES, "image").or_else(|| find(&VIDEO_SUFFIXES, "video")),
     };
     if let Some(sniffed) = sniff_media(header) {
-        return if hint.is_some_and(|hint| hint != sniffed) {
-            "unknown"
-        } else {
-            sniffed
+        return match hint {
+            _ if media => sniffed,
+            Some(hint) if hint.0 != sniffed.0 => UNKNOWN,
+            Some(hint) => hint,
+            None => sniffed,
         };
     }
-    if hint == Some("image") || header.contains(&0) {
-        return "unknown";
+    match hint {
+        Some(("image", _)) => UNKNOWN,
+        Some(hint @ ("video", _)) if media => hint,
+        _ if header.contains(&0) => UNKNOWN,
+        Some(hint) => hint,
+        None if NON_TEXT.contains(&suffix) => UNKNOWN,
+        None => ("text", "text/plain"),
     }
-    hint.unwrap_or(match NON_TEXT.contains(&suffix) {
-        true => "unknown",
-        false => "text",
-    })
 }
 
 /// Kimi Code's `sniffMediaFromMagic`.
-fn sniff_media(header: &[u8]) -> Option<&'static str> {
-    const IMAGES: [&[u8]; 8] = [
-        b"\x89PNG\r\n\x1a\n",
-        b"\xff\xd8\xff",
-        b"GIF87a",
-        b"GIF89a",
-        b"BM",
-        b"II*\0",
-        b"MM\0*",
-        b"\0\0\x01\0",
+fn sniff_media(header: &[u8]) -> Option<(&'static str, &'static str)> {
+    const IMAGES: [(&[u8], &str); 8] = [
+        (b"\x89PNG\r\n\x1a\n", "image/png"),
+        (b"\xff\xd8\xff", "image/jpeg"),
+        (b"GIF87a", "image/gif"),
+        (b"GIF89a", "image/gif"),
+        (b"BM", "image/bmp"),
+        (b"II*\0", "image/tiff"),
+        (b"MM\0*", "image/tiff"),
+        (b"\0\0\x01\0", "image/x-icon"),
     ];
     const ASF: &[u8] = b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c";
-    const IMAGE_BRANDS: [&str; 8] = [
-        "avif", "avis", "heic", "heif", "heix", "hevc", "mif1", "msf1",
+    const IMAGE_BRANDS: [(&str, &str); 8] = [
+        ("avif", "image/avif"),
+        ("avis", "image/avif"),
+        ("heic", "image/heic"),
+        ("heif", "image/heif"),
+        ("heix", "image/heif"),
+        ("hevc", "image/heic"),
+        ("mif1", "image/heif"),
+        ("msf1", "image/heif"),
     ];
-    const VIDEO_BRANDS: [&str; 14] = [
-        "isom", "iso2", "iso5", "mp41", "mp42", "avc1", "mp4v", "m4v", "qt", "3gp4", "3gp5",
-        "3gp6", "3gp7", "3g2",
+    const VIDEO_BRANDS: [(&str, &str); 14] = [
+        ("isom", "video/mp4"),
+        ("iso2", "video/mp4"),
+        ("iso5", "video/mp4"),
+        ("mp41", "video/mp4"),
+        ("mp42", "video/mp4"),
+        ("avc1", "video/mp4"),
+        ("mp4v", "video/mp4"),
+        ("m4v", "video/x-m4v"),
+        ("qt", "video/quicktime"),
+        ("3gp4", "video/3gpp"),
+        ("3gp5", "video/3gpp"),
+        ("3gp6", "video/3gpp"),
+        ("3gp7", "video/3gpp"),
+        ("3g2", "video/3gpp2"),
     ];
     let has = |needle: &[u8]| {
         header
@@ -704,21 +754,29 @@ fn sniff_media(header: &[u8]) -> Option<&'static str> {
             .windows(needle.len())
             .any(|window| window == needle)
     };
-    if IMAGES.iter().any(|magic| header.starts_with(magic)) {
-        return Some("image");
+    if let Some(&(_, mime)) = IMAGES.iter().find(|(magic, _)| header.starts_with(magic)) {
+        return Some(("image", mime));
     }
     if header.starts_with(b"RIFF") && header.len() >= 12 {
         match &header[8..12] {
-            b"WEBP" => return Some("image"),
-            b"AVI " => return Some("video"),
+            b"WEBP" => return Some(("image", "image/webp")),
+            b"AVI " => return Some(("video", "video/x-msvideo")),
             _ => {}
         }
     }
-    if header.starts_with(b"FLV")
-        || header.starts_with(ASF)
-        || (header.starts_with(b"\x1a\x45\xdf\xa3") && (has(b"webm") || has(b"matroska")))
-    {
-        return Some("video");
+    if header.starts_with(b"FLV") {
+        return Some(("video", "video/x-flv"));
+    }
+    if header.starts_with(ASF) {
+        return Some(("video", "video/x-ms-wmv"));
+    }
+    if header.starts_with(b"\x1a\x45\xdf\xa3") {
+        if has(b"webm") {
+            return Some(("video", "video/webm"));
+        }
+        if has(b"matroska") {
+            return Some(("video", "video/x-matroska"));
+        }
     }
     if header.len() >= 12 && &header[4..8] == b"ftyp" {
         let space = |byte: &u8| matches!(byte, b'\t'..=b'\r' | b' ' | 0xA0);
@@ -729,11 +787,17 @@ fn sniff_media(header: &[u8]) -> Option<&'static str> {
         let brand =
             brand.trim_end_matches(|c: char| c == '\0' || u8::try_from(c).is_ok_and(|b| space(&b)));
         let brand = brand.trim_start_matches(|c: char| u8::try_from(c).is_ok_and(|b| space(&b)));
-        if IMAGE_BRANDS.contains(&brand) {
-            return Some("image");
+        let find = |table: &[(&str, &'static str)]| {
+            table
+                .iter()
+                .find(|(known, _)| *known == brand)
+                .map(|&(_, mime)| mime)
+        };
+        if let Some(mime) = find(&IMAGE_BRANDS) {
+            return Some(("image", mime));
         }
-        if VIDEO_BRANDS.contains(&brand) {
-            return Some("video");
+        if let Some(mime) = find(&VIDEO_BRANDS) {
+            return Some(("video", mime));
         }
     }
     None

@@ -69,9 +69,66 @@ pub enum Message {
         note: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notice: Option<String>,
+        /// The parts after `content` when the output carries media, as Kimi Code stores them: `text`,
+        /// `image_url` (a data URL, or the saved file's path for a format the provider does not accept) and
+        /// `video_url` (the saved file's path, empty when unsaved); `lower_media` turns them into what K3 is sent.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
+}
+
+/// Kimi Code's per-part media estimate (`MEDIA_TOKEN_ESTIMATE`).
+const MEDIA_TOKENS: u64 = 2000;
+const VIDEO_UNSUPPORTED: &str = "[video omitted: the current model does not support video input; use a model with video input capability or convert the file to text]";
+const IMAGE_UNAVAILABLE: &str = "[image omitted: the uploaded file is no longer available]";
+
+fn text_part(text: &str) -> Value {
+    json!({"type": "text", "text": text})
+}
+
+/// A tool result's stored output parts: `content`, then `media`, with the repeated-call note appended to the
+/// last text part (`appendReminder`).
+fn output_parts(content: &str, note: &str, media: &[Value]) -> Vec<Value> {
+    let mut parts: Vec<Value> = std::iter::once(text_part(stored(content)))
+        .chain(media.iter().cloned())
+        .collect();
+    match parts.last_mut().and_then(|last| last.get_mut("text")) {
+        Some(Value::String(text)) => text.push_str(note),
+        _ if note.is_empty() => {}
+        _ => parts.push(text_part(note)),
+    }
+    parts
+}
+
+/// `buildMediaPathTag`.
+fn path_tag(kind: &str, path: &str) -> String {
+    let path = path
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!("<{kind} path=\"{path}\"></{kind}>")
+}
+
+/// Kimi Code's `AgentMediaResolverService` for K3 (`image_in`, no `video_in`): an inline image is sent as
+/// is, an image the provider does not accept becomes its path tag (`degradedImage`), and a video the
+/// `unsupportedMedia` notice. Kimi Code first tries to upload images to the provider's `/files` endpoint and
+/// sends `ms://<id>`; this keeps its fallback, the inline data URL.
+fn lower_media(part: &Value) -> Value {
+    let url = |key: &str| part[key]["url"].as_str().unwrap_or_default();
+    match part["type"].as_str() {
+        Some("image_url") if url("image_url").starts_with("data:") => part.clone(),
+        Some("image_url") if url("image_url").is_empty() => text_part(IMAGE_UNAVAILABLE),
+        Some("image_url") => text_part(&path_tag("image", url("image_url"))),
+        Some("video_url") if url("video_url").is_empty() => text_part(VIDEO_UNSUPPORTED),
+        Some("video_url") => text_part(&format!(
+            "{VIDEO_UNSUPPORTED}\n{}",
+            path_tag("video", url("video_url"))
+        )),
+        _ => part.clone(),
+    }
 }
 
 const TOOL_ERROR_STATUS: &str = "<system>ERROR: Tool execution failed.</system>";
@@ -134,26 +191,26 @@ impl Message {
                 failed,
                 note,
                 notice,
+                media,
                 ..
             } => {
-                let content = match notice {
-                    // With a note, Kimi Code sends the stored parts as they are, behind an error status
-                    // part when the tool failed.
-                    Some(notice) => {
-                        let mut parts: Vec<String> = failed
-                            .then(|| TOOL_ERROR_STATUS.to_owned())
+                let content = match (notice, media.is_empty()) {
+                    (None, true) => json!(timed(render_tool_output(content, *failed) + note)),
+                    // With a note or media, Kimi Code sends the stored parts as they are (the repeated-call
+                    // note appended to the last text part), behind an error status part when the tool failed,
+                    // then the note as its own part.
+                    _ => {
+                        let mut parts: Vec<Value> = failed
+                            .then(|| text_part(TOOL_ERROR_STATUS))
                             .into_iter()
+                            .chain(output_parts(content, note, media))
                             .collect();
-                        parts.extend([format!("{}{note}", stored(content)), notice.clone()]);
-                        parts[0] = timed(std::mem::take(&mut parts[0]));
-                        json!(
-                            parts
-                                .iter()
-                                .map(|text| json!({"type": "text", "text": text}))
-                                .collect::<Vec<_>>()
-                        )
+                        parts.extend(notice.as_deref().map(text_part));
+                        if let Some(Value::String(text)) = parts[0].get_mut("text") {
+                            *text = timed(std::mem::take(text));
+                        }
+                        json!(parts.iter().map(lower_media).collect::<Vec<_>>())
                     }
-                    None => json!(timed(render_tool_output(content, *failed) + note)),
                 };
                 json!({"role": "tool", "tool_call_id": tool_call_id, "content": content})
             }
@@ -298,11 +355,14 @@ fn estimate(message: &Message, arguments: impl Fn(&str) -> u64) -> u64 {
             content,
             note,
             notice,
+            media,
             ..
         } => {
-            estimate_text("tool")
-                + estimate_text(&format!("{}{note}", stored(content)))
-                + notice.as_deref().map_or(0, estimate_text)
+            let output = output_parts(content, note, media)
+                .iter()
+                .map(|part| part["text"].as_str().map_or(MEDIA_TOKENS, estimate_text))
+                .sum::<u64>();
+            estimate_text("tool") + output + notice.as_deref().map_or(0, estimate_text)
         }
         Message::Assistant {
             content,

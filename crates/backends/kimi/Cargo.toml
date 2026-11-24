@@ -22,6 +22,10 @@ nanocode-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+nanocode-executor.workspace = true
+nanocode-io.workspace = true
+
 [lints]
 workspace = true
 

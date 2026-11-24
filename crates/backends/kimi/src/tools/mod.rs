@@ -159,6 +159,7 @@ impl Builtins {
     /// Kimi Code's `resolvePathAccessPath`: expands `~`, resolves against the working directory,
     /// normalizes lexically, refuses well-known secret files, and requires an absolute path to reach
     /// outside the working directory. Errors are the resolve-phase failure Kimi Code reports for `tool`.
+    /// Glob and Grep (`Access::Search`) skip the secret check, as Kimi Code's `checkSensitive: false`.
     pub fn resolve(&self, tool: &str, path: &str, access: Access) -> Result<PathBuf, Outcome> {
         let fail = |message: String| {
             Outcome::error(format!(
@@ -178,7 +179,7 @@ impl Builtins {
             true => expanded,
             false => self.cwd.join(expanded),
         });
-        if sensitive(&canonical) {
+        if access != Access::Search && sensitive(&canonical) {
             return Err(fail(format!(
                 "\"{path}\" matches a sensitive-file pattern (env / credential / SSH key). Access is blocked to protect secrets."
             )));

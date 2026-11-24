@@ -12,5 +12,5 @@
     {"file": "compaction-summary-prefix.md", "path": "packages/agent-core-v2/src/agent/contextMemory/compaction-summary-prefix.md", "sha256": "17960cc9d999d84e49e2642e1a8b613fefb8fd73fb202d88dbfc949a784e5cbb", "bytes": 621},
     {"file": "permission-mode-auto-enter-reminder.md", "path": "packages/agent-core-v2/src/agent/permissionMode/injection/permission-mode-auto-enter-reminder.md", "sha256": "c104ad38c40136c1acecd59a147eb55f0cd71b9b1dd2b29c328a62a3f49ba404", "bytes": 416}
   ],
-  "tools": {"file": "tools.json", "source": "the tools array of a chat/completions request sent by the release CLI, built-in tools only", "sha256": "ce2d6f3f060355509678374f7c42d1bdd6d180df33671e77c2aec28d43a9e561", "bytes": 28333}
+  "tools": {"file": "tools.json", "source": "the tools array of a chat/completions request sent by the release CLI, built-in tools only", "sha256": "172fd22d5aa898545d7d057700c1b22fe0b6313385e364f10e5275c6427ce0d3", "bytes": 32504}
 }

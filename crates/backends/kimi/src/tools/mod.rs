@@ -3,10 +3,12 @@
 //! Kimi Code exposes them.
 
 mod files;
+mod media;
 mod search;
 mod shell;
 pub mod spill;
 mod todo;
+mod web;
 
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
@@ -86,9 +88,11 @@ impl Builtins {
             name,
             "Bash"
                 | "Edit"
+                | "FetchURL"
                 | "Glob"
                 | "Grep"
                 | "Read"
+                | "ReadMediaFile"
                 | "TaskList"
                 | "TaskOutput"
                 | "TaskStop"
@@ -112,6 +116,8 @@ impl Builtins {
             "TaskStop" => self.shell.stop(args).await,
             "WaitFor" => self.shell.wait(args).await,
             "TodoList" => todo::call(self, args),
+            "FetchURL" => web::fetch(self, args).await,
+            "ReadMediaFile" => media::read(self, args).await,
             other => Outcome::error(format!("Tool \"{other}\" not found")),
         }
     }

@@ -1,0 +1,757 @@
+use crate::compaction;
+use crate::nanotools::NanoTools;
+use crate::prompts;
+use nanocode_agent_core::{
+    Agent, AgentSessionContext, Capabilities, CostStatus, ForkRequest, HarnessFamily, Lineage,
+    ModelSelection, NanocodeError, ReportedTurnUsage, Result, SessionCheckpoint, SpawnOptions,
+    Thinking, TurnResult, TurnUsage,
+    backend::{
+        BackendFuture, BackendPrompt, BackendPromptRoute, BackendTurn, BackendTurnKey,
+        LifecycleBackend, ParkedCall,
+    },
+    events::{AgentEventKind, AgentEventPublisher, AgentEvents},
+    input::{PromptInput, UserInput},
+};
+use nanocode_backend_kimi_client::{
+    Client, Delta, Message, Origin, Reply, Request, ToolCall, estimate_message, estimate_text,
+};
+use nanocode_sync::Signal;
+use nanocode_sync::future::{Either, select};
+use nanocode_tool_host::ToolContext;
+use serde_json::{Value, json, value::RawValue};
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+const STOP_STREAK: u32 = 12;
+
+pub struct Config {
+    pub client: Client,
+    pub model: ModelSelection,
+    pub thinking: Thinking,
+    pub effort: &'static str,
+    pub window: u64,
+    pub system: String,
+    pub tools: NanoTools,
+    pub zone: String,
+    pub session: String,
+}
+
+#[derive(Clone, Default)]
+pub struct State {
+    messages: Vec<Message>,
+    calls: u64,
+    date: Option<String>,
+    disclosed: bool,
+}
+
+struct Inner {
+    config: Config,
+    state: Mutex<State>,
+    cancel: Mutex<Option<Arc<Signal>>>,
+    stopped: AtomicBool,
+}
+
+pub struct Driver {
+    inner: Arc<Inner>,
+}
+
+fn emit(events: &AgentEventPublisher, kind: AgentEventKind, value: Value) {
+    if let Ok(raw) = RawValue::from_string(value.to_string()) {
+        drop(events.publish_next(kind, Arc::from(raw)));
+    }
+}
+
+fn prompt_text(input: &PromptInput) -> String {
+    match input {
+        PromptInput::Text(text) => text.clone(),
+        PromptInput::Content(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                UserInput::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let body = entries
+                .iter()
+                .map(|(key, value)| {
+                    format!("{}:{}", Value::String((*key).clone()), canonical(value))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(canonical).collect::<Vec<_>>().join(",")
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn call_key(call: &ToolCall) -> String {
+    let args = match serde_json::from_str::<Value>(&call.arguments) {
+        Ok(value) => canonical(&value),
+        Err(_) => call.arguments.clone(),
+    };
+    format!("{} {args}", call.name)
+}
+
+fn advance(streak: &mut (Option<String>, u32), key: &str) {
+    if streak.0.as_deref() == Some(key) {
+        streak.1 += 1;
+    } else {
+        *streak = (Some(key.to_owned()), 1);
+    }
+}
+
+fn local_date(at: std::time::SystemTime) -> String {
+    let seconds = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+        + i64::from(nanocode_platform::utc_offset_seconds(at));
+    let shifted = seconds.div_euclid(86_400) + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (of_era - of_era / 1_460 + of_era / 36_524 - of_era / 146_096) / 365;
+    let day_of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn unique(calls: &mut [ToolCall], messages: &[Message]) {
+    let mut used = messages
+        .iter()
+        .flat_map(|message| match message {
+            Message::Assistant { tool_calls, .. } => {
+                tool_calls.iter().map(|call| call.id.clone()).collect()
+            }
+            Message::Tool { tool_call_id, .. } => vec![tool_call_id.clone()],
+            Message::User { .. } => Vec::new(),
+        })
+        .collect::<BTreeSet<_>>();
+    for call in calls {
+        if used.contains(&call.id) {
+            let base = call.id.clone();
+            let mut suffix = 2;
+            while used.contains(&format!("{base}__{suffix}")) {
+                suffix += 1;
+            }
+            call.id = format!("{base}__{suffix}");
+        }
+        used.insert(call.id.clone());
+    }
+}
+
+impl Inner {
+    fn load(&self) -> State {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, state: &State) {
+        if let Ok(mut current) = self.state.lock() {
+            *current = state.clone();
+        }
+    }
+
+    fn overhead(&self) -> u64 {
+        estimate_text(&self.config.system) + self.config.tools.sizes
+    }
+
+    fn remind(&self, state: &mut State) {
+        let today = local_date(nanocode_platform::system_time());
+        let zone = &self.config.zone;
+        if !state.disclosed {
+            state
+                .messages
+                .push(Message::user(prompts::date(&today, zone), Origin::Reminder));
+            state.messages.push(Message::user(
+                prompts::reminder(prompts::AUTO_MODE),
+                Origin::Reminder,
+            ));
+            state.disclosed = true;
+            state.date = Some(today);
+        } else if state.date.as_deref() != Some(today.as_str()) {
+            state.messages.push(Message::user(
+                prompts::date_changed(&today, zone),
+                Origin::Reminder,
+            ));
+            state.date = Some(today);
+        }
+    }
+
+    async fn request(
+        &self,
+        messages: &[Message],
+        extra: Option<&Message>,
+        max_completion_tokens: u64,
+        call: u64,
+        events: &AgentEventPublisher,
+    ) -> Result<Reply> {
+        let config = &self.config;
+        let body = Request {
+            model: config.model.as_str(),
+            system: &config.system,
+            messages,
+            extra,
+            tools: &config.tools.declarations,
+            max_completion_tokens,
+            prompt_cache_key: &config.session,
+            effort: config.effort,
+        }
+        .encode();
+        emit(
+            events,
+            AgentEventKind::ModelCallStarted,
+            json!({
+                "call_index": call,
+                "model_call_index": call,
+                "model": config.model.as_str(),
+                "reasoning_mode": "standard",
+                "effort": config.effort,
+            }),
+        );
+        let started = nanocode_platform::now();
+        let nanos = |since: nanocode_platform::Instant| {
+            u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        };
+        let mut first_event = None;
+        let mut first_output = None;
+        let mut on_delta = |delta: Delta<'_>| {
+            first_event.get_or_insert_with(|| nanos(started));
+            if let Delta::Text(text) = delta
+                && extra.is_none()
+            {
+                first_output.get_or_insert_with(|| nanos(started));
+                emit(
+                    events,
+                    AgentEventKind::AssistantDelta,
+                    json!({"model_call_index": call, "item_id": format!("call-{call}"), "text": text}),
+                );
+            }
+        };
+        let reply = match config.client.stream(&body, &mut on_delta).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                emit(
+                    events,
+                    AgentEventKind::ModelCallFailed,
+                    json!({
+                        "call_index": call,
+                        "model_call_index": call,
+                        "model": config.model.as_str(),
+                        "duration_ns": nanos(started),
+                        "error": error.to_string(),
+                    }),
+                );
+                return Err(NanocodeError::InvalidRequest(error.to_string()));
+            }
+        };
+        let usage = reply.usage.unwrap_or_default();
+        emit(
+            events,
+            AgentEventKind::ModelCallCompleted,
+            json!({
+                "call_index": call,
+                "model_call_index": call,
+                "model": config.model.as_str(),
+                "attempt": 1,
+                "connection_generation": 0,
+                "status": reply.finish_reason.as_deref().unwrap_or("stop"),
+                "duration_ns": nanos(started),
+                "time_to_first_event_ns": first_event.unwrap_or_else(|| nanos(started)),
+                "time_to_first_output_ns": first_output,
+                "tool_calls": reply.tool_calls.len(),
+                "usage": {
+                    "input_tokens": usage.prompt_tokens,
+                    "input_tokens_details": {"cached_tokens": usage.cached_tokens, "cache_write_tokens": 0},
+                    "output_tokens": usage.completion_tokens,
+                    "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
+                    "total_tokens": usage.total(),
+                },
+            }),
+        );
+        Ok(reply)
+    }
+
+    async fn compact(&self, state: &mut State, events: &AgentEventPublisher) -> Result<()> {
+        emit(events, AgentEventKind::ModelCompactionStarted, json!({}));
+        let window = self.config.window;
+        let instruction = Message::user(prompts::compaction_instruction(), Origin::Prompt);
+        let cap = window.min(compaction::MAX_OUTPUT_TOKENS);
+        let margin = (window as f64 * compaction::MARGIN_RATIO).ceil() as u64;
+        let mut history = state.messages.clone();
+        let mut attempts = 0;
+        let summary = loop {
+            attempts += 1;
+            let used = self.overhead()
+                + history.iter().map(estimate_message).sum::<u64>()
+                + estimate_message(&instruction)
+                + margin;
+            let max = cap.min(window.saturating_sub(used)).max(1);
+            let reply = self
+                .request(&history, Some(&instruction), max, state.calls, events)
+                .await;
+            state.calls += 1;
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(error) => {
+                    emit(
+                        events,
+                        AgentEventKind::ModelCompactionFailed,
+                        json!({"error": error.to_string()}),
+                    );
+                    return Err(error);
+                }
+            };
+            let summary = reply.content.trim();
+            if reply.finish_reason.as_deref() != Some("length") && !summary.is_empty() {
+                break summary.to_owned();
+            }
+            if attempts >= compaction::ATTEMPTS || history.len() <= 1 {
+                let error = "Kimi's compaction ended without a usable summary".to_owned();
+                emit(
+                    events,
+                    AgentEventKind::ModelCompactionFailed,
+                    json!({"error": error}),
+                );
+                return Err(NanocodeError::InvalidRequest(error));
+            }
+            history = compaction::without_oldest(&history);
+        };
+        state.messages = compaction::compacted(&state.messages, &summary);
+        state.disclosed = false;
+        emit(events, AgentEventKind::ModelCompactionCompleted, json!({}));
+        Ok(())
+    }
+
+    async fn execute(&self, call: &ToolCall, turn: &str) -> (String, bool) {
+        let args = match call.arguments.trim() {
+            "" => Ok(json!({})),
+            text => serde_json::from_str::<Value>(text),
+        };
+        let args = match args {
+            Ok(args) => args,
+            Err(error) => return (format!("Invalid JSON in tool arguments: {error}"), true),
+        };
+        if !self.config.tools.handles(&call.name) {
+            return (format!("Tool `{}` not found.", call.name), true);
+        }
+        let context = ToolContext::new(
+            self.config.model.as_str(),
+            &self.config.session,
+            &call.id,
+            &[],
+            usize::MAX,
+        )
+        .with_turn_id(Some(turn));
+        match self.config.tools.call(&call.name, &args, context).await {
+            Ok(body) => (body, false),
+            Err(error) => (error, true),
+        }
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        input: PromptInput,
+        events: AgentEventPublisher,
+        request_id: String,
+    ) -> Result<TurnResult> {
+        let window = self.config.window;
+        let mut state = self.load();
+        state
+            .messages
+            .push(Message::user(prompt_text(&input), Origin::Prompt));
+        let mut streak: (Option<String>, u32) = (None, 0);
+        let mut final_message = String::new();
+        let mut totals = ReportedTurnUsage {
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            estimated_cost: None,
+            cost_status: CostStatus::UsageNotReported,
+        };
+        loop {
+            self.remind(&mut state);
+            if compaction::should_compact(
+                compaction::used(self.overhead(), &state.messages),
+                window,
+            ) {
+                self.compact(&mut state, &events).await?;
+                self.remind(&mut state);
+            }
+            self.save(&state);
+            let used = compaction::used(self.overhead(), &state.messages);
+            let call_index = state.calls;
+            let mut reply = self
+                .request(
+                    &state.messages,
+                    None,
+                    window.saturating_sub(used).max(1),
+                    call_index,
+                    &events,
+                )
+                .await?;
+            state.calls += 1;
+            if let Some(usage) = reply.usage {
+                totals.input_tokens += usage.prompt_tokens;
+                totals.cached_input_tokens += usage.cached_tokens;
+                totals.output_tokens += usage.completion_tokens;
+                totals.reasoning_output_tokens += usage.reasoning_tokens;
+                totals.total_tokens += usage.total();
+            }
+            unique(&mut reply.tool_calls, &state.messages);
+            if !reply.content.trim().is_empty() {
+                final_message.clone_from(&reply.content);
+                emit(
+                    &events,
+                    AgentEventKind::AssistantMessage,
+                    json!({"model_call_index": call_index, "item_id": format!("call-{call_index}"), "text": reply.content}),
+                );
+            }
+            let calls = reply.tool_calls.clone();
+            state.messages.push(Message::Assistant {
+                content: reply.content,
+                reasoning: reply.reasoning,
+                tool_calls: reply.tool_calls,
+                usage: reply.usage,
+            });
+            if calls.is_empty() {
+                self.save(&state);
+                break;
+            }
+            let keys = calls.iter().map(call_key).collect::<Vec<_>>();
+            let mut stop = false;
+            let mut injected = None;
+            for (index, call) in calls.iter().enumerate() {
+                emit(
+                    &events,
+                    AgentEventKind::ToolCall,
+                    json!({"call_id": call.id, "tool": call.name, "arguments": call.arguments, "model_call_index": call_index}),
+                );
+                let (output, failed) = self.execute(call, &request_id).await;
+                let mut running = streak.clone();
+                for key in &keys[..=index] {
+                    advance(&mut running, key);
+                }
+                let mut content = prompts::tool_output(&output, failed);
+                match running.1 {
+                    count if count > STOP_STREAK => {
+                        content.push_str("\n\n");
+                        content.push_str(&prompts::repeated(count).unwrap_or_default());
+                        stop = true;
+                    }
+                    STOP_STREAK => injected = prompts::repeated(STOP_STREAK),
+                    count => {
+                        if let Some(text) = prompts::repeated(count) {
+                            content.push_str("\n\n");
+                            content.push_str(&text);
+                        }
+                    }
+                }
+                emit(
+                    &events,
+                    AgentEventKind::ToolResult,
+                    json!({"call_id": call.id, "tool": call.name, "result": content, "status": if failed { "failed" } else { "completed" }}),
+                );
+                state.messages.push(Message::Tool {
+                    tool_call_id: call.id.clone(),
+                    content,
+                });
+            }
+            for key in &keys {
+                advance(&mut streak, key);
+            }
+            if let Some(text) = injected {
+                state.messages.push(Message::user(text, Origin::Reminder));
+            }
+            self.save(&state);
+            if stop {
+                break;
+            }
+        }
+        Ok(TurnResult {
+            request_id: Some(request_id),
+            turn_id: None,
+            final_message,
+            usage: Some(TurnUsage::from_reported(totals)),
+            boundary: None,
+        })
+    }
+
+    fn checkpoint(&self) -> SessionCheckpoint {
+        let state = self.load();
+        let payload = json!({
+            "format": crate::durability::FORMAT,
+            "model": self.config.model.as_str(),
+            "thinking": self.config.thinking,
+            "messages": state.messages,
+            "calls": state.calls,
+            "date": state.date,
+            "disclosed": state.disclosed,
+        });
+        SessionCheckpoint::native(
+            self.config.session.clone(),
+            self.config.model.clone(),
+            self.config.thinking,
+            Lineage::root(self.config.session.clone()),
+            self.config.session.clone(),
+            None,
+            true,
+            payload,
+        )
+    }
+}
+
+fn unsupported<T: Send + 'static>(capability: &'static str) -> BackendFuture<Result<T>> {
+    Box::pin(async move { Err(NanocodeError::UnsupportedCapability { capability }) })
+}
+
+fn done() -> BackendFuture<Result<()>> {
+    Box::pin(async { Ok(()) })
+}
+
+impl Driver {
+    pub fn new(config: Config) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                config,
+                state: Mutex::new(State::default()),
+                cancel: Mutex::new(None),
+                stopped: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    pub fn restore(self, checkpoint: &SessionCheckpoint) -> Result<Self> {
+        let payload: Value = checkpoint
+            .payload()
+            .decode()
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
+        let messages: Vec<Message> = payload
+            .get("messages")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?
+            .unwrap_or_default();
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.messages = messages;
+            state.calls = payload.get("calls").and_then(Value::as_u64).unwrap_or(0);
+            state.date = payload
+                .get("date")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            state.disclosed = payload
+                .get("disclosed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        }
+        Ok(self)
+    }
+
+    fn start(&self, prompt: BackendPrompt) -> BackendTurn {
+        let inner = Arc::clone(&self.inner);
+        let request_id = prompt
+            .request_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", inner.config.session, prompt.key.0));
+        let cancel = Arc::new(Signal::new());
+        if let Ok(mut slot) = inner.cancel.lock() {
+            *slot = Some(Arc::clone(&cancel));
+        }
+        let events = prompt.events.clone();
+        let id = request_id.clone();
+        let (sender, receiver) = nanocode_sync::oneshot::channel();
+        nanocode_platform::spawn(async move {
+            let run =
+                Box::pin(Arc::clone(&inner).run(prompt.prompt.instruction.clone(), events, id));
+            let stop = Box::pin(async move { cancel.wait().await });
+            let result = match select(run, stop).await {
+                Either::Left((result, _)) => result,
+                Either::Right(_) => {
+                    let mut state = inner.load();
+                    let answered = state
+                        .messages
+                        .iter()
+                        .filter_map(|message| match message {
+                            Message::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                            _ => None,
+                        })
+                        .collect::<BTreeSet<_>>();
+                    if let Some(position) = state.messages.iter().rposition(|message| {
+                        matches!(message, Message::Assistant { tool_calls, .. }
+                            if tool_calls.iter().any(|call| !answered.contains(&call.id)))
+                    }) {
+                        state.messages.truncate(position);
+                    }
+                    inner.save(&state);
+                    Err(NanocodeError::TurnCancelled)
+                }
+            };
+            drop(sender.send(result));
+        });
+        let result =
+            Box::pin(async move { receiver.await.unwrap_or(Err(NanocodeError::TurnStopped)) });
+        BackendTurn {
+            request_id: Some(request_id),
+            result,
+        }
+    }
+
+    fn cancel_turn(&self) -> BackendFuture<Result<()>> {
+        if let Ok(slot) = self.inner.cancel.lock()
+            && let Some(cancel) = slot.as_ref()
+        {
+            cancel.fire();
+        }
+        done()
+    }
+}
+
+impl LifecycleBackend for Driver {
+    fn harness_family(&self) -> HarnessFamily {
+        HarnessFamily::new(crate::harness::FAMILY)
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        let mut capabilities = Capabilities::NONE;
+        capabilities.checkpoint = true;
+        capabilities.compaction = true;
+        capabilities
+    }
+
+    fn submit(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendTurn>> {
+        if !prompt.carried_steers.is_empty() {
+            return Box::pin(async {
+                Err(NanocodeError::UnsupportedCapability {
+                    capability: "carried_steers",
+                })
+            });
+        }
+        let turn = self.start(prompt);
+        Box::pin(async move { Ok(turn) })
+    }
+
+    fn route(&self, prompt: BackendPrompt) -> BackendFuture<Result<BackendPromptRoute>> {
+        let turn = self.start(prompt);
+        Box::pin(async move { Ok(BackendPromptRoute::Started(turn)) })
+    }
+
+    fn steer(
+        &self,
+        _key: BackendTurnKey,
+        _prompt: nanocode_agent_core::input::Prompt,
+    ) -> BackendFuture<Result<()>> {
+        unsupported("steering")
+    }
+
+    fn cancel(&self, _key: BackendTurnKey) -> BackendFuture<Result<()>> {
+        self.cancel_turn()
+    }
+
+    fn cancel_active(&self) -> BackendFuture<Result<()>> {
+        self.cancel_turn()
+    }
+
+    fn set_harness_model(&self, _model: ModelSelection) -> BackendFuture<Result<()>> {
+        unsupported("model_switch")
+    }
+
+    fn set_thinking(&self, _thinking: Thinking) -> BackendFuture<Result<()>> {
+        unsupported("thinking_switch")
+    }
+
+    fn set_fast_mode(&self, _enabled: bool) -> BackendFuture<Result<()>> {
+        done()
+    }
+
+    fn compact(&self) -> BackendFuture<Result<()>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let (events, _receiver) =
+                nanocode_agent_core::backend::BackendRuntime::new(inner.config.session.clone());
+            let publisher = events.events();
+            let mut state = inner.load();
+            if state.messages.is_empty() {
+                return Ok(());
+            }
+            inner.compact(&mut state, &publisher).await?;
+            inner.save(&state);
+            Ok(())
+        })
+    }
+
+    fn append_developer_message(
+        &self,
+        _text: String,
+    ) -> BackendFuture<Result<AgentSessionContext>> {
+        unsupported("developer_messages")
+    }
+
+    fn context(&self) -> BackendFuture<Result<AgentSessionContext>> {
+        unsupported("context")
+    }
+
+    fn checkpoint(&self) -> BackendFuture<Result<SessionCheckpoint>> {
+        let checkpoint = self.inner.checkpoint();
+        Box::pin(async move { Ok(checkpoint) })
+    }
+
+    fn spawn(&self, _options: SpawnOptions) -> BackendFuture<Result<(Agent, AgentEvents)>> {
+        unsupported("spawn")
+    }
+
+    fn fork(&self, _request: ForkRequest) -> BackendFuture<Result<(Agent, AgentEvents)>> {
+        unsupported("fork")
+    }
+
+    fn flush(&self) -> BackendFuture<Result<()>> {
+        done()
+    }
+
+    fn shutdown(&self) -> BackendFuture<Result<()>> {
+        self.inner.stopped.store(true, Ordering::SeqCst);
+        done()
+    }
+
+    fn set_parking(&self, _parking: bool) {}
+
+    fn parked(&self, _after: u64) -> BackendFuture<u64> {
+        Box::pin(std::future::pending())
+    }
+
+    fn park(&self) -> BackendFuture<Result<Option<Arc<dyn ParkedCall>>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn unpark(&self, _call: Arc<dyn ParkedCall>) {}
+
+    fn is_stopped(&self) -> bool {
+        self.inner.stopped.load(Ordering::SeqCst)
+    }
+}

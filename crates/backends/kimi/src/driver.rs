@@ -37,6 +37,7 @@ pub struct Config {
     pub zone: String,
     pub today: crate::harness::Clock,
     pub session: String,
+    pub owner: Option<nanocode_durability::DurableOwner>,
 }
 
 #[derive(Clone, Default)]
@@ -544,17 +545,6 @@ impl Inner {
     }
 
     fn checkpoint(&self) -> SessionCheckpoint {
-        let state = self.load();
-        let payload = json!({
-            "format": crate::durability::FORMAT,
-            "model": self.config.model.as_str(),
-            "thinking": self.config.thinking,
-            "messages": state.messages,
-            "calls": state.calls,
-            "date": state.date,
-            "disclosed": state.disclosed,
-            "rebase": state.rebase,
-        });
         SessionCheckpoint::native(
             self.config.session.clone(),
             self.config.model.clone(),
@@ -563,8 +553,34 @@ impl Inner {
             self.config.session.clone(),
             None,
             true,
-            payload,
+            self.payload(),
         )
+    }
+
+    async fn persist(&self) -> Result<()> {
+        let Some(owner) = &self.config.owner else {
+            return Ok(());
+        };
+        let payload = nanocode_durability::EncodedPayload::encode(&self.payload())
+            .map_err(nanocode_durability::agent_error)?;
+        owner
+            .commit_checkpoint(payload)
+            .await
+            .map_err(nanocode_durability::agent_error)
+    }
+
+    fn payload(&self) -> Value {
+        let state = self.load();
+        json!({
+            "format": crate::durability::FORMAT,
+            "model": self.config.model.as_str(),
+            "thinking": self.config.thinking,
+            "messages": state.messages,
+            "calls": state.calls,
+            "date": state.date,
+            "disclosed": state.disclosed,
+            "rebase": state.rebase,
+        })
     }
 }
 
@@ -593,6 +609,10 @@ impl Driver {
             .payload()
             .decode()
             .map_err(|error| NanocodeError::InvalidCheckpoint(error.to_string()))?;
+        self.restore_payload(&payload)
+    }
+
+    pub fn restore_payload(self, payload: &Value) -> Result<Self> {
         let messages: Vec<Message> = payload
             .get("messages")
             .cloned()
@@ -657,6 +677,10 @@ impl Driver {
                     inner.save(&state);
                     Err(NanocodeError::TurnCancelled)
                 }
+            };
+            let result = match inner.persist().await {
+                Ok(()) => result,
+                Err(error) => Err(error),
             };
             drop(sender.send(result));
         });

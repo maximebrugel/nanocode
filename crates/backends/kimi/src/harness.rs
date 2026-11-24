@@ -260,6 +260,19 @@ impl KimiHarness {
         let today = given.today.clone().unwrap_or_else(|| {
             Arc::new(|| crate::driver::local_date(nanocode_platform::system_time()))
         });
+        let (owner, stored) = match &spec.durable_state {
+            Some(state) => {
+                let (owner, stored) = state
+                    .acquire_agent_with_initial(nanocode_durability::InitialSettings {
+                        thinking: spec.thinking,
+                        service_tier: nanocode_agent_core::ServiceTier::Standard,
+                    })
+                    .await
+                    .map_err(nanocode_durability::agent_error)?;
+                (Some(owner), stored)
+            }
+            None => (None, None),
+        };
         let checkpoint = spec.checkpoint.clone();
         let (runtime, events) = BackendRuntime::new(session.clone());
         let driver = Driver::new(Config {
@@ -273,10 +286,16 @@ impl KimiHarness {
             zone,
             today,
             session,
+            owner,
         });
-        let driver = match checkpoint {
-            Some(checkpoint) => driver.restore(&checkpoint)?,
-            None => driver,
+        let driver = match (checkpoint, stored) {
+            (Some(checkpoint), _) => driver.restore(&checkpoint)?,
+            (None, Some(stored)) => driver.restore_payload(
+                &stored
+                    .decode::<serde_json::Value>()
+                    .map_err(nanocode_durability::agent_error)?,
+            )?,
+            (None, None) => driver,
         };
         Ok((runtime.bind(driver), events))
     }

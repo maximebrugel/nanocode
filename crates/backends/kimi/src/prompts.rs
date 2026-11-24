@@ -167,20 +167,6 @@ pub fn repeated(streak: u32) -> Option<String> {
     Some(reminder(&text))
 }
 
-pub fn tool_output(output: &str, failed: bool) -> String {
-    match (failed, output.trim().is_empty()) {
-        (true, true) => {
-            "<system>ERROR: Tool execution failed. Tool output is empty.</system>".to_owned()
-        }
-        (true, false) => format!("<system>ERROR: Tool execution failed.</system>\n{output}"),
-        (false, true) => "<system>Tool output is empty.</system>".to_owned(),
-        (false, false) if output.trim() == "Tool output is empty." => {
-            "<system>Tool output is empty.</system>".to_owned()
-        }
-        (false, false) => output.to_owned(),
-    }
-}
-
 pub fn os_name(os: &str) -> String {
     match os {
         "macos" => "macOS".to_owned(),

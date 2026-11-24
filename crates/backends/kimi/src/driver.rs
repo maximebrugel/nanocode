@@ -13,7 +13,8 @@ use nanocode_agent_core::{
     input::{PromptInput, UserInput},
 };
 use nanocode_backend_kimi_client::{
-    Client, Delta, Message, Origin, Reply, Request, ToolCall, estimate_message, estimate_text,
+    Client, Delta, Message, Origin, Reply, Request, TOOL_OUTPUT_EMPTY, ToolCall, estimate_message,
+    estimate_text, render_tool_output,
 };
 use nanocode_sync::Signal;
 use nanocode_sync::future::{Either, select};
@@ -44,6 +45,7 @@ pub struct State {
     calls: u64,
     date: Option<String>,
     disclosed: bool,
+    rebase: Option<(usize, u64)>,
 }
 
 struct Inner {
@@ -296,23 +298,34 @@ impl Inner {
         Ok(reply)
     }
 
-    async fn compact(&self, state: &mut State, events: &AgentEventPublisher) -> Result<()> {
+    async fn compact(&self, state: &mut State, events: &AgentEventPublisher) -> Result<u64> {
         emit(events, AgentEventKind::ModelCompactionStarted, json!({}));
         let window = self.config.window;
         let instruction = Message::user(prompts::compaction_instruction(), Origin::Prompt);
+        let instruction_tokens = estimate_message(&instruction);
         let cap = window.min(compaction::MAX_OUTPUT_TOKENS);
         let margin = (window as f64 * compaction::MARGIN_RATIO).ceil() as u64;
-        let mut history = state.messages.clone();
+        let overhead = self.overhead();
+        let original = state.messages.clone();
+        let weights = compaction::weights(&original, overhead);
+        let mut start =
+            compaction::pre_shrink(&original, &weights, overhead, instruction_tokens, window);
         let mut attempts = 0;
-        let summary = loop {
+        let (summary, output) = loop {
             attempts += 1;
-            let used = self.overhead()
-                + history.iter().map(estimate_message).sum::<u64>()
-                + estimate_message(&instruction)
-                + margin;
-            let max = cap.min(window.saturating_sub(used)).max(1);
+            let estimated = match start {
+                0 => compaction::history_tokens(overhead, &original),
+                _ => overhead + weights[start..].iter().sum::<u64>(),
+            } + instruction_tokens;
+            let max = cap.min(window.saturating_sub(estimated + margin)).max(1);
             let reply = self
-                .request(&history, Some(&instruction), max, state.calls, events)
+                .request(
+                    &original[start..],
+                    Some(&instruction),
+                    max,
+                    state.calls,
+                    events,
+                )
                 .await;
             state.calls += 1;
             let reply = match reply {
@@ -328,9 +341,12 @@ impl Inner {
             };
             let summary = reply.content.trim();
             if reply.finish_reason.as_deref() != Some("length") && !summary.is_empty() {
-                break summary.to_owned();
+                break (
+                    summary.to_owned(),
+                    reply.usage.map(|usage| usage.completion_tokens),
+                );
             }
-            if attempts >= compaction::ATTEMPTS || history.len() <= 1 {
+            if attempts >= compaction::ATTEMPTS || original.len() - start <= 1 {
                 let error = "Kimi's compaction ended without a usable summary".to_owned();
                 emit(
                     events,
@@ -339,12 +355,25 @@ impl Inner {
                 );
                 return Err(NanocodeError::InvalidRequest(error));
             }
-            history = compaction::without_oldest(&history);
+            start = compaction::without_oldest(&original, start);
         };
         state.messages = compaction::compacted(&state.messages, &summary);
+        let after = overhead
+            + state
+                .messages
+                .iter()
+                .map(|message| match message {
+                    Message::User {
+                        content,
+                        origin: Origin::Summary,
+                    } => output.unwrap_or_else(|| estimate_text(content)),
+                    message => estimate_message(message),
+                })
+                .sum::<u64>();
+        state.rebase = Some((state.messages.len(), after));
         state.disclosed = false;
         emit(events, AgentEventKind::ModelCompactionCompleted, json!({}));
-        Ok(())
+        Ok(after)
     }
 
     async fn execute(&self, call: &ToolCall, turn: &str) -> (String, bool) {
@@ -367,9 +396,13 @@ impl Inner {
             usize::MAX,
         )
         .with_turn_id(Some(turn));
-        match self.config.tools.call(&call.name, &args, context).await {
+        let (output, failed) = match self.config.tools.call(&call.name, &args, context).await {
             Ok(body) => (body, false),
             Err(error) => (error, true),
+        };
+        match output.is_empty() {
+            true => (TOOL_OUTPUT_EMPTY.to_owned(), failed),
+            false => (output, failed),
         }
     }
 
@@ -386,6 +419,7 @@ impl Inner {
             .push(Message::user(prompt_text(&input), Origin::Prompt));
         let mut streak: (Option<String>, u32) = (None, 0);
         let mut final_message = String::new();
+        let mut floor = None;
         let mut totals = ReportedTurnUsage {
             input_tokens: 0,
             cached_input_tokens: 0,
@@ -398,15 +432,19 @@ impl Inner {
         };
         loop {
             self.remind(&mut state);
-            if compaction::should_compact(
-                compaction::used(self.overhead(), &state.messages),
-                window,
-            ) {
-                self.compact(&mut state, &events).await?;
+            let counted = compaction::counted(&state.messages, state.rebase);
+            if floor.is_none_or(|floor| counted > floor)
+                && compaction::should_compact(counted, window)
+            {
+                floor = Some(self.compact(&mut state, &events).await?);
                 self.remind(&mut state);
             }
             self.save(&state);
-            let used = compaction::used(self.overhead(), &state.messages);
+            let used = compaction::request_used(
+                &state.messages,
+                estimate_text(&self.config.system),
+                self.config.tools.listing,
+            );
             let call_index = state.calls;
             let mut reply = self
                 .request(
@@ -459,21 +497,20 @@ impl Inner {
                 for key in &keys[..=index] {
                     advance(&mut running, key);
                 }
-                let mut content = prompts::tool_output(&output, failed);
+                let mut note = String::new();
                 match running.1 {
                     count if count > STOP_STREAK => {
-                        content.push_str("\n\n");
-                        content.push_str(&prompts::repeated(count).unwrap_or_default());
+                        note = format!("\n\n{}", prompts::repeated(count).unwrap_or_default());
                         stop = true;
                     }
                     STOP_STREAK => injected = prompts::repeated(STOP_STREAK),
                     count => {
                         if let Some(text) = prompts::repeated(count) {
-                            content.push_str("\n\n");
-                            content.push_str(&text);
+                            note = format!("\n\n{text}");
                         }
                     }
                 }
+                let content = render_tool_output(&output, failed) + &note;
                 emit(
                     &events,
                     AgentEventKind::ToolResult,
@@ -481,7 +518,9 @@ impl Inner {
                 );
                 state.messages.push(Message::Tool {
                     tool_call_id: call.id.clone(),
-                    content,
+                    content: output,
+                    failed,
+                    note,
                 });
             }
             for key in &keys {
@@ -514,6 +553,7 @@ impl Inner {
             "calls": state.calls,
             "date": state.date,
             "disclosed": state.disclosed,
+            "rebase": state.rebase,
         });
         SessionCheckpoint::native(
             self.config.session.clone(),
@@ -571,6 +611,10 @@ impl Driver {
                 .get("disclosed")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            state.rebase = payload
+                .get("rebase")
+                .cloned()
+                .and_then(|rebase| serde_json::from_value(rebase).ok());
         }
         Ok(self)
     }

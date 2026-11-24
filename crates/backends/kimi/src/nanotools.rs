@@ -11,6 +11,7 @@ pub struct NanoTools {
     routes: BTreeMap<String, Route>,
     pub declarations: Vec<Value>,
     pub sizes: u64,
+    pub listing: u64,
 }
 
 #[derive(Clone)]
@@ -43,6 +44,7 @@ impl NanoTools {
         let mut routes = BTreeMap::new();
         let mut declarations = Vec::new();
         let mut sizes = 0;
+        let mut listing = Vec::new();
         for definition in flatten(runtime.model_specs(session)) {
             let (name, description, schema, route) = match definition {
                 ToolDefinition::Function {
@@ -75,6 +77,7 @@ impl NanoTools {
             sizes += nanocode_backend_kimi_client::estimate_text(&name)
                 + nanocode_backend_kimi_client::estimate_text(&description)
                 + nanocode_backend_kimi_client::estimate_text(&schema.to_string());
+            listing.push(json!({"name": name, "description": description, "parameters": schema}));
             let parameters = normalize_tool_schema(&schema)
                 .map_err(|error| format!("tool {name:?} has a schema Kimi refuses: {error}"))?;
             declarations.push(json!({
@@ -83,11 +86,18 @@ impl NanoTools {
             }));
             routes.insert(name, route);
         }
+        let listing = match listing.is_empty() {
+            true => 0,
+            false => {
+                nanocode_backend_kimi_client::estimate_text(&Value::Array(listing).to_string())
+            }
+        };
         Ok(Self {
             runtime,
             routes,
             declarations,
             sizes,
+            listing,
         })
     }
 

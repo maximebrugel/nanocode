@@ -63,7 +63,29 @@ pub enum Message {
     Tool {
         tool_call_id: String,
         content: String,
+        #[serde(default)]
+        failed: bool,
+        #[serde(default)]
+        note: String,
     },
+}
+
+const TOOL_ERROR_STATUS: &str = "<system>ERROR: Tool execution failed.</system>";
+const TOOL_EMPTY_STATUS: &str = "<system>Tool output is empty.</system>";
+const TOOL_EMPTY_ERROR_STATUS: &str =
+    "<system>ERROR: Tool execution failed. Tool output is empty.</system>";
+pub const TOOL_OUTPUT_EMPTY: &str = "Tool output is empty.";
+
+#[must_use]
+pub fn render_tool_output(output: &str, failed: bool) -> String {
+    match failed {
+        true if output.is_empty() => TOOL_EMPTY_ERROR_STATUS.to_owned(),
+        true => format!("{TOOL_ERROR_STATUS}\n{output}"),
+        false if output.trim().is_empty() || output.trim() == TOOL_OUTPUT_EMPTY => {
+            TOOL_EMPTY_STATUS.to_owned()
+        }
+        false => output.to_owned(),
+    }
 }
 
 impl Message {
@@ -81,7 +103,13 @@ impl Message {
             Self::Tool {
                 tool_call_id,
                 content,
-            } => json!({"role": "tool", "tool_call_id": tool_call_id, "content": content}),
+                failed,
+                note,
+            } => json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": render_tool_output(content, *failed) + note,
+            }),
             Self::Assistant {
                 content,
                 reasoning,
@@ -173,9 +201,22 @@ pub fn estimate_text(text: &str) -> u64 {
 
 #[must_use]
 pub fn estimate_message(message: &Message) -> u64 {
+    estimate(message, |arguments| {
+        estimate_text(&Value::String(arguments.to_owned()).to_string())
+    })
+}
+
+#[must_use]
+pub fn estimate_request_message(message: &Message) -> u64 {
+    estimate(message, estimate_text)
+}
+
+fn estimate(message: &Message, arguments: impl Fn(&str) -> u64) -> u64 {
     match message {
         Message::User { content, .. } => estimate_text("user") + estimate_text(content),
-        Message::Tool { content, .. } => estimate_text("tool") + estimate_text(content),
+        Message::Tool { content, note, .. } => {
+            estimate_text("tool") + estimate_text(&format!("{content}{note}"))
+        }
         Message::Assistant {
             content,
             reasoning,
@@ -184,10 +225,7 @@ pub fn estimate_message(message: &Message) -> u64 {
         } => {
             let calls = tool_calls
                 .iter()
-                .map(|call| {
-                    estimate_text(&call.name)
-                        + estimate_text(&Value::String(call.arguments.clone()).to_string())
-                })
+                .map(|call| estimate_text(&call.name) + arguments(&call.arguments))
                 .sum::<u64>();
             estimate_text("assistant") + estimate_text(reasoning) + estimate_text(content) + calls
         }

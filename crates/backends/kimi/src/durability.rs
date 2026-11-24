@@ -83,10 +83,15 @@ impl CheckpointFormat for KimiCheckpointFormat {
                 Message::Tool {
                     tool_call_id,
                     content,
+                    failed,
+                    ..
                 } => items.push(TranscriptItem::ToolResult {
                     call_id: tool_call_id,
                     output: content,
-                    outcome: ToolOutcome::Completed,
+                    outcome: match failed {
+                        true => ToolOutcome::Failed,
+                        false => ToolOutcome::Completed,
+                    },
                 }),
             }
         }

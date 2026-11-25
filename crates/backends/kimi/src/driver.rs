@@ -14,8 +14,8 @@ use nanocode_agent_core::{
     input::{PromptInput, UserInput},
 };
 use nanocode_backend_kimi_client::{
-    Client, Delta, Message, Origin, Reply, Request, TOOL_OUTPUT_EMPTY, ToolCall, estimate_message,
-    estimate_text, render_tool_output,
+    Client, ClientError, Delta, Message, Origin, Reply, Request, TOOL_OUTPUT_EMPTY, ToolCall,
+    estimate_message, estimate_text, render_tool_output,
 };
 use nanocode_sync::Signal;
 use nanocode_sync::future::{Either, select};
@@ -59,6 +59,8 @@ struct Inner {
     state: Mutex<State>,
     cancel: Mutex<Option<Arc<Signal>>>,
     stopped: AtomicBool,
+    /// The `/files` ids of the images uploaded so far (`media_key`), as Kimi Code's upload cache.
+    uploads: Mutex<std::collections::BTreeMap<u64, String>>,
 }
 
 pub struct Driver {
@@ -271,6 +273,56 @@ impl Inner {
         }
     }
 
+    /// Kimi Code's media resolution before a request: each inline image not uploaded yet goes to `/files`,
+    /// one at a time; a refused key fails the request, and any other failure leaves the image inline until
+    /// the next request tries again. ponytail: the ids live as long as the agent, where Kimi Code keeps them
+    /// on disk across sessions.
+    async fn upload_images<'a>(
+        &self,
+        messages: impl Iterator<Item = &'a Message>,
+    ) -> Result<std::collections::BTreeMap<u64, String>> {
+        for (url, name) in nanocode_backend_kimi_client::inline_images(messages) {
+            let key = nanocode_backend_kimi_client::media_key(url);
+            if self.uploaded().contains_key(&key) {
+                continue;
+            }
+            let Some((mime, data)) = url
+                .strip_prefix("data:")
+                .and_then(|rest| rest.split_once(";base64,"))
+            else {
+                continue;
+            };
+            let Ok(bytes) = nanocode_sys::base64::STANDARD.decode(data) else {
+                continue;
+            };
+            match self
+                .config
+                .client
+                .upload(&bytes, &name, mime, "image")
+                .await
+            {
+                Ok(id) => {
+                    self.uploaded().insert(key, id);
+                }
+                Err(
+                    error @ ClientError::Status {
+                        status: 401 | 403, ..
+                    },
+                ) => {
+                    return Err(NanocodeError::InvalidRequest(error.to_string()));
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(self.uploaded().clone())
+    }
+
+    fn uploaded(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<u64, String>> {
+        self.uploads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     async fn request(
         &self,
         messages: &[Message],
@@ -280,6 +332,7 @@ impl Inner {
         events: &AgentEventPublisher,
     ) -> Result<Reply> {
         let config = &self.config;
+        let uploads = self.upload_images(messages.iter().chain(extra)).await?;
         let body = Request {
             model: config.model.as_str(),
             system: &config.system,
@@ -289,6 +342,7 @@ impl Inner {
             max_completion_tokens,
             prompt_cache_key: &config.session,
             effort: config.effort,
+            uploads: &uploads,
         }
         .encode();
         emit(
@@ -742,6 +796,7 @@ impl Driver {
                 state: Mutex::new(State::default()),
                 cancel: Mutex::new(None),
                 stopped: AtomicBool::new(false),
+                uploads: Mutex::default(),
             }),
         }
     }

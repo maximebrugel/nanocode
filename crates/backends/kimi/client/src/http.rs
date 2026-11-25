@@ -198,13 +198,24 @@ impl Client {
         path: &str,
         body: &str,
     ) -> Result<nanocode_http::layer::Response, ClientError> {
+        self.send_with(method, path, self.headers()?, body.as_bytes().to_vec())
+            .await
+    }
+
+    async fn send_with(
+        &self,
+        method: Method,
+        path: &str,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<nanocode_http::layer::Response, ClientError> {
         let response = self
             .sender
             .send(Request {
                 method,
                 url: self.url(path),
-                headers: self.headers()?,
-                body: body.as_bytes().to_vec().into(),
+                headers,
+                body: body.into(),
             })
             .await
             .map_err(|error| ClientError::Transport(error.detail().to_owned()))?;
@@ -239,6 +250,48 @@ impl Client {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Kimi Code's `createKimiFiles().upload`: one multipart `POST {base}/files` of the file under `name`
+    /// with its `purpose`, no retries; the file id once Kimi reports it ready.
+    pub async fn upload(
+        &self,
+        bytes: &[u8],
+        name: &str,
+        mime: &str,
+        purpose: &str,
+    ) -> Result<String, ClientError> {
+        let boundary = format!("----nanocode{}", nanocode_platform::uuid_v4().simple());
+        let escape = |text: &str| {
+            text.replace('"', "%22")
+                .replace('\r', "%0D")
+                .replace('\n', "%0A")
+        };
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: {mime}\r\n\r\n",
+            escape(name)
+        )
+        .into_bytes();
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(
+            format!(
+                "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\n{purpose}\r\n--{boundary}--\r\n"
+            )
+            .as_bytes(),
+        );
+        let mut headers = self.headers()?;
+        let content_type =
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
+                .map_err(|_| ClientError::Transport("invalid content-type header".to_owned()))?;
+        headers.insert(HeaderName::from_static("content-type"), content_type);
+        let response = self.send_with(Method::POST, "files", headers, body).await?;
+        let bytes = collect(response.body)
+            .await
+            .map_err(|error| ClientError::Transport(error.detail().to_owned()))?;
+        let uploaded = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+            ClientError::Decode("Kimi file upload returned an invalid response payload".to_owned())
+        })?;
+        uploaded_file(&uploaded).map_err(ClientError::Decode)
     }
 
     pub async fn context_length(&self, model: &str) -> Result<Option<u64>, ClientError> {
@@ -408,4 +461,60 @@ async fn collect(
         bytes.extend_from_slice(&chunk?);
     }
     Ok(bytes)
+}
+
+/// Kimi Code's `parseUploadedKimiFile`: the id of a file whose extraction and status say it is ready.
+fn uploaded_file(uploaded: &Value) -> Result<String, String> {
+    let Value::Object(record) = uploaded else {
+        return Err("Kimi file upload returned an invalid response payload".to_owned());
+    };
+    let id = record
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or("Kimi file upload returned an empty file id")?;
+    let not_ready = |field: &str, value: &Value| {
+        let shown = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        match value.as_str() {
+            Some("error") => format!("Kimi file upload failed for file \"{id}\" ({field}={shown})"),
+            _ => format!("Kimi file upload for file \"{id}\" is not ready ({field}={shown})"),
+        }
+    };
+    let extract = record
+        .get("extract_status")
+        .filter(|value| !value.is_null());
+    if let Some(value) = extract.filter(|value| value.as_str() != Some("ready")) {
+        return Err(not_ready("extract_status", value));
+    }
+    if let Some(status) = record.get("status").filter(|value| !value.is_null()) {
+        let ready = matches!(status.as_str(), Some("ready" | "ok" | "processed"))
+            || (extract.is_some() && status.as_str() == Some("uploaded"));
+        if !ready {
+            return Err(not_ready("status", status));
+        }
+    }
+    Ok(id.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn uploads_are_ready_files() {
+        let parse = |value| super::uploaded_file(&value);
+        assert_eq!(parse(json!({"id": "f1", "status": "ok"})), Ok("f1".to_owned()));
+        assert_eq!(
+            parse(json!({"id": "f1", "extract_status": "ready", "status": "uploaded"})),
+            Ok("f1".to_owned())
+        );
+        assert!(parse(json!({"id": " "})).is_err());
+        assert!(parse(json!({"id": "f1", "status": "uploaded"})).is_err());
+        assert_eq!(
+            parse(json!({"id": "f1", "extract_status": "error"})),
+            Err("Kimi file upload failed for file \"f1\" (extract_status=error)".to_owned())
+        );
+    }
 }

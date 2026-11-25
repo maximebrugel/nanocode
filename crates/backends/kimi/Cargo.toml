@@ -18,6 +18,7 @@ nanocode-digest.workspace = true
 nanocode-durability.workspace = true
 nanocode-image.workspace = true
 nanocode-platform.workspace = true
+nanocode-process-contracts.workspace = true
 nanocode-sync.workspace = true
 nanocode-sys.workspace = true
 nanocode-tool-contracts.workspace = true

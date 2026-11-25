@@ -615,12 +615,19 @@ impl Inner {
                 } = outcome;
                 let output = match call.name == "Read" && self.config.builtins.is_some() {
                     true => output,
-                    false => crate::tools::spill::truncate(
-                        &call.name,
-                        &call.id,
-                        output,
-                        self.config.spill.as_deref(),
-                    ),
+                    false => {
+                        crate::tools::spill::truncate(
+                            &call.name,
+                            &call.id,
+                            output,
+                            self.config.spill.as_deref(),
+                            self.config
+                                .builtins
+                                .as_ref()
+                                .and_then(|builtins| builtins.host()),
+                        )
+                        .await
+                    }
                 };
                 let mut running = streak.clone();
                 for key in &keys[..=index] {

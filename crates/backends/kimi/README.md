@@ -6,7 +6,10 @@ built-in tools: Read, Write, Edit, Glob, Grep, Bash, ReadMediaFile, FetchURL, Ta
 and TodoList. They follow the tool selection the way Codex's built-ins do: no selection means `Tools::default()`; the
 workspace switch (`ToolsBuilder::workspace`, off with `without_defaults`) brings them, the web-search switch brings
 FetchURL, and their names are reserved against registered tools. An explicit workspace source or a Code Mode host brings
-its own workspace tools instead, and wasm targets have none. The rest of the selection reaches the model beside them, in
+its own workspace tools instead. They run on the local machine, or over a host's files and shell
+(`KimiHarness::host`, a `FileHost` and a `ForegroundExecutor`), which is how a wasm agent gets them, as Codex's
+and Claude's `host_tools` do; wasm without a host has none. Over a host, Glob and Grep run `rg` through its shell, task
+logs, spilled results and media are written through its files under `/tmp`, and outputs match the local ones. The rest of the selection reaches the model beside them, in
 Code Mode or directly (`KimiHarness::direct_tools`). Subagents, Code Mode and MCP stay nanocode's own.
 
 ## Selecting it
@@ -38,7 +41,7 @@ default) or `max`; K3 always reasons, so other levels are refused.
 | History: assistant `reasoning_content` always replayed, no `content` beside tool calls when it is blank, tool call IDs sanitized and made unique | The same |
 | Built-in tools: the declarations Kimi Code sends (`prompts/tools.json`, verbatim), their outputs, notes, errors and path guards, Bash's background tasks and their completion notifications, TodoList's guidance and stale-list reminder | The same, checked call by call against the release CLI; Glob and Grep run `rg` from `PATH`. FetchURL fetches locally (the API-key path; Readability text differs from Kimi's linkedom DOM on a few pages) and is native only. ReadMediaFile matches PNG bytes; JPEG re-encodes differ slightly, and images go inline as `data:` URLs where Kimi first tries its `/files` upload. Calls in a step start together and are recorded in call order, with Bash, Glob, Grep, Write and Edit taking turns in call order, as Kimi Code's process lease makes them; a Write or Edit is applied before later calls of its step run, where Kimi Code's file-history capture often lets them run first. Not ported: WebSearch, Agent, AskUserQuestion, plan mode, goals, cron, skills |
 | Tool calls: arguments parsed, unknown tools refused, then validated as AJV does (`allErrors`, every error joined with `; `) for every tool, nanocode's included | The same; a malformed-JSON message uses serde's wording except at end of input |
-| Tool results: `<system>` markers for failed and empty outputs, a note as a second text part, results over 50 000 characters saved to a file with a head and tail preview (a preview alone when they cannot be saved, as on wasm), a `Wall time` header for Bash, Glob, Grep and MCP tools in compaction requests | The same; results are saved under the system temp directory instead of Kimi Code's session directory |
+| Tool results: `<system>` markers for failed and empty outputs, a note as a second text part, results over 50 000 characters saved to a file with a head and tail preview (on the host when the built-in tools run there; a preview alone when they cannot be saved, as on wasm without a host), a `Wall time` header for Bash, Glob, Grep and MCP tools in compaction requests | The same; results are saved under the system temp directory instead of Kimi Code's session directory |
 | Reminders: the date at the start and when it changes, auto permission mode, both again after a compaction | The same |
 | Repeated-call guard: reminders on the 3rd, 5th and 8th identical call in a row, a separate one at the 12th, the turn stopped after the 13th | The same |
 | Compaction at 85% of the window (or within 50k tokens of it): the whole history plus the pinned instruction, then the user's messages (20k tokens, head and tail), the summary and a continuation reminder | The same, without Kimi Code's pointer to its on-disk event log |

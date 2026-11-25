@@ -2,6 +2,7 @@
 //! `globTool.ts` and `grepTool.ts` do.
 
 use super::files::fs_error;
+use super::io::{self, Kind};
 use super::{Access, Builtins, Outcome, input, normalize, sensitive};
 use serde::Deserialize;
 use serde_json::Value;
@@ -91,7 +92,7 @@ async fn run_rg(builtins: &Builtins, args: Vec<String>, cwd: &Path) -> Result<Ru
         std::io::ErrorKind::NotFound => unavailable(builtins),
         _ => error.to_string(),
     };
-    let run = spawn_rg(&args, cwd).await.map_err(fail)?;
+    let run = spawn(builtins, &args, cwd).await.map_err(fail)?;
     let eagain = run.stderr.contains("os error 11")
         || run.stderr.contains("Resource temporarily unavailable");
     if run.code == 0 || run.code == 1 || run.timed_out || run.truncated || !eagain {
@@ -101,7 +102,37 @@ async fn run_rg(builtins: &Builtins, args: Vec<String>, cwd: &Path) -> Result<Ru
         .into_iter()
         .chain(args)
         .collect::<Vec<_>>();
-    spawn_rg(&single, cwd).await.map_err(fail)
+    spawn(builtins, &single, cwd).await.map_err(fail)
+}
+
+async fn spawn(builtins: &Builtins, args: &[String], cwd: &Path) -> std::io::Result<Run> {
+    match builtins.host() {
+        Some(host) => host_rg(host, args, cwd).await,
+        None => spawn_rg(args, cwd).await,
+    }
+}
+
+/// rg through a host's shell. The host enforces the timeout and the output cap; a shell without rg
+/// (exit 127) reads as rg missing.
+async fn host_rg(host: &io::Host, args: &[String], cwd: &Path) -> std::io::Result<Run> {
+    let command = std::iter::once("rg".to_owned())
+        .chain(args.iter().map(|arg| io::quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let limit = std::time::Duration::from_secs(TIMEOUT_SECS);
+    let started = nanocode_platform::Instant::now();
+    let out = io::run(host, cwd, &command, limit, MAX_OUTPUT_BYTES, None).await?;
+    if out.exit_code == 127 {
+        return Err(std::io::ErrorKind::NotFound.into());
+    }
+    Ok(Run {
+        code: out.exit_code,
+        stdout: out.stdout,
+        stderr: out.stderr,
+        truncated: out.truncated,
+        stderr_truncated: false,
+        timed_out: started.elapsed() >= limit,
+    })
 }
 
 /// `rgUnavailableMessage` for a local environment. ponytail: Kimi first tries to download rg into
@@ -210,12 +241,12 @@ pub async fn glob(builtins: &Builtins, args: &Value) -> Outcome {
         Err(error) => return error,
     };
     let root_text = root.display().to_string();
-    match std::fs::metadata(&root) {
-        Ok(stat) if !stat.is_dir() => {
+    match io::kind(builtins.host(), &root).await {
+        Ok(Kind::File(_) | Kind::Special) => {
             return Outcome::error(format!("{root_text} is not a directory"));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Ok(Kind::Dir) => {}
+        Ok(Kind::Missing) => {
             return Outcome::error(format!("{root_text} does not exist"));
         }
         Err(error) => return Outcome::error(fs_error(&error, "stat")),
@@ -449,6 +480,10 @@ pub async fn grep(builtins: &Builtins, args: &Value) -> Outcome {
     }
     rg.push("--null".to_owned());
     push_globs(&mut rg, VCS.iter().map(|dir| format!("!{dir}")));
+    // A host has no file times to sort on, so rg sorts the files-with-matches list by them instead.
+    if mode == Mode::Files && builtins.host().is_some() {
+        rg.push("--sortr=modified".to_owned());
+    }
     let flags: &[&str] = match mode {
         Mode::Files => &["-l"],
         Mode::Count => &["--count-matches", "--with-filename"],
@@ -531,7 +566,7 @@ pub async fn grep(builtins: &Builtins, args: &Value) -> Outcome {
             lines.pop();
         }
     }
-    if mode == Mode::Files && !run.timed_out {
+    if mode == Mode::Files && !run.timed_out && builtins.host().is_none() {
         let mut dated = lines
             .into_iter()
             .map(|line| {

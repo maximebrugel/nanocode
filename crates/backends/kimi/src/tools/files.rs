@@ -1,7 +1,7 @@
+use super::io::{self, Kind};
 use super::{APPLIED, Access, Builtins, Outcome, input};
 use serde::Deserialize;
 use serde_json::Value;
-use std::io::Write as _;
 use std::path::Path;
 
 const MAX_CHARS: i64 = 100_000;
@@ -29,7 +29,7 @@ struct Request<'a> {
 }
 
 /// Kimi Code's `ReadTool` (`execution`, `readForward`, `readTail`, `finishPage`).
-pub fn read(builtins: &Builtins, args: &Value) -> Outcome {
+pub async fn read(builtins: &Builtins, args: &Value) -> Outcome {
     let args: ReadInput = match input("Read", args) {
         Ok(args) => args,
         Err(error) => return error,
@@ -44,17 +44,20 @@ pub fn read(builtins: &Builtins, args: &Value) -> Outcome {
         Err(error) => return error,
     };
     let shown = &args.path;
-    match std::fs::metadata(&path) {
+    match io::kind(builtins.host(), &path).await {
+        Ok(Kind::Missing) => {
+            return Outcome::error(format!("\"{shown}\" does not exist."));
+        }
         Err(error) if missing(&error) => {
             return Outcome::error(format!("\"{shown}\" does not exist."));
         }
         Err(error) => return Outcome::error(fs_error(&error, "stat")),
-        Ok(stat) if !stat.is_file() => {
+        Ok(Kind::Dir | Kind::Special) => {
             return Outcome::error(format!("\"{shown}\" is not a file."));
         }
-        Ok(_) => {}
+        Ok(Kind::File(_)) => {}
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match io::read(builtins.host(), &path).await {
         Ok(bytes) => bytes,
         Err(error) => return Outcome::error(fs_error(&error, "read")),
     };
@@ -812,7 +815,7 @@ struct EditInput {
 }
 
 /// Kimi Code's `EditTool.execution` and `FileEditService.edit`.
-pub fn edit(builtins: &Builtins, args: &Value) -> Outcome {
+pub async fn edit(builtins: &Builtins, args: &Value) -> Outcome {
     let args: EditInput = match input("Edit", args) {
         Ok(args) => args,
         Err(error) => return error,
@@ -827,7 +830,10 @@ pub fn edit(builtins: &Builtins, args: &Value) -> Outcome {
             "No changes to make: old_string and new_string are exactly the same.",
         );
     }
-    let raw = match std::fs::read(&path).map(String::from_utf8) {
+    let raw = match io::read(builtins.host(), &path)
+        .await
+        .map(String::from_utf8)
+    {
         Ok(Ok(raw)) => raw,
         Ok(Err(_)) => return Outcome::error("read failed: unrecognized filesystem error"),
         Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => {
@@ -855,7 +861,7 @@ pub fn edit(builtins: &Builtins, args: &Value) -> Outcome {
     } else {
         text
     };
-    if let Err(error) = std::fs::write(&path, text) {
+    if let Err(error) = io::write(builtins.host(), &path, text.as_bytes(), false).await {
         return Outcome::error(fs_error(&error, "write"));
     }
     let word = if count == 1 {
@@ -874,7 +880,7 @@ struct WriteInput {
 }
 
 /// Kimi Code's `WriteTool.execution`.
-pub fn write(builtins: &Builtins, args: &Value) -> Outcome {
+pub async fn write(builtins: &Builtins, args: &Value) -> Outcome {
     let args: WriteInput = match input("Write", args) {
         Ok(args) => args,
         Err(error) => return error,
@@ -884,12 +890,17 @@ pub fn write(builtins: &Builtins, args: &Value) -> Outcome {
         Err(error) => return error,
     };
     let append = args.mode.as_deref() == Some("append");
-    let attempt = || write_text(&path, &args.content, append);
-    let outcome = match attempt() {
-        Err(error) if missing(&error) => match path.parent().map(ensure_parent) {
-            Some(Some(message)) => return Outcome::error(message),
-            _ => attempt(),
-        },
+    let host = builtins.host();
+    let content = args.content.as_bytes();
+    let outcome = match io::write(host, &path, content, append).await {
+        Err(error) if missing(&error) => {
+            if let Some(parent) = path.parent()
+                && let Some(message) = ensure_parent(host, parent).await
+            {
+                return Outcome::error(message);
+            }
+            io::write(host, &path, content, append).await
+        }
         other => other,
     };
     match outcome {
@@ -908,16 +919,6 @@ pub fn write(builtins: &Builtins, args: &Value) -> Outcome {
     }
 }
 
-fn write_text(path: &Path, content: &str, append: bool) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)?;
-    file.write_all(content.as_bytes())
-}
-
 fn missing(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -925,19 +926,17 @@ fn missing(error: &std::io::Error) -> bool {
     )
 }
 
-fn ensure_parent(parent: &Path) -> Option<String> {
-    match std::fs::metadata(parent) {
-        Ok(stat) if !stat.is_dir() => Some(format!(
+async fn ensure_parent(host: Option<&io::Host>, parent: &Path) -> Option<String> {
+    match io::kind(host, parent).await {
+        Ok(Kind::File(_) | Kind::Special) => Some(format!(
             "Parent path is not a directory: {}.",
             parent.display()
         )),
-        Ok(_) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(parent)
-                .err()
-                .map(|error| fs_error(&error, "mkdir"))
-        }
-        Err(_) => None,
+        Ok(Kind::Dir) | Err(_) => None,
+        Ok(Kind::Missing) => io::create_dir_all(host, parent)
+            .await
+            .err()
+            .map(|error| fs_error(&error, "mkdir")),
     }
 }
 

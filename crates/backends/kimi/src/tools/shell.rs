@@ -5,8 +5,10 @@
 // Without processes (wasm), only the spawning path is missing; what it alone reaches is unused there.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+use super::io::{self, Host, Kind};
 use super::{Builtins, Outcome, input, normalize};
 use nanocode_platform::Instant;
+use nanocode_sync::future::{AbortHandle, abortable};
 use nanocode_sync::watch;
 use serde::Deserialize;
 use serde_json::Value;
@@ -66,6 +68,8 @@ struct Task {
     description: String,
     command: String,
     pid: u32,
+    /// Stops a task run through a host, which has no process to signal.
+    abort: Mutex<Option<AbortHandle>>,
     parent: String,
     timeout_ms: Option<u64>,
     started: Instant,
@@ -89,6 +93,18 @@ impl Task {
 
     fn running(&self) -> bool {
         self.run().ended.is_none()
+    }
+
+    /// Signals the task's process group, or aborts its host command (any signal ends it at once).
+    fn signal(&self, signal: i32) {
+        match &*self
+            .abort
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(handle) => handle.abort(),
+            None => self::signal(self.pid, signal),
+        }
     }
 
     /// `formatPlainObject` of the task info, in its field order.
@@ -184,7 +200,9 @@ struct Shared {
     tasks: Mutex<Vec<Arc<Task>>>,
     pending: Mutex<Vec<String>>,
     changed: watch::Sender<()>,
-    dir: PathBuf,
+    /// Where output logs go: locally, or on the host, where `persist` writes them.
+    dir: Option<PathBuf>,
+    host: Option<Host>,
 }
 
 impl Shared {
@@ -223,22 +241,41 @@ impl Shared {
         if text.is_empty() || run.ended.is_some() {
             return;
         }
-        let path = self.dir.join(&task.id).join("output.log");
-        let written = std::fs::create_dir_all(self.dir.join(&task.id)).and_then(|()| {
-            use std::io::Write as _;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?
-                .write_all(text.as_bytes())
-        });
-        if written.is_ok() {
-            run.file = Some(path);
+        if let (Some(dir), Some(_)) = (&self.dir, &self.host) {
+            run.file = Some(dir.join(&task.id).join("output.log"));
+        } else if let Some(dir) = &self.dir {
+            let path = dir.join(&task.id).join("output.log");
+            let written = std::fs::create_dir_all(dir.join(&task.id)).and_then(|()| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)?
+                    .write_all(text.as_bytes())
+            });
+            if written.is_ok() {
+                run.file = Some(path);
+            }
         }
         run.output.push_str(text);
         if run.output.len() > OUTPUT_LIMIT_BYTES && run.stop_reason.is_none() {
             run.stop_reason = Some(OUTPUT_LIMIT_REASON.to_owned());
-            signal(task.pid, SIGTERM);
+            task.signal(SIGTERM);
+        }
+    }
+
+    /// Writes a host task's log as it stands; the log reaches the host when the task ends and whenever
+    /// TaskOutput reports it. ponytail: the whole log is rewritten each time, as `FileHost` cannot append.
+    async fn persist(&self, task: &Task) {
+        let Some(host) = &self.host else {
+            return;
+        };
+        let (file, output) = {
+            let run = task.run();
+            (run.file.clone(), run.output.clone())
+        };
+        if let Some(file) = file {
+            let _ = io::store(Some(host), &file, output.as_bytes()).await;
         }
     }
 
@@ -313,6 +350,7 @@ struct WaitInput {
 /// Bash and the background tasks it starts.
 pub struct Shell {
     cwd: PathBuf,
+    host: Option<Host>,
     shell: &'static str,
     shared: Arc<Shared>,
     /// WaitFor calls and milliseconds waited in the current turn.
@@ -320,7 +358,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(cwd: &Path) -> Self {
+    pub fn new(cwd: &Path, host: Option<Host>) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             shell: shell_path(),
@@ -328,8 +366,13 @@ impl Shell {
                 tasks: Mutex::default(),
                 pending: Mutex::default(),
                 changed: watch::Sender::new(()),
-                dir: tasks_dir(),
+                dir: match &host {
+                    Some(_) => Some(tasks_dir(Path::new("/tmp"))),
+                    None => cfg!(unix).then(|| tasks_dir(&std::env::temp_dir())),
+                },
+                host: host.clone(),
             }),
+            host,
             tally: Mutex::default(),
         }
     }
@@ -365,18 +408,19 @@ impl Shell {
             true => format!("Bash: {}", ellipsis(&args.command, 60)),
         };
         let cwd = normalize(&self.cwd.join(args.cwd.as_deref().unwrap_or_default()));
-        if !cwd.is_dir() {
+        if !matches!(io::kind(self.host.as_ref(), &cwd).await, Ok(Kind::Dir)) {
             return Outcome::error(format!(
                 "Failed to spawn \"{}\": cwd {} does not exist or is not a directory",
                 self.shell,
                 cwd.display()
             ));
         }
-        let task = match launch(&self.shared, self.shell, &cwd, &args.command, |pid| Task {
+        let make = |pid| Task {
             id: task_id(),
             description,
             command: args.command.clone(),
             pid,
+            abort: Mutex::default(),
             parent: call.to_owned(),
             timeout_ms,
             started: Instant::now(),
@@ -391,7 +435,12 @@ impl Shell {
                 stopped: false,
                 detached: background,
             }),
-        }) {
+        };
+        let launched = match &self.host {
+            Some(host) => Ok(launch_host(&self.shared, host, &cwd, &args.command, make)),
+            None => launch(&self.shared, self.shell, &cwd, &args.command, make),
+        };
+        let task = match launched {
             Ok(task) => task,
             Err(error) => {
                 return Outcome::error(format!("Failed to spawn \"{}\": {error}", self.shell));
@@ -399,7 +448,10 @@ impl Shell {
         };
         if background {
             if let Some(ms) = timeout_ms.filter(|ms| *ms > 0) {
-                arm(&task, Duration::from_millis(ms));
+                match self.host {
+                    Some(_) => arm_host(&task, Duration::from_millis(ms)),
+                    None => arm(&task, Duration::from_millis(ms)),
+                }
             }
             return Outcome::ok(started(&task, "", false));
         }
@@ -434,7 +486,7 @@ impl Shell {
     }
 
     /// Kimi Code's `TaskOutputTool`.
-    pub fn output(&self, args: &Value) -> Outcome {
+    pub async fn output(&self, args: &Value) -> Outcome {
         let args: TaskInput = match input("TaskOutput", args) {
             Ok(args) => args,
             Err(error) => return error,
@@ -442,6 +494,7 @@ impl Shell {
         let Some(task) = self.shared.find(&args.task_id) else {
             return Outcome::error(format!("Task not found: {}", args.task_id));
         };
+        self.shared.persist(&task).await;
         let (file, total, running, preview) = {
             let run = task.run();
             let bytes = run.output.as_bytes();
@@ -671,7 +724,18 @@ impl Shell {
                 self.shared.halt(&task, None).await;
             }
         }
-        let _ = std::fs::remove_dir_all(self.shared.dir.parent().unwrap_or(&self.shared.dir));
+        if let Some(dir) = &self.shared.dir {
+            let root = dir.parent().unwrap_or(dir);
+            match &self.host {
+                Some(host) => {
+                    let command = format!("rm -rf {}", io::quote(&root.display().to_string()));
+                    let _ = io::run(host, Path::new("/"), &command, KILL_GRACE, 4096, None).await;
+                }
+                None => {
+                    let _ = std::fs::remove_dir_all(root);
+                }
+            }
+        }
     }
 }
 
@@ -685,11 +749,11 @@ impl Shared {
                 run.stop_reason = reason;
             }
         }
-        signal(task.pid, SIGTERM);
+        task.signal(SIGTERM);
         self.until(Some(Instant::now() + KILL_GRACE), || !task.running())
             .await;
         if task.running() {
-            signal(task.pid, SIGKILL);
+            task.signal(SIGKILL);
             self.until(None, || !task.running()).await;
         }
     }
@@ -705,7 +769,7 @@ struct Guard<'a>(&'a Arc<Shared>, &'a Arc<Task>);
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        signal(self.1.pid, SIGKILL);
+        self.1.signal(SIGKILL);
         self.0.forget(self.1);
     }
 }
@@ -1021,22 +1085,11 @@ fn shell_path() -> &'static str {
         .unwrap_or("/bin/sh")
 }
 
-#[cfg(unix)]
-fn tasks_dir() -> PathBuf {
-    let mut bytes = [0u8; 8];
-    let _ = nanocode_platform::fill_random(&mut bytes);
-    let tag = bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    std::env::temp_dir()
-        .join(format!("nanocode-kimi-{tag}"))
+/// A fresh `nanocode-kimi-<tag>/tasks` under `root`.
+fn tasks_dir(root: &Path) -> PathBuf {
+    let tag = nanocode_platform::uuid_v4().simple().to_string();
+    root.join(format!("nanocode-kimi-{}", &tag[..16]))
         .join("tasks")
-}
-
-#[cfg(not(unix))]
-fn tasks_dir() -> PathBuf {
-    PathBuf::new()
 }
 
 /// Kimi Code's background timeout: SIGTERM at the deadline, SIGKILL after the grace period.
@@ -1053,10 +1106,10 @@ fn arm(task: &Arc<Task>, after: Duration) {
             run.timed_out = true;
             run.stop_reason = Some("Timed out".to_owned());
         }
-        signal(task.pid, SIGTERM);
+        task.signal(SIGTERM);
         std::thread::sleep(KILL_GRACE);
         if task.running() {
-            signal(task.pid, SIGKILL);
+            task.signal(SIGKILL);
         }
     });
 }
@@ -1123,6 +1176,130 @@ fn launch(
         from.finish(&into, code);
     });
     Ok(task)
+}
+
+/// Runs `cd <cwd> && <command>` through the host's shell with the variables Kimi Code sets, streaming
+/// its output into the task when the host streams it, and taking it from the result otherwise.
+fn launch_host(
+    shared: &Arc<Shared>,
+    host: &Host,
+    cwd: &Path,
+    command: &str,
+    task: impl FnOnce(u32) -> Task,
+) -> Arc<Task> {
+    let task = Arc::new(task(0));
+    if let Ok(mut tasks) = shared.tasks.lock() {
+        tasks.push(task.clone());
+    }
+    let sink = Arc::new(Sink {
+        shared: shared.clone(),
+        task: task.clone(),
+        pending: Mutex::default(),
+        streamed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let script = format!(
+        "export NO_COLOR=1 TERM=dumb GIT_TERMINAL_PROMPT=\"${{GIT_TERMINAL_PROMPT:-0}}\" SHELL=\"${{BASH:-$SHELL}}\"; cd {} && {command}",
+        io::quote(&cwd.display().to_string())
+    );
+    let (host, cwd, output) = (host.clone(), cwd.to_path_buf(), sink.clone());
+    let (run, handle) = abortable(async move {
+        let limit = Duration::from_secs(BACKGROUND_MAX_S);
+        io::run(
+            &host,
+            &cwd,
+            &script,
+            limit,
+            OUTPUT_LIMIT_BYTES + 1,
+            Some(&*output),
+        )
+        .await
+    });
+    *task
+        .abort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    spawn(async move {
+        let code = match run.await {
+            Ok(Ok(out)) => {
+                let rest = match sink.streamed.load(std::sync::atomic::Ordering::Relaxed) {
+                    true => sink.flush(),
+                    false => out.stdout + &out.stderr,
+                };
+                sink.shared.append(&sink.task, &rest);
+                out.exit_code
+            }
+            Ok(Err(error)) => {
+                sink.shared.append(&sink.task, &error.to_string());
+                -1
+            }
+            Err(_) => -1,
+        };
+        sink.shared.persist(&sink.task).await;
+        sink.shared.finish(&sink.task, code);
+    });
+    task
+}
+
+struct Sink {
+    shared: Arc<Shared>,
+    task: Arc<Task>,
+    pending: Mutex<Vec<u8>>,
+    streamed: std::sync::atomic::AtomicBool,
+}
+
+impl Sink {
+    fn flush(&self) -> String {
+        decode(
+            &mut self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            true,
+        )
+    }
+}
+
+impl nanocode_process_contracts::OutputSink for Sink {
+    fn write(&self, bytes: &[u8]) {
+        self.streamed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let text = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.extend_from_slice(bytes);
+            decode(&mut pending, false)
+        };
+        self.shared.append(&self.task, &text);
+    }
+}
+
+/// Kimi Code's background timeout for a host task: at the deadline it is marked timed out and aborted.
+fn arm_host(task: &Arc<Task>, after: Duration) {
+    let task = task.clone();
+    spawn(async move {
+        nanocode_platform::sleep(after).await;
+        {
+            let mut run = task.run();
+            if run.ended.is_some() {
+                return;
+            }
+            run.timed_out = true;
+            run.stop_reason = Some("Timed out".to_owned());
+        }
+        task.signal(SIGTERM);
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn spawn(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    drop(nanocode_platform::spawn_task(future));
+}
+
+#[cfg(target_family = "wasm")]
+fn spawn(future: impl std::future::Future<Output = ()> + 'static) {
+    nanocode_platform::spawn(future);
 }
 
 #[cfg(not(unix))]

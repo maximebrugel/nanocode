@@ -33,6 +33,7 @@ pub struct KimiHarness {
     context_window: Option<u64>,
     environment: Environment,
     direct_tools: bool,
+    host: Option<crate::tools::Host>,
 }
 
 impl KimiHarness {
@@ -74,6 +75,19 @@ impl KimiHarness {
     #[must_use]
     pub const fn direct_tools(mut self, direct: bool) -> Self {
         self.direct_tools = direct;
+        self
+    }
+
+    /// Runs Kimi Code's built-in tools over a host's files and shell instead of the local machine, which is
+    /// how a wasm agent gets them (Codex's and Claude's `host_tools` serve the same purpose). Both must see
+    /// the runtime workspace; the shell is POSIX and finds `rg` for Glob and Grep. FetchURL stays native.
+    #[must_use]
+    pub fn host(
+        mut self,
+        files: Arc<dyn nanocode_process_contracts::FileHost>,
+        shell: Arc<dyn nanocode_process_contracts::ForegroundExecutor>,
+    ) -> Self {
+        self.host = Some(crate::tools::Host { files, shell });
         self
     }
 
@@ -210,12 +224,29 @@ impl KimiHarness {
                 .map_err(|error| invalid(error.to_string()))?,
             None => Tools::default(),
         };
-        let builtins = kimi_workspace(&selected).then(|| {
+        let local = self.host.is_none();
+        let kimi = kimi_workspace(&selected, !local);
+        // Kimi Code's session stores (spilled results, media) sit where its tools can Read them back: on
+        // the host when they run there.
+        let spill = match kimi && !local {
+            true => Some(
+                std::path::PathBuf::from("/tmp/nanocode-kimi")
+                    .join(&session)
+                    .join("tool-results"),
+            ),
+            false => spill_directory(&session),
+        };
+        let builtins = kimi.then(|| {
             Arc::new(crate::tools::Builtins::new(
-                std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.to_path_buf()),
+                match local {
+                    true => std::fs::canonicalize(&workspace)
+                        .unwrap_or_else(|_| workspace.to_path_buf()),
+                    false => workspace.to_path_buf(),
+                },
                 home(),
-                spill_directory(&session).map(|spill| spill.with_file_name("media")),
-                selected.web_search_enabled(),
+                spill.as_ref().map(|spill| spill.with_file_name("media")),
+                selected.web_search_enabled() && !cfg!(target_family = "wasm"),
+                self.host.clone(),
             ))
         });
         let selected = match &builtins {
@@ -309,7 +340,7 @@ impl KimiHarness {
             catalog,
             builtins,
             root,
-            spill: spill_directory(&session),
+            spill,
             zone,
             today,
             session,
@@ -375,16 +406,24 @@ const fn spill_directory(_session: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Whether Kimi Code's built-in tools serve this selection's workspace (Codex's rule for its own).
-#[cfg(not(target_family = "wasm"))]
-fn kimi_workspace(tools: &nanocode_tool_host::Tools) -> bool {
-    tools.workspace_enabled() && tools.workspace_source().is_none() && !tools.has_code_mode_host()
+/// Whether Kimi Code's built-in tools serve this selection's workspace, by Codex's rule for its own: the
+/// workspace switch is on and no Code Mode host or explicit workspace source brings other workspace tools.
+/// They run locally, or over a host (`KimiHarness::host`), the only way on wasm.
+fn kimi_workspace(tools: &nanocode_tool_host::Tools, hosted: bool) -> bool {
+    tools.workspace_enabled()
+        && !tools.has_code_mode_host()
+        && no_workspace_source(tools)
+        && (hosted || !cfg!(target_family = "wasm"))
 }
 
-/// Kimi Code's built-in tools use the local file system and processes, which wasm hosts do not have.
+#[cfg(not(target_family = "wasm"))]
+const fn no_workspace_source(tools: &nanocode_tool_host::Tools) -> bool {
+    tools.workspace_source().is_none()
+}
+
 #[cfg(target_family = "wasm")]
-const fn kimi_workspace(_: &nanocode_tool_host::Tools) -> bool {
-    false
+const fn no_workspace_source(_: &nanocode_tool_host::Tools) -> bool {
+    true
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -403,18 +442,17 @@ mod tests {
 
     #[test]
     fn selection_drives_kimi_builtins() {
-        let builtins = |web| crate::tools::Builtins::new("/w".into(), None, None, web);
-        assert!(super::kimi_workspace(&Tools::default()));
-        assert!(!super::kimi_workspace(
-            &Tools::builder().without_defaults().build().unwrap()
-        ));
-        assert!(super::kimi_workspace(
-            &Tools::builder()
-                .without_defaults()
-                .workspace(true)
-                .build()
-                .unwrap()
-        ));
+        let builtins = |web| crate::tools::Builtins::new("/w".into(), None, None, web, None);
+        let none = Tools::builder().without_defaults().build().unwrap();
+        let workspace = Tools::builder()
+            .without_defaults()
+            .workspace(true)
+            .build()
+            .unwrap();
+        assert!(super::kimi_workspace(&Tools::default(), false));
+        assert!(super::kimi_workspace(&Tools::default(), true));
+        assert!(!super::kimi_workspace(&none, true));
+        assert!(super::kimi_workspace(&workspace, false));
         assert!(builtins(true).handles("FetchURL") && builtins(true).handles("Bash"));
         assert!(!builtins(false).handles("FetchURL") && builtins(false).handles("Write"));
         assert_eq!(builtins(false).names().count(), 12);

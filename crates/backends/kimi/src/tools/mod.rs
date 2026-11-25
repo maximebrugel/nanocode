@@ -3,6 +3,7 @@
 //! Kimi Code exposes them.
 
 mod files;
+mod io;
 mod media;
 mod search;
 mod shell;
@@ -16,6 +17,7 @@ use std::sync::Mutex;
 
 pub const CONTRACTS: &str = include_str!("../../prompts/tools.json");
 
+pub use io::Host;
 pub use todo::{REMINDER_PREFIX as TODO_REMINDER_PREFIX, reminder as todo_reminder};
 
 /// What a tool hands back to the model: its output, whether it failed, the `note` Kimi Code sends as
@@ -86,14 +88,23 @@ pub struct Builtins {
     media: Option<PathBuf>,
     /// Whether FetchURL is on: it follows the selection's web-search switch, the way Codex's web tool does.
     web: bool,
+    /// The host the tools reach files and processes through; the local machine when `None`.
+    host: Option<Host>,
     todos: Mutex<Vec<todo::Todo>>,
     shell: shell::Shell,
 }
 
 impl Builtins {
-    pub fn new(cwd: PathBuf, home: Option<PathBuf>, media: Option<PathBuf>, web: bool) -> Self {
+    pub fn new(
+        cwd: PathBuf,
+        home: Option<PathBuf>,
+        media: Option<PathBuf>,
+        web: bool,
+        host: Option<Host>,
+    ) -> Self {
         Self {
-            shell: shell::Shell::new(&cwd),
+            shell: shell::Shell::new(&cwd, host.clone()),
+            host,
             cwd,
             home,
             media,
@@ -116,6 +127,10 @@ impl Builtins {
             .filter(|name| self.web || *name != "FetchURL")
     }
 
+    pub const fn host(&self) -> Option<&Host> {
+        self.host.as_ref()
+    }
+
     pub fn handles(&self, name: &str) -> bool {
         self.names().any(|known| known == name)
     }
@@ -123,14 +138,14 @@ impl Builtins {
     /// Runs a built-in tool on arguments that already passed schema validation; `id` is the tool call's.
     pub async fn call(&self, id: &str, name: &str, args: &Value) -> Outcome {
         match name {
-            "Read" => files::read(self, args),
-            "Write" => files::write(self, args),
-            "Edit" => files::edit(self, args),
+            "Read" => files::read(self, args).await,
+            "Write" => files::write(self, args).await,
+            "Edit" => files::edit(self, args).await,
             "Glob" => search::glob(self, args).await,
             "Grep" => search::grep(self, args).await,
             "Bash" => self.shell.bash(self, id, args).await,
             "TaskList" => self.shell.list(args),
-            "TaskOutput" => self.shell.output(args),
+            "TaskOutput" => self.shell.output(args).await,
             "TaskStop" => self.shell.stop(args).await,
             "WaitFor" => self.shell.wait(args).await,
             "TodoList" => todo::call(self, args),

@@ -87,15 +87,20 @@ fn stem(tool: &str, call: &str) -> String {
     }
 }
 
-fn save(directory: Option<&Path>, tool: &str, call: &str, text: &str) -> Option<PathBuf> {
+async fn save(
+    directory: Option<&Path>,
+    host: Option<&super::Host>,
+    tool: &str,
+    call: &str,
+    text: &str,
+) -> Option<PathBuf> {
     let directory = directory?;
     let path = directory.join(format!(
         "{}-{}.txt",
         stem(tool, call),
         nanocode_platform::uuid_v4()
     ));
-    std::fs::create_dir_all(directory).ok()?;
-    std::fs::write(&path, text).ok()?;
+    super::io::store(host, &path, text.as_bytes()).await.ok()?;
     Some(path)
 }
 
@@ -127,9 +132,15 @@ fn preview(lines: &mut Vec<String>, text: &str) {
     }
 }
 
-/// Applies Kimi Code's spill to `output`, saving into `directory` (no directory: the result cannot be
-/// saved, as on wasm).
-pub fn truncate(tool: &str, call: &str, output: String, directory: Option<&Path>) -> String {
+/// Applies Kimi Code's spill to `output`, saving into `directory`, through `host` when there is one (no
+/// directory: the result cannot be saved, as on wasm without a host).
+pub async fn truncate(
+    tool: &str,
+    call: &str,
+    output: String,
+    directory: Option<&Path>,
+    host: Option<&super::Host>,
+) -> String {
     let total = units(&output);
     if total <= MAX_CHARS {
         return output;
@@ -139,7 +150,7 @@ pub fn truncate(tool: &str, call: &str, output: String, directory: Option<&Path>
         false => head(&output, MAX_RETAINED_CHARS),
     };
     let preserved = units(retained);
-    let Some(path) = save(directory, tool, call, retained) else {
+    let Some(path) = save(directory, host, tool, call, retained).await else {
         let mut lines = vec![
             format!(
                 "Tool output exceeded {MAX_CHARS} characters and could not be saved to a file; only this preview is available."
@@ -223,7 +234,7 @@ mod tests {
     #[test]
     fn previews_unsaved_output() {
         let output = "y".repeat(60_000);
-        let text = truncate("Bash", "c1", output, None);
+        let text = nanocode_sync::block_on(truncate("Bash", "c1", output, None, None));
         assert!(text.starts_with("Tool output exceeded 50000 characters and could not be saved to a file; only this preview is available.\ntool_name: Bash\ntool_call_id: c1\noutput_size_chars: 60000\n\n[preview: chars [0, 4096)]\n"));
         assert!(
             text.contains("\n\n[elided: chars [4096, 58976)]\n\n[preview: chars [58976, 60000)]\n")

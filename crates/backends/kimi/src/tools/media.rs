@@ -5,6 +5,7 @@
 //! supported.
 
 use super::files::{IMAGE_SUFFIXES, VIDEO_SUFFIXES, file_kind, fs_error};
+use super::io::{self, Kind};
 use super::{Access, Builtins, Outcome, input};
 use nanocode_image::{Encoding, Format, Image, Pixels};
 use serde::Deserialize;
@@ -76,10 +77,18 @@ pub async fn read(builtins: &Builtins, args: &Value) -> Outcome {
             fs_error(&error, "read")
         ))
     };
+    // ponytail: a host has no partial reads, so the whole file is read up front and once more below;
+    // add a ranged read to `FileHost` if large media over a host gets slow.
     let mut header = Vec::with_capacity(512);
-    if let Err(error) =
-        std::fs::File::open(&path).and_then(|file| file.take(512).read_to_end(&mut header))
-    {
+    let opened = match builtins.host() {
+        Some(host) => io::read(Some(host), &path).await.map(|bytes| {
+            header.extend_from_slice(&bytes[..bytes.len().min(512)]);
+        }),
+        None => std::fs::File::open(&path)
+            .and_then(|file| file.take(512).read_to_end(&mut header))
+            .map(drop),
+    };
+    if let Err(error) = opened {
         return failed(error);
     }
     let name = path.to_string_lossy();
@@ -97,8 +106,9 @@ pub async fn read(builtins: &Builtins, args: &Value) -> Outcome {
         }
         _ => {}
     }
-    let size = match std::fs::metadata(&path) {
-        Ok(stat) => stat.len(),
+    let size = match io::kind(builtins.host(), &path).await {
+        Ok(Kind::File(size)) => size,
+        Ok(_) => return failed(std::io::ErrorKind::NotFound.into()),
         Err(error) => return failed(error),
     };
     let image = kind == "image";
@@ -134,7 +144,7 @@ pub async fn read(builtins: &Builtins, args: &Value) -> Outcome {
     if image && !options && size > MAX_DECODE_BYTES {
         return too_large(size);
     }
-    let data = match std::fs::read(&path) {
+    let data = match io::read(builtins.host(), &path).await {
         Ok(data) => data,
         Err(error) => return failed(error),
     };
@@ -185,10 +195,10 @@ pub async fn read(builtins: &Builtins, args: &Value) -> Outcome {
             "image_url": {"url": format!("data:{out_mime};base64,{}", nanocode_sys::base64::STANDARD.encode(&bytes))},
         }),
         "image" => {
-            json!({"type": "image_url", "image_url": {"url": save(builtins, &bytes, out_mime, &name)}})
+            json!({"type": "image_url", "image_url": {"url": save(builtins, &bytes, out_mime, &name).await}})
         }
         _ => {
-            json!({"type": "video_url", "video_url": {"url": save(builtins, &bytes, out_mime, &name)}})
+            json!({"type": "video_url", "video_url": {"url": save(builtins, &bytes, out_mime, &name).await}})
         }
     };
     Outcome {
@@ -201,7 +211,7 @@ pub async fn read(builtins: &Builtins, args: &Value) -> Outcome {
 
 /// Kimi Code's `SessionMediaStoreService.put`: saves the bytes as `f_<sha256(mime NUL bytes)><ext>` in the
 /// session's media directory and returns the path, or nothing when there is no store.
-fn save(builtins: &Builtins, bytes: &[u8], mime: &str, name: &str) -> String {
+async fn save(builtins: &Builtins, bytes: &[u8], mime: &str, name: &str) -> String {
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let ext = match file.rfind('.') {
         Some(dot) if dot > 0 => &file[dot..],
@@ -226,7 +236,7 @@ fn save(builtins: &Builtins, bytes: &[u8], mime: &str, name: &str) -> String {
         return String::new();
     };
     let path = directory.join(format!("{id}{ext}"));
-    let saved = std::fs::create_dir_all(directory).and_then(|()| std::fs::write(&path, bytes));
+    let saved = io::store(builtins.host(), &path, bytes).await;
     saved.map_or_else(|_| String::new(), |()| path.display().to_string())
 }
 

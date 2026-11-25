@@ -653,6 +653,7 @@ dependencies = [
  "nanocode-image",
  "nanocode-io",
  "nanocode-platform",
+ "nanocode-process-contracts",
  "nanocode-sync",
  "nanocode-sys",
  "nanocode-tls",

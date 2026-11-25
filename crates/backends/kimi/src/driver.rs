@@ -61,6 +61,8 @@ struct Inner {
     stopped: AtomicBool,
     /// The `/files` ids of the images uploaded so far (`media_key`), as Kimi Code's upload cache.
     uploads: Mutex<std::collections::BTreeMap<u64, String>>,
+    /// The endpoint answered an upload with no `/files` route (404, 405, 501): images stay inline.
+    no_files: std::sync::atomic::AtomicBool,
 }
 
 pub struct Driver {
@@ -276,13 +278,17 @@ impl Inner {
     /// Kimi Code's media resolution before a request: each inline image not uploaded yet goes to `/files`,
     /// one at a time; a refused key fails the request, and any other failure leaves the image inline until
     /// the next request tries again. ponytail: the ids live as long as the agent, where Kimi Code keeps them
-    /// on disk across sessions.
+    /// on disk across sessions. An endpoint without a `/files` route (a proxy such as Cloudflare's AI Gateway)
+    /// turns uploads off for the agent, where Kimi Code would try again on every request.
     async fn upload_images<'a>(
         &self,
         messages: impl Iterator<Item = &'a Message>,
     ) -> Result<std::collections::BTreeMap<u64, String>> {
         for (url, name) in nanocode_backend_kimi_client::inline_images(messages) {
             let key = nanocode_backend_kimi_client::media_key(url);
+            if self.no_files.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             if self.uploaded().contains_key(&key) {
                 continue;
             }
@@ -311,6 +317,12 @@ impl Inner {
                 ) => {
                     return Err(NanocodeError::InvalidRequest(error.to_string()));
                 }
+                Err(ClientError::Status {
+                    status: 404 | 405 | 501,
+                    ..
+                }) => self
+                    .no_files
+                    .store(true, std::sync::atomic::Ordering::Relaxed),
                 Err(_) => {}
             }
         }
@@ -797,6 +809,7 @@ impl Driver {
                 cancel: Mutex::new(None),
                 stopped: AtomicBool::new(false),
                 uploads: Mutex::default(),
+                no_files: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }

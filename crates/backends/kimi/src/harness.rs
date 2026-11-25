@@ -202,19 +202,28 @@ impl KimiHarness {
         let handle = AgentHandle::new(session.clone(), model.clone(), spec.spawn_factory.clone())
             .with_root_session_id(root)
             .with_spawn_factory(spec.spawn_factory.clone());
-        let builtins = match (&settings.tools, cfg!(target_family = "wasm")) {
-            (None, false) => Some(Arc::new(crate::tools::Builtins::new(
+        // As in Codex, no selection means `Tools::default()`: the workspace tools (here Kimi Code's own) and
+        // web access are on. An explicit workspace source or a code-mode host brings its own workspace tools.
+        let selected = match &settings.tools {
+            Some(tools) => tools
+                .materialize(handle.clone())
+                .map_err(|error| invalid(error.to_string()))?,
+            None => Tools::default(),
+        };
+        let builtins = kimi_workspace(&selected).then(|| {
+            Arc::new(crate::tools::Builtins::new(
                 std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.to_path_buf()),
                 home(),
                 spill_directory(&session).map(|spill| spill.with_file_name("media")),
-            ))),
-            _ => None,
+                selected.web_search_enabled(),
+            ))
+        });
+        let selected = match &builtins {
+            Some(builtins) => selected
+                .with_builtin_names(builtins.names())
+                .map_err(|error| invalid(error.to_string()))?,
+            None => selected,
         };
-        let selected = match &settings.tools {
-            Some(tools) => tools.materialize(handle.clone()),
-            None => Tools::builder().without_defaults().build(),
-        }
-        .map_err(|error| invalid(error.to_string()))?;
         let selected = services
             .prepare_tools(&handle, selected, None)
             .map_err(|error| invalid(error.to_string()))?;
@@ -239,8 +248,8 @@ impl KimiHarness {
         let runtime = ToolRuntime::new_with_tools(workspace.to_path_buf(), Vec::new(), &selected);
         let mut tools = NanoTools::new(runtime, &session).map_err(invalid)?;
         let mut entries = std::mem::take(&mut tools.entries);
-        if builtins.is_some() {
-            entries.extend(crate::nanotools::builtin_entries());
+        if let Some(builtins) = &builtins {
+            entries.extend(crate::nanotools::builtin_entries(builtins));
         }
         let catalog = crate::nanotools::Catalog::new(entries);
         let given = &self.environment;
@@ -366,6 +375,18 @@ const fn spill_directory(_session: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Whether Kimi Code's built-in tools serve this selection's workspace (Codex's rule for its own).
+#[cfg(not(target_family = "wasm"))]
+fn kimi_workspace(tools: &nanocode_tool_host::Tools) -> bool {
+    tools.workspace_enabled() && tools.workspace_source().is_none() && !tools.has_code_mode_host()
+}
+
+/// Kimi Code's built-in tools use the local file system and processes, which wasm hosts do not have.
+#[cfg(target_family = "wasm")]
+const fn kimi_workspace(_: &nanocode_tool_host::Tools) -> bool {
+    false
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn home() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
@@ -374,4 +395,50 @@ fn home() -> Option<std::path::PathBuf> {
 #[cfg(target_family = "wasm")]
 const fn home() -> Option<std::path::PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use nanocode_tool_host::Tools;
+
+    #[test]
+    fn selection_drives_kimi_builtins() {
+        let builtins = |web| crate::tools::Builtins::new("/w".into(), None, None, web);
+        assert!(super::kimi_workspace(&Tools::default()));
+        assert!(!super::kimi_workspace(
+            &Tools::builder().without_defaults().build().unwrap()
+        ));
+        assert!(super::kimi_workspace(
+            &Tools::builder()
+                .without_defaults()
+                .workspace(true)
+                .build()
+                .unwrap()
+        ));
+        assert!(builtins(true).handles("FetchURL") && builtins(true).handles("Bash"));
+        assert!(!builtins(false).handles("FetchURL") && builtins(false).handles("Write"));
+        assert_eq!(builtins(false).names().count(), 12);
+        struct Noop;
+        impl nanocode_tool_host::FunctionHandler for Noop {
+            fn call<'a>(
+                &'a self,
+                _: &'a str,
+                _: serde_json::Value,
+                _: nanocode_tool_host::ToolContext<'a>,
+            ) -> nanocode_tool_host::embedded::HostFuture<'a, Result<serde_json::Value, String>>
+            {
+                Box::pin(async { Ok(serde_json::Value::Null) })
+            }
+        }
+        let read = nanocode_tool_host::FunctionTool::new(
+            "Read",
+            "",
+            serde_json::json!({"type": "object"}),
+            std::sync::Arc::new(Noop),
+        );
+        let reserved = Tools::default()
+            .with_builtin_names(builtins(true).names())
+            .unwrap();
+        assert!(reserved.into_builder().tool(read).build().is_err());
+    }
 }

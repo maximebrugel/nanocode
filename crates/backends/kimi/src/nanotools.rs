@@ -71,7 +71,7 @@ impl Catalog {
     }
 }
 
-pub fn builtin_entries() -> Vec<Entry> {
+pub fn builtin_entries(builtins: &crate::tools::Builtins) -> Vec<Entry> {
     let ordered = match Node::parse(crate::tools::CONTRACTS) {
         Ok(Node::List(tools)) => tools,
         _ => Vec::new(),
@@ -96,6 +96,7 @@ pub fn builtin_entries() -> Vec<Entry> {
             schema: declaration["function"]["parameters"].clone(),
             declaration,
         })
+        .filter(|entry| builtins.handles(&entry.name))
         .collect()
 }
 

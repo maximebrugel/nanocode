@@ -52,6 +52,22 @@ impl Outcome {
     }
 }
 
+const NAMES: [&str; 13] = [
+    "Bash",
+    "Edit",
+    "FetchURL",
+    "Glob",
+    "Grep",
+    "Read",
+    "ReadMediaFile",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TodoList",
+    "WaitFor",
+    "Write",
+];
+
 pub const APPLIED: &str =
     "<system>The change is applied; there is no need to Read the file back to check it.</system>";
 
@@ -68,17 +84,20 @@ pub struct Builtins {
     /// The session's media store (Kimi Code's `<session>/media`), where ReadMediaFile saves what it cannot
     /// send inline.
     media: Option<PathBuf>,
+    /// Whether FetchURL is on: it follows the selection's web-search switch, the way Codex's web tool does.
+    web: bool,
     todos: Mutex<Vec<todo::Todo>>,
     shell: shell::Shell,
 }
 
 impl Builtins {
-    pub fn new(cwd: PathBuf, home: Option<PathBuf>, media: Option<PathBuf>) -> Self {
+    pub fn new(cwd: PathBuf, home: Option<PathBuf>, media: Option<PathBuf>, web: bool) -> Self {
         Self {
             shell: shell::Shell::new(&cwd),
             cwd,
             home,
             media,
+            web,
             todos: Mutex::default(),
         }
     }
@@ -89,23 +108,16 @@ impl Builtins {
             .expect("verified upstream Kimi tool contracts")
     }
 
-    pub fn handles(name: &str) -> bool {
-        matches!(
-            name,
-            "Bash"
-                | "Edit"
-                | "FetchURL"
-                | "Glob"
-                | "Grep"
-                | "Read"
-                | "ReadMediaFile"
-                | "TaskList"
-                | "TaskOutput"
-                | "TaskStop"
-                | "TodoList"
-                | "WaitFor"
-                | "Write"
-        )
+    /// The built-in tools this agent has: every one Kimi Code runs locally, less FetchURL when web access
+    /// is off.
+    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        NAMES
+            .into_iter()
+            .filter(|name| self.web || *name != "FetchURL")
+    }
+
+    pub fn handles(&self, name: &str) -> bool {
+        self.names().any(|known| known == name)
     }
 
     /// Runs a built-in tool on arguments that already passed schema validation; `id` is the tool call's.

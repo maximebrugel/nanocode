@@ -2,9 +2,12 @@
 
 A nanocode harness that reproduces the engine of Kimi Code CLI (`@moonshot-ai/kimi-code` 2.7.3) for Kimi models: its
 system prompt, its reminders, its repeated-call guard, its compaction, its Chat Completions request shape and its
-built-in workspace tools: Read, Write, Edit, Glob, Grep, Bash, TaskList, TaskOutput, TaskStop, WaitFor and TodoList.
-Those are installed when the caller selects no tools (native targets only); with a tool selection, the model gets that
-selection, in Code Mode or directly (`KimiHarness::direct_tools`). Subagents, Code Mode and MCP stay nanocode's own.
+built-in tools: Read, Write, Edit, Glob, Grep, Bash, ReadMediaFile, FetchURL, TaskList, TaskOutput, TaskStop, WaitFor
+and TodoList. They follow the tool selection the way Codex's built-ins do: no selection means `Tools::default()`; the
+workspace switch (`ToolsBuilder::workspace`, off with `without_defaults`) brings them, the web-search switch brings
+FetchURL, and their names are reserved against registered tools. An explicit workspace source or a Code Mode host brings
+its own workspace tools instead, and wasm targets have none. The rest of the selection reaches the model beside them, in
+Code Mode or directly (`KimiHarness::direct_tools`). Subagents, Code Mode and MCP stay nanocode's own.
 
 ## Selecting it
 

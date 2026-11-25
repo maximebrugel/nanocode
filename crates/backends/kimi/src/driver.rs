@@ -463,7 +463,7 @@ impl Inner {
             .config
             .builtins
             .as_ref()
-            .filter(|_| Builtins::handles(&call.name));
+            .filter(|builtins| builtins.handles(&call.name));
         if builtin.is_none() && !self.config.tools.handles(&call.name) {
             return Outcome::error(format!("Tool \"{}\" not found", call.name));
         }
